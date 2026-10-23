@@ -4,27 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A window whose frame the window manager holds says so, so that frame is never taken for its
-//! normal one: tiled to a screen edge (`Window::is_tiled`) or full screen however it got there
-//! (`Window::is_shown_fullscreen`). GNOME's edge tiling (Super+Left/Right, a drag to an edge)
-//! sets `_NET_WM_STATE_MAXIMIZED_VERT` alone, and `is_maximized` asks for both directions; a full
-//! screen is `_NET_WM_STATE_FULLSCREEN`, which `is_maximized` does not read either. So aterm-gui
-//! recorded a tiled window's half-screen frame, and a full-screen window's screen, as the frame
-//! it restores to: after a restart it reopened floating at that size and place (the desk audit,
-//! 2026-10-22).
-//!
-//! A stand-in window manager on its own connection does what one does to the hidden window (no
-//! real window manager manages a window that was never mapped): it places it, sets the state, and
-//! sends the synthetic `ConfigureNotify` ICCCM 4.1.5 has it send for every move, from which the
-//! event loop reports `Moved` and `Resized`. At each, the test applies the rule aterm-gui's
-//! normal-frame tracker applies (`app_restore::frame_held`, feeding `NormalFrame` through
-//! `WindowState::note_normal_origin` and `note_normal_grid`): a frame is the window's normal one
-//! only while it shows neither maximized, tiled nor full screen. Through a tile or a full screen
-//! the normal frame stays the one before it, and after it ends the tracker follows the window
-//! again. Each test's negative control is in the test: the rule its fix replaced records the
-//! held frame.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! X11 tiled and fullscreen held-frame state tests.
 
 use std::time::{Duration, Instant};
 
@@ -51,14 +31,12 @@ fn frame(x: i32, y: i32, width: u32, height: u32) -> Frame {
     (PhysicalPosition::new(x, y), PhysicalSize::new(width, height))
 }
 
-/// The rule aterm-gui's tracker holds a window off its normal frame by, off Windows
-/// (`app_restore::frame_held`).
+/// Returns whether the window's frame is held by the window manager (`app_restore::frame_held`).
 fn held(window: &Window) -> bool {
     window.is_maximized() || window.is_tiled() || window.is_shown_fullscreen()
 }
 
-/// A synthetic `ConfigureNotify` for `window` at (`x`, `y`) on the root, `width` × `height`, as a
-/// window manager sends one (ICCCM 4.1.5): root coordinates, no border, no sibling.
+/// Builds a synthetic `ConfigureNotify` event for `window` at `(x, y)` with `width` by `height`.
 fn configure_notify(window: u32, (x, y): (i16, i16), (width, height): (u16, u16)) -> [u8; 32] {
     let mut event = [0; 32];
     event[0] = CONFIGURE_NOTIFY;
@@ -105,8 +83,7 @@ impl StandIn {
         (stand_in, States { vert, horz, fullscreen })
     }
 
-    /// Show the window in `states` (`_NET_WM_STATE`'s atoms, none for a normal window) at `at`,
-    /// `size`: the state first, then the move, as mutter sets them.
+    /// Applies `states` and configures the window at `at` and `size`.
     fn show(&self, states: &[u32], at: (i16, i16), size: (u16, u16)) {
         let state = if states.is_empty() {
             xproto::delete_property(self.window, self.net_wm_state)
@@ -129,9 +106,7 @@ impl StandIn {
     }
 }
 
-/// What the tracker made of the window's `Moved` and `Resized`: the normal frame under the rule
-/// aterm-gui reads ([`held`]), and under the rule a fix replaced (`control`), each the last
-/// position and size it recorded.
+/// What the tracker made of the window's `Moved` and `Resized` ([`held`]).
 #[derive(Debug, Default)]
 struct Tracked {
     held: (Option<PhysicalPosition<i32>>, Option<PhysicalSize<u32>>),
@@ -150,8 +125,7 @@ impl Tracked {
     }
 }
 
-/// A window on its own X11 event loop, the stand-in window manager that holds its frame, and
-/// what the tracker made of it.
+/// A window on its own X11 event loop, the stand-in window manager that holds its frame.
 struct Rig {
     event_loop: EventLoop<()>,
     window: Window,
@@ -173,9 +147,7 @@ impl Rig {
         (Self { event_loop, window, wm, tracked: Tracked::default(), control }, states)
     }
 
-    /// The stand-in shows the window in `states` at `shown`, and the loop is pumped until it has
-    /// reported that frame, feeding each `Moved` and `Resized` to the trackers as it comes; the
-    /// test fails after [`HANG`].
+    /// The stand-in shows the window in `states` at `shown` ([`HANG`]).
     fn show(&mut self, states: &[u32], shown: Frame) {
         let (at, size) = shown;
         self.wm.show(states, (at.x as i16, at.y as i16), (size.width as u16, size.height as u16));
@@ -230,16 +202,13 @@ fn a_tiled_windows_frame_is_never_its_normal_one() {
         return;
     }
     let _turn = super::shared_display_turn();
-    // The rule the tile fix replaced: held only while maximized in both directions.
     let (mut rig, States { vert, horz, .. }) = Rig::new(|window| window.is_maximized());
 
-    // Floating where the user put it: the normal frame, under either rule.
     let normal = frame(300, 200, 640, 400);
     rig.show(&[], normal);
     assert!(!held(&rig.window));
     assert_eq!(rig.tracked.held(), Some(normal));
 
-    // Super+Left: maximized vertically alone, on the left half.
     rig.show(&[vert], frame(0, 0, 800, 1000));
     assert!(rig.window.is_tiled(), "a window maximized vertically alone is tiled");
     assert!(!rig.window.is_maximized(), "and not maximized");
@@ -250,13 +219,11 @@ fn a_tiled_windows_frame_is_never_its_normal_one() {
         "negative control: the both-flags rule takes the tiled frame for the normal one"
     );
 
-    // Maximized from the tile, then tiled to the other side: the normal frame stays put.
     rig.show(&[vert, horz], frame(0, 0, 1600, 1000));
     assert!(rig.window.is_maximized() && !rig.window.is_tiled(), "both directions are maximized");
     rig.show(&[vert], frame(800, 0, 800, 1000));
     assert_eq!(rig.tracked.held(), Some(normal));
 
-    // Untiled: floating again, and the tracker follows a move.
     rig.show(&[], normal);
     rig.show(&[], frame(320, 210, 660, 420));
     assert!(!rig.window.is_tiled());
@@ -269,25 +236,19 @@ fn a_full_screen_windows_frame_is_never_its_normal_one() {
         return;
     }
     let _turn = super::shared_display_turn();
-    // The rule the full-screen fix replaced: held only while maximized or tiled.
     let (mut rig, States { vert, fullscreen, .. }) =
         Rig::new(|window| window.is_maximized() || window.is_tiled());
 
-    // Floating where the user put it: the normal frame, under either rule.
     let normal = frame(300, 200, 640, 400);
     rig.show(&[], normal);
     assert!(!rig.window.is_shown_fullscreen());
     assert_eq!(rig.tracked.held(), Some(normal));
 
-    // A full screen this window asks for counts before the window manager shows it (aterm-window
-    // moves the window to the monitor's origin first, so that `Moved` can come first), and stops
-    // counting when it asks to leave.
     rig.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
     assert!(rig.window.is_shown_fullscreen(), "a full screen asked for is held");
     rig.window.set_fullscreen(None);
     assert!(!rig.window.is_shown_fullscreen(), "and no longer once left");
 
-    // The window manager's own full screen (a key or rule of its own: aterm asked for nothing).
     rig.show(&[fullscreen], frame(0, 0, 1600, 1000));
     assert!(rig.window.is_shown_fullscreen(), "_NET_WM_STATE_FULLSCREEN is a full screen");
     assert!(
@@ -301,13 +262,11 @@ fn a_full_screen_windows_frame_is_never_its_normal_one() {
         "negative control: the maximized-or-tiled rule takes the full screen for the normal frame"
     );
 
-    // Full screen from a tile, and back to the tile: still not the normal frame.
     rig.show(&[vert], frame(0, 0, 800, 1000));
     rig.show(&[vert, fullscreen], frame(0, 0, 1600, 1000));
     assert!(rig.window.is_shown_fullscreen());
     assert_eq!(rig.tracked.held(), Some(normal));
 
-    // Out of full screen: floating again, and the tracker follows a move.
     rig.show(&[], normal);
     rig.show(&[], frame(320, 210, 660, 420));
     assert!(!rig.window.is_shown_fullscreen());

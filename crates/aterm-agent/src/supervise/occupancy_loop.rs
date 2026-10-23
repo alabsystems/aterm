@@ -4,8 +4,9 @@
 //! THE HOLD'S CLOCK AND THE OCCUPANCY DOOR IN THE LOOP (`docs/DESIGN-harness-occupancy-2026-10-20.md`
 //! §3.1, §3.2 and §6; the clock itself is [`crate::supervise::occupancy::hold`], the decider
 //! [`crate::supervise::occupancy::rules`]): what the loop feeds the clock, what it says of each
-//! change, and what the built-in rules would do at a break. It TYPES NOTHING, asks the server
-//! nothing and changes no decision.
+//! change, and what the built-in rules would do at a break. Under `off` and `observe` it TYPES
+//! NOTHING, asks the server nothing and changes no decision; under the owner's `prompt` alone the
+//! door types its line at a drawn break ([`Session::occupancy_write`]).
 //!
 //! WHERE IT RUNS (the red-team's F2 and F4): on a HOSTED loop (a window's host, `stall_host`),
 //! run UNATTENDED, with a policy whose `occupancy` is not `off`. Anywhere else nothing is fed,
@@ -40,7 +41,8 @@
 //! * guards judged ONLY from what the loop holds already (the red-team's F1): the last `status`'s
 //!   person, driver and halt, the draft every read clocks, the break's own screen (a launch card
 //!   with nothing asked under it: no task yet), the memory verdict and the API's reach the last
-//!   points measured, the policy's own state, the brakes the loop keeps — and no `status`,
+//!   points measured, the policy's own state (a line of the policy's, the door's or the host's
+//!   the agent has not taken among it), the brakes the loop keeps — and no `status`,
 //!   `cell`, memory, taskless or reach read is made for them. The host's record of whose turns
 //!   the conversation holds ([`IdleHost::taskless`]) is such a read: a session the screen draws
 //!   with a message under its card is not judged taskless here. Where a brake's own test reads the clock or the
@@ -51,7 +53,22 @@
 //! What it says: one `OCCUPANCY seq=<n> rule=<id> rev=builtin episode=<hex> door=break …` line a
 //! rule a change (`would`, `held:<guard>`, `paced next_s=<n>`, `spent`), and for each would-be
 //! line a `fact-would@v1` row (`waiting`), which counts toward the rule's caps and the session's
-//! pace as a typed line would. Currently types nothing under any key: `prompt` reads as `observe`.
+//! pace as a typed line would.
+//!
+//! UNDER `prompt` ([`Session::occupancy_write`]; the red-team's F1, F10, F11 and F12) the due line
+//! is no would-be row: the break's step, once the host's own step is judged, takes it to the
+//! write, where — and only there, with the owner's grant in hand — the door makes its reads: one
+//! `status`, parsed apart from the loop's fields; the guards again with that read, a draft in the
+//! composer (an unknown one is a draft) and the host's record of a taskless session; a manager
+//! waiting on the session holds it; then the host's withhold and wind-down, the upgrade's notice
+//! due (a nudge waits for it), and the host's pace (`IdleHost::occupancy_pace`). Then a
+//! `fact-intent@v1` row, the fenced write (`Session::type_fact`: never the guarded submit), and
+//! after it the line's own turn state (`TurnEndState::fact_typed`), the facts state, the books,
+//! the host's `break_taken` and `inform`, and the outcome's `fact-hold@v1` row, `typed` or
+//! `skipped why=<word>`. Its `OCCUPANCY` line says `typed`, `skipped why=…`, `held:<guard>`,
+//! `told`, `paced why=…` or `refused why=…`, once a change. A typed line is booked as a would-be
+//! line is, and a successor seeds its facts from the door's rows ([`door::seed_rows_in`]): an
+//! intent with no outcome after it is untold, so a crash between them retells it once.
 //!
 //! A SUCCESSOR CARRIES THE HOLD (a seamless update, a loop restarted on the same agent) only from
 //! a loop that watched it until just before this one began (the red-team's F3): the last
@@ -70,12 +87,14 @@
 use std::time::{Duration, Instant};
 
 use super::super::config::SupervisorConfig;
-use super::super::facts::FactKind;
+use super::super::facts::{EpisodeKey, FactKind, FactsState};
 use super::super::memory;
-use super::super::occupancy::OccupancyReading;
+use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
+use super::super::occupancy::fault::{Fault, armed};
 use super::super::occupancy::hold::{self, Close, HoldChange, HoldClock, HoldEvent, RowSaid};
 use super::super::occupancy::rules::{self, Books, Guards, HoldSeen, RuleId, Verdict};
-use super::super::policy::turn_end::Reach;
+use super::super::occupancy::{FactLine, OccupancyReading};
+use super::super::policy::turn_end::{HostTurn, Reach};
 use super::approvals::Outcome;
 use super::*;
 
@@ -120,6 +139,45 @@ struct DoorWatch {
     /// The clock's milliseconds and the wall's (unix ms) at the loop's start
     /// ([`Session::hold_seed_from`]): a hold's start in unix ms, for its episodes' ids.
     wall: Option<(i64, i64)>,
+    /// Under `prompt`, this break's due line, for the write at the same break
+    /// ([`Session::occupancy_write`]).
+    due: Option<DueLine>,
+    /// Which episodes the session was told, seeded from the ledger's fact rows.
+    facts: FactsState,
+    /// The episode whose write last made its reads and wrote nothing, with when it may be tried
+    /// again (the clock's): a skipped write once the session's pace has passed, so a host that
+    /// cannot fence books no rows every break; a held one at the next board look
+    /// ([`ASK_EVERY_MS`]), so a person's keys or a machine pace cost one `status` read, one
+    /// composer read and one pace a look, not one a settled read (the safety review's F-D).
+    again: Option<(u64, i64)>,
+}
+
+/// A due line under `prompt`, between the decider and the write at the same break.
+#[derive(Debug, Clone)]
+struct DueLine {
+    rule: RuleId,
+    line: FactLine,
+    episode: u64,
+    hold: HoldSeen,
+    /// The break's read, on the clock's milliseconds and as an instant.
+    now_ms: i64,
+    now: Instant,
+    seq: u64,
+}
+
+/// What the door's write came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrote {
+    /// A guard held it at the write.
+    Held(Guard),
+    /// The episode was told already (a predecessor's row).
+    Told,
+    /// The host's pace held or refused it.
+    Paced(PaceGrant),
+    /// Typed and submitted.
+    Typed,
+    /// Its intent was booked, and nothing was written: why.
+    Skipped(&'static str),
 }
 
 /// What a rule's last `OCCUPANCY` line said.
@@ -133,6 +191,14 @@ enum Said {
     Paced,
     /// Its cap was spent.
     Spent,
+    /// Under `prompt`: this episode typed.
+    Typed(u64),
+    /// Under `prompt`: this episode's write skipped.
+    Skipped(u64),
+    /// Under `prompt`: this episode told already.
+    Told(u64),
+    /// Under `prompt`: the host's pace held it.
+    HostPaced(PaceGrant),
 }
 
 /// What a loop before this one left of the hold.
@@ -193,6 +259,8 @@ impl<C: Ctl> Session<'_, C> {
         }
         let start_ms = self.hold_ms(start);
         self.hold.door.wall = Some((start_ms, now_ms));
+        let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
+        self.hold.door.facts.seed(&facts, now_ms);
         let would = rules::would_rows_in(body, self.setup.sid.as_deref());
         let Some(row) = hold::seed_row_in(body, self.setup.sid.as_deref()) else {
             self.door_seed(&would, start_ms, now_ms, None);
@@ -363,6 +431,7 @@ impl<C: Ctl> Session<'_, C> {
         // the nudge that needs no machine reading. Keep its 1a hold clock,
         // but add no new rule notes, row stamps or ledger outputs on replay.
         // A live empty board still permits the machine-independent nudge.
+        self.hold.door.due = None;
         if self.fx.replay_lacks_host_door("host.occupancy") {
             return;
         }
@@ -385,9 +454,307 @@ impl<C: Ctl> Session<'_, C> {
         };
         let guards = self.occupancy_guards(now, cfg, &screen.rows);
         let verdicts = rules::decide(&reading, Some(hold), &self.hold.door.books, &guards, now_ms);
+        // A tape from a build with no write (no `host.occupancy_pace` door: 1b's, which read
+        // `prompt` as `observe`) replays as it was recorded: its due lines are would-be rows.
+        let prompt = cfg.occupancy.grant().is_some()
+            && !self.fx.replay_lacks_host_door("host.occupancy_pace");
         for (rule, verdict) in verdicts {
+            if prompt && let Verdict::Due(line) = &verdict {
+                self.occupancy_due(screen.seq, rule, line, hold, (now_ms, now));
+                continue;
+            }
             self.occupancy_said(screen.seq, rule, verdict, hold, now_ms, review);
         }
+    }
+
+    /// UNDER `prompt`, A DUE LINE kept for the write at this same break
+    /// ([`Self::occupancy_write`]), which the break's step makes once the host's own step is
+    /// judged (§2.1: the host's line, the upgrade's notice, goes first). Nothing is said yet. An
+    /// episode whose write made its reads and wrote nothing waits until it may be tried again
+    /// (`DoorWatch::again`).
+    fn occupancy_due(
+        &mut self,
+        seq: u64,
+        rule: RuleId,
+        line: &FactLine,
+        hold: HoldSeen,
+        (now_ms, now): (i64, Instant),
+    ) {
+        let episode = rules::episode(
+            rule,
+            self.hold_wall_ms(hold.since_ms),
+            self.hold.door.books.this_hold(rule),
+        );
+        if self
+            .hold
+            .door
+            .again
+            .is_some_and(|(waits, at_ms)| waits == episode && now_ms < at_ms)
+        {
+            return;
+        }
+        self.hold.door.due = Some(DueLine {
+            rule,
+            line: line.clone(),
+            episode,
+            hold,
+            now_ms,
+            now,
+            seq,
+        });
+    }
+
+    /// THE DOOR'S WRITE UNDER `prompt`, at the break whose decider left a line due
+    /// (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2.1; the red-team's F1, F10, F11): the
+    /// break's step calls it last, with `before` the guard that already held the break (a brake,
+    /// or [`Guard::HostLine`] where the host typed its line, which [`door::write_held`] judges
+    /// first). Only under the owner's grant, and in this order: the break's one line not gone
+    /// already; the episode not told already; one `status` read, parsed apart from the
+    /// loop's own fields; the full guard set again (that read's person, driver, halt and unread
+    /// input, a draft in the composer, the host's record of a taskless session); the host's
+    /// withhold and its wind-down, then the upgrade's notice due (a nudge waits for it); the
+    /// host's pace; the `fact-intent@v1` row; the fenced write ([`Self::type_fact`]); then the
+    /// bookkeeping and the outcome's `fact-hold@v1` row, and one `OCCUPANCY` line once a change.
+    /// Whether the line was typed.
+    pub(super) fn occupancy_write(
+        &mut self,
+        screen: &Screen,
+        before: Option<Guard>,
+        cfg: Option<&SupervisorConfig>,
+        review: &mut dyn Review,
+    ) -> Result<bool, Fail> {
+        let Some(due) = self.hold.door.due.take() else {
+            return Ok(false);
+        };
+        let (Some(cfg), Some(host)) = (cfg, self.stall_host.clone()) else {
+            return Ok(false);
+        };
+        let Some(grant) = cfg.occupancy.grant() else {
+            return Ok(false);
+        };
+        if due.seq != screen.seq {
+            return Ok(false);
+        }
+        let key = EpisodeKey {
+            kind: FactKind::Hold,
+            id: due.episode,
+        };
+        let line_gone = before == Some(Guard::HostLine);
+        let gone = AtWrite {
+            host_line: line_gone,
+            ..AtWrite::default()
+        };
+        let wrote = if let Some(guard) = before.filter(|_| !line_gone) {
+            Wrote::Held(guard)
+        } else if let Some(guard) = door::write_held(due.rule, gone) {
+            Wrote::Held(guard)
+        } else if self.hold.door.facts.is_told(key) {
+            Wrote::Told
+        } else {
+            let wrote = if let Some(guard) = self.door_holds(screen, &due, cfg, host.as_ref())? {
+                Wrote::Held(guard)
+            } else {
+                let pace = host.occupancy_pace(due.rule, self.hold_wall_ms(due.hold.since_ms));
+                if pace.lets() {
+                    self.door_types(&grant, screen, &due, key, cfg, host.as_ref(), review)?
+                } else {
+                    Wrote::Paced(pace)
+                }
+            };
+            // Its reads made and nothing written: tried again at the next look (a skip has
+            // set its own wait).
+            if matches!(wrote, Wrote::Held(_) | Wrote::Paced(_)) && !armed(Fault::DoorRereads) {
+                self.hold.door.again = Some((due.episode, due.now_ms.saturating_add(ASK_EVERY_MS)));
+            }
+            wrote
+        };
+        self.door_said(&due, wrote, review);
+        Ok(wrote == Wrote::Typed)
+    }
+
+    /// What holds the due line at the write, past the decider: the `status` read and the full
+    /// guard set again, then the host's withhold, its wind-down and the upgrade's notice
+    /// ([`door::write_held`]). `None`: nothing.
+    fn door_holds(
+        &mut self,
+        screen: &Screen,
+        due: &DueLine,
+        cfg: &SupervisorConfig,
+        host: &dyn IdleHost,
+    ) -> Result<Option<Guard>, Fail> {
+        let seen = if armed(Fault::DoorSkipsStatus) {
+            StatusSeen {
+                human: super::super::screen::HumanInput::Never,
+                driver: false,
+                halted: false,
+                input_unread: false,
+            }
+        } else {
+            let r = self.call(&["status"])?;
+            if self.unserved(&r) {
+                return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
+            }
+            let Some(seen) = r.ok().then(|| StatusSeen::of(&r.stdout)).flatten() else {
+                return Ok(Some(Guard::Person));
+            };
+            seen
+        };
+        let mut guards = self.occupancy_guards(due.now, cfg, &screen.rows);
+        guards.person |= seen.person(cfg.human_grace_s);
+        guards.halted |= seen.halted;
+        guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
+        guards.taskless |= host.taskless();
+        if armed(Fault::DoorIgnoresPerson) {
+            guards.person = false;
+            guards.halted = false;
+        }
+        if armed(Fault::DoorIgnoresDraft) {
+            guards.draft = false;
+        }
+        let brakes = !armed(Fault::DoorIgnoresBrakes);
+        if !brakes {
+            guards.brake = None;
+            guards.memory = false;
+            guards.reach_down = false;
+        }
+        if let Some(guard) = guards.held(due.rule) {
+            return Ok(Some(guard));
+        }
+        let withheld = brakes && (host.withholds_turn_end() || host.owns_turn_end());
+        // The break's line gone was judged before anything was read.
+        let at = AtWrite {
+            host_line: false,
+            withheld,
+            upgrade_due: !withheld && host.upgrade_due(),
+        };
+        Ok(door::write_held(due.rule, at))
+    }
+
+    /// Whether the composer the break's screen draws holds a draft: `Some(true)` a draft,
+    /// `None` unknown — which the door reads as a draft (F10).
+    fn door_draft(&mut self, screen: &Screen) -> Option<bool> {
+        let reader = self.reader(&screen.rows);
+        let reading = reader.read(&screen.rows, Some(screen.cursor_col));
+        let (placeholder, hint_fg) = (
+            reading.program.reader().placeholder(),
+            reading.program.reader().placeholder_fg(),
+        );
+        self.composer_draft(reading.composer.as_ref(), placeholder, hint_fg, screen)
+    }
+
+    /// The write itself, every guard passed: the intent row, the fenced write, and after it the
+    /// line's bookkeeping and its outcome row.
+    #[allow(clippy::too_many_arguments)]
+    fn door_types(
+        &mut self,
+        grant: &super::super::config::PromptGrant,
+        screen: &Screen,
+        due: &DueLine,
+        key: EpisodeKey,
+        cfg: &SupervisorConfig,
+        host: &dyn IdleHost,
+        review: &mut dyn Review,
+    ) -> Result<Wrote, Fail> {
+        let held_ms = due.now_ms.saturating_sub(due.hold.since_ms);
+        let (rule, episode, declared) = (due.rule, due.episode, due.hold.declared);
+        self.ledger_row(
+            door::INTENT_RULE,
+            Outcome::Waiting,
+            "",
+            &door::intent_reason(rule, episode, held_ms, declared),
+            due.seq,
+        );
+        let text = due.line.text();
+        let outcome_row = |s: &mut Self, told: Told| {
+            let outcome = match told {
+                Told::Typed => Outcome::Typed,
+                Told::Skipped(_) => Outcome::Skipped,
+            };
+            s.ledger_row(
+                FactKind::Hold.rule(),
+                outcome,
+                text,
+                &door::outcome_reason(rule, episode, held_ms, declared, told),
+                due.seq,
+            );
+        };
+        let early = armed(Fault::DoorOutcomeFirst);
+        if early {
+            outcome_row(self, Told::Typed);
+        }
+        let point = self.turn_of(screen.clone());
+        let written = self.type_fact(grant, &point, text, rule.name(), review)?;
+        if written != Some(true) {
+            let why = if written.is_none() {
+                "unfenced"
+            } else {
+                "not-written"
+            };
+            self.door_skipped(due, why, &outcome_row);
+            return Ok(Wrote::Skipped(why));
+        }
+        if armed(Fault::DoorHostTyped) {
+            self.turn_end.host_typed(self.fx.mono(), HostTurn::Notice);
+        } else {
+            self.turn_end.fact_typed();
+        }
+        self.hold
+            .door
+            .facts
+            .told(key, self.hold_wall_ms(due.now_ms));
+        self.hold.door.books.fired(rule, due.now_ms, true);
+        self.hold_line(due.seq, Some(cfg), review);
+        host.break_taken();
+        host.inform(text);
+        if !early {
+            outcome_row(self, Told::Typed);
+        }
+        Ok(Wrote::Typed)
+    }
+
+    /// A WRITE THAT WROTE NOTHING after its intent row (`OccupancyDoor`'s `Skip`): its outcome
+    /// row `skipped why=<why>`, the episode untold, and tried again only past the session's pace.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "Skip",
+            project = "conformance_occupancy::project"
+        )
+    )]
+    fn door_skipped(&mut self, due: &DueLine, why: &'static str, row: &dyn Fn(&mut Self, Told)) {
+        self.hold.door.again = Some((
+            due.episode,
+            due.now_ms.saturating_add(rules::SESSION_PACE_MS),
+        ));
+        row(self, Told::Skipped(why));
+    }
+
+    /// The write's `OCCUPANCY` line, once a change: `typed`, `skipped why=<word>`,
+    /// `held:<guard>`, `told`, `paced why=<word>` or `refused why=<word>`.
+    fn door_said(&mut self, due: &DueLine, wrote: Wrote, review: &mut dyn Review) {
+        let (said, words) = match wrote {
+            Wrote::Held(guard) => (Said::Held(guard), format!("held:{}", guard.word())),
+            Wrote::Told => (Said::Told(due.episode), "told".to_string()),
+            Wrote::Paced(PaceGrant::Refused(why)) => (
+                Said::HostPaced(PaceGrant::Refused(why)),
+                format!("refused why={}", why.word()),
+            ),
+            Wrote::Paced(pace) => (Said::HostPaced(pace), format!("paced why={}", pace.word())),
+            Wrote::Typed => (Said::Typed(due.episode), "typed".to_string()),
+            Wrote::Skipped(why) => (Said::Skipped(due.episode), format!("skipped why={why}")),
+        };
+        let last = &mut self.hold.door.said[due.rule.index()];
+        if *last == Some(said) {
+            return;
+        }
+        *last = Some(said);
+        review.note(&format!(
+            "OCCUPANCY seq={} rule={} rev=builtin episode={:016x} door=break {words}",
+            due.seq,
+            due.rule.name(),
+            due.episode
+        ));
     }
 
     /// The board's reading for this break: the one asked within the last [`ASK_EVERY_MS`], else
@@ -425,10 +792,16 @@ impl<C: Ctl> Session<'_, C> {
         let reader = self.reader(rows);
         let credits =
             !cfg.usage_credits && (self.credits_kept.is_some() || reader.credits(rows).is_some());
+        // An act untaken is any line the harness typed that the agent has not taken: the
+        // policy's, the door's own, and the host's (the upgrade's notice, a carry-on), which
+        // `act_untaken` leaves to the host's own step and which stands until the agent's turn
+        // is read, past the break it went at (the safety review's F-A).
+        let untaken = self.turn_end.act_untaken()
+            || (self.turn_end.typed_untaken() && !armed(Fault::OverUntakenHostLine));
         let brake = [
             (self.stalled.is_some(), Guard::Stall),
             (self.limit.is_some(), Guard::LimitEpisode),
-            (self.turn_end.act_untaken(), Guard::ActUntaken),
+            (untaken, Guard::ActUntaken),
             (self.wake_settle.is_some(), Guard::WakeSettle),
             (credits, Guard::Credits),
         ]
@@ -447,6 +820,7 @@ impl<C: Ctl> Session<'_, C> {
             draft: self.draft_seen.is_some(),
             taskless: reader.fresh(rows),
             exchange: self.turn_end.left_to_person(),
+            managed: self.turn_end.managed(),
             memory: self.memory_seen.is_some()
                 || matches!(
                     self.memory_told,
@@ -613,6 +987,10 @@ impl<C: Ctl> Session<'_, C> {
                 format!("hold closed why={} held_s={}", why.word(), s(held_ms))
             }
         };
+        if let HoldChange::Closed { .. } = change {
+            // The hold's episodes closed with it: none is open, and a seed holds its kind no more.
+            self.hold.door.facts.observe_closed(&[]);
+        }
         review.note(&format!("OCCUPANCY seq={seq} {words}"));
         let row = match change {
             HoldChange::Opened { .. } => None,

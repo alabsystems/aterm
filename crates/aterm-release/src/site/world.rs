@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machine's [`World`]: `gh`, the release download host, `curl` for the live
-//! site, the wasm32 pin's stock cargo and `wasm-opt` for the `/terminal` engine, the
-//! site's `deploy.sh` and `firebase`.
+//! The machine's [`World`]: GitHub's REST API ([`crate::github`]), the release download host,
+//! `curl` for the live site, the wasm32 pin's stock cargo and `wasm-opt` for the `/terminal`
+//! engine, the site's `deploy.sh` and `firebase`.
 
 use std::io::{BufRead as _, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use aterm_uds::spawnfd::{Command, Stdio, command};
+use aterm_update_core::github_rest::Spawn;
 use aterm_verify::wasm_glue::WASM_OPT_FLAGS;
 
 use super::engine::{STEM, TARGET};
 use super::{Launch, Ran, World, output};
 
-/// The variables that relocate cargo's output or replace its compiler or flags: the
-/// engine's inputs are the fresh clone and its pin, never the caller's shell (a
-/// `CARGO_TARGET_DIR` or build dir moves the build out of the clone the remaps cover; a
-/// `RUSTC_WRAPPER` that caps lints changes what compiles). The build then sets `RUSTC`,
-/// `CARGO_TARGET_DIR` and `CARGO_ENCODED_RUSTFLAGS` itself; the last outranks every
-/// other rustflags source, so the caller's flags never reach the module.
+/// The variables that relocate cargo's output or replace its compiler or flags: the engine's inputs
+/// are the fresh clone and its pin, never the caller's shell (a `CARGO_TARGET_DIR` or build dir
+/// moves the build out of the clone the remaps cover; a `RUSTC_WRAPPER` that caps lints changes
+/// what compiles).
 pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
@@ -36,15 +36,8 @@ pub const ENGINE_BUILD_UNSET: [&str; 12] = [
     "CARGO_BUILD_RUSTFLAGS",
 ];
 
-/// `pin`'s own `cargo` (STOCK EXCEPTION: Trust ships only its host std) building the
-/// CPU module in `clone`: release profile, the clone's own lock, wasm32, the output in
-/// the clone's `target/`. [`ENGINE_BUILD_UNSET`] and `unset` are removed, then `pin`'s
-/// `rustc` is named and `rustflags` are handed over as `CARGO_ENCODED_RUSTFLAGS`
-/// ([`encoded_rustflags`]). Cargo takes that variable over every other rustflags source
-/// (`RUSTFLAGS`, `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, `--config`, the `target` and `build`
-/// rustflags of any config file above the clone or in `CARGO_HOME`), exactly as the site
-/// script's `RUSTFLAGS` did, and with `--target` hands it to the wasm32 units alone.
-///
+/// `pin`'s own `cargo` (STOCK EXCEPTION: Trust ships only its host std) building the CPU module in
+/// `clone`: release profile, the clone's own lock, wasm32, the output in the clone's `target/`.
 /// # Errors
 /// A flag [`encoded_rustflags`] cannot carry.
 pub fn module_command(
@@ -82,9 +75,8 @@ pub fn module_command(
     Ok(build)
 }
 
-/// `flags` as `CARGO_ENCODED_RUSTFLAGS` spells them: joined by the unit separator
-/// (0x1f), so a path with a space stays one flag.
-///
+/// `flags` as `CARGO_ENCODED_RUSTFLAGS` spells them: joined by the unit separator (0x1f), so a path
+/// with a space stays one flag.
 /// # Errors
 /// A flag that holds 0x1f itself, which cargo would split in two.
 pub fn encoded_rustflags(flags: &[String]) -> Result<String, String> {
@@ -135,8 +127,8 @@ pub fn deploy_command(site: &Path, unset: &[String]) -> Command {
     deploy
 }
 
-/// `firebase projects:list` with the credential deploy.sh would use: the service-account
-/// key when it exists (and the site's headless config), else the pinned account.
+/// `firebase projects:list` with the credential deploy.sh would use: the service-account key when
+/// it exists (and the site's headless config), else the pinned account.
 #[must_use]
 pub fn firebase_probe_command(
     site: &Path,
@@ -192,13 +184,11 @@ fn streamed(
         .map_err(|e| format!("cannot make a pipe: {e}"))?;
     cmd.stdin(Stdio::null()).stdout(writer).stderr(second);
     let spawned = launch.spawn(cmd);
-    // the command's copies of the write end go, so the reader sees the end
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let (mut child, guard) =
         spawned.map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
     let (tx, rx) = std::sync::mpsc::channel::<Event>();
     let lines = tx.clone();
-    // Detached: a reader blocked on a pipe a daemon holds ends when the daemon does.
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
@@ -239,7 +229,6 @@ fn streamed(
                 status = Some(s);
                 until = Some(std::time::Instant::now() + drain);
             }
-            // the drain's bound passed with the pipe still held
             None => break,
         }
     }
@@ -254,12 +243,11 @@ fn streamed(
     })
 }
 
-/// The machine. `unset` names the variables no child it starts may inherit: the
-/// launcher's own when `targo ... ship` runs it, or the release's whole scrub list;
-/// `launch` starts every child.
+/// The machine.
 pub struct Real {
     pub unset: Vec<String>,
     pub launch: Rc<dyn Launch>,
+    pub github: Arc<dyn Spawn>,
 }
 
 impl World for Real {
@@ -267,21 +255,19 @@ impl World for Real {
         Rc::clone(&self.launch)
     }
 
-    fn gh_api(&mut self, path: &str, paginate: bool) -> Result<String, String> {
-        let mut gh = command("gh");
-        gh.args(["api", path]);
-        if paginate {
-            gh.arg("--paginate");
+    fn github(&mut self, path: &str, paginate: bool) -> Result<String, String> {
+        if let Some(signal) = self.launch.interrupted() {
+            return Err(format!(
+                "not asked: the sync was interrupted by signal {signal}"
+            ));
         }
-        for name in &self.unset {
-            gh.env_remove(name);
-        }
-        let out = output(&*self.launch, &mut gh).map_err(|e| format!("cannot run gh: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let spawn = Some(&self.github);
+        let answered = if paginate {
+            crate::github::pages_via(spawn, path, 100).map(aterm_json::Value::Array)
         } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+            crate::github::get_via(spawn, path)
+        };
+        answered.map(|v| v.to_string()).map_err(|e| e.to_string())
     }
 
     fn download(&mut self, url: &str, limit: u64) -> Result<Vec<u8>, String> {
@@ -334,8 +320,6 @@ impl World for Real {
             keep_rust_homes(&mut cmd);
             cmd
         };
-        // wasm-opt is asked first: the build takes minutes, and its module never ships
-        // without the pass
         let mut probe = plain(&wasm_opt_program());
         probe.arg("--version");
         if !output(launch, &mut probe).is_ok_and(|o| o.status.success()) {
@@ -350,7 +334,6 @@ impl World for Real {
                 aterm_verify::rustup::RUSTUP_LOOKED
             )
         })?;
-        // the pin's wasm32 std, added as the release's wasm32 gate adds it
         let mut add = plain(&rustup);
         add.args(["target", "add", "--toolchain", pin, TARGET]);
         let added = streamed(launch, &mut add, out, DRAIN_AFTER_EXIT)?;
@@ -473,7 +456,6 @@ mod tests {
         .unwrap();
         assert_eq!(cmd.get_program(), "/rustup/1.97.1/bin/cargo");
         assert_eq!(cmd.get_current_dir(), Some(clone));
-        // every steering variable is gone, but the three the build names itself
         let own = ["RUSTC", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS"];
         let gone = removed(&cmd);
         for name in ENGINE_BUILD_UNSET
@@ -495,8 +477,6 @@ mod tests {
             set(&cmd, "CARGO_TARGET_DIR"),
             Some(clone.join("target").as_os_str())
         );
-        // the flags reach cargo as CARGO_ENCODED_RUSTFLAGS, which splits back into exactly
-        // them, a path with a space and quotes included; nothing on the command line
         let encoded = set(&cmd, "CARGO_ENCODED_RUSTFLAGS")
             .unwrap()
             .to_str()
@@ -518,7 +498,6 @@ mod tests {
             module_path(clone),
             clone.join("target/wasm32-unknown-unknown/release/aterm_wasm.wasm")
         );
-        // a flag holding the separator would split, so it is refused
         let split = vec!["--cfg".to_string(), "a\x1fb".to_string()];
         let why = module_command(Path::new("c"), Path::new("r"), "p", clone, &split, &[])
             .err()
@@ -553,7 +532,6 @@ mod tests {
                 "--non-interactive"
             ]
         );
-        // a key that exists wins, with the site's headless config
         let dir = aterm_tempfile::Builder::new()
             .prefix("aterm-site-key-")
             .tempdir()
@@ -573,7 +551,6 @@ mod tests {
             set(&cmd, "XDG_CONFIG_HOME"),
             Some(site.join(".firebase/headless-config").as_os_str())
         );
-        // a key named but absent falls back to the account
         let cmd = firebase_probe_command(site, Some("a@b.invalid"), Some(&dir.path().join("gone")));
         assert_eq!(cmd.get_args().next(), Some(OsStr::new("--account")));
     }

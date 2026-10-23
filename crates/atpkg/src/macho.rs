@@ -26,9 +26,21 @@ pub fn is_macho_header(head: &[u8]) -> bool {
     FAT_MAGICS.contains(&magic) && head.get(4..8).is_some_and(|n| n != [0; 4])
 }
 
+/// The load commands that name a dylib the loader maps (`<mach-o/loader.h>`):
+/// `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and
 /// `LC_LOAD_UPWARD_DYLIB`. `LC_ID_DYLIB` is a library's own name and loads nothing.
 const DYLIB_LOADS: [u32; 5] = [0xC, 0x8000_0018, 0x8000_001F, 0x20, 0x8000_0023];
 
+/// `LC_ID_DYLIB`: a dylib's own install name, which a program linked against it records.
+const DYLIB_ID: u32 = 0xD;
+
+/// `LC_RPATH`: one run path an `@rpath/` name is searched under.
+const RPATH: u32 = 0x8000_001C;
+
+/// The fixed part of an `rpath_command`: cmd, cmdsize, then the path's offset.
+const RPATH_COMMAND: usize = 12;
+
+/// The most slices a universal file may name before the reader refuses it: a real one
 /// carries two or three.
 const MAX_SLICES: u32 = 16;
 
@@ -38,6 +50,14 @@ const MAX_MACHO_BYTES: usize = 1 << 30;
 /// A 64-bit Mach-O header's size, which its load commands follow.
 const HEADER_64: usize = 32;
 
+/// A 32-bit Mach-O header's size (no reserved word), which its load commands follow.
+const HEADER_32: usize = 28;
+
+/// What a static archive opens with (`ar`'s magic): a universal file's slice may be one,
+/// which carries object files and loads no dylib.
+const ARCHIVE_MAGIC: &[u8] = b"!<arch>\n";
+
+/// The fixed part of a `dylib_command`: cmd, cmdsize, then the `dylib` struct (name
 /// offset, timestamp, current and compatibility versions).
 const DYLIB_COMMAND: usize = 24;
 
@@ -46,7 +66,7 @@ const DYLIB_COMMAND: usize = 24;
 pub enum LoadError {
     /// The file could not be read (not a regular file, too large, or I/O).
     Io(std::io::Error),
-    /// The bytes are not a well-formed 64-bit Mach-O: what is wrong, and where.
+    /// The bytes are not a well-formed Mach-O: what is wrong, and where.
     Malformed(String),
 }
 
@@ -61,7 +81,7 @@ impl std::fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-fn malformed(why: String) -> LoadError {
+const fn malformed(why: String) -> LoadError {
     LoadError::Malformed(why)
 }
 
@@ -86,13 +106,79 @@ fn wide(bytes: &[u8], at: usize, what: &str) -> Result<u64, LoadError> {
     Ok((u64::from(hi) << 32) | u64::from(lo))
 }
 
-/// Returns every dylib path loaded by the Mach-O `bytes` in load-command order.
+/// Whether `bytes` open as a Java class file rather than a universal Mach-O: both start
+/// `CAFEBABE`, and a class file's minor and major versions read as an arch count of at
+/// least 45 (Java 1.1's major), more slices than any universal file carries.
+#[must_use]
+pub fn is_java_class(bytes: &[u8]) -> bool {
+    bytes.get(..4) == Some(&[0xCA, 0xFE, 0xBA, 0xBE][..])
+        && bytes
+            .get(4..8)
+            .is_some_and(|n| u32::from_be_bytes([n[0], n[1], n[2], n[3]]) >= 45)
+}
+
+/// The names a Mach-O's load commands carry, each list in load-command order, slice after
+/// slice for a universal file (a name both slices carry appears once per slice): what
+/// `otool -D`, `otool -L` and `otool -l`'s `LC_RPATH` rows print, read without a process.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadNames {
+    /// The dylib's own install name (`LC_ID_DYLIB`), once per slice; empty for a program.
+    pub id: Vec<String>,
+    /// Every dylib it loads ([`DYLIB_LOADS`]).
+    pub loads: Vec<String>,
+    /// Its run paths (`LC_RPATH`).
+    pub rpaths: Vec<String>,
+}
+
+impl LoadNames {
+    /// Each list with every name once, first appearance first: the names of a universal
+    /// file's slices merged.
+    #[must_use]
+    pub fn once(&self) -> LoadNames {
+        let once = |list: &[String]| -> Vec<String> {
+            let mut seen: Vec<String> = Vec::new();
+            for name in list {
+                if !seen.contains(name) {
+                    seen.push(name.clone());
+                }
+            }
+            seen
+        };
+        LoadNames {
+            id: once(&self.id),
+            loads: once(&self.loads),
+            rpaths: once(&self.rpaths),
+        }
+    }
+}
+
+/// Every dylib the Mach-O `bytes` loads, in load-command order, slice after slice for a
+/// universal file (a name both slices load appears once per slice): [`load_names`]'
+/// `loads`.
 ///
 /// # Errors
-/// [`LoadError::Malformed`] if `bytes` is not a well-formed 64-bit or universal Mach-O.
+/// [`LoadError::Malformed`] as [`load_names`] refuses.
 pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
+    load_names(bytes).map(|names| names.loads)
+}
+
+/// The install name, the loaded dylibs and the run paths of the Mach-O `bytes`
+/// ([`LoadNames`]).
+///
+/// Reads thin 32- and 64-bit Mach-Os in either byte order and universal files with 32- or
+/// 64-bit arch tables; a universal file's static-archive slice (`!<arch>`, object files)
+/// names nothing, as `otool` lists no dylib for one. Refuses ([`LoadError::Malformed`]) a
+/// byte-swapped or nested universal header, an empty or oversized arch table, a slice
+/// outside the file, load commands that overrun `sizeofcmds` or the file, a `cmdsize`
+/// under 8 or not a multiple of the header's alignment (8 for 64-bit, 4 for 32-bit), and a
+/// dylib or rpath command whose name offset falls outside it or whose name is empty,
+/// unterminated or not UTF-8.
+///
+/// # Errors
+/// [`LoadError::Malformed`] as above.
+pub fn load_names(bytes: &[u8]) -> Result<LoadNames, LoadError> {
     let magic = word(bytes, 0, false, "the header")?;
-    let mut out = Vec::new();
+    let mut out = LoadNames::default();
     match magic {
         0xCAFE_BABE | 0xCAFE_BABF => {
             let is_wide = magic == 0xCAFE_BABF;
@@ -128,6 +214,9 @@ pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
                             "slice {i} (offset {offset}, size {size}) lies outside the file"
                         ))
                     })?;
+                if slice.starts_with(ARCHIVE_MAGIC) {
+                    continue;
+                }
                 thin_loads(slice, &format!("slice {i}"), &mut out)?;
             }
         }
@@ -141,16 +230,14 @@ pub fn load_dylibs(bytes: &[u8]) -> Result<Vec<String>, LoadError> {
     Ok(out)
 }
 
-/// The dylib names one thin slice's load commands carry, appended to `out`.
-fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), LoadError> {
-    let little = match word(slice, 0, false, what)? {
-        0xCFFA_EDFE => true,
-        0xFEED_FACF => false,
-        0xFEED_FACE | 0xCEFA_EDFE => {
-            return Err(malformed(format!(
-                "{what} is a 32-bit Mach-O, which this reader does not read"
-            )));
-        }
+/// The names one thin slice's load commands carry, appended to `out`.
+fn thin_loads(slice: &[u8], what: &str, out: &mut LoadNames) -> Result<(), LoadError> {
+    // (little-endian, header size, the alignment every cmdsize keeps)
+    let (little, header, align) = match word(slice, 0, false, what)? {
+        0xCFFA_EDFE => (true, HEADER_64, 8),
+        0xFEED_FACF => (false, HEADER_64, 8),
+        0xCEFA_EDFE => (true, HEADER_32, 4),
+        0xFEED_FACE => (false, HEADER_32, 4),
         0xCAFE_BABE | 0xCAFE_BABF | 0xBEBA_FECA | 0xBFBA_FECA => {
             return Err(malformed(format!(
                 "{what} is a universal file inside a universal file"
@@ -162,12 +249,12 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), Loa
             )));
         }
     };
-    if slice.len() < HEADER_64 {
+    if slice.len() < header {
         return Err(malformed(format!("{what} is shorter than a Mach-O header")));
     }
     let ncmds = word(slice, 16, little, what)?;
     let sizeofcmds = word(slice, 20, little, what)? as usize;
-    let end = HEADER_64
+    let end = header
         .checked_add(sizeofcmds)
         .filter(|end| *end <= slice.len())
         .ok_or_else(|| {
@@ -175,7 +262,7 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), Loa
                 "{what}'s load commands ({sizeofcmds} bytes) run past its end"
             ))
         })?;
-    let mut at = HEADER_64;
+    let mut at = header;
     for i in 0..ncmds {
         if at + 8 > end {
             return Err(malformed(format!(
@@ -184,9 +271,9 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), Loa
         }
         let cmd = word(slice, at, little, what)?;
         let size = word(slice, at + 4, little, what)? as usize;
-        if size < 8 || !size.is_multiple_of(8) {
+        if size < 8 || !size.is_multiple_of(align) {
             return Err(malformed(format!(
-                "{what}'s load command {i} has cmdsize {size} (a multiple of 8, at least 8)"
+                "{what}'s load command {i} has cmdsize {size} (a multiple of {align}, at least 8)"
             )));
         }
         let next = at.checked_add(size).filter(|n| *n <= end).ok_or_else(|| {
@@ -194,52 +281,88 @@ fn thin_loads(slice: &[u8], what: &str, out: &mut Vec<String>) -> Result<(), Loa
                 "{what}'s load command {i} (cmdsize {size}) runs past sizeofcmds"
             ))
         })?;
-        if DYLIB_LOADS.contains(&cmd) {
-            if size < DYLIB_COMMAND {
-                return Err(malformed(format!(
-                    "{what}'s dylib command {i} is {size} bytes, under a dylib_command"
-                )));
-            }
-            let offset = word(slice, at + 8, little, what)? as usize;
-            if !(DYLIB_COMMAND..size).contains(&offset) {
-                return Err(malformed(format!(
-                    "{what}'s dylib command {i} names its path at offset {offset}, outside \
-                     the command ({DYLIB_COMMAND}..{size})"
-                )));
-            }
-            let body = &slice[at + offset..next];
-            let name = body
-                .iter()
-                .position(|b| *b == 0)
-                .map(|nul| &body[..nul])
-                .ok_or_else(|| {
-                    malformed(format!(
-                        "{what}'s dylib command {i} has no NUL-terminated path"
-                    ))
-                })?;
-            let name = std::str::from_utf8(name)
-                .ok()
-                .filter(|n| !n.is_empty())
-                .ok_or_else(|| {
-                    malformed(format!(
-                        "{what}'s dylib command {i} names an empty or non-UTF-8 path"
-                    ))
-                })?;
-            out.push(name.to_owned());
-        }
+        let (list, fixed, kind) = if DYLIB_LOADS.contains(&cmd) {
+            (&mut out.loads, DYLIB_COMMAND, "dylib")
+        } else if cmd == DYLIB_ID {
+            (&mut out.id, DYLIB_COMMAND, "dylib id")
+        } else if cmd == RPATH {
+            (&mut out.rpaths, RPATH_COMMAND, "rpath")
+        } else {
+            at = next;
+            continue;
+        };
+        let command = Command {
+            slice,
+            at,
+            next,
+            fixed,
+            little,
+        };
+        list.push(command.name(&format!("{what}'s {kind} command {i}"))?);
         at = next;
     }
     Ok(())
 }
 
-/// Reads the regular file at `path` (no-follow) and returns its loaded dylib paths.
+/// One load command that names a path: `slice[at..next]`, whose first `fixed` bytes are
+/// its fixed part, the path's offset the word at `at + 8` (`lc_str`).
+struct Command<'a> {
+    slice: &'a [u8],
+    at: usize,
+    next: usize,
+    fixed: usize,
+    little: bool,
+}
+
+impl Command<'_> {
+    /// The path the command names, `what` naming the command in a refusal.
+    fn name(&self, what: &str) -> Result<String, LoadError> {
+        let size = self.next - self.at;
+        if size < self.fixed {
+            return Err(malformed(format!(
+                "{what} is {size} bytes, under its fixed {} bytes",
+                self.fixed
+            )));
+        }
+        let offset = word(self.slice, self.at + 8, self.little, what)? as usize;
+        if !(self.fixed..size).contains(&offset) {
+            return Err(malformed(format!(
+                "{what} names its path at offset {offset}, outside the command ({}..{size})",
+                self.fixed
+            )));
+        }
+        let body = &self.slice[self.at + offset..self.next];
+        let name = body
+            .iter()
+            .position(|b| *b == 0)
+            .map(|nul| &body[..nul])
+            .ok_or_else(|| malformed(format!("{what} has no NUL-terminated path")))?;
+        std::str::from_utf8(name)
+            .ok()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| malformed(format!("{what} names an empty or non-UTF-8 path")))
+    }
+}
+
+/// Every dylib the Mach-O at `path` loads ([`load_dylibs`]), read whole through a
+/// no-follow open of a regular file.
 ///
 /// # Errors
 /// [`LoadError::Io`] on I/O failure or non-regular file; [`LoadError::Malformed`] if malformed.
 pub fn load_dylibs_at(path: &Path) -> Result<Vec<String>, LoadError> {
+    load_names_at(path).map(|names| names.loads)
+}
+
+/// [`load_names`] of the Mach-O at `path`, read whole through a no-follow open of a
+/// regular file.
+///
+/// # Errors
+/// As [`load_dylibs_at`].
+pub fn load_names_at(path: &Path) -> Result<LoadNames, LoadError> {
     let bytes =
         crate::metadata_io::read_bounded_regular(path, MAX_MACHO_BYTES).map_err(LoadError::Io)?;
-    load_dylibs(&bytes)
+    load_names(&bytes)
 }
 
 /// Returns whether `name` is an absolute path under `/usr/lib/` or `/System/` without `.` or `..`.
@@ -263,11 +386,13 @@ pub fn foreign_dylibs(path: &Path) -> Result<Vec<String>, LoadError> {
     Ok(foreign)
 }
 
+/// Whether `head` opens an interpreter script (`#!`), which the kernel runs without any
 /// code signature.
 fn is_script_header(head: &[u8]) -> bool {
     head.starts_with(b"#!")
 }
 
+/// What the regular file at `path` opens as. Opened no-follow and proven regular on the
 /// handle, so a FIFO or a link swapped in cannot block or redirect the read.
 fn sniff(path: &Path) -> std::io::Result<Sniffed> {
     let head = crate::metadata_io::read_head(path, 8)?;
@@ -351,6 +476,7 @@ pub(crate) fn is_native_object(path: &Path) -> bool {
         .is_ok_and(|head| is_macho_header(&head) || head.starts_with(b"\x7fELF"))
 }
 
+/// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF
 /// on every other unix. Elsewhere no file carries an execute bit to keep.
 fn is_native_executable(head: &[u8]) -> bool {
     if cfg!(target_os = "macos") {
@@ -404,8 +530,155 @@ pub(crate) fn demote_foreign_executables(root: &Path) -> Result<bool, StageError
     Ok(changed)
 }
 
+/// Mach-O fixtures built from their load commands, for this reader's tests and for the
+/// tests of what reads through it (abrew's linkage scan and relocation).
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{DYLIB_COMMAND, RPATH, RPATH_COMMAND};
+
+    /// `LC_LOAD_DYLIB`.
+    pub(crate) const LOAD_DYLIB: u32 = 0xC;
+    /// `LC_ID_DYLIB`.
+    pub(crate) const ID_DYLIB: u32 = super::DYLIB_ID;
+
+    fn words(ws: &[u32], little: bool) -> Vec<u8> {
+        ws.iter()
+            .flat_map(|w| {
+                if little {
+                    w.to_le_bytes()
+                } else {
+                    w.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// One `dylib_command` naming `name`, padded to a multiple of 8 (a 64-bit file's).
+    pub(crate) fn dylib_command(cmd: u32, name: &str, little: bool) -> Vec<u8> {
+        dylib_command_aligned(cmd, name, little, 8)
+    }
+
+    /// One `dylib_command` naming `name`, padded to a multiple of 4 only (a 32-bit
+    /// file's alignment).
+    pub(crate) fn dylib_command32(cmd: u32, name: &str, little: bool) -> Vec<u8> {
+        dylib_command_aligned(cmd, name, little, 4)
+    }
+
+    fn dylib_command_aligned(cmd: u32, name: &str, little: bool, align: usize) -> Vec<u8> {
+        let size = (DYLIB_COMMAND + name.len() + 1).div_ceil(align) * align;
+        let fixed = [
+            cmd,
+            size as u32,
+            DYLIB_COMMAND as u32,
+            2,
+            0x1_0000,
+            0x1_0000,
+        ];
+        let mut c = words(&fixed, little);
+        c.extend_from_slice(name.as_bytes());
+        c.resize(size, 0);
+        c
+    }
+
+    /// One `rpath_command` naming `path`, padded to a multiple of 8.
+    pub(crate) fn rpath_command(path: &str, little: bool) -> Vec<u8> {
+        let size = (RPATH_COMMAND + path.len() + 1).div_ceil(8) * 8;
+        let mut c = words(&[RPATH, size as u32, RPATH_COMMAND as u32], little);
+        c.extend_from_slice(path.as_bytes());
+        c.resize(size, 0);
+        c
+    }
+
+    /// A `cmd`/`cmdsize` pair padded to `size` bytes: a load command the reader skips.
+    pub(crate) fn other_command(cmd: u32, size: u32, little: bool) -> Vec<u8> {
+        let mut c = words(&[cmd, size], little);
+        c.resize(size as usize, 0);
+        c
+    }
+
+    /// A thin 64-bit arm64 executable whose load commands are `commands`, in that order.
+    pub(crate) fn thin(commands: &[Vec<u8>], little: bool) -> Vec<u8> {
+        let body: Vec<u8> = commands.concat();
+        let magic = if little { 0xCFFA_EDFEu32 } else { 0xFEED_FACF };
+        let mut m = magic.to_be_bytes().to_vec();
+        let header = [
+            0x0100_000C,
+            0,
+            2,
+            commands.len() as u32,
+            body.len() as u32,
+            0,
+            0,
+        ];
+        m.extend(words(&header, little));
+        m.extend_from_slice(&body);
+        m.extend_from_slice(&[0u8; 64]);
+        m
+    }
+
+    /// A thin 32-bit arm64_32 dylib (a watchOS slice's shape) whose load commands are
+    /// `commands`, in that order: a 28-byte header, no reserved word.
+    pub(crate) fn thin32(commands: &[Vec<u8>], little: bool) -> Vec<u8> {
+        let body: Vec<u8> = commands.concat();
+        let magic = if little { 0xCEFA_EDFEu32 } else { 0xFEED_FACE };
+        let mut m = magic.to_be_bytes().to_vec();
+        let header = [
+            0x0200_000C,
+            1,
+            6,
+            commands.len() as u32,
+            body.len() as u32,
+            0,
+        ];
+        m.extend(words(&header, little));
+        m.extend_from_slice(&body);
+        m.extend_from_slice(&[0u8; 64]);
+        m
+    }
+
+    /// A static archive (`ar`'s magic, then one member header): what a universal
+    /// file's archive slice holds, object files that load no dylib.
+    pub(crate) fn archive() -> Vec<u8> {
+        let mut a = super::ARCHIVE_MAGIC.to_vec();
+        a.extend_from_slice(b"absvdi2.c.o/    0           0     0     644     8         `\n");
+        a.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE, 0, 0, 0, 0]);
+        a
+    }
+
+    /// A universal file of `slices`, with a 32- or 64-bit arch table.
+    pub(crate) fn fat(slices: &[Vec<u8>], is_wide: bool) -> Vec<u8> {
+        let entry = if is_wide { 32 } else { 20 };
+        let mut offset = (8 + entry * slices.len()).div_ceil(16) * 16;
+        let magic = if is_wide { 0xCAFE_BABFu32 } else { 0xCAFE_BABE };
+        let mut f = magic.to_be_bytes().to_vec();
+        f.extend_from_slice(&(slices.len() as u32).to_be_bytes());
+        for s in slices {
+            f.extend_from_slice(&0x0100_000Cu32.to_be_bytes());
+            f.extend_from_slice(&0u32.to_be_bytes());
+            if is_wide {
+                f.extend_from_slice(&(offset as u64).to_be_bytes());
+                f.extend_from_slice(&(s.len() as u64).to_be_bytes());
+                f.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]);
+            } else {
+                f.extend_from_slice(&(offset as u32).to_be_bytes());
+                f.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                f.extend_from_slice(&4u32.to_be_bytes());
+            }
+            offset += s.len().div_ceil(16) * 16;
+        }
+        for s in slices {
+            f.resize(f.len().div_ceil(16) * 16, 0);
+            f.extend_from_slice(s);
+        }
+        f
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{
+        archive, dylib_command, dylib_command32, fat, other_command, rpath_command, thin, thin32,
+    };
     use super::*;
 
     fn tmp(label: &str) -> crate::testdir::Dir {
@@ -429,6 +702,7 @@ mod tests {
         h
     }
 
+    /// Every thin magic in either byte order is a Mach-O, and so is a universal header of
     /// either width and order with any nonzero arch count, a Java class file's included.
     #[test]
     fn thin_and_fat_headers_are_recognised_at_any_arch_count() {
@@ -452,6 +726,7 @@ mod tests {
         );
     }
 
+    /// A universal header counting no arch (it names no slice to run), a truncated
     /// header, and ordinary files are not Mach-O.
     #[test]
     fn empty_fat_headers_and_other_files_are_not() {
@@ -466,6 +741,7 @@ mod tests {
         assert!(!is_macho_header(b""));
     }
 
+    /// The walk finds thin and fat Mach-Os at any depth by content, whatever their names or
     /// arch counts, skips everything else, and sorts the list.
     #[test]
     fn the_walk_finds_thin_and_fat_files_by_content() {
@@ -495,6 +771,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// An interpreter script anywhere in the tree is refused by name: the kernel runs it
     /// with no signature to check, beside Mach-Os that all verify.
     #[test]
     fn an_interpreter_script_is_refused() {
@@ -517,6 +794,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A symlink resolving to a Mach-O is refused by name — inside the tree or out of it —
     /// while a symlink to anything else, or to nothing, is left alone.
     #[cfg(unix)]
     #[test]
@@ -550,69 +828,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// One `dylib_command` naming `name`, padded to a multiple of 8.
-    fn dylib_command(cmd: u32, name: &str, little: bool) -> Vec<u8> {
-        let size = (DYLIB_COMMAND + name.len() + 1).div_ceil(8) * 8;
-        let mut c = Vec::new();
-        for w in [
-            cmd,
-            size as u32,
-            DYLIB_COMMAND as u32,
-            2,
-            0x1_0000,
-            0x1_0000,
-        ] {
-            c.extend_from_slice(&if little {
-                w.to_le_bytes()
-            } else {
-                w.to_be_bytes()
-            });
-        }
-        c.extend_from_slice(name.as_bytes());
-        c.resize(size, 0);
-        c
-    }
-
-    /// A thin 64-bit arm64 executable whose load commands are `commands`, in that order.
-    fn thin(commands: &[Vec<u8>], little: bool) -> Vec<u8> {
-        let body: Vec<u8> = commands.concat();
-        let mut m = Vec::new();
-        let magic = if little { 0xCFFA_EDFEu32 } else { 0xFEED_FACF };
-        m.extend_from_slice(&magic.to_be_bytes());
-        for w in [
-            0x0100_000C,
-            0,
-            2,
-            commands.len() as u32,
-            body.len() as u32,
-            0,
-            0,
-        ] {
-            m.extend_from_slice(&if little {
-                w.to_le_bytes()
-            } else {
-                w.to_be_bytes()
-            });
-        }
-        m.extend_from_slice(&body);
-        m.extend_from_slice(&[0u8; 64]);
-        m
-    }
-
-    /// A `cmd`/`cmdsize` pair padded to `size` bytes: a load command the reader skips.
-    fn other_command(cmd: u32, size: u32, little: bool) -> Vec<u8> {
-        let mut c = Vec::new();
-        for w in [cmd, size] {
-            c.extend_from_slice(&if little {
-                w.to_le_bytes()
-            } else {
-                w.to_be_bytes()
-            });
-        }
-        c.resize(size as usize, 0);
-        c
-    }
-
+    /// The fish row's shape: libSystem, an `LC_LOAD_DYLINKER` and an `LC_UUID` beside the
     /// dylib a Homebrew-linked build loads.
     fn homebrew_pcre2_fish(little: bool) -> Vec<u8> {
         thin(
@@ -626,34 +842,8 @@ mod tests {
         )
     }
 
-    /// A universal file of `slices`, with a 32- or 64-bit arch table.
-    fn fat(slices: &[Vec<u8>], is_wide: bool) -> Vec<u8> {
-        let entry = if is_wide { 32 } else { 20 };
-        let mut offset = (8 + entry * slices.len()).div_ceil(16) * 16;
-        let magic = if is_wide { 0xCAFE_BABFu32 } else { 0xCAFE_BABE };
-        let mut f = magic.to_be_bytes().to_vec();
-        f.extend_from_slice(&(slices.len() as u32).to_be_bytes());
-        for s in slices {
-            f.extend_from_slice(&0x0100_000Cu32.to_be_bytes());
-            f.extend_from_slice(&0u32.to_be_bytes());
-            if is_wide {
-                f.extend_from_slice(&(offset as u64).to_be_bytes());
-                f.extend_from_slice(&(s.len() as u64).to_be_bytes());
-                f.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0]);
-            } else {
-                f.extend_from_slice(&(offset as u32).to_be_bytes());
-                f.extend_from_slice(&(s.len() as u32).to_be_bytes());
-                f.extend_from_slice(&4u32.to_be_bytes());
-            }
-            offset += s.len().div_ceil(16) * 16;
-        }
-        for s in slices {
-            f.resize(f.len().div_ceil(16) * 16, 0);
-            f.extend_from_slice(s);
-        }
-        f
-    }
-
+    /// A build that links Homebrew's PCRE2 is refused by name, in either byte order and
+    /// inside either universal table; the libSystem-only build is self-contained. The
     /// fish row's self-containment check (§6.2) is exactly [`foreign_dylibs`].
     #[test]
     fn a_homebrew_pcre2_link_is_foreign_and_libsystem_alone_is_not() {
@@ -724,6 +914,262 @@ mod tests {
         );
     }
 
+    /// A Homebrew `:any` dylib before relocation: its own name, what it loads and its run
+    /// paths all name the placeholder prefix, beside libSystem and an `LC_UUID`.
+    fn placeholder_dylib(little: bool) -> Vec<u8> {
+        thin(
+            &[
+                dylib_command(
+                    DYLIB_ID,
+                    "@@HOMEBREW_PREFIX@@/opt/x/lib/libx.1.dylib",
+                    little,
+                ),
+                other_command(0x1B, 24, little),
+                dylib_command(0xC, "@@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib", little),
+                rpath_command("@@HOMEBREW_PREFIX@@/lib", little),
+                dylib_command(0xC, "/usr/lib/libSystem.B.dylib", little),
+                rpath_command("@loader_path/../lib", little),
+            ],
+            little,
+        )
+    }
+
+    /// The install name, the loads and the run paths are each read, in load-command order
+    /// and in either byte order, and once per slice of a universal file: what `otool -D`,
+    /// `-L` and `-l` print. NEGATIVE CONTROL: a program (no `LC_ID_DYLIB`) has no id, and
+    /// an `LC_UUID` between them is skipped, not read as a name.
+    #[test]
+    fn the_id_the_loads_and_the_rpaths_are_each_read() {
+        let want = LoadNames {
+            id: vec!["@@HOMEBREW_PREFIX@@/opt/x/lib/libx.1.dylib".into()],
+            loads: vec![
+                "@@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib".into(),
+                "/usr/lib/libSystem.B.dylib".into(),
+            ],
+            rpaths: vec![
+                "@@HOMEBREW_PREFIX@@/lib".into(),
+                "@loader_path/../lib".into(),
+            ],
+        };
+        for little in [true, false] {
+            assert_eq!(load_names(&placeholder_dylib(little)).unwrap(), want);
+        }
+        let both = load_names(&fat(
+            &[placeholder_dylib(true), placeholder_dylib(true)],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(both.id, [want.id.clone(), want.id.clone()].concat());
+        assert_eq!(both.rpaths.len(), 4);
+        assert_eq!(both.once(), want, "the slices' names merge to one of each");
+        let program = load_names(&homebrew_pcre2_fish(true)).unwrap();
+        assert!(
+            program.id.is_empty() && program.rpaths.is_empty(),
+            "{program:?}"
+        );
+        assert_eq!(program.loads.len(), 2);
+    }
+
+    /// An `rpath_command` is held to the same shape as a dylib command: a path offset
+    /// inside the command and past its 12 fixed bytes, a NUL-terminated non-empty path.
+    #[test]
+    fn a_malformed_rpath_command_is_refused() {
+        let good = thin(&[rpath_command("@loader_path/../lib", true)], true);
+        assert!(load_names(&good).is_ok(), "the unmutated fixture reads");
+        let at = HEADER_64;
+        let size = u32::from_le_bytes(good[at + 4..at + 8].try_into().unwrap()) as usize;
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut low = good.clone();
+        low[at + 8..at + 12].copy_from_slice(&4u32.to_le_bytes());
+        cases.push(("offset inside the fixed part", low));
+        // Past a dylib command's 8-byte cmd/cmdsize but inside the rpath command's own
+        // offset word: the 12 fixed bytes, not 8, bound it.
+        for offset in [8u32, 11] {
+            let mut word = good.clone();
+            word[at + 8..at + 12].copy_from_slice(&offset.to_le_bytes());
+            cases.push(("offset inside the path's own offset word", word));
+        }
+        let mut high = good.clone();
+        high[at + 8..at + 12].copy_from_slice(&(size as u32).to_le_bytes());
+        cases.push(("offset at the command's end", high));
+        let mut unterminated = good.clone();
+        for b in &mut unterminated[at + RPATH_COMMAND..at + size] {
+            *b = b'a';
+        }
+        cases.push(("no NUL", unterminated));
+        let mut empty = good.clone();
+        for b in &mut empty[at + RPATH_COMMAND..at + size] {
+            *b = 0;
+        }
+        cases.push(("empty path", empty));
+        cases.push((
+            "under its fixed part",
+            thin(&[other_command(RPATH, 8, true)], true),
+        ));
+        for (what, bytes) in cases {
+            match load_names(&bytes) {
+                Err(LoadError::Malformed(_)) => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    /// A 32-bit Mach-O (an arm64_32 watchOS dylib, an i386 slice) reads as `otool` reads
+    /// it: a 28-byte header, then load commands each a multiple of 4 bytes, in either
+    /// byte order and as a universal file's slice. A static-archive slice (`!<arch>`)
+    /// names nothing, and the slices around it are still read. NEGATIVE CONTROL: a 32-bit
+    /// command whose cmdsize is not a multiple of 4 is refused, a 64-bit command that is a
+    /// multiple of 4 but not of 8 still is, and an archive alone is no Mach-O.
+    #[test]
+    fn a_32_bit_mach_o_reads_and_an_archive_slice_names_nothing() {
+        let watch = |little: bool| {
+            thin32(
+                &[
+                    dylib_command32(DYLIB_ID, "@rpath/libswiftCore.dylib", little),
+                    other_command(0x1B, 24, little),
+                    dylib_command32(0xC, "/usr/lib/libSystem.B.dylib", little),
+                    rpath_command("@loader_path/../lib", little),
+                ],
+                little,
+            )
+        };
+        assert_ne!(
+            dylib_command32(DYLIB_ID, "@rpath/libswiftCore.dylib", true).len() % 8,
+            0,
+            "the fixture's command is 4- and not 8-aligned"
+        );
+        let want = LoadNames {
+            id: vec!["@rpath/libswiftCore.dylib".into()],
+            loads: vec!["/usr/lib/libSystem.B.dylib".into()],
+            rpaths: vec!["@loader_path/../lib".into()],
+        };
+        for little in [true, false] {
+            assert_eq!(load_names(&watch(little)).unwrap(), want, "little={little}");
+        }
+        for is_wide in [false, true] {
+            let universal = fat(&[watch(true), archive(), placeholder_dylib(true)], is_wide);
+            let read = load_names(&universal).unwrap();
+            assert_eq!(
+                read.id,
+                [
+                    "@rpath/libswiftCore.dylib",
+                    "@@HOMEBREW_PREFIX@@/opt/x/lib/libx.1.dylib"
+                ]
+            );
+            assert_eq!(read.loads.len(), 3, "{read:?}");
+            let archives = load_names(&fat(&[archive(), archive()], is_wide)).unwrap();
+            assert_eq!(archives, LoadNames::default(), "a universal static archive");
+        }
+        let mut odd = watch(true);
+        odd[HEADER_32 + 4..HEADER_32 + 8].copy_from_slice(&42u32.to_le_bytes());
+        let four = thin(
+            &[dylib_command32(0xC, "/usr/lib/libSystem.B.dylib", true)],
+            true,
+        );
+        for (what, bytes) in [
+            ("a 32-bit cmdsize not a multiple of 4", odd),
+            ("a 64-bit cmdsize a multiple of 4 only", four),
+            ("an archive alone", archive()),
+            ("a 32-bit header cut short", watch(true)[..20].to_vec()),
+        ] {
+            match load_names(&bytes) {
+                Err(LoadError::Malformed(_)) => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+    }
+
+    /// The reader agrees with Apple's own `otool` on real files: a Command Line Tools
+    /// dylib with an install name and a run path, Apple's universal `/bin/ls` and this test
+    /// binary, every slice (`-arch all`), and where the developer tools carry them a thin
+    /// 32-bit dylib (Swift 5.0's arm64_32 `libswiftCore.dylib`), a universal dylib with a
+    /// 32-bit slice and a universal static archive (clang's runtime libraries, whose
+    /// archive `otool` lists no dylib for). The `otool` run is the developer directory's own
+    /// (read off `/var/db/xcode_select_link`, no process), never `/usr/bin/otool`, the shim
+    /// that raises Apple's install dialog where no developer tools are; with none, the
+    /// comparison ends COULD NOT RUN once the files it needs no tool for were read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_reader_agrees_with_the_developer_tools_otool() {
+        let developer = std::fs::read_link("/var/db/xcode_select_link")
+            .unwrap_or_else(|_| PathBuf::from("/Library/Developer/CommandLineTools"));
+        let me = std::env::current_exe().unwrap();
+        let mut files = vec![PathBuf::from("/bin/ls"), me];
+        for root in ["", "Toolchains/XcodeDefault.xctoolchain/"] {
+            let lib = developer.join(root).join("usr/lib");
+            let mut libs = vec![
+                lib.join("libLTO.dylib"),
+                lib.join("swift-5.0/watchos/libswiftCore.dylib"),
+            ];
+            // `usr/lib/clang/<version>/lib/darwin`, whatever the version.
+            for version in std::fs::read_dir(lib.join("clang")).into_iter().flatten() {
+                let darwin = version.map(|v| v.path().join("lib/darwin"));
+                if let Ok(darwin) = darwin {
+                    libs.push(darwin.join("libclang_rt.asan_watchos_dynamic.dylib"));
+                    libs.push(darwin.join("libclang_rt.osx.a"));
+                }
+            }
+            files.extend(libs.into_iter().filter(|p| p.is_file()));
+        }
+        for file in &files {
+            load_names_at(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
+        let Some(otool) = [
+            "usr/bin/otool",
+            "Toolchains/XcodeDefault.xctoolchain/usr/bin/otool",
+        ]
+        .iter()
+        .map(|rel| developer.join(rel))
+        .find(|p| p.is_file()) else {
+            aterm_uds::host::could_not_run_without(&["otool"]);
+            return;
+        };
+        let run = |flag: &str, file: &Path| -> Vec<String> {
+            let out = aterm_uds::spawnfd::command(&otool)
+                .args(["-arch", "all", flag])
+                .arg(file)
+                .output()
+                .expect("the developer tools' otool runs");
+            assert!(out.status.success(), "otool {flag} {}", file.display());
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter_map(|line| match flag {
+                    // `-l` prints every load command; an rpath's `path` row follows its cmd.
+                    "-l" => line.strip_prefix("path "),
+                    // `-D` and `-L` print a `<file>:` or `<file> (architecture …):` header
+                    // per slice (and per archive member), then one name per line; an
+                    // archive slice opens with an `Archive : <file>` line.
+                    _ => (!line.ends_with(':') && !line.starts_with("Archive : ")).then_some(line),
+                })
+                .map(|name| name.split(" (").next().unwrap_or(name).to_owned())
+                .collect()
+        };
+        let set = |names: Vec<String>| -> Vec<String> {
+            let mut names = names;
+            names.sort();
+            names.dedup();
+            names
+        };
+        let mut rpaths_seen = 0;
+        for file in &files {
+            let names = load_names_at(file).unwrap();
+            let shown = file.display();
+            assert_eq!(set(names.id.clone()), set(run("-D", file)), "-D {shown}");
+            // `-L` prints a dylib's own name first, then what it loads.
+            let listed = [names.id.clone(), names.loads.clone()].concat();
+            assert_eq!(set(listed), set(run("-L", file)), "-L {shown}");
+            let rpaths = run("-l", file);
+            // Only `LC_RPATH` rows carry a `path` (an `LC_LOAD_DYLINKER`'s says `name`).
+            assert_eq!(set(names.rpaths.clone()), set(rpaths), "-l {shown}");
+            rpaths_seen += names.rpaths.len();
+        }
+        assert!(
+            files.len() < 3 || rpaths_seen > 0,
+            "libLTO.dylib carries a run path: the -l comparison compared something"
+        );
+    }
+
     /// Only an absolute path under the OS's own roots, with no `.` or `..`, is the system's.
     #[test]
     fn only_the_os_roots_are_system_dylibs() {
@@ -791,9 +1237,6 @@ mod tests {
         let mut short_dylib = thin(&[other_command(0xC, 16, true)], true);
         short_dylib.truncate(HEADER_64 + 16 + 8);
         cases.push(("dylib command under its fixed part", short_dylib));
-        let mut thirty_two = good.clone();
-        thirty_two[..4].copy_from_slice(&0xCEFA_EDFEu32.to_be_bytes());
-        cases.push(("32-bit slice", thirty_two));
         cases.push(("not a Mach-O", b"#!/bin/sh\necho hi\n".to_vec()));
         cases.push(("empty arch table", fat(&[], false)));
         let mut many = fat(std::slice::from_ref(&good), false);
@@ -825,6 +1268,7 @@ mod tests {
         assert!(load_dylibs(&good).is_ok(), "the unmutated fixture reads");
     }
 
+    /// A real binary reads: the test binary itself and Apple's universal `/bin/ls` each
     /// load libSystem and nothing outside the OS.
     #[cfg(target_os = "macos")]
     #[test]

@@ -145,6 +145,7 @@ pub fn occupancy_door_model() -> Model {
                 uwake = if (due == 2) { 1 } else { 0 };
                 upg = 0;
                 lines = lines + 1;
+                untaken = 1;
                 owed = held;
             }
             action Sample when (due > 0 && esc == 0 && K - 1 > age) { age = age + 1; }
@@ -447,6 +448,7 @@ pub fn occupancy_door_model() -> Model {
                 uwake = if (due == 2) { 1 } else { 0 };
                 upg = 0;
                 lines = lines + 1;
+                untaken = 1;
                 owed = held;
             }
             action LateRaise when (Buggy == 15 && due > 0 && esc == 0 && age == K - 1) { age = K; }

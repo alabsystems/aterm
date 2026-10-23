@@ -1735,6 +1735,15 @@ type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
 /// The occupancy facts board as session `sid`'s host reads it ([`Acts::occupancy`]).
 type OccupancyFn =
     dyn Fn(&str) -> aterm_agent::supervise::occupancy::OccupancyReading + Send + Sync;
+/// The machine's pace and a slot's reservation for session `sid`'s fact line of a rule, its hold
+/// begun at a unix ms ([`Acts::occupancy_pace`]).
+type OccupancyPaceFn = dyn Fn(
+        &str,
+        aterm_agent::supervise::occupancy::RuleId,
+        i64,
+    ) -> aterm_agent::supervise::occupancy::PaceGrant
+    + Send
+    + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 type ExitLookFn = dyn Fn(&str, &Snapshot) -> Option<ExitLook> + Send + Sync;
@@ -2224,6 +2233,9 @@ pub(crate) struct Acts {
     /// The occupancy facts board the worker reads the machine from ([`WorkerIdle::occupancy`], the
     /// occupancy door's reading).
     pub(crate) occupancy: Arc<OccupancyFn>,
+    /// The board's pace and reservation table the worker takes a fact line's pace from
+    /// ([`WorkerIdle::occupancy_pace`], live [`crate::occupancy_host::pace_for`]).
+    pub(crate) occupancy_pace: Arc<OccupancyPaceFn>,
     pub(crate) snapshot: Arc<SnapshotFn>,
     pub(crate) follow: Arc<FollowFn>,
     pub(crate) status: Arc<StatusFn>,
@@ -3300,6 +3312,49 @@ impl IdleHost for WorkerIdle {
         (self.hooks.acts.occupancy)(&self.sid)
     }
 
+    /// The loop typed its fact line at a break: the point offered, as [`Self::at_background`]
+    /// stamps it.
+    fn break_taken(&self) {
+        self.points.offered(crate::upgrade_host::now_s());
+    }
+
+    /// The upgrade's notice is due for this session, whether or not this break's look at it is
+    /// paused ([`BACKGROUND_LOOK`]): a nudge waits for it (the occupancy red-team's F11).
+    fn upgrade_due(&self) -> bool {
+        self.on()
+            && !self.beside()
+            && upgrades(self.agent)
+            && self.switches.upgrade()
+            && (self.hooks.acts.due)(&self.sid) == Due::Yes
+    }
+
+    /// A fact line's pace: refused where this worker takes no step for its session (off, beside
+    /// a self-supervising agent, the upgrade's wind-down owning its turn ends, a relaunch's
+    /// carry-on owed; the red-team's F10), else the board's pace and reservation table
+    /// ([`Acts::occupancy_pace`]).
+    fn occupancy_pace(
+        &self,
+        rule: aterm_agent::supervise::occupancy::RuleId,
+        hold_since_ms: i64,
+    ) -> aterm_agent::supervise::occupancy::PaceGrant {
+        use aterm_agent::supervise::occupancy::{PaceGrant, PaceRefusal};
+        let refused = if !self.on() {
+            Some(PaceRefusal::Off)
+        } else if self.beside() {
+            Some(PaceRefusal::Beside)
+        } else if self.owns_turn_end() {
+            Some(PaceRefusal::Owns)
+        } else if host_carries_relaunch(self.agent) && with_kept_of(&self.kept, |k| k.carry_asked) {
+            Some(PaceRefusal::CarryOwed)
+        } else {
+            None
+        };
+        match refused {
+            Some(why) => PaceGrant::Refused(why),
+            None => (self.hooks.acts.occupancy_pace)(&self.sid, rule, hold_since_ms),
+        }
+    }
+
     /// A supervisor's information for a person (Codex's save-then-wait hold among them).
     fn inform(&self, text: &str) {
         (self.hooks.note)(HostNote::Inform {
@@ -3639,6 +3694,14 @@ impl IdleHost for WorkerIdle {
             .snapshot
             .as_ref()
             .and_then(|snap| process_started(&snap.start))
+    }
+
+    /// The tab's agent's relaunch is this host's, its continuation still owed
+    /// ([`IdleHost::relaunch_owed`], [`relaunch::owed_of`] of the agent's own
+    /// record, as [`Self::wants`] asks it): asked only at the first point of an
+    /// agent relaunched under a limit.
+    fn relaunch_owed(&self) -> bool {
+        (self.hooks.acts.owed)(&self.sid, carries_only(self.agent))
     }
 
     /// The conversation the kept snapshot names ([`IdleHost::agent_conversation`]).
@@ -10959,7 +11022,7 @@ pub(crate) struct HeldRead {
     /// (`aterm_phase::settings_panel`).
     pub(crate) panel: bool,
     /// The screen was not read at this look where the worker may be held (the engine's lock was
-    /// busy).
+    /// busy, or its program's DEC 2026 frame unfinished).
     pub(crate) unread: bool,
     /// When a person last gave the session input (its person stamp, what `status human_ms=`
     /// reports; `None`: no person has in this process).
@@ -12914,20 +12977,21 @@ fn words_of(store: &Store) -> HashMap<String, Autopilot> {
         .iter()
         .filter(|h| h.state != SessionState::Exited)
         .filter_map(|h| {
-            let word = h
+            let unapplied_no_harness = h
                 .ctx
-                .meta
+                .timeline
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .autopilot_word()
-                .or_else(|| {
-                    h.ctx
-                        .timeline
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .leader_no_harness()
-                        .then_some(Autopilot::Off)
-                })?;
+                .unapplied_leader_no_harness();
+            let word = if unapplied_no_harness {
+                Some(Autopilot::Off)
+            } else {
+                h.ctx
+                    .meta
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .autopilot_word()
+            }?;
             Some((h.sid.as_str().to_string(), word))
         })
         .collect()
@@ -13262,6 +13326,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         jobs_board: &crate::vitals_jobs::BOARD,
         program_check: &crate::program_check_watch::BOARD,
         occupancy: Arc::new(crate::occupancy_host::reading_for),
+        occupancy_pace: Arc::new(crate::occupancy_host::pace_for),
         resume: Arc::new(move |sid, grace, carry| {
             let Some(o) = o7(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -13776,10 +13841,13 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 (TaskState::Working, Some("turn" | "moved")) => StartupState::Reopened,
                 _ => StartupState::Other,
             };
-            let rows_of = |t: &aterm_core::terminal::Terminal| -> Vec<String> {
-                (0..t.rows() as usize)
-                    .map(|r| crate::control::visible_row(t, r))
-                    .collect()
+            // An unfinished DEC 2026 frame is unread, as a busy lock is.
+            let rows_of = |t: &aterm_core::terminal::Terminal| -> Option<Vec<String>> {
+                (!crate::frame_unfinished_now(t)).then(|| {
+                    (0..t.rows() as usize)
+                        .map(|r| crate::control::visible_row(t, r))
+                        .collect()
+                })
             };
             let for_start = state == StartupState::StalledAtStartup
                 || (state == StartupState::Working && !judged.contains(&sid));
@@ -13787,8 +13855,8 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 && held.may_be_held();
             let rows = (for_start || for_held)
                 .then(|| match h.term.try_lock() {
-                    Ok(t) => Some(rows_of(&t)),
-                    Err(std::sync::TryLockError::Poisoned(p)) => Some(rows_of(&p.into_inner())),
+                    Ok(t) => rows_of(&t),
+                    Err(std::sync::TryLockError::Poisoned(p)) => rows_of(&p.into_inner()),
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 })
                 .flatten();
@@ -17569,6 +17637,7 @@ impl Acts {
                 &INERT
             },
             occupancy: Arc::new(|_| aterm_agent::supervise::occupancy::OccupancyReading::default()),
+            occupancy_pace: Arc::new(|_, _, _| aterm_agent::supervise::occupancy::PaceGrant::Local),
             snapshot: Arc::new(|_| None),
             follow: Arc::new(|_, _| Foreground::Shell),
             status: Arc::new(|_| None),

@@ -15,7 +15,6 @@ fn rle_local_compact_model_proves_and_catches_mutant() {
         m.actions.len(),
         "all actions must fire at Buggy=0"
     );
-    aterm_spec::verify::prove_and_catch_scalar(&m, "RleLocalCompactModel");
 }
 
 #[test]
@@ -28,5 +27,4 @@ fn ascii_grapheme_fast_path_model_proves_and_catches_mutant() {
         m.actions.len(),
         "all actions must fire at Buggy=0"
     );
-    aterm_spec::verify::prove_and_catch_scalar(&m, "AsciiGraphemeFastPath");
 }

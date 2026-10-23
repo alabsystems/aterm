@@ -6,15 +6,8 @@
 // src/decoding/sequence_execution.rs, modified by the aterm project in 2026.
 // See ../../LICENSE-MIT for the upstream MIT license.
 
-//! The sequences section, the second half of a compressed block (RFC 8878
-//! §3.1.1.3.2), decoded and executed in one pass: each sequence copies some
-//! literals, then a match from earlier output. (ruzstd decodes every sequence
-//! into a vector first; executing as they decode keeps memory at one block.)
-//!
-//! The FSE tables are flattened into [`SeqTable`]s whose states carry their
-//! code's base value and extra-bit count (libzstd's `ZSTD_seqSymbol` layout),
-//! and RLE mode is a one-state table that reads no bits, so the loop does one
-//! lookup per symbol and never asks which mode it is in.
+//! The sequences section, the second half of a compressed block (RFC 8878 §3.1.1.3.2), decoded and
+//! executed in one pass: each sequence copies some literals, then a match from earlier output.
 
 use super::bits::BitReaderReversed;
 use super::error::DecodeError;
@@ -206,7 +199,6 @@ impl Codes {
         match self {
             Self::LiteralLength => LL_CODES.get(usize::from(code)).copied(),
             Self::MatchLength => ML_CODES.get(usize::from(code)).copied(),
-            // Offset code n: the value is 2^n plus n extra bits.
             Self::Offset => (code <= MAX_OFFSET_CODE).then(|| (1u32 << code, code)),
         }
     }
@@ -244,7 +236,6 @@ impl SeqTable {
             };
             self.entries.push(SeqEntry {
                 base_value,
-                // A base line is below the table size, at most 512.
                 next_base: base_line as u16,
                 nb_bits,
                 extra_bits,
@@ -288,8 +279,6 @@ impl Kind {
     fn new(codes: Codes, max_symbol: u8, max_log: u8, default_log: u8, default: &[i32]) -> Self {
         let mut fse = FseTable::new(max_symbol);
         let mut predefined = SeqTable::default();
-        // The predefined distributions are constants that build; were one
-        // not to, Predefined mode would find the table unbuilt and refuse.
         if fse.build_from_probabilities(default_log, default).is_ok() {
             let _ = predefined.set_fse(&fse, codes);
         }
@@ -306,7 +295,6 @@ impl Kind {
     /// `source`. Returns the bytes read.
     fn update(&mut self, mode: u8, source: &[u8]) -> Result<usize, DecodeError> {
         match mode {
-            // Predefined_Mode.
             0 => {
                 if !self.predefined.built {
                     return Err(DecodeError::Corrupt("predefined sequence table missing"));
@@ -314,7 +302,6 @@ impl Kind {
                 self.table.clone_from(&self.predefined);
                 Ok(0)
             }
-            // RLE_Mode: one byte, the only code.
             1 => {
                 let Some(&code) = source.first() else {
                     return Err(DecodeError::Corrupt("RLE sequence table lacks its byte"));
@@ -322,14 +309,12 @@ impl Kind {
                 self.table.rle(code, self.codes)?;
                 Ok(1)
             }
-            // FSE_Compressed_Mode.
             2 => {
                 self.table.built = false;
                 let read = self.fse.build_decoder(source, self.max_log)?;
                 self.table.set_fse(&self.fse, self.codes)?;
                 Ok(read)
             }
-            // Repeat_Mode: the previous block's table, which must exist.
             _ => {
                 if self.table.built {
                     Ok(0)
@@ -447,12 +432,9 @@ impl<'t> State<'t> {
     }
 }
 
-/// Decodes `header.num_sequences` sequences from `source` (table
-/// descriptions, then the bitstream) and executes each against the first
-/// `lit_count` bytes of `literals` (which runs [`SLACK`] bytes past them);
-/// the literals left over follow the last sequence.
-///
-/// [`SLACK`]: super::window::SLACK
+/// Decodes `header.num_sequences` sequences from `source` (table descriptions, then the bitstream)
+/// and executes each against the first `lit_count` bytes of `literals` (which runs [`SLACK`] bytes
+/// past them); the literals left over follow the last sequence.
 pub(crate) fn execute(
     header: &Header,
     source: &[u8],
@@ -466,7 +448,6 @@ pub(crate) fn execute(
     let mut br = BitReaderReversed::new(stream);
     br.skip_padding()?;
 
-    // Initial states in this order: literal lengths, offsets, match lengths.
     let mut ll = State::init(&tables.ll.table, &mut br)?;
     let mut of = State::init(&tables.of.table, &mut br)?;
     let mut ml = State::init(&tables.ml.table, &mut br)?;
@@ -474,18 +455,12 @@ pub(crate) fn execute(
     let mut lit_pos: usize = 0;
     for i in 0..header.num_sequences {
         let (lle, mle, ofe) = (ll.entry, ml.entry, of.entry);
-        // Extra bits in this order: offset, match length, literal length.
         let (of_add, ml_add, ll_add) =
             br.get_bits_triple(ofe.extra_bits, mle.extra_bits, lle.extra_bits);
-        // `of_add < 1 << code`, the base is `1 << code` and the code is at
-        // most 31, so the OR is the sum and the value fits a u32.
         let offset_value = ofe.base_value | of_add as u32;
-        // Bases are below 2^17 and the extra bits below 2^56: no overflow.
         let lit_len = u64::from(lle.base_value) + ll_add;
         let match_len = u64::from(mle.base_value) + ml_add;
 
-        // State updates in this order: literal length, match length, offset;
-        // not after the last sequence.
         if i + 1 < header.num_sequences {
             ll.update(&mut br);
             ml.update(&mut br);
@@ -508,10 +483,6 @@ pub(crate) fn execute(
         if offset == 0 {
             return Err(DecodeError::Corrupt("match offset of zero"));
         }
-        // The history remains a full window behind the block's start, so
-        // its available bytes plus this block's prefix can exceed the
-        // frame's permitted match distance. Check every resolved offset,
-        // including repeat offsets, before either sequence copy.
         if offset > exec.history.max_offset() {
             return Err(DecodeError::Corrupt(
                 "match offset exceeds the frame's window",
@@ -522,8 +493,6 @@ pub(crate) fn execute(
         exec.out.copy_match(exec.history, offset, match_len)?;
     }
 
-    // Reading past the start yields zeros and counts them, so a stream too
-    // short for its sequences ends below zero, one too long above it.
     if br.bits_remaining() != 0 {
         return Err(DecodeError::Corrupt(
             "sequences bitstream length does not match its sequences",
@@ -538,15 +507,13 @@ pub(crate) fn execute(
 /// (RFC 8878 §3.1.2.5). Values 1 to 3 name a repeat offset (shifted by one
 /// when the literal length is zero); larger values are the offset plus 3. A
 /// result of 0 is corrupt input, which the caller refuses.
-fn resolve_offset(offset_value: u32, lit_len: usize, hist: &mut [u32; 3]) -> u32 {
+const fn resolve_offset(offset_value: u32, lit_len: usize, hist: &mut [u32; 3]) -> u32 {
     let [r0, r1, r2] = *hist;
     if offset_value > 3 {
         let offset = offset_value - 3;
         *hist = [offset, r0, r1];
         return offset;
     }
-    // Which repeat offset, 0-based, after the zero-literal-length shift; 3
-    // means "the most recent, less one".
     let index = if lit_len == 0 {
         offset_value
     } else {
@@ -602,8 +569,6 @@ mod tests {
         assert_eq!(h, [8, 4, 1]);
         assert_eq!(resolve_offset(103, 5, &mut h), 100);
         assert_eq!(h, [100, 8, 4]);
-        // Literal length 0 shifts: 1 is the second, 2 the third, 3 the
-        // first less one.
         assert_eq!(resolve_offset(1, 0, &mut h), 8);
         assert_eq!(h, [8, 100, 4]);
         assert_eq!(resolve_offset(2, 0, &mut h), 4);

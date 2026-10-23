@@ -165,6 +165,14 @@ pub trait Item: Send + Sync {
         None
     }
 
+    /// Why the probe just made answered `Unusable` because the run lacks what the read
+    /// needs (the network is down, [`aterm_converge::Item::read_aside`]): the engine then
+    /// reports it `Blocked` with this line, so the surface exits 69 rather than 1. `None`,
+    /// the default.
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        None
+    }
+
     /// Why this item leaves some of its keys alone in this pass: they are in another app's
     /// sandbox container and the pass holds no known Full Disk Access
     /// ([`defaults::withheld`]). Such an item is not done, whatever its row reads, until a

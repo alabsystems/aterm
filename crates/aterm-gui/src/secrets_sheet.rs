@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS sheet that offers a secrets vault's join (`secrets_join`: its URL field holds
-//! the ALab default until the person edits it), built as
-//! the `sudo` askpass sheet is (`askpass_sheet.rs`): a window-attached `NSAlert` with an
-//! `NSSecureTextField`, raised on the focused window at the ask's quiet moment — it never
-//! selects a tab or makes a window key. Synthetic key posting is fenced off while it is up
-//! (`askpass::PROMPT_INPUT`), the owner's keys reach the field only once they click it
-//! (`alert_keys::watch_password_keys`), and the password is read once, straight into
-//! scrubbed storage (`askpass_sheet::read_secure_field`), on the event loop's thread.
+//! macOS window-attached `NSAlert` sheet for joining a secrets vault.
 
 use aterm_objc::{CGPoint, CGRect, CGSize, Id, Obj, RcBlock, Sel, class, sel};
 use aterm_secrets::SecretBytes;
@@ -17,9 +10,7 @@ use crate::appkit::{self, MainThread};
 use crate::secrets_join::{Choice, VaultWake};
 use crate::{App, Wake};
 
-/// The sheet that is up: its id, the window it hangs on, the retained secure field and
-/// alert panel (held so a close can end it). Dropping it clears the field and ends the
-/// sheet if it is still attached.
+/// Active secrets-vault join sheet attached to a window.
 pub(crate) struct SecretsSheet {
     pub(crate) id: u64,
     window: crate::WindowId,
@@ -33,12 +24,8 @@ pub(crate) struct SecretsSheet {
 
 impl Drop for SecretsSheet {
     fn drop(&mut self) {
-        // The input fence is the last field dropped, after the secure field is cleared
-        // and its sheet has ended. An answered sheet has no parent, so its completion
-        // and this cannot end it twice.
-        // SAFETY: retained AppKit objects on the main thread (the App drops its lane
-        // there); `-setStringValue:` copies, `-endSheet:returnCode:` ends a sheet that
-        // is still attached to `parent`.
+        // SAFETY: retained AppKit objects on the main thread; -setStringValue: copies
+        // and -endSheet:returnCode: ends an attached sheet.
         unsafe {
             if let Some(empty) = appkit::nsstring("") {
                 appkit::send_v_id(self.field.id(), sel!(setStringValue:), empty.id());
@@ -63,9 +50,7 @@ fn informative() -> String {
 }
 
 impl App {
-    /// Build the sheet and hang it on the focused window: its id, or why not (no focused
-    /// window, a window that shows a sheet already, an AppKit failure). Its completion
-    /// handler posts the button; the App reads the field.
+    /// Builds and attaches the secrets-vault join sheet to the focused window.
     pub(crate) fn raise_secrets_sheet(&mut self) -> Result<u64, &'static str> {
         let Some(mtm) = MainThread::new() else {
             return Err("headless");
@@ -82,8 +67,7 @@ impl App {
                     .as_ref()
                     .map(|w| crate::platform::ns_window_of(w))
                     .filter(|id| !id.is_null())
-                    // SAFETY: a live NSWindow borrowed on the main thread; `-window` is
-                    // +0, retained into an owning `Obj` for the sheet.
+                    // SAFETY: live NSWindow borrowed on the main thread.
                     .and_then(|id| unsafe { Obj::retain(id) })
                     .map(|ns_window| (*wid, ns_window))
             });
@@ -124,13 +108,10 @@ impl App {
                 choice: Choice::of_response(response),
             }));
         };
-        // SAFETY: AppKit invokes the block as `void(^)(NSModalResponse)`; the
-        // `(isize)->()` prototype matches (`NSModalResponse` is `NSInteger`), and nothing
-        // unwinds out of it.
+        // SAFETY: AppKit invokes the block as void(^)(NSModalResponse) matching (isize)->().
         let Some(handler) = (unsafe { RcBlock::new1(completion) }) else {
             return Err("could not build the sheet handler");
         };
-        // `mtm` is the main-thread witness the whole path stands on.
         let _: MainThread = mtm;
         // SAFETY: `+[NSAlert new]` is +1, adopted by `Obj::from_owned`.
         let Some(alert) =
@@ -185,13 +166,8 @@ impl App {
             appkit::send_v_id(accessory.id(), sel!(addSubview:), field.id());
             (url, accessory)
         };
-        // SAFETY: standard NSAlert setters on the main thread, as the askpass sheet's:
-        // text setters copy, `-addButtonWithTitle:` returns the +0 button the alert owns,
-        // `-setAccessoryView:` retains the field, and
-        // `-beginSheetModalForWindow:completionHandler:` copies the block. The field and
-        // panel are retained for the App to hold.
+        // SAFETY: standard NSAlert and event-queue calls on the main thread.
         let (panel, input_fence) = crate::askpass::PROMPT_INPUT.present(|| unsafe {
-            // No key queued before the sheet may reach the field once it is up.
             let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
             if past.is_null() {
                 return Err("could not establish the key-queue deadline");
@@ -222,7 +198,6 @@ impl App {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
             appkit::send_v_id(alert.id(), sel!(setAccessoryView:), accessory.id());
-            // The first button added is the default (Return); Escape is Not Now.
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), join.id());
             let later = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), not_now.id());
             if !later.is_null() {
@@ -246,8 +221,6 @@ impl App {
                 ns_window.id(),
                 handler.as_block_ptr(),
             );
-            // NSAlert can focus its accessory; the key watch discards keys until the
-            // owner clicks the field, so no focus is left there to type into unasked.
             let _ = appkit::send_bool_id(panel.id(), sel!(makeFirstResponder:), Id::NIL);
             Ok((panel, keys))
         });
@@ -265,10 +238,7 @@ impl App {
         Ok(id)
     }
 
-    /// The sheet `id` was answered: its typed password when `read` (Join) and the field
-    /// holds one, read once into scrubbed storage; the field is cleared and the sheet
-    /// ended either way. `None` for a stale id, an empty field (approved by code) or a
-    /// password the field cannot hand over (a line break, over 1023 bytes).
+    /// Consumes the answered sheet `id` and returns its password when `read` is true.
     pub(crate) fn take_secrets_sheet(&mut self, id: u64, read: bool) -> Option<SecretBytes> {
         self.take_secrets_sheet_with_source(id, read)
             .and_then(|(_, password)| password)
@@ -296,9 +266,7 @@ impl App {
         Some((source, password))
     }
 
-    /// The window `wid` closes, or `sudo`'s password sheet needs it: a sheet on it goes
-    /// unanswered (dropping it ends it, and its completion's answer is then a stale one),
-    /// and is asked again at the next quiet moment, which waits out `sudo`'s sheet.
+    /// Withdraws any active secrets sheet on `wid` so it can be re-asked later.
     pub(crate) fn withdraw_secrets_sheet_window(&mut self, wid: crate::WindowId) {
         if let Some(sheet) = self
             .secrets_join

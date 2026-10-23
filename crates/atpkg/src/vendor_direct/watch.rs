@@ -234,7 +234,7 @@ impl Watched {
                 == Some((result.version, result.offered_at))
     }
 
-    fn apply_result(&mut self, result: DeferredResult) {
+    const fn apply_result(&mut self, result: DeferredResult) {
         if !result.success {
             self.short_retries = self.short_retries.saturating_add(1);
         }

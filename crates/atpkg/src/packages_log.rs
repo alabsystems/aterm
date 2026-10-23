@@ -518,7 +518,7 @@ pub fn sanitize_capped(value: &str, max_chars: usize) -> String {
 
 /// The Unicode bidirectional formatting characters (LRM/RLM/ALM, the embeddings and
 /// overrides, the isolates): invisible, and able to make a line read as something else.
-fn is_bidi_control(c: char) -> bool {
+const fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
@@ -527,7 +527,7 @@ fn is_bidi_control(c: char) -> bool {
 
 /// The zero-width characters (ZWSP, ZWNJ, ZWJ, the word joiner, the BOM): invisible, and
 /// able to hide a word from a reader and split one from the redactor.
-fn is_zero_width(c: char) -> bool {
+const fn is_zero_width(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}')
 }
 

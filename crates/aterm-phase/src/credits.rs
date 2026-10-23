@@ -24,7 +24,7 @@ impl Window {
 
     /// The word the CLI and the records print.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Window::Session => "session",
             Window::Weekly => "weekly",

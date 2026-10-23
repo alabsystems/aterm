@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A DAMAGED HISTORY RING COSTS A CRASH RESTORE (the restore plan's R12). A
-//! measurement, not a gate:
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-restore --bench resync_walk --profile opt-test -- [--runs N] [--max-kib N] [--only CASE]
-//! ```
-//!
-//! When a ring chunk's frame fails, `astream_wire::steps` tells a torn tail from a fault
-//! by looking, byte by byte, for a frame that decodes after the break, and a candidate
-//! whose header looks like a frame runs a CRC over the length it names. Unbounded, bytes
-//! packed with such candidates make that search quadratic; astream bounds it with a CRC
-//! budget of `max(2 * after, 16 MiB)` bytes per search.
-//!
-//! This builds a v1 region with the real writer (a keyframe of a real engine and a ring
-//! of real history chunks), puts bytes in the ring after a damaged chunk, and times the
-//! real [`aterm_restore::recover`] over it: the header, both keyframe slots, the tail
-//! replay and the ring walk that meets the break. Each row is the median of `--runs`
-//! calls (default 7) over the same prepared region, with the ring's verdict and the
-//! chunks it kept. `--max-kib` caps the planted sizes (the unbounded search at the full
-//! ring takes hours); `--only` runs one case. The cases:
-//!
-//! - `clean`: the real ring, undamaged.
-//! - `bitflip`: one payload byte flipped in the ring's first chunk, real chunks after it.
-//! - `random S`: the last real chunk damaged and `S` random bytes after it.
-//! - `lookalike-tail S`: the last real chunk damaged and `S` bytes after it packed with
-//!   twelve-byte frame look-alikes, each naming a length to the segment's end and a wrong
-//!   CRC: torn by the unbounded rule, since none decodes.
-//! - `lookalike-chunk S`: the segment's first 32 KiB (a chunk's worth, the break at its
-//!   start) packed with such look-alikes, then zeros, then one real chunk ending the
-//!   `S`-byte segment: a fault by any rule, so only the time differs.
-//!
-//! The planted bytes go into the region directly, as damage or a foreign writer would
-//! leave them. A program's output reaches the ring only through the line serializer and
-//! LZ4; this measures the walk over such bytes, not whether a program can steer the ring
-//! to them. Public API only.
+//! Benchmark measuring [`aterm_restore::recover`] over damaged history rings.
 
 use std::time::Instant;
 
@@ -67,7 +33,7 @@ const CHUNK_LOOKALIKES: usize = 32 * 1024;
 struct Base {
     store: VecStore,
     geometry: Geometry,
-    /// Each chunk's ring positions `[start, end)`, oldest first.
+    /// Half-open ring byte ranges for each chunk, oldest first.
     chunks: Vec<(u64, u64)>,
     lo: u64,
     hi: u64,
@@ -165,8 +131,7 @@ impl Base {
         self.flip(store, pos);
     }
 
-    /// Look-alikes over ring positions `[from, until)`, each naming a length that reaches
-    /// `seg_end` (capped at the frame cap) and at least one byte, with a zero CRC.
+    /// Writes synthetic frame look-alikes across ring positions `from..until`.
     fn lookalikes(&self, store: &VecStore, from: u64, until: u64, seg_end: u64) {
         let mut p = from;
         while p + (HEADER_SIZE as u64) < until.min(seg_end) {
@@ -309,8 +274,6 @@ fn main() {
         base.set_hi(&tail, end);
         row("lookalike-tail", Some(kib), &tail, runs);
 
-        // The segment is `[lo, end)`: look-alikes over its first 32 KiB, zeros, and one
-        // real chunk (a copy of the first) ending it.
         let chunk = base.store.snapshot();
         let (c0, c1) = base.chunks[0];
         let mut real = vec![0u8; usize::try_from(c1 - c0).expect("a chunk")];

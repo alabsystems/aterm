@@ -1,22 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A compositor that stops reading: the client's socket fills, and
-//! `Display::try_flush`, the flush aterm-window's event loop makes, says
-//! `Flushed::Queued` (LW.7's delta: upstream's loop exited with errno 11,
-//! aterm-window's keeps the rest queued and waits for the socket to take it,
-//! `docs/measured/linux-lw7-2026-10-17.md`). Over a socket pair whose far end
-//! is this test, no compositor needed: libwayland speaks first on a fresh
-//! connection, so requests can be written and read back raw.
-//!
-//! Held: the full socket is not the display's error; what did not fit stays
-//! queued, and once the far end reads, the next flushes deliver every request
-//! in order; the socket polls writable again once it has room. Past that,
-//! when libwayland's own buffer fills too and it ends the connection with the
-//! write's `EAGAIN`, that `EAGAIN` is an error, never `Queued` (a loop that
-//! read it as queued would poll a dead display). Measured: how many more
-//! requests libwayland queues behind a full socket before it ends the
-//! connection, a property of the libwayland version, printed for the record.
+//! A compositor that stops reading: the client's socket fills, and `Display::try_flush`, the flush
+//! aterm-window's event loop makes, says `Flushed::Queued` (LW.7's delta: upstream's loop exited
+//! with errno 11, aterm-window's keeps the rest queued and waits for the socket to take it,
+//! `docs/measured/linux-lw7-2026-10-17.md`).
 
 #![cfg(target_os = "linux")]
 
@@ -140,7 +128,6 @@ fn a_full_socket_keeps_the_rest_queued_until_the_compositor_reads() {
     );
     assert!(d.error().is_none(), "EAGAIN is not the display's error");
     assert!(!writable(fd), "a full socket does not poll writable");
-    // A few more behind it: queued in libwayland's own buffer, not fatal.
     for _ in 0..16 {
         // SAFETY: as above.
         assert!(unsafe { wl_display::sync(d.proxy()) }.is_some());
@@ -148,8 +135,6 @@ fn a_full_socket_keeps_the_rest_queued_until_the_compositor_reads() {
     }
     assert!(d.error().is_none(), "queued behind a full socket");
 
-    // The compositor reads: the socket polls writable, and flushes deliver
-    // the rest, until all of it is out.
     let mut wire = Vec::new();
     let mut flushes = 0;
     loop {
@@ -169,8 +154,6 @@ fn a_full_socket_keeps_the_rest_queued_until_the_compositor_reads() {
         "every request on the wire, once"
     );
     let got = requests(&wire);
-    // Each sync on wl_display (object 1, opcode 0, 12 bytes), each with the
-    // next new id (wl_display is 1, so the first callback is 2).
     for (i, r) in got.iter().enumerate() {
         let id = u32::try_from(i).unwrap() + 2;
         assert_eq!(*r, (1, 0, 12, id), "request {i} of {sent}");
@@ -196,9 +179,6 @@ fn queued_past_libwaylands_own_buffer_the_connection_ends() {
             break;
         }
     }
-    // Measured: requests marshalled with no flush until libwayland's own
-    // buffer is full too and it ends the connection (1.22: a 4096-byte ring,
-    // and `display_fatal_error` with the failed write's errno).
     let mut more = 0usize;
     let fatal = loop {
         // SAFETY: as above; once the display has failed a marshal is dropped.
@@ -216,15 +196,11 @@ fn queued_past_libwaylands_own_buffer_the_connection_ends() {
          end: {fatal:?}",
         more * SYNC_BYTES
     );
-    // Either it ends the connection with the write's EAGAIN (1.22) or it
-    // keeps queueing (a libwayland whose buffer grows): never another error.
     assert!(
         matches!(fatal, None | Some(Error::Display(libc::EAGAIN))),
         "{fatal:?}"
     );
     if let Some(fatal) = fatal {
-        // The ended display's EAGAIN is its error, not a full socket: the
-        // loop must end, not wait for the socket to take the rest.
         assert_eq!(d.try_flush(), Err(fatal), "an ended display is not queued");
     }
     drop(server);

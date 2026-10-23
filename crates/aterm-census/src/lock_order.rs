@@ -201,6 +201,16 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/lib.rs",
     },
     GuardHelper {
+        symbol: "term_lock_whole",
+        identity: "term",
+        def_file: "crates/aterm-gui/src/lib.rs",
+    },
+    GuardHelper {
+        symbol: "term_lock_whole_when",
+        identity: "term",
+        def_file: "crates/aterm-gui/src/lib.rs",
+    },
+    GuardHelper {
         symbol: "retire_slot",
         identity: "shared",
         def_file: "crates/aterm-gui/src/consent_retire.rs",

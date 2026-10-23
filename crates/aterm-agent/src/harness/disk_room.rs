@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ROOM: what one round of this machine's builds takes, measured as the
-//! two-hour fall in free space on a typical day of the last week (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §2.3). The lines derive from it
-//! ([`super::Config::thresholds_with`]): warn at least twice the room, the
-//! floor at least the room.
-//!
-//! ```text
-//! fall(t) = max over readings s in (t − 2 h, t] of free(s) − free(t)
-//! day(d)  = max over the readings of UTC day d of fall(t)
-//! raw     = the second-largest day(d) of the last 7 days     (readings on ≥ 2 days)
-//! lo      = min(16 GiB, 5 % of total)
-//! hi      = max(lo, min(10 % of total, 256 GiB))
-//! room    = clamp(raw, lo, hi); no history, < 2 days, an unreadable file: lo
-//! ```
-//!
-//! * *Falls, not build sizes.* A build directory's size is everything it ever
-//!   accumulated, not what the next build writes. A fall is what the volume
-//!   lost, concurrent builds included, read from the `statfs` the watch makes
-//!   every minute anyway. A later rise (a pass, an agent's `rm`) cancels no
-//!   earlier fall.
-//! * *The second-largest day.* One event (a dataset copy, a VM image) must not
-//!   set the floors for a week; a fall seen on two days of the week is what
-//!   the machine does.
-//!
-//! [`RoomMeter`] is pure: every instant is the caller's (as sysprobe's
-//! `SwapMeter`). [`Rooms`] is the watch's set, one meter per volume, persisted
-//! in `<harness state>/disk-room.json` ([`ROOM_FILE`]) at most hourly by temp
-//! file and rename; only the day pairs are kept, the in-day ring is rebuilt.
+//! Free-space fall metering over a seven-day rolling window for disk-room thresholds.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -69,9 +42,7 @@ const WINDOW_MINUTES: i64 = FALL_WINDOW_S / 60;
 
 const DAY_S: i64 = 86_400;
 
-/// The clamp of a room on a volume of `total` bytes: `(lo, hi)`, with
-/// `lo = min(16 GiB, 5 %)` and `hi = max(lo, min(10 %, 256 GiB))` — defined on
-/// every volume (`[16 GiB, 10 %]` alone is empty below about 160 GiB).
+/// Returns the `(lo, hi)` room bounds for a volume of `total` bytes.
 #[must_use]
 pub fn room_bounds(total: u64) -> (u64, u64) {
     let pct = |p: u64| total.saturating_mul(p) / 100;
@@ -80,9 +51,7 @@ pub fn room_bounds(total: u64) -> (u64, u64) {
     (lo, hi)
 }
 
-/// ONE VOLUME'S ROOM METER: at most 120 one-minute maxima of free space for
-/// the two-hour window, and at most [`ROOM_DAYS`] `(UTC day, largest fall)`
-/// pairs. Pure.
+/// One volume's room meter tracking two-hour free-space falls across [`ROOM_DAYS`] days.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RoomMeter {
     /// `(unix minute, the most free bytes read in it)`, oldest first.
@@ -98,10 +67,7 @@ impl RoomMeter {
         Self::default()
     }
 
-    /// Read `free` bytes at unix second `at_s` (the caller's clock): its fall
-    /// against the window's largest reading enters its day's maximum. A clock
-    /// that moved back drops the readings after it (they say nothing of now),
-    /// never a day's maximum it already holds for an earlier day.
+    /// Records `free` bytes at unix second `at_s` into the current window and daily maximum.
     pub fn observe(&mut self, at_s: i64, free: u64) {
         let minute = at_s.div_euclid(60);
         self.minutes
@@ -120,9 +86,7 @@ impl RoomMeter {
         }
     }
 
-    /// The room at `now_s` on a volume of `total` bytes: the second-largest
-    /// daily fall of the last [`ROOM_DAYS`] days clamped to [`room_bounds`],
-    /// or the bounds' `lo` with readings on fewer than two days.
+    /// Returns the room at `now_s` on a volume of `total` bytes.
     #[must_use]
     pub fn room(&self, now_s: i64, total: u64) -> u64 {
         let (lo, hi) = room_bounds(total);
@@ -157,8 +121,7 @@ impl RoomMeter {
         )
     }
 
-    /// A meter from [`Self::encode`]'s JSON: its day pairs, the in-day ring
-    /// empty. `None` for anything else (a corrupt file is no history).
+    /// Decodes a meter from [`Self::encode`]'s JSON representation.
     #[must_use]
     pub fn decode(v: &Value) -> Option<Self> {
         let mut days: Vec<(i64, u64)> = Vec::new();
@@ -186,8 +149,7 @@ impl RoomMeter {
     }
 }
 
-/// THE WATCH'S ROOMS: one [`RoomMeter`] per volume key
-/// (`aterm_sysprobe::volumes::VolumeKey::spelled`), at most [`MAX_ROOMS`].
+/// Per-volume [`RoomMeter`] table bounded to [`MAX_ROOMS`] volumes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Rooms {
     meters: BTreeMap<String, RoomMeter>,
@@ -196,8 +158,7 @@ pub struct Rooms {
 }
 
 impl Rooms {
-    /// The meter of volume `key`, made when it is new and there is room for
-    /// it (a ninth volume is not metered: its room is its bounds' `lo`).
+    /// Returns the meter for volume `key`, creating one when there is room.
     pub fn meter(&mut self, key: &str) -> Option<&mut RoomMeter> {
         if !self.meters.contains_key(key) && self.meters.len() >= MAX_ROOMS {
             return None;
@@ -205,8 +166,7 @@ impl Rooms {
         Some(self.meters.entry(key.to_owned()).or_default())
     }
 
-    /// The room of volume `key` at `now_s` on a volume of `total` bytes: its
-    /// meter's, or the bounds' `lo` for one with no meter.
+    /// Returns the room of volume `key` at `now_s` on a volume of `total` bytes.
     #[must_use]
     pub fn room(&self, key: &str, now_s: i64, total: u64) -> u64 {
         self.meters
@@ -214,9 +174,7 @@ impl Rooms {
             .map_or_else(|| room_bounds(total).0, |m| m.room(now_s, total))
     }
 
-    /// Whether a write is due at `now_s` ([`ROOM_SAVE_EVERY_S`] since the
-    /// last one let through, or none yet); one let through is counted, so a
-    /// write that then fails (a full disk) waits for the next hour too.
+    /// Returns whether a write is due at `now_s` and records the save timestamp.
     pub fn save_due(&mut self, now_s: i64) -> bool {
         if self
             .saved_at
@@ -241,8 +199,7 @@ impl Rooms {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| "{}".to_owned())
     }
 
-    /// The rooms of the file's `text`; a volume whose entry does not decode
-    /// is left out, and a text that is not the file's is no history.
+    /// Decodes the rooms from `text`, returning an empty table on invalid input.
     #[must_use]
     pub fn decode(text: &str) -> Self {
         let Ok(v) = aterm_json::from_str::<Value>(text) else {
@@ -286,10 +243,7 @@ impl Rooms {
     }
 }
 
-/// The room of the volume `reading` read, from the rooms the window's watch
-/// keeps in the harness state directory `state` ([`Rooms::load`]), at
-/// `now_s`: what `aterm harness disk` (another process) shows on its watch
-/// line. No file, or no meter for this volume: the bounds' `lo`.
+/// Reads the persisted room for `reading`'s volume from `state` at `now_s`.
 #[must_use]
 pub fn kept_room(state: &Path, reading: &aterm_sysprobe::volumes::Reading, now_s: i64) -> u64 {
     Rooms::load(state).room(&reading.key.spelled(), now_s, reading.total)

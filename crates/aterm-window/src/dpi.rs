@@ -5,25 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! UI scaling: positions and sizes in physical or logical pixels.
-//!
-//! LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-//! upstream winit re-exports the `dpi` crate here; this crate carries the part of it that
-//! aterm, this crate's backends and accesskit_winit use, so the package left every cell. Cut
-//! with it: the `LogicalUnit`/`PhysicalUnit`/`PixelUnit` and inset types, the
-//! `from_logical`/`from_physical` constructors, the `[x, y]` array conversions, and the
-//! `serde`, `mint` and `no_std` (libm, the crate's one MIT-licensed file) support.
-//! `tests/recorded_answers.rs` holds what the package answered.
-//!
-//! The [`PhysicalPosition`] / [`PhysicalSize`] types correspond with the actual pixels on the
-//! device, and the [`LogicalPosition`] / [`LogicalSize`] types correspond to the physical pixels
-//! divided by the scale factor: a button that is 50 logical pixels across is 100 physical pixels
-//! across at a scale factor of `2.0`, or 75 at `1.5`.
-//!
-//! The types are generic over their pixel type, `P`, so the API can have integer precision where
-//! appropriate (most window manipulation) and floating precision where needed (logical sizes at
-//! fractional scale factors). If `P` is a float, do not cast it with `as {int}`, which truncates:
-//! `cast` and the [`From`]/[`Into`] conversions round to the nearest integer, half away from zero,
-//! and saturate at the integer type's bounds.
 
 /// A pixel coordinate type: a primitive number that converts through `f64`.
 pub trait Pixel: Copy + Into<f64> {
@@ -84,20 +65,12 @@ impl Pixel for f64 {
 }
 
 /// Checks that the scale factor is a normal positive `f64`.
-///
-/// All functions that take a scale factor assert that this will return `true`. If you're sourcing
-/// scale factors from anywhere other than winit, it's recommended to validate them using this
-/// function before passing them to winit; otherwise, you risk panics.
 #[inline]
 pub const fn validate_scale_factor(scale_factor: f64) -> bool {
     scale_factor.is_sign_positive() && scale_factor.is_normal()
 }
 
 /// A position represented in logical pixels.
-///
-/// The position is stored as floats, so please be careful. Casting floats to integers truncates the
-/// fractional part, which can cause noticeable issues. To help with that, an `Into<(i32, i32)>`
-/// implementation is provided which does the rounding for you.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Default, Hash)]
 pub struct LogicalPosition<P> {
     pub x: P,

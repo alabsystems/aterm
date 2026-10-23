@@ -161,7 +161,7 @@ pub(crate) fn parse_line_number(text: &str) -> Option<usize> {
 
 /// The h6 of a 64-bit hash: its top 24 bits, the first 6 of its 16 hex
 /// digits.
-fn h6_of_hash(hash: u64) -> u64 {
+const fn h6_of_hash(hash: u64) -> u64 {
     hash >> H6_SHIFT
 }
 
@@ -280,17 +280,17 @@ impl<'t> Lines<'t> {
     }
 
     /// The text the table was built over.
-    pub(crate) fn text(&self) -> &'t str {
+    pub(crate) const fn text(&self) -> &'t str {
         self.text
     }
 
     /// How many lines the text has.
-    pub(crate) fn count(&self) -> usize {
+    pub(crate) const fn count(&self) -> usize {
         self.spans.len()
     }
 
     /// Where line 1 starts (past a byte-order mark).
-    pub(crate) fn origin(&self) -> usize {
+    pub(crate) const fn origin(&self) -> usize {
         self.origin
     }
 

@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `TrickListenerPurity` (`aterm_models_effects::trick_listener_purity_model`):
-//! the real `TrickListener`, fed the way the host's press cascade feeds it,
-//! beside the line an editor would hold.
-//!
-//! The model keeps hidden state (the open token, the snapshot, the tentative
-//! fire, whether the line named the pet), so each press is checked against
-//! every model state still consistent with what was observed: some action
-//! must take one of them to the listener's observers (`is_pure`,
-//! `is_poisoned`, `line_chars`), the editor's line and the event it reported.
-//! The input class is the trace's, read off the key and the line before it.
-//! Ctrl+Z goes through the listener's own `note_job_chord`, the call the host
-//! makes.
-//!
-//! The negative controls are the bugs the laws were written against: `site`
-//! and `npm run sit` answered as if the listener had fired, a glued run that
-//! named its own line or said its guess at its own edge, and the real
-//! listener under the host's old job-chord
-//! mapping (Ctrl+Z after Esc reset a line the shell kept).
-//!
-//! The anchors are string coverage, as for every machine outside the aterm-gui
-//! gate's step-evidence audit: `close_token` and `deliver` also run inside
-//! other actions' steps.
+//! Tier-1 of `TrickListenerPurity` (`aterm_models_effects::trick_listener_purity_model`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -259,33 +238,33 @@ impl Rig {
 
 /// Every line of the trace, from a fresh listener: each class, each answer.
 const TRACE: &str = concat!(
-    "sit ⏎",                    // tentative, then confirmed by Enter
-    "sit⏎",                     // fired and confirmed by the same Enter
-    "kitty sit ⏎",              // named, so final
-    "good kitty ⏎",             // the held address word fires at the name
-    "good kitty! ⏎",            // a stop closing the name names the line too
-    "sit kitty. ⏎",             // and parks its confirmation for the space
-    "kitty, sit ⏎",             // and the word after it is final
-    "sit tight⏎",               // prose revokes
-    "sit.txt ⌃",                // the glue law
-    "sit: 3⌃",                  // code
-    "npm run sit ⌃",            // never on a line that is not pet talk
-    "site ⌃",                   // never on a prefix
-    "siy ⌫⌫t ⏎",                // a typo fixed across one boundary
-    "sit ⌫e ⌃",                 // un-typing a fired boundary revokes
-    "npm sit ⌫ ⌃",              // an impure snapshot restores impure
-    "sit sit ⌫⌫⌫⌫⌫⌫⌫⌫⌫sit ⏎",   // a second boundary crossed, then the start
-    "sotʷsit ⏎",                // a measured word-kill
-    "⌫⎋sotᶻ⏎",                  // Esc, text the listener never saw, the job chord
-    "si②sit ①⌃②⏎①",             // sessions left dirty come back poisoned
-    "猫咪坐下 ⏎",               // a glued run waits for Enter
-    "坐下猫咪 ⏎",               // in either order
-    "猫咪坐下.  ⏎",             // a stop parks nothing for the edges after it
-    "猫咪坐下 kitty ⏎",         // or a name after it
-    "猫咪 猫咪坐下 ⏎",          // never one before it
-    "猫咪 猫咪坐下. ⏎",         // whatever closes the run
-    "猫咪坐下，需要注意什么 ⌃", // and prose drops it
-    "猫咪玩具 ⌃",               // a thing is never half of a run
+    "sit ⏎",
+    "sit⏎",
+    "kitty sit ⏎",
+    "good kitty ⏎",
+    "good kitty! ⏎",
+    "sit kitty. ⏎",
+    "kitty, sit ⏎",
+    "sit tight⏎",
+    "sit.txt ⌃",
+    "sit: 3⌃",
+    "npm run sit ⌃",
+    "site ⌃",
+    "siy ⌫⌫t ⏎",
+    "sit ⌫e ⌃",
+    "npm sit ⌫ ⌃",
+    "sit sit ⌫⌫⌫⌫⌫⌫⌫⌫⌫sit ⏎",
+    "sotʷsit ⏎",
+    "⌫⎋sotᶻ⏎",
+    "si②sit ①⌃②⏎①",
+    "猫咪坐下 ⏎",
+    "坐下猫咪 ⏎",
+    "猫咪坐下.  ⏎",
+    "猫咪坐下 kitty ⏎",
+    "猫咪 猫咪坐下 ⏎",
+    "猫咪 猫咪坐下. ⏎",
+    "猫咪坐下，需要注意什么 ⌃",
+    "猫咪玩具 ⌃",
 );
 
 #[test]
@@ -307,7 +286,6 @@ fn the_real_listener_refines_the_purity_model() {
     let actions: BTreeSet<&str> = model.actions.iter().map(|a| a.name).collect();
     assert_eq!(fired, actions, "the trace drives every action");
 
-    // Every action is anchored on the real code, and nothing else is.
     let anchored: BTreeSet<&str> = xref::refinements()
         .filter(|r| r.machine == model.name)
         .map(|r| r.action)
@@ -353,20 +331,13 @@ fn caught(keys: &str, forged: impl Fn(Seen) -> Seen) {
 #[test]
 fn a_fire_on_a_prefix_on_prose_or_on_a_glued_name_is_refused() {
     let fired = |seen: Seen| Seen { said: 1, ..seen };
-    // `sit` of `site`, on its completing letter.
     caught("sit", fired);
-    // `npm run sit␣`: a word on a line that is not pet talk.
     caught("npm run sit ", fired);
-    // `猫咪坐下␣` alone, final as if the name inside it named the line, in
-    // either order.
     caught("猫咪坐下 ", |seen| Seen { said: 2, ..seen });
     caught("坐下猫咪 ", |seen| Seen { said: 2, ..seen });
-    // Nor even tentative: a guess is never said at its own edge.
     let model = trick_listener_purity_model();
     refused(&model, "猫咪坐下 ", fired);
     refused(&model, "坐下猫咪 ", fired);
-    // Nor at an edge after it: a stop that closed the run parked nothing,
-    // and a name before the run vouches for nothing after it.
     refused(&model, "猫咪坐下. ", fired);
     refused(&model, "猫咪坐下  ", fired);
     caught("猫咪坐下. ", |seen| Seen { said: 2, ..seen });

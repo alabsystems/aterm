@@ -33,7 +33,7 @@ pub struct StepEvidence {
 impl StepEvidence {
     /// A fresh, empty ledger for `machine` (spelled as [`machine_matches`] accepts).
     #[must_use]
-    pub fn new(machine: &'static str) -> Self {
+    pub const fn new(machine: &'static str) -> Self {
         Self {
             machine,
             steps: Vec::new(),
@@ -81,7 +81,7 @@ impl StepEvidence {
 
     /// The machine this ledger is about.
     #[must_use]
-    pub fn machine(&self) -> &'static str {
+    pub const fn machine(&self) -> &'static str {
         self.machine
     }
 
@@ -566,7 +566,7 @@ pub enum SpecModule {
 
 impl SpecModule {
     /// The machine name this module declares.
-    pub fn name(&self) -> &str {
+    pub const fn name(&self) -> &str {
         match self {
             SpecModule::Embedded(m) => m.name,
         }
@@ -639,7 +639,7 @@ pub struct ClosureReport {
 
 impl ClosureReport {
     /// Whether the closure holds (no violations).
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.violations.is_empty()
     }
 }

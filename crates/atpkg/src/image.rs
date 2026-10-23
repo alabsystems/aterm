@@ -90,7 +90,7 @@ impl ImageBuild {
 
     /// Construct an [`ImageSource::Unknown`] classification with `build = 0`.
     #[must_use]
-    pub fn unknown(program: Option<ProgramTag>) -> Self {
+    pub const fn unknown(program: Option<ProgramTag>) -> Self {
         Self {
             program,
             build: 0,
@@ -138,7 +138,7 @@ impl ImageRoots {
 
     /// Underlying package manager [`Layout`].
     #[must_use]
-    pub fn layout(&self) -> &Layout {
+    pub const fn layout(&self) -> &Layout {
         &self.layout
     }
 

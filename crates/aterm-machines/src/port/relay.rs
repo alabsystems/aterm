@@ -117,7 +117,7 @@ fn start(cmd: &Cmd, env: &[(String, String)], stream: TcpStream) -> io::Result<C
     // Nagle off, as on the host's end (`agent::relay`): the stream is interactive.
     let _ = stream.set_nodelay(true);
     let output = stream.try_clone()?;
-    let mut child = super::fixed_command(&cmd.program, &cmd.args, env);
+    let mut child = super::fixed_command(&cmd.program, &cmd.args, env, cmd.cwd.as_deref());
     child
         .stdin(OwnedFd::from(stream))
         .stdout(OwnedFd::from(output))

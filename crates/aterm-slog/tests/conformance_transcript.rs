@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the shipping [`TurnTracker`]'s transcript join (one
-//! method, [`TurnTracker::transcript`], over a real [`Log`]) against the
-//! derived `TranscriptJoin` model
-//! (`aterm_models_session::transcript_join_model`, checked at Tier-0 in
-//! `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! Seeded walks interleave the screen's verdicts (busy, an approval box, a
-//! usage wall, the idle settle, the wall's settle, five seconds passing) with
-//! the transcript's rows and the glue's moves (a bind, a lapsed watch's
-//! re-bind, an adoption with and without the `tx_` carry tokens, the build
-//! turning partial and back; prompts — dated now, dated older than the open
-//! turn by more than the window, and dated at the newest closed turn's open
-//! while a turn is open — tool calls and results, turn ends,
-//! Esc's interrupt, the wall judge, a compaction, a replayed row, a row
-//! older than the floor). After every step the real state is projected onto the model's
-//! variables, and the step must be the model's action (or nothing, for a
-//! row the join must ignore) with every law holding along it, and the turn
-//! opens and closes it appended must be that action's. The model's ghost
-//! `g` is read off the records each step appended.
-//!
-//! NEGATIVE CONTROLS (plan §4.4): four broken joins, each a wrapper around
-//! the real calls, are rejected by the same walks: one that ignores the
-//! watermark (a replayed row is handed on past it), one that opens a tool
-//! call's step under the run when the join drops it, one that dates a
-//! prompt that came 6 s after its turn opened back to the turn, and one
-//! that hands a prompt row dated in the past on dated now (the join before
-//! its window was two-sided). And per mutant, the broken state is not the
-//! model's step, is the Buggy model's, and breaks its law.
+//! Tier-1 conformance tests for [`TurnTracker::transcript`] against `transcript_join_model`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,8 +37,7 @@ pub enum Broken {
     PromptAtNow,
 }
 
-/// The real tracker and its log, the transcript file the join reads, and
-/// the ghost the model's laws read.
+/// The real tracker and its log, the transcript file the join reads, and the model ghost.
 pub struct Join {
     pub log: Log,
     pub run: Node,
@@ -164,8 +136,7 @@ impl Join {
         self.tracker.tick(&mut self.log, stamp);
     }
 
-    /// One `transcript` call at `pos`; the ghosts a call can raise are read
-    /// off what it appended.
+    /// Runs one `transcript` call at `pos` and returns the appended records.
     pub fn call(&mut self, ev: TxEvent<'static>, pos: TxPos) -> Vec<Rec> {
         let seq0 = self.log.last_seq();
         let held = self.tracker.view(self.now).step;
@@ -173,8 +144,6 @@ impl Join {
         self.tracker
             .transcript(&mut self.log, ev, pos, state, stamp);
         let recs = self.since(seq0);
-        // A screen step the call closed, other than by retracting it: a
-        // box (S4), or a wall whose need no wall step holds any more (S2).
         if let Some((n, what, _)) = held
             && !self.log.is_open(n)
             && !recs
@@ -192,8 +161,6 @@ impl Join {
                 _ => self.ghost(6),
             }
         }
-        // A partial build's record that closed a turn or a screen node, or
-        // changed an outcome (S9).
         if state == TxState::Partial
             && recs.iter().any(|r| {
                 r.src == Src::Transcript
@@ -218,7 +185,6 @@ impl Join {
     pub fn row(&mut self, ev: TxEvent<'static>, wall_ms: u64) -> Vec<Rec> {
         self.off += 160;
         let pos = self.pos(self.off, wall_ms);
-        // A judge's answer is no row of the file: a replay is of a row.
         if !matches!(ev, TxEvent::Wall { .. }) {
             self.last = Some((ev, pos));
         }
@@ -246,9 +212,7 @@ impl Join {
         }
     }
 
-    /// A successor adopts the tracker's carry line, with or without its
-    /// `tx_` tokens (a 3A-shaped carry, a crash's): the adoption is the
-    /// floor.
+    /// Adopts the tracker's carry line, with or without its `tx_` tokens.
     pub fn adopt(&mut self, keep_tx: bool) {
         let stamp = self.stamp();
         let line = self.tracker.carry_line(stamp);
@@ -295,10 +259,7 @@ pub fn project(j: &Join) -> State {
     project_parts(&j.log, j.run, &j.tracker, j.now, j.partial, j.g)
 }
 
-/// [`project`] of any rig's parts: the log and its agent `run`, the
-/// tracker, the test ms `now` (wall `WALL0 + now`), whether the source is
-/// partial, and the ghost `g` the rig read off its records (the `.seq`
-/// runner's laws and mutant measure read the same variables).
+/// Projects the log, agent `run`, and tracker state onto the model's variables.
 pub fn project_parts(
     log: &Log,
     run: Node,
@@ -461,9 +422,7 @@ const PROMPTS: [&str; 6] = [
     "PromptOpens",
 ];
 
-/// One step on `j`, checked against the model: the model's actions it was
-/// (empty: a row the join ignored), or `None` when the step does not apply
-/// here (the screen's word already says it, or the model has no such move).
+/// Applies one step on `j` and checks it against the model.
 pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static str>>, String> {
     let prev = project(j);
     let seq0 = j.log.last_seq();
@@ -524,7 +483,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
             vec!["Age"]
         }
         Step::Bind => {
-            // A new file (a first read, `/clear`): 4 KiB of history in it.
             j.fp += 1;
             j.off = 4096;
             let bind = TxEvent::Bind {
@@ -545,7 +503,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
             };
             let pos = j.pos(j.off, wall);
             j.call(bind, pos);
-            // The fresh fold reads the file again from its start.
             if let Some((ev, pos)) = j.last {
                 let seq = j.log.last_seq();
                 j.call(ev, pos);
@@ -577,7 +534,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
                 _ => tp,
             };
             let recs = j.row(TxEvent::Prompt { vref }, dated);
-            // A prompt attached to a turn opened outside its window (S13).
             if recs.iter().any(|r| {
                 r.op == Op::Amend
                     && r.f.get(Key::Vref).is_some()
@@ -590,9 +546,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
             path
         }
         Step::PromptOld | Step::PromptNear => {
-            // A prompt row dated in the past, read while a turn is open:
-            // older than that turn by more than the window, or at the
-            // newest closed turn's open (no `vref` of its own yet).
             let Some((_, opened)) = j.open_turn() else {
                 return Ok(None);
             };
@@ -608,9 +561,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
             let Some(tp) = tp.filter(|&t| t >= j.floor) else {
                 return Ok(None);
             };
-            // The closed turn that can take it: no `vref`, this run's,
-            // opened within the window of it and nearer it than the open
-            // turn opened.
             let near = closed.filter(|&(_, o, held)| {
                 !held
                     && o >= WALL0
@@ -633,8 +583,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
                 .filter(|r| r.op == Op::Amend && r.f.get(Key::Vref).is_some())
                 .map(|r| r.node)
                 .collect();
-            // A prompt attached to a turn opened outside its window (S13),
-            // or one that named any turn but the nearer one (ghost 9).
             if named.iter().any(|n| {
                 j.opened
                     .get(n)
@@ -682,7 +630,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
             }
         }
         Step::Result => {
-            // An open step's result, else one its turn's cascade closed.
             let open = j
                 .tools
                 .iter()
@@ -716,7 +663,6 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
                 .collect()
         }
         Step::Interrupt => {
-            // Esc's row: Claude Code writes no turn end after it.
             j.row(TxEvent::Interrupt, wall);
             if on("Interrupt") {
                 vec!["Interrupt"]
@@ -813,15 +759,12 @@ const POOL: &[Step] = &[
     Step::OldRow,
 ];
 
-/// One seeded walk of `n` steps; returns the actions it drove, or the first
-/// step the model refused.
+/// Runs one seeded walk of `n` steps and returns the actions it drove.
 pub fn walk(seed: u64, n: usize, broken: Broken) -> Result<BTreeSet<&'static str>, String> {
     let m = transcript_join_model();
     let mut rng = XorShift::new(seed);
     let mut j = Join::new(broken);
     let mut ran = BTreeSet::new();
-    // Most walks bind first, as the glue does at its first read; some read
-    // rows before any bind (each ignored).
     if rng.below(4) > 0 {
         apply(&m, &mut j, Step::Bind)?;
     }

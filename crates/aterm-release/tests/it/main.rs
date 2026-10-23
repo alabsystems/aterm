@@ -62,6 +62,9 @@ mod fixtures;
 #[path = "../../src/gates.rs"]
 #[allow(dead_code)]
 mod gates;
+#[path = "../../src/github.rs"]
+#[allow(dead_code)]
+mod github;
 #[path = "../../src/hook.rs"]
 #[allow(dead_code)]
 mod hook;

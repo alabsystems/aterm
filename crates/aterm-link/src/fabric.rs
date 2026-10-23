@@ -396,7 +396,7 @@ impl Source {
         }
     }
 
-    fn token(&self) -> &'static str {
+    const fn token(&self) -> &'static str {
         match self {
             Source::Env => "env",
             Source::File(_) => "config",
@@ -826,7 +826,7 @@ const GUARD_PROBE_SECRET: &[u8] = b"aterm fabric guard probe: no broker's secret
 impl BrokerView {
     /// Whether the bus was read: connect, `Hello`, every attach and the head query all answered.
     #[must_use]
-    pub fn read_ok(&self) -> bool {
+    pub const fn read_ok(&self) -> bool {
         self.reachable && self.attached && self.head.is_some()
     }
 

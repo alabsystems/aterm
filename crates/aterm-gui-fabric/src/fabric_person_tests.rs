@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PERSON'S HOLD (`docs/DESIGN-owner-surfaces-2026-10-16.md` §4, §10
-//! "Person hold"): the `person` slot is the window's own. Asserted on answers'
-//! classes, slot origins and counts, never on sentence prose.
+//! Tests for the `person` hold origin and refusal accounting.
 
 use super::inbox_hold::registered_as;
 use super::*;
@@ -42,9 +40,6 @@ fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     assert!(refusal.starts_with("ERR halted "), "{refusal}");
     assert!(refusal.contains(" origin=person"), "{refusal}");
 
-    // The held agent's own `hold off` (Owner), and the bridge's: each lifts
-    // its own slot, which is empty, and answers that the session is still
-    // held. The person's slot stands.
     assert_eq!(owner(&store, &format!("{sid} off")), "OK hold=1\n");
     assert_eq!(bridge(&store, &format!("{sid} off")), "OK hold=1\n");
     assert_eq!(
@@ -53,8 +48,6 @@ fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     );
     assert_eq!(ctx.fabric.holds().person(), Some(TAKEN_OVER));
 
-    // `origin=person` is no scope's to name, either way, from either issuer;
-    // nor does a Person issuer ride the wire grammar.
     for (who, rest) in [
         ("owner", format!("{sid} off origin=person")),
         ("owner", format!("{sid} on origin=person")),
@@ -74,8 +67,6 @@ fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     );
     assert_eq!(ctx.fabric.holds().origins(), PERSON_ORIGIN, "nothing moved");
 
-    // CONTROL: the Owner's own slot moves beside the person's, and its lift
-    // leaves the person's standing.
     assert_eq!(
         owner(&store, &format!("{sid} on reason=mine")),
         "OK hold=1\n"
@@ -84,7 +75,6 @@ fn the_window_sets_origin_person_and_no_socket_names_or_lifts_it() {
     assert_eq!(owner(&store, &format!("{sid} off")), "OK hold=1\n");
     assert_eq!(ctx.fabric.holds().origins(), PERSON_ORIGIN);
 
-    // Hand Back: the person's slot only; the session runs again.
     assert_eq!(person_hold(&ctx, false, &|| {}), PersonHoldOutcome::Moved);
     assert!(!ctx.fabric.holds().is_held());
     assert_eq!(
@@ -152,7 +142,6 @@ fn the_handoff_export_and_import_round_trip_the_person_slot() {
     assert_eq!(successor.fabric.holds(), exported);
     assert_eq!(successor.fabric.holds().person(), Some(TAKEN_OVER));
 
-    // A person row with no reason still halts, in the person's slot.
     let unreadable = parse_hold("person");
     assert_eq!(
         (unreadable.origin.as_str(), unreadable.reason.as_str()),
@@ -169,7 +158,6 @@ fn the_handoff_export_and_import_round_trip_the_person_slot() {
 fn the_counter_moves_only_on_refusals_under_the_person_hold() {
     let store = new_store();
     let (sid, ctx) = registered_as(&store, 1);
-    // CONTROL: a local hold's refusals are not the person's to count.
     assert_eq!(
         owner(&store, &format!("{sid} on reason=mine")),
         "OK hold=1\n"

@@ -2,17 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The jq parser: design §8.4's grammar and precedence, from `|` (lowest) through `,`, `//`,
-//! `or`, `and`, the comparisons and `+`/`-` to the postfix steps. `e as $x | body` binds the
-//! postfix term just before `as`, as jq 1.7.1 does, and its body runs to the end of the
-//! enclosing pipeline: `1, 2 as $x | $x` is `1, (2 as $x | $x)`. A name is refused here when it
-//! stands where a function would: by its `REFUSED_JQ` row, or with next `agh help jq` when it
-//! is neither a function nor a keyword.
-//!
-//! Every node knows its depth, and no tree grows deeper than `MAX_DEPTH`, so neither the
-//! parser, the evaluator nor the tree's drop can run out of stack. The parser's own recursion
-//! (parentheses, brackets, arguments, interpolations, objects, `|` and `//`) is bounded by the
-//! same number.
+//! The jq parser: design §8.4's grammar and precedence, from `|` (lowest) through `,`, `//`, `or`,
+//! `and`, the comparisons and `+`/`-` to the postfix steps.
 
 use aterm_json::Value;
 
@@ -49,14 +40,11 @@ pub(super) enum Ast {
     Str(Vec<StrPiece>),
     /// `$name`.
     Var(String),
-    /// `target[key]` (and `.key`, `."key"`): the key runs on the input, not the target. The
-    /// flag is a `?` right after the step (jq's `INDEX_OPT`): a target the key cannot index is
-    /// skipped, and the stream goes on; the target's and the key's own errors still stop it.
+    /// `target[key]` (and `.key`, `."key"`): the key runs on the input, not the target.
     Index(Box<Ast>, Box<Ast>, bool),
     /// `target[lo:hi]`, and its `?` flag, as `Index`'s.
     Slice(Box<Ast>, Option<Box<Ast>>, Option<Box<Ast>>, bool),
-    /// `target[]`, and its `?` flag (jq's `EACH_OPT`): a target that cannot be iterated is
-    /// skipped.
+    /// `target[]`, and its `?` flag (jq's `EACH_OPT`): a target that cannot be iterated is skipped.
     Iterate(Box<Ast>, bool),
     /// `term?` after any term but a step: the term's errors end its stream quietly.
     Try(Box<Ast>),
@@ -311,13 +299,7 @@ impl Parser<'_> {
 
     /// A primary and its postfix steps: `.name`, `."name"`, `[e]`, `[]`, `[a:b]` and `?`;
     /// then, when `as` follows, the binding `term as $NAME | pipeline`.
-    ///
-    /// A `?` right after a step makes that one step optional, for each target on its own, as
-    /// jq 1.7.1's `INDEX_OPT` and `EACH_OPT` do: `[1,[2]] | [.[][]?]` is `[2]`, and the error
-    /// of an earlier step still stops the stream. A `?` after any other term (`(...)?`, a
-    /// call, a literal, `$x`, a second `?`) wraps the term in `Try`.
     fn postfix(&mut self) -> Result<Node> {
-        // A primary `.name` or `."name"` is itself a step; `.` and `(...)` are not.
         let mut step = match self.peek() {
             Some(Tok::Field(_)) => true,
             Some(Tok::Dot) => matches!(self.peek_at(1), Some(Tok::Str(_))),

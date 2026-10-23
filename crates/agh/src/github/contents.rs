@@ -20,8 +20,7 @@ use crate::wire::WireKind;
 /// The most entries GitHub lists in one directory.
 const DIRECTORY_CAP: usize = 1000;
 
-/// Why a directory listing at the cap is not whole: the Incomplete error's why, and `ls`'s
-/// partial answer's.
+/// Why a directory listing at the cap is not whole.
 pub(crate) const DIRECTORY_CAP_WHY: &str =
     "the directory holds 1000 entries or more, and GitHub lists at most 1000";
 
@@ -53,8 +52,6 @@ impl<'a> Contents<'a> {
     }
 
     /// `GET /repos/{o}/{r}/contents/{path}` (no trailing `/` for the root), `?ref=` when given.
-    /// A path with a `.` or `..` part is usage, before any request: a server that normalised
-    /// it would resolve it off this repository's route.
     fn call(&self, reference: Option<&str>, path: &str) -> Result<Call> {
         path::refuse_dot_segment("path", path).map_err(|e| e.with_repo(self.slug.to_string()))?;
         let encoded = path::file_path(path);
@@ -76,16 +73,9 @@ impl<'a> Contents<'a> {
     }
 
     /// One file's bytes, at most `max` (Accept raw).
-    ///
     /// # Errors
-    ///
-    /// Usage for a path with a `.` or `..` part, before any request; Invalid for a file over
-    /// `max`, a directory or a submodule; the call's error.
+    /// Usage for a path with a `.` or `..` part, before any request.
     pub fn raw(&self, reference: Option<&str>, path: &str, max: u64) -> Result<Vec<u8>> {
-        // The body is read whole through `call`, the door a tape records (`call_stream` is the
-        // downloads' door). The wire limit never drops below the 64 KiB a failed answer's body
-        // is classified from, so a small `--max-bytes` cannot turn a 404 into "too large";
-        // `max` itself is held on the bytes that arrived.
         let call = self
             .call(reference, path)?
             .accept(Accept::Raw)
@@ -98,10 +88,6 @@ impl<'a> Contents<'a> {
                 error
             }
         })?;
-        // Under Accept raw GitHub labels a file's bytes `application/vnd.github.raw+json` and a
-        // directory's listing `application/json`, so only the latter's essence is a directory.
-        // A submodule answers its JSON object under Accept raw too (the raw type covers files
-        // and symlinks), so the object's own `type` names what it is.
         if Media::of(answered.header("content-type")) == Media::Json {
             let value = answered.json().ok();
             return Err(match value.as_ref().and_then(entry_type) {
@@ -117,14 +103,9 @@ impl<'a> Contents<'a> {
         Ok(answered.body)
     }
 
-    /// One directory's entries, sorted by name. At GitHub's 1000-entry cap the listing is
-    /// Incomplete `DirectoryCap`, or under `partial` it ends `Capped { pages: 1 }`.
-    ///
+    /// One directory's entries, sorted by name.
     /// # Errors
-    ///
-    /// Usage for a path with a `.` or `..` part, before any request; Invalid for a file, a
-    /// symlink or a submodule;
-    /// Incomplete at GitHub's 1000-entry cap unless `partial`.
+    /// Usage for a path with a `.` or `..` part, before any request.
     pub fn list(
         &self,
         reference: Option<&str>,
@@ -136,8 +117,6 @@ impl<'a> Contents<'a> {
             .json()
             .map_err(|e| e.with_repo(self.slug.to_string()))?;
         let Some(array) = value.as_array() else {
-            // One object: a file or a symlink (`agh cat` reads either), or a submodule,
-            // which neither verb reads.
             return Err(match entry_type(&value) {
                 None => self.invalid(format!("{path} is a file: use agh cat")),
                 Some(kind @ ("file" | "symlink")) => {

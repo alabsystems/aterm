@@ -985,7 +985,7 @@ impl Reply {
         }
     }
 
-    fn empty(status: u16) -> Reply {
+    const fn empty(status: u16) -> Reply {
         Reply {
             status,
             body: Body::Empty,
@@ -995,7 +995,7 @@ impl Reply {
     }
 }
 
-fn reason_phrase(status: u16) -> &'static str {
+const fn reason_phrase(status: u16) -> &'static str {
     match status {
         100 => "Continue",
         200 => "OK",

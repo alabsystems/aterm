@@ -78,7 +78,7 @@ impl ClassMeta {
     /// The registered class object.
     #[inline]
     #[must_use]
-    pub fn class(&self) -> ClassPtr {
+    pub const fn class(&self) -> ClassPtr {
         // SAFETY: `class_addr` is private and written only by `ClassBuilder::register`, from the pair `objc_registerClassPair` just registered; classes are never disposed, so it is still a class.
         unsafe { ClassPtr::from_ptr(std::ptr::with_exposed_provenance_mut(self.class_addr)) }
     }
@@ -102,7 +102,7 @@ impl<T> IvarSlot<T> {
     /// Fill an all-zero slot.
     /// # Safety
     /// `slot` must point at a properly aligned, writable `IvarSlot<T>` whose `initialized` flag is `false` (freshly `+alloc`ed; refilling would leak the old value).
-    pub unsafe fn init(slot: *mut Self, value: T) {
+    pub const unsafe fn init(slot: *mut Self, value: T) {
         // SAFETY: `slot` is aligned, writable and unfilled.
         unsafe {
             slot.write(Self {
@@ -177,7 +177,7 @@ impl ClassBuilder {
     /// The class under construction (unregistered).
     #[inline]
     #[must_use]
-    pub fn as_ptr(&self) -> ClassPtr {
+    pub const fn as_ptr(&self) -> ClassPtr {
         self.cls
     }
 

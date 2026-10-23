@@ -2,21 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! THE BEAT: the disk watch's sign that it is making progress (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §3.1). A pass that takes many
-//! minutes beats throughout — every [`EVERY`] entries any of its walks reads
-//! and every [`EVERY`] a delete removes — so a wait that holds a demand reads
-//! a beat a minute old as a blocked syscall or a dead thread, never as a long
-//! pass (`await sys`'s `why=watch-stalled`). A beat is a timestamp the host
-//! keeps; nothing here sleeps or waits.
-//!
-//! The host registers the one handler ([`set_handler`]); without one a beat
-//! does nothing. The count is one atomic add per entry and a lock only every
-//! [`EVERY`] entries.
-//!
-//! A walk that is not the watch's (the Stats Deck's read-only "where"
-//! survey, which runs whether or not the harness is on) walks the same trees
-//! through the same code, so it runs [`quietly`]: its thread beats nothing,
-//! and a stalled watch is not read as alive while a survey runs.
+//! `docs/DESIGN-disk-awareness-2026-10-17.md` §3.1).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,8 +22,8 @@ thread_local! {
     static QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Run `f` with this thread's beats silenced: every [`beat`] and [`tick`]
-/// it makes is no sign of the watch's progress and counts toward none.
+/// Run `f` with this thread's beats silenced: every [`beat`] and [`tick`] it makes is no sign of
+/// the watch's progress and counts toward none.
 pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
     /// The flag as it was, put back however `f` ends.
     struct Restore(bool);
@@ -60,8 +46,8 @@ pub fn set_handler(handler: Handler) {
     *HANDLER.lock().unwrap_or_else(PoisonError::into_inner) = Some(handler);
 }
 
-/// Beat now: a step of a pass finished (a look began or ended, a directory
-/// was sized, a unit's step was taken).
+/// Beat now: a step of a pass finished (a look began or ended, a directory was sized, a unit's step
+/// was taken).
 pub fn beat() {
     if quiet() {
         return;
@@ -76,8 +62,7 @@ pub fn beat() {
     }
 }
 
-/// Count `n` entries a walk read or a delete removed, beating once every
-/// [`EVERY`].
+/// Count `n` entries a walk read or a delete removed, beating once every [`EVERY`].
 pub fn tick(n: usize) {
     if quiet() {
         return;

@@ -1665,13 +1665,15 @@ mod tests {
             Link,
             Status,
         }
-        // The connection's frame wait, and how late the keeper answers: past that wait.
-        let frame = Duration::from_millis(300);
-        let late = Duration::from_secs(1);
-        for (n, hello) in [Hello::App, Hello::Link, Hello::Status]
+        // The connection's frame wait, and how late the keeper answers: past that wait. The
+        // three dials are independent, so they run at once.
+        let frame = Duration::from_millis(100);
+        let late = Duration::from_millis(400);
+        let dials: Vec<(usize, Hello)> = [Hello::App, Hello::Link, Hello::Status]
             .into_iter()
             .enumerate()
-        {
+            .collect();
+        aterm_spec::check::each(&dials, |&(n, hello)| {
             let dir = std::env::temp_dir().join(format!("akl-late-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("dir");
@@ -1740,7 +1742,7 @@ mod tests {
             );
             drop(keeper.join().expect("the late keeper"));
             let _ = std::fs::remove_dir_all(&dir);
-        }
+        });
     }
 
     /// A keeper whose WELCOME states no CAP_SYNC (an older one, which refuses an unknown kind and

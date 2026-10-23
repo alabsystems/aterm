@@ -17,9 +17,10 @@
 //!   `accounts.toml`, and wrote `fleet-accounts.toml` from what came back; all
 //!   three are gone, and a fleet file with no [`OPT_IN_KEY`] (every one those
 //!   versions wrote) opts nothing in.
-//! * Parses an accounting spreadsheet's CSV (a local file, an `http(s)://`
-//!   export URL, or `rclone:<remote>:<path>`) or a LAN `fleet-accounts.toml`
-//!   URL/path.
+//! * Parses an accounting spreadsheet's CSV (a local file or an `http(s)://`
+//!   export URL) or a LAN `fleet-accounts.toml` URL/path. An rclone remote
+//!   (`rclone:<remote>:<path>`) is refused by name: aterm runs no rclone
+//!   (init design §6.1 row 29).
 //! * Writes `fleet-accounts.toml` beside `accounts.toml` so any machine on
 //!   the LAN can sync from one shared config file, and writes this machine's
 //!   `accounts.toml` (`m8` -> `m8` and `m8-2`), adopting whichever account is
@@ -57,13 +58,15 @@ use super::upgrade;
 /// accounts source.
 pub const SOURCE_TABLE: &str = "fleet";
 
-/// `[fleet] accounts_source = "<path | http(s) URL | rclone:<remote>:<path>>"`:
+/// `[fleet] accounts_source = "<path | http(s) URL>"`:
 /// where a machine with no `fleet-accounts.toml` yet syncs its roster from
 /// ([`configured_source`]).
 pub const SOURCE_KEY: &str = "accounts_source";
 
-/// The prefix that names an rclone remote as a source
-/// (`rclone:<remote>:<path>`): rclone runs only for a source written so.
+/// The prefix that names an rclone remote (`rclone:<remote>:<path>`), a source
+/// refused by name ([`fetch_plan`]): aterm runs no rclone, so the sources are
+/// a sheet's CSV export URL, a LAN `fleet-accounts.toml` and a local file
+/// (init design §6.1 row 29).
 pub const RCLONE_PREFIX: &str = "rclone:";
 
 /// What a sync says when it was handed no source and none is configured:
@@ -1400,49 +1403,42 @@ fn read_local_source_text(path: &Path) -> io::Result<String> {
         .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
-fn rclone_program() -> &'static str {
-    for candidate in [
-        "/opt/homebrew/bin/rclone",
-        "/usr/local/bin/rclone",
-        "/usr/bin/rclone",
-    ] {
-        if Path::new(candidate).is_file() {
-            return candidate;
-        }
-    }
-    "rclone"
-}
-
 /// How one named source is read ([`fetch_plan`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FetchPlan {
-    /// `rclone cat` of the remote path after [`RCLONE_PREFIX`].
-    Rclone(String),
     /// `curl` of an `http(s)://` URL (a Sheets `/edit` link as its CSV export).
     Http(String),
     /// A local file (a leading `~/` is the home's).
     File(PathBuf),
 }
 
-/// What reading `source` takes: rclone only behind [`RCLONE_PREFIX`], curl
-/// only for an `http(s)://` URL, else a file. Nothing is added to it: no
-/// fallback source, no default remote.
-fn fetch_plan(env: &Env, source: &str) -> FetchPlan {
-    if let Some(remote) = source.strip_prefix(RCLONE_PREFIX) {
-        return FetchPlan::Rclone(remote.to_owned());
+/// What reading `source` takes: curl only for an `http(s)://` URL, else a
+/// file. Nothing is added to it: no fallback source, no default remote.
+///
+/// # Errors
+///
+/// An rclone remote ([`RCLONE_PREFIX`]), refused by name with the sources
+/// that remain.
+fn fetch_plan(env: &Env, source: &str) -> Result<FetchPlan, String> {
+    if source.starts_with(RCLONE_PREFIX) {
+        return Err(format!(
+            "{source}: rclone remotes are not read; name the sheet's CSV export URL \
+             (https://docs.google.com/spreadsheets/d/<id>/export?format=csv), a LAN \
+             {FLEET_ROSTER_FILE} URL or path, or a local CSV file"
+        ));
     }
     if source.starts_with("http://") || source.starts_with("https://") {
-        return FetchPlan::Http(normalize_google_sheet_url(source));
+        return Ok(FetchPlan::Http(normalize_google_sheet_url(source)));
     }
-    match (source.strip_prefix("~/"), env.home.as_deref()) {
+    Ok(match (source.strip_prefix("~/"), env.home.as_deref()) {
         (Some(rest), Some(home)) => FetchPlan::File(home.join(rest)),
         _ => FetchPlan::File(PathBuf::from(source)),
-    }
+    })
 }
 
 /// How a fetch's one program is run: [`run_fetcher`] live, a test's witness
 /// in a test, so the composition of [`fetch_source_text_with`] is seen
-/// without curl or rclone running.
+/// without curl running.
 type RunFetcher =
     dyn Fn(aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String> + Sync;
 
@@ -1451,20 +1447,6 @@ type RunFetcher =
 /// refused, not cut).
 fn run_fetcher(cmd: aterm_uds::spawnfd::Command) -> Result<super::align::Captured, String> {
     super::align::capture_bounded(cmd, Duration::from_secs(20), SOURCE_TEXT_MAX_BYTES + 1)
-}
-
-fn fetch_rclone_csv(env: &Env, remote: &str, run: &RunFetcher) -> Result<String, String> {
-    let mut cmd = aterm_uds::spawnfd::command(rclone_program());
-    if let Some(home) = &env.home {
-        cmd.env("HOME", home);
-    }
-    cmd.args(["--drive-export-formats", "csv", "cat", "--", remote]);
-    let cap = run(cmd).map_err(|e| format!("failed to run rclone for {remote}: {e}"))?;
-    if cap.code != Some(0) {
-        let out = String::from_utf8_lossy(&cap.stdout);
-        return Err(format!("rclone failed for {remote}: {}", out.trim()));
-    }
-    decode_source_text(cap.stdout, remote)
 }
 
 fn fetch_http(url: &str, run: &RunFetcher) -> Result<String, String> {
@@ -1497,11 +1479,10 @@ fn fetch_source_text(env: &Env, source: &str) -> Result<String, String> {
 }
 
 /// [`fetch_source_text`] over `run`: one program at most (curl for a link,
-/// rclone for `rclone:`, none for a file), and its failure is the answer —
-/// nothing else is tried after it.
+/// none for a file or a refused rclone remote), and its failure is the
+/// answer — nothing else is tried after it.
 fn fetch_source_text_with(env: &Env, source: &str, run: &RunFetcher) -> Result<String, String> {
-    match fetch_plan(env, source) {
-        FetchPlan::Rclone(remote) => fetch_rclone_csv(env, &remote, run),
+    match fetch_plan(env, source)? {
         FetchPlan::Http(url) => fetch_http(&url, run),
         FetchPlan::File(path) => {
             let mut bytes = Vec::new();
@@ -1986,7 +1967,7 @@ pub enum Upkept {
 /// What the upkeep may do past reading its own files: fetch a source, start a
 /// renewal's worker, and the two process-wide gates (the sync's cooldown and
 /// the renewal's admission). The live ones in [`upkeep_live`]; a test's own
-/// in a test, so none reaches curl, rclone, `claude` or another test's gates.
+/// in a test, so none reaches curl, `claude` or another test's gates.
 struct UpkeepEffects<'a> {
     fetch: &'a Fetch,
     spawn_renewal: &'a SpawnRenewal,
@@ -4735,13 +4716,14 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
     }
 
     /// A SOURCE IS READ AS WRITTEN AND NOTHING MORE, where the fetch is
-    /// composed ([`fetch_source_text_with`]): rclone only behind `rclone:`,
-    /// curl only for an `http(s)` link (a Sheets `/edit` link as its export),
-    /// no program for a file (`~/` the home's; a bare `remote:path` is a file
-    /// name), and a fetcher's failure is the answer — nothing is tried after
-    /// it (FAILS with 0.112.0's fallback restored: a Sheets link whose curl
-    /// failed went on to an rclone remote). NEGATIVE CONTROL: a fetcher that
-    /// answers is the answer.
+    /// composed ([`fetch_source_text_with`]): an rclone remote (`rclone:`) is
+    /// refused by name, naming the sources that remain, and runs nothing
+    /// (init design §6.1 row 29); curl only for an `http(s)` link (a Sheets
+    /// `/edit` link as its export); no program for a file (`~/` the home's; a
+    /// bare `remote:path` is a file name); and a fetcher's failure is the
+    /// answer — nothing is tried after it (FAILS with 0.112.0's fallback
+    /// restored: a Sheets link whose curl failed went on to an rclone remote).
+    /// NEGATIVE CONTROL: a fetcher that answers is the answer.
     #[test]
     fn a_source_is_fetched_only_as_it_is_written() {
         let w = World::new();
@@ -4769,8 +4751,16 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         };
         let sheet_export =
             "https://docs.google.com/spreadsheets/d/FAKE-SHEET/export?format=csv&gid=0";
+        let (refused, ran) = took("rclone:gdrive:AI Email Accounting.csv", &failing);
+        let refused = refused.unwrap_err();
+        assert!(
+            refused.contains("rclone remotes are not read")
+                && refused.contains("/export?format=csv")
+                && refused.contains(FLEET_ROSTER_FILE),
+            "{refused}"
+        );
+        assert!(ran.is_empty(), "an rclone remote runs no program: {ran:?}");
         for (source, program, last) in [
-            ("rclone:remote:Fleet.csv", "rclone", "remote:Fleet.csv"),
             (
                 "https://docs.google.com/spreadsheets/d/FAKE-SHEET/edit#gid=0",
                 "curl",

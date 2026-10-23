@@ -1,23 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Torn reads on real bytes, through the host seam: a real `aterm_core` [`Terminal`] fed the
-//! bytes, its rows sampled as `app_render.rs`'s frame hold samples them (the caret's row, every
-//! row the ribbon names, the print anchor), its content-scroll clock read as
-//! `sync_cursor_effect_scroll` reads it, fed to [`CursorGlow`] with the hints `app_input.rs`
-//! stamps for each key.
-//!
-//! * Real bytes at every read size: the Claude Code composer takes and Codex's particle take,
-//!   each burst presented whole, then re-cut into 1024- and 512-byte reads with a present after
-//!   each. No interior dark run on the composer row from the first typed key to the last, and
-//!   nothing drawn once the take has rested past the longest swoosh. Claude takes run with the
-//!   `?2026` hold lapsed (past `SYNC_HOLD_CAP`, 150 ms), the torn-read condition; Codex's with
-//!   the hold held (SYNC-1).
-//! * A typed line into the swoosh: 12 cps into an Ink-shaped composer, every key's repaint torn
-//!   at the same text column, then a rest through the whole exit. Neither the plan's coverage
-//!   (what a pixel census reads) nor the ribbon's live cells (whose one-cell gaps the plan
-//!   feathers over) may show a gap.
-
 use std::time::{Duration, Instant};
 
 use crate::common::{
@@ -28,8 +11,6 @@ use aterm_core::render::GlowQuad;
 use aterm_core::terminal::{ContentScrollState, Terminal};
 use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig};
 use aterm_effects::rainbow_kitty::ribbon::Ribbon;
-
-// Shared.
 
 /// Idle after the last gesture before T6 is read, as in
 /// `rainbow_kitty_v2_frame_cost.rs`: longer than the longest swoosh (a 1.5 s
@@ -110,8 +91,6 @@ fn rest_of(glow: &CursorGlow, fp: u64, now: Instant) -> Rest {
             .is_some(),
     }
 }
-
-// 1. Real bytes at every read size.
 
 struct Take {
     name: &'static str,
@@ -464,7 +443,6 @@ fn replay(take: &Take, chunking: Chunking) -> Replay {
             }
         }
     }
-    // The take has ended: rest past the longest swoosh.
     let dark_from = h.t0 + Duration::from_millis(last_gesture);
     let end = dark_from + Duration::from_millis(IDLE_CEILING_MS);
     let mut dark_after_ms = None;
@@ -528,16 +506,6 @@ fn assert_take_holds(take: &Take) {
 
 /// Every take at every read size, each presented whole and in 1024- and
 /// 512-byte reads: no interior hole while typing, nothing drawn at rest.
-///
-/// * Claude Code's bytes: the insert take (the line typed, ⌥← into it,
-///   `INTO ` inserted, ⌥→ back); the End take (the insert, then End back to
-///   the end of the line); the scrub take (three word hops each way inside
-///   the typed line); the popup take (an `@`-mention popup open under the
-///   composer while typing); the plain-arrow insert.
-/// * Codex's bytes: braille particles painted into the composer's blank cells
-///   on every ~150 ms frame inside `?2026`, with SYNC-1 holding the present
-///   while a bracket is open. The band under the typed line, the backward
-///   edit and the forward hops stays one run.
 #[test]
 fn every_take_holds_whole_and_torn_at_every_read_size() {
     crate::common::par_map(&TAKES, assert_take_holds);
@@ -569,8 +537,6 @@ fn claude_code_s_arrow_insert_keeps_the_pushed_tail_lit_at_every_read_size() {
         );
     }
 }
-
-// 2. A typed line, torn, into the swoosh.
 
 const COMPOSER_ROWS: usize = 40;
 const COMPOSER_CW: usize = 8;

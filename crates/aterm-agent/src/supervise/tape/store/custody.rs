@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Hosted-store operations over retained directory handles. Pathnames below
-//! are labels, never authority to reopen an admitted parent. Existing roots
-//! and session directories must be owned by this uid and private (0700).
-//! Unsupported platforms refuse this optional development store.
-//!
-//! Retirement first transfers a name, without replacement, to an unpredictable
-//! name under the held private root. It checks the transferred inode against
-//! the still-open tape before unlinking. A different entry is restored without
-//! replacement, or preserved at the transfer name if restoration is occupied.
-//! This is not unlink-by-fd: a hostile same-uid writer that discovers and
-//! replaces the fresh private transfer name can still race check-to-unlink.
-//! Nor is a directory scan a snapshot of concurrent writers. No such stronger
-//! POSIX guarantee is claimed. Ancestor replacement never redirects an operation.
+//! Hosted-store operations over retained directory handles.
 
 use std::fs::File;
 use std::io;
@@ -108,7 +96,6 @@ mod platform {
         let file = match open(&parent.file, name, true) {
             Ok(file) => file,
             Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
-                // No recursive adoption and no chmod of an existing entry.
                 fd::mkdirat(&parent.file, name, Mode::RWXU)?;
                 open(&parent.file, name, true)?
             }
@@ -136,8 +123,7 @@ mod platform {
     }
 
     impl Tape {
-        /// Observe this inventory's retained tape, not a path another writer
-        /// can replace. Inventory opens a fresh description; it owns no lock.
+        /// Observe this inventory's retained tape, not a path another writer can replace.
         pub fn owner(&self) -> aterm_uds::ownerlock::Owner {
             use aterm_uds::ownerlock::Owner;
             #[cfg(any(target_vendor = "apple", target_os = "linux"))]
@@ -283,8 +269,6 @@ mod platform {
         }
 
         pub fn retire(&self, tape: &Tape) -> io::Result<()> {
-            // Randomness supplies an unadvertised transfer name; NOREPLACE supplies
-            // uniqueness. A collision is a refusal, never a pre-delete/retry.
             let name = format!(".retiring-{}", aterm_uds::rand::hex_token::<16>()?);
             private_directory(&self.root.file)?;
             private_directory(&tape.parent.file)?;
@@ -302,8 +286,6 @@ mod platform {
                 .as_ref()
                 .is_ok_and(|m| m.dev() == expected.dev() && m.ino() == expected.ino());
             if !same {
-                // Restore without clobbering any newly occupied original name.
-                // If that refuses, preserve the transferred bytes at `name`.
                 let restored = fd::renameat_with(
                     &self.root.file,
                     &name,

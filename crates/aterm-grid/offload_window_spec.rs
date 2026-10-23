@@ -60,25 +60,17 @@ fn offload_window_model() -> Model {
             var budget_applied = 0; // budget installed on attached backend
             var budget_dirty = 0; // host changed the detach-time budget snapshot
 
-            // PTY output scrolls a line off during the window: staged to the lazy
-            // buffer (Buggy drops it).
             action Produce when (detached > 0 && done <= 0 && produced <= W - 1) {
                 produced = produced + 1;
                 retained = if Buggy > 0 { retained } else { retained + 1 };
             }
 
-            // A `clear` / ED3 lands during the window. The real `erase_scrollback`
-            // also clears the lazy buffer: that is the user's clear, not loss, so the
-            // produced/retained debt resets and NoLoss covers only later output.
             action Erase when (detached > 0 && done <= 0 && cleared <= 0) {
                 cleared = 1;
                 produced = 0;
                 retained = 0;
             }
 
-            // Line-limit requests: 0 is an explicit unlimited request, not "no
-            // request". With a backend attached they apply at once; a low total also
-            // tightens the hot ring, and raises never grow it back.
             action SetLineLow when (detached > 0 && done <= 0) {
                 line_latest = LineLow;
                 line_observed = if Buggy > 0 { line_observed } else { LineLow };
@@ -125,10 +117,6 @@ fn offload_window_model() -> Model {
                 budget_dirty = 1;
             }
 
-            // A replacement store is authoritative at once and takes every line
-            // staged so far. Untouched settings adopt its baseline; dirty host
-            // requests are applied to it. The pending snapshot stays live until the
-            // stale worker resolves, so later setters still win.
             action AttachReplacement when (
                 detached > 0 && done <= 0 && replacement <= 0
             ) {
@@ -154,9 +142,6 @@ fn offload_window_model() -> Model {
                 } else { ReplacementBudget };
             }
 
-            // Worker finishes and re-attaches. An erase during the window drops the
-            // stale pre-erase store, so nothing resurrects (Buggy re-attaches it).
-            // The newest pending settings are installed before staged output drains.
             action Reattach when (detached > 0 && done <= 0) {
                 detached = 0;
                 done = 1;
@@ -176,12 +161,6 @@ fn offload_window_model() -> Model {
                 budget_dirty = 0;
             }
 
-            // Worker died; `abort_reflow_offload` recovers to a bounded state.
-            // Without a replacement, window output is discarded and nothing
-            // re-attaches; a newest low finite total tightens the surviving ring
-            // (high/unlimited cannot expand it) and the budget is dropped. A
-            // replacement stays authoritative, receives the newest settings and
-            // drains the rows staged since it attached, so that Abort is lossless.
             action Abort when (detached > 0 && done <= 0) {
                 detached = 0;
                 done = 1;
@@ -213,24 +192,9 @@ fn offload_window_model() -> Model {
                 budget_dirty = 0;
             }
 
-            // A produced line is accounted for while staged (`retained`) or after a
-            // drain relocated it into the tiered store (`relocated`). AttachReplacement
-            // and replacement-backed Abort transfer staged rows; a discard in place of
-            // that transfer breaks the sum.
             invariant NoLoss: produced <= retained + relocated + slack;
-            // The lower bound NoLoss cannot state: over this alphabet the staging
-            // buffer holds only rows produced since the last erase. Every action that
-            // resets the produced debt (`Erase`) or hands staged rows on
-            // (`AttachReplacement`, `Abort`) empties the buffer in the same step.
-            //
-            // This alphabet only: resize shedding stages rows without `Produce`, so
-            // the real `lazy_buffer` can exceed the window's scroll-off. Do not lower
-            // this to a `debug_assert!` on `lazy_buffer.len()` (a height shrink inside
-            // a window trips it while correct). A resize step added here must bump
-            // `produced` and `retained` together; bumping only `retained` refutes this.
             invariant StagedWithinProduced: retained <= produced;
             invariant ErasedStaysErased: resurrected <= 0;
-            // The window closes: an Abort that forgets `detached' = 0` leaves both set.
             invariant WindowCloses: detached + done <= 1;
             invariant PendingIffUnresolved: pending == detached;
             invariant DirtyOnlyWhilePending:

@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TAB MENU ACROSS A RE-GRID: its card's recorded rect answers the
-//! pointer only on the grid the frame that painted it laid it on
-//! (`App::laid_cell_at`), and the next frame lays it again.
+//! Tests that a tab menu card's recorded rect answers the pointer only on the grid it was laid on.
 
 use crate::{App, WindowId, term_lock};
 
-/// One frame of window `wid` as a redraw lays it: the engine's cells, the
-/// strip, then the open menu's card.
+/// One frame of window `wid` as a redraw lays it.
 fn frame(app: &mut App, wid: WindowId) {
     let (rows, cols) = {
         let ws = &app.windows[&wid];
@@ -29,8 +26,7 @@ fn frame(app: &mut App, wid: WindowId) {
     app.splice_tab_menu(wid);
 }
 
-/// Window `wid`'s pixel at the centre of frame cell `(row, col)` on the grid
-/// the window has now.
+/// Window `wid`'s pixel at the centre of frame cell `(row, col)` on the grid the window has now.
 fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     let (cw, ch) = app.win_cell_size(wid);
     let (ox, oy) = app.frame_origin(wid);
@@ -44,9 +40,7 @@ fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
     (x, y)
 }
 
-/// A font zoom to `size` px: the zoom's own transaction, its renderer
-/// rebuild elided (a headless window has none, nor an OS window to re-fit),
-/// so the window's cells grow and its grid keeps its rows and columns.
+/// A font zoom to `size` px.
 fn zoom(app: &mut App, size: f32) {
     assert!(app.set_font_size_with(size, |_| true), "zoomed to {size}");
 }
@@ -69,11 +63,6 @@ fn lit(app: &App, wid: WindowId) -> Option<usize> {
 /// onto one of its rows there lights it. A re-grid again, and a press before
 /// the frame closes the card without choosing, as a press before its first
 /// paint does.
-///
-/// NEGATIVE CONTROLS: the zoom undone, the grid is the one the card was laid
-/// on and the rect answers the resting pointer with its action; and the last
-/// frame's rect stamped as the zoomed grid's (no stamp, as before), the same
-/// motion lights the other action and a press there would choose it.
 #[test]
 fn a_regrid_leaves_the_tab_menus_last_rect_answering_nothing() {
     let mut app = App::headless_for_test();
@@ -91,13 +80,10 @@ fn a_regrid_leaves_the_tab_menus_last_rect_answering_nothing() {
         .entries
         .clone();
     let action = |(row, col): (usize, usize)| crate::tab_menu::action_at(rect, &entries, row, col);
-    // Every action cell's pixel on the grid the card was laid on.
     let cells: Vec<(usize, (f64, f64))> = (rect.row..rect.row + rect.h)
         .flat_map(|row| (rect.col..rect.col + rect.w).map(move |col| (row, col)))
         .filter_map(|cell| Some((action(cell)?, cell_px(&app, wid, cell))))
         .collect();
-    // The first zoom step that puts, under one action's pixel, another
-    // action's cell of the painted rect.
     let base = app.font_size;
     let (size, was, now, (x, y)) = (1..=16u8)
         .find_map(|step| {
@@ -112,17 +98,13 @@ fn a_regrid_leaves_the_tab_menus_last_rect_answering_nothing() {
         })
         .expect("a zoom puts another action under one's pixel");
 
-    // CONTROL: on the grid the card was laid on, the rect answers.
     assert_eq!(app.glass_grid(wid), laid, "the zoom undone");
     app.on_cursor_moved(wid, x, y);
     assert_eq!(lit(&app, wid), Some(was), "CONTROL: its action lit");
     assert_eq!(app.tab_menu_action_at(wid, x, y), Some(was));
 
-    // The zoom: no frame painted yet.
     zoom(&mut app, size);
     assert_ne!(app.glass_grid(wid), laid, "the zoom re-grids the window");
-    // CONTROL: the last rect stamped as the zoomed grid's, the same motion
-    // lights the action no frame will lay under the pointer.
     app.windows.get_mut(&wid).expect("window").tab_menu_laid = app.glass_grid(wid);
     app.on_cursor_moved(wid, x, y);
     assert_eq!(
@@ -152,8 +134,6 @@ fn a_regrid_leaves_the_tab_menus_last_rect_answering_nothing() {
         "the re-grid closes nothing"
     );
 
-    // The next frame lays the card again on the zoomed grid: a motion onto
-    // one of its rows lights it.
     frame(&mut app, wid);
     let relaid = app.windows[&wid].tab_menu_rect.expect("laid again");
     assert_eq!(app.windows[&wid].tab_menu_laid, app.glass_grid(wid));
@@ -166,8 +146,6 @@ fn a_regrid_leaves_the_tab_menus_last_rect_answering_nothing() {
     app.on_cursor_moved(wid, x, y);
     assert_eq!(lit(&app, wid), Some(i), "the card laid again answers");
 
-    // A re-grid again, and a press before the frame: the card closes, and no
-    // action was under the press.
     zoom(&mut app, base);
     assert_eq!(
         app.tab_menu_action_at(wid, x, y),

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Private files: admitted reads and atomic 0600 writes.
-//!
-//! Every read opens with `O_NOFOLLOW | O_NONBLOCK` and judges the descriptor it opened
-//! (`fstat`), so a symlink, a FIFO or a file swapped in after a check is refused, and is
-//! bounded. Every write goes through a fresh temp beside the target (mode set on the
-//! descriptor, synced), then `aterm_uds::atomic_file::write`'s rename ([`write_atomic`]: a
-//! link at the target is replaced, not followed) or a link that refuses any name already
-//! taken ([`write_new`]).
+//! Admitted file reads (`O_NOFOLLOW | O_NONBLOCK`) and atomic 0600 writes.
 
 use crate::{Error, SecretBytes};
 use std::fs::{File, OpenOptions};
@@ -16,9 +9,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-/// Make `dir` (and missing parents) exist, owned by this user; narrow `dir` itself to 0700 if
-/// it is wider. Refuses a symlink at `dir`, a non-directory, or a directory another user
-/// owns.
+/// Ensures `dir` exists as a 0700 directory owned by this user, refusing symlinks.
 pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
     match kind(dir)? {
         Kind::Dir => {}
@@ -82,7 +73,6 @@ fn read_admitted(path: &Path, max: usize, admit: Admit) -> crate::Result<Option<
     {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        // ELOOP: the final component is a symlink.
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(Error::new(format!(
                 "{}: is a symlink; refused",
@@ -153,28 +143,22 @@ fn read_buffer(len: u64, max: usize) -> Vec<u8> {
     Vec::with_capacity(len.saturating_add(1))
 }
 
-/// Read a private file: a regular file this user owns with no group/other bits, at most
-/// `max` bytes. `Ok(None)` when it does not exist.
+/// Reads a regular file owned by this user with no group/other bits, up to `max` bytes.
 pub fn read_private(path: &Path, max: usize) -> crate::Result<Option<SecretBytes>> {
     Ok(read_admitted(path, max, Admit::Private)?.map(SecretBytes::new))
 }
 
-/// Read a file this user owns that no one else may write (no group/other write bits): a
-/// config a person keeps, or a plain vault text at a path. At most `max` bytes.
-/// `Ok(None)` when it does not exist.
+/// Reads a regular file owned by this user with no group/other write bits, up to `max` bytes.
 pub fn read_owned(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_admitted(path, max, Admit::Owned)
 }
 
-/// Read any regular file (no symlink, no FIFO) of at most `max` bytes, whoever owns it: an
-/// envelope at a shared path, which its signature, not its owner, makes trustworthy.
-/// `Ok(None)` when it does not exist.
+/// Reads any regular file up to `max` bytes, refusing symlinks and non-regular files.
 pub fn read_public(path: &Path, max: usize) -> crate::Result<Option<Vec<u8>>> {
     read_admitted(path, max, Admit::Any)
 }
 
-/// Write `bytes` to `path` atomically at `mode` (0600 for anything secret). The parent
-/// directory must exist.
+/// Writes `bytes` atomically to `path` with permissions `mode`.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
@@ -188,11 +172,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> {
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
-/// Write `bytes` to `path` at `mode` only if nothing is there: a fresh temp beside it,
-/// written, its mode set on the descriptor, synced, then linked to `path`
-/// ([`rename_noreplace`]), so whatever is at `path` (a file, a link, dangling or not),
-/// or lands there first, is never replaced. `Ok(false)` when `path` was taken; the temp
-/// is removed either way. The parent directory must exist.
+/// Writes `bytes` to `path` at `mode` only if `path` does not exist.
 pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
         && kind(parent)? != Kind::Dir
@@ -221,7 +201,6 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
     if !matches!(placed, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
     } else if let Some(parent) = path.parent() {
-        // Best effort, as aterm_uds::atomic_file::write: the file is in place either way.
         let _ = aterm_durable::durable_dir(parent);
     }
     placed
@@ -262,22 +241,14 @@ pub fn kind(path: &Path) -> crate::Result<Kind> {
     }
 }
 
-/// What a path names as (device, inode), without following a final symlink: two paths are
-/// one file exactly when these agree, however they are spelled (`Token` and `token` on a
-/// case-insensitive volume, two hard links). `None` when nothing is there or it cannot be
-/// looked at.
+/// Returns `(device, inode)` of `path` via `lstat`, or `None` if missing.
 pub fn file_id(path: &Path) -> Option<(u64, u64)> {
     std::fs::symlink_metadata(path)
         .ok()
         .map(|meta| (meta.dev(), meta.ino()))
 }
 
-/// Rename `from` to `to`, refusing to replace an existing `to`: a hard link (which fails on
-/// an existing name) then the removal of `from`. Both must be on one filesystem.
-///
-/// When the removal fails, the link is undone while `to` is still the file `from` names,
-/// so a failure leaves the names as it found them. When `from` vanished meanwhile, the
-/// file is at `to` alone, which is the rename done.
+/// Renames `from` to `to` without replacing an existing `to`.
 pub fn rename_noreplace(from: &Path, to: &Path) -> crate::Result<()> {
     link_then_unlink(from, to).map_err(|moved| match moved {
         Moved::NotLinked(e) => Error::new(format!("{} -> {}: {e}", from.display(), to.display())),
@@ -302,7 +273,6 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     };
     let linked = file_id(to);
     if linked.is_some() && file_id(from) == linked {
-        // Best effort: the removal's error is the one to report.
         let _ = std::fs::remove_file(to);
     } else if e.kind() == io::ErrorKind::NotFound {
         return Ok(());
@@ -310,8 +280,7 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     Err(Moved::NotUnlinked(e))
 }
 
-/// Remove a regular file as [`wipe_if`] does, whatever it holds (one this user cannot read
-/// stays). Missing is fine; a symlink is removed without touching what it names.
+/// Zeroes and removes a regular file at `path`, or unlinks a symlink without following it.
 pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     if kind(path)? == Kind::File {
         return wipe(path, |_| Ok(true)).map(drop);
@@ -323,24 +292,11 @@ pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     }
 }
 
-/// Remove the regular file at `path` while what it holds (at most `max` bytes) passes `ours`,
-/// then overwrite its bytes with zeros (best effort, synced). `Ok(true)` when it was removed;
-/// `Ok(false)`, with nothing changed, when it is not a regular file, is gone, cannot be read,
-/// fails `ours`, or is no longer at `path` (a tool renamed its own file over it since).
-///
-/// The bytes are judged, and the zeros written, through the one descriptor this opens, so
-/// whatever lands at `path` meanwhile is never zeroed; and the name goes before the bytes, so
-/// a refused unlink, or a pass cut short, leaves the file as it was for the next pass to judge
-/// again. The zeros reach every other name of the file: a hard link is no copy, and another
-/// local user who can search the directory (a macOS home folder is searchable by group
-/// `staff`) may have made one to keep the bytes, so a removed secret's bytes must not outlive
-/// the name the vault gave them. A file its owner may not write (a person's `chmod 0400`) is
-/// the exception: it loses its name and keeps its bytes.
+/// Zeroes and removes the regular file at `path` if its contents (up to `max` bytes) pass `ours`.
 pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> crate::Result<bool> {
     wipe(path, |file| {
         let mut bytes = read_buffer(file.metadata().map_or(0, |meta| meta.len()), max);
         let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-        // Unreadable: nothing shows it is what `ours` wants.
         if crate::secret::read_to_end_wiping_on_error(file.take(limit), &mut bytes).is_err() {
             return Ok(false);
         }
@@ -359,14 +315,12 @@ fn wipe(path: &Path, judge: impl FnOnce(&mut File) -> io::Result<bool>) -> crate
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
     };
-    // A file its owner may not write is judged and removed all the same; its bytes stay.
     let opened = match open(true) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => open(false),
         opened => opened,
     };
     let mut file = match opened {
         Ok(file) => file,
-        // Gone, a link now (ELOOP), or unreadable.
         Err(e)
             if matches!(
                 e.kind(),
@@ -534,12 +488,10 @@ mod tests {
         let from = locked.join("f");
         write_atomic(&from, b"kept", 0o600).expect("write");
         let to = root.path().join("to");
-        // Searchable, so the link can name `from`, but not writable, so its unlink fails.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
         let result = rename_noreplace(&from, &to);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock");
         if euid() == 0 {
-            // No directory mode refuses root an unlink: the rename simply happens.
             result.expect("root renames");
             assert_eq!(kind(&from).expect("kind"), Kind::Missing);
             return;
@@ -572,7 +524,6 @@ mod tests {
         assert_eq!(file_id(&a), file_id(&link));
         assert_ne!(file_id(&a), file_id(&other));
         assert_eq!(file_id(&root.path().join("missing")), None);
-        // A symlink is a file of its own, never the one it names.
         let soft = root.path().join("soft");
         std::os::unix::fs::symlink(&a, &soft).expect("symlink");
         assert_ne!(file_id(&soft), file_id(&a));
@@ -597,7 +548,6 @@ mod tests {
         let root = scratch();
         let file = root.path().join("f");
         write_atomic(&file, b"secret", 0o600).expect("write");
-        // A hard link, which anyone who can search the directory could have made.
         let kept = root.path().join("kept");
         std::fs::hard_link(&file, &kept).expect("link");
         let mut open = File::open(&file).expect("open");
@@ -624,8 +574,6 @@ mod tests {
         );
         assert_eq!(std::fs::read(&file).expect("kept"), b"the vault's");
 
-        // A tool renames its own file over the path (git's config.lock) once the bytes are
-        // judged and before the name goes: it is neither zeroed nor removed.
         let tools = root.path().join("config.lock");
         write_atomic(&tools, b"the tool's", 0o600).expect("write");
         let removed = wipe_if(&file, 64, |bytes| {
@@ -678,7 +626,6 @@ mod tests {
             "the temp's name is gone"
         );
 
-        // A file there, or a link (dangling or not), is never replaced or followed.
         assert!(!write_new(&path, b"again", 0o600).expect("taken"));
         assert_eq!(std::fs::read(&path).expect("read"), b"filled");
         let dangling = root.path().join("dangling");

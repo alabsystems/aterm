@@ -187,7 +187,7 @@ pub fn row_for(name: &str) -> Option<&'static Row> {
 
 /// The branded name a row resolves to (what a DIRECT row runs, what a SIGNPOST or ORACLE row names).
 #[must_use]
-pub fn branded_of(row: &Row) -> &'static str {
+pub const fn branded_of(row: &Row) -> &'static str {
     match row.policy {
         Policy::Direct { branded, .. }
         | Policy::Signpost { branded, .. }
@@ -197,7 +197,7 @@ pub fn branded_of(row: &Row) -> &'static str {
 
 /// The program whose install lays a row's branded name ([`branded_of`]).
 #[must_use]
-pub fn program_of(row: &Row) -> &'static str {
+pub const fn program_of(row: &Row) -> &'static str {
     match row.policy {
         Policy::Direct { program, .. }
         | Policy::Signpost { program, .. }
@@ -346,7 +346,7 @@ pub fn stock_channel_signpost(
     )
 }
 
-fn lanes_of(row: &Row) -> &'static [Lane] {
+const fn lanes_of(row: &Row) -> &'static [Lane] {
     match row.policy {
         Policy::Signpost { lanes, .. } => lanes,
         Policy::Direct { .. } | Policy::Oracle { .. } => &[],

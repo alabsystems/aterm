@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE SESSION LOG'S STEP TAP COSTS THE FOOTER THREAD (Phase 3B, plan
-//! §9 M1) — a benchmark, not a gate: it writes a 64 MiB synthetic
-//! transcript (Claude Code's row shapes, a tool mix, values made up) into a
-//! scratch directory and prints how long the usage fold takes to read it
-//! from the first byte (`SessionUsage::refresh`), without the step tap and
-//! with it, two ways: bound to the file as it is (every row history: the
-//! first read of a transcript that already exists) and seeded at offset 0
-//! (every row past the watermark, queued and shed past the queue's bound:
-//! the worst case). Run it by hand, release:
-//!
-//! ```text
-//! targo --unverified bench -p aterm-agent --bench step_tap_cost
-//! ```
+//! WHAT THE SESSION LOG'S STEP TAP COSTS THE FOOTER THREAD (Phase 3B, plan §9 M1).
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -91,7 +79,6 @@ fn main() {
     let mb = body.len() as f64 / (1024.0 * 1024.0);
     drop(body);
 
-    // The file's key, as the cursor binds a fold to it.
     let key = {
         let mut usage = SessionUsage::new(&path);
         let mut tap = StepFold::new(0, None);
@@ -148,7 +135,5 @@ fn main() {
             share * 100.0
         );
     }
-    // Per turn a prompt, a call, its result and the turn's end; once, the
-    // bind and the model.
     assert_eq!(queued, (1, 4 * turns as u64 + 2), "the steps the rows hold");
 }

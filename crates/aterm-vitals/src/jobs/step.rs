@@ -1,31 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One job's tick (§11.4–§11.7): the class with its hysteresis, the named
-//! wait's standing, the suspect quiet clock, μ, φ and the verdict.
-//!
-//! [`classify_tick`] is the step the `StuckVerdict` model
-//! (`aterm_models_misc::stuck_verdict_model`) is bound to: the conformance
-//! test (`tests/conformance_stuck_verdict.rs`) replays every §18 scenario
-//! through it and projects each tick onto the model's `(cls, q band, v)`.
-//!
-//! Laws held here:
-//!
-//! * time in a legitimate wait never counts toward φ: the suspect quiet
-//!   clock starts at `max(last progress, start of the current suspect run)`,
-//!   and a legitimate run must last 2 ticks to restart it (a one-tick blip
-//!   keeps the suspect standing and its clock);
-//! * a refused reading is unknown, never zero progress: it moves no band and
-//!   resets no clock;
-//! * only stuck-capable standings reach `stuck`; `unnamed`, `event-loop`,
-//!   BUSY-SILENT and THRASHING are capped at quiet (busy, slow);
-//! * `stuck` leaves only on progress, exit, a legitimate class held 2 ticks,
-//!   or φ under 3 (μ grew); quiet leaves under 2.5;
-//! * the shown wait name changes after 2 agreeing ticks;
-//! * an agent's call quiet at φ ≥ 8 whose members used under
-//!   [`NO_PROGRESS_CPU_NS_PER_MIN`] over the whole suspect run, every
-//!   reading of it known, says `no_progress` (the hung-call design's D2): a
-//!   word beside the verdict, which stays quiet, so the cap above holds.
+//! Per-tick job classification, hysteresis, and stuck verdicts.
+//! Implements [`classify_tick`] and [`NO_PROGRESS_CPU_NS_PER_MIN`].
 
 use std::collections::VecDeque;
 
@@ -37,12 +14,10 @@ use super::{
 };
 use crate::jobs::GateWord;
 
-/// Page-wait milliseconds one page-in stands for. No public per-process
-/// counter gives page-wait time, so page-ins stand in for it; like the
-/// THRASHING thresholds themselves (§11.5), unmeasured.
+/// Page-wait milliseconds attributed to one page fault.
 pub const PAGEIN_WAIT_MS: u64 = 1;
 
-/// Which channel made a progress event (§11.4).
+/// Channel that produced a progress event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Progress {
     /// PTY output in canonical mode carried a line feed.
@@ -95,8 +70,7 @@ pub enum Effective {
     Exited,
 }
 
-/// What one tick saw: read by the conformance projection and by a person
-/// asking why.
+/// What one tick saw: read by the conformance projection and by a person asking why.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Tick {
     /// The progress channel this tick credited.
@@ -109,8 +83,7 @@ pub struct Tick {
     pub effective: Effective,
 }
 
-/// A defect the conformance test's negative controls inject into the real
-/// step (`docs/DESIGN-system-awareness-2026-10-16.md` §17's table).
+/// Defect injected by the conformance test's negative controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {
     /// Raw output bytes count as progress (a CR spinner's redraw).
@@ -142,9 +115,7 @@ pub struct Evidence {
     pub progress: Option<(Progress, u64)>,
     /// A live member's counters were refused this tick.
     pub refused: bool,
-    /// Some live member's CPU over this tick is unknown: its counters were
-    /// refused, or the reading before was and this one is only its new
-    /// baseline.
+    /// Some live member's CPU over this tick is unknown.
     pub cpu_unread: bool,
     /// Σ ΔCPU over the members, ns; `None` where unread.
     pub cpu_ns: Option<u64>,
@@ -266,8 +237,7 @@ pub struct Track {
     prev_mu_eff: Option<u64>,
     /// The start of the suspect run `run_cpu` sums over.
     run_cpu_from: Option<u64>,
-    /// Σ ΔCPU over the members during that run, ns; `None` once a reading in
-    /// it was unknown.
+    /// Σ ΔCPU over the members during that run, ns; `None` once a reading in it was unknown.
     run_cpu: Option<u64>,
 }
 
@@ -307,18 +277,14 @@ impl Track {
         v
     }
 
-    /// Where the suspect quiet clock starts: `max(last progress, start of the
-    /// current suspect run)`.
+    /// Where the suspect quiet clock starts.
     fn suspect_from(&self) -> u64 {
         self.last_progress_ms
             .unwrap_or(0)
             .max(self.suspect_since_ms)
     }
 
-    /// Fold one tick's CPU into the suspect run's sum. The sum restarts with
-    /// the suspect clock (progress, a legitimate class held 2 ticks, a new
-    /// job), and a tick read at the run's first instant covers only time
-    /// before it. An unknown reading makes the run's CPU unknown, never zero.
+    /// Fold one tick's CPU into the suspect run's sum.
     fn note_run_cpu(&mut self, ev: &Evidence) {
         let from = self.suspect_from();
         if self.run_cpu_from != Some(from) {
@@ -332,11 +298,7 @@ impl Track {
     }
 }
 
-/// The no-progress word: an agent's call (foreground, background or
-/// unknown) at quiet with φ ≥ 8 whose members, every reading known, used
-/// under [`NO_PROGRESS_CPU_NS_PER_MIN`] over the suspect run. The CPU clause
-/// leaves the sleepers, the waits Tier A cannot name; `sleep 1200` says it
-/// too, so the word is "no progress", never "stuck".
+/// The no-progress word ([`NO_PROGRESS_CPU_NS_PER_MIN`]).
 fn no_progress(out: &Out, cx: &Cx, run_cpu: Option<u64>) -> bool {
     let agent = cx.kind == JobKind::AgentCall
         && matches!(
@@ -385,7 +347,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         return out;
     }
 
-    // Progress resets the quiet clock and teaches the job its own rhythm.
     if let Some((p, when)) = ev.progress {
         tick.progress = Some(p);
         let when = when.min(at);
@@ -402,11 +363,9 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         }
     }
     if ev.refused && fault(cx, Fault::RefusedResetsAge) {
-        // The defect: the unknown reading restarts the suspect clock.
         t.suspect_since_ms = at;
     }
 
-    // The bands move only on a reading: a refused one is unknown.
     if !ev.refused && ev.dt_ms > 0 {
         if let Some(cpu) = ev.cpu_ns {
             let wall_ns = u128::from(ev.dt_ms) * 1_000_000;
@@ -431,20 +390,11 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         }
     }
 
-    // The class: the first match wins.
     let holds_fg = ev.holds_fg;
     let published = holds_fg && matches!(ev.gate.word, GateWord::Stalled | GateWord::Stopped);
     let running = t
         .last_progress_ms
         .is_some_and(|l| at.saturating_sub(l) <= RUNNING_WINDOW_MS);
-    // The person's own terminal wait (a full-screen program reading keys, a
-    // password prompt, named only with the input queue empty and the mode
-    // word fresh) is not POLLING however often the program wakes: an idle
-    // TUI's timers are no stall (a Claude Code that printed nothing for 40 s
-    // and read no key for 3 h made 1,109 BSD system calls a second on this
-    // Mac, 2026-10-20), and a key it leaves unread is the input gate's to
-    // judge (rules 2 and 5). A departure from the table's literal order,
-    // where rule 8 precedes rule 10.
     let tty_wait = holds_fg && matches!(ev.wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
     let class = if published {
         Class::UnreadInput
@@ -467,7 +417,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     };
     out.class = class;
 
-    // The shown wait name changes after 2 agreeing ticks.
     if class == Class::Waiting {
         let cand = ev.wait.clone();
         match &t.shown {
@@ -509,7 +458,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         t.follow_since = None;
     }
 
-    // How it counts (§11.6), and the legitimate verdict where legitimate.
     let (raw, legit_verdict, cap) = match class {
         Class::UnreadInput => (Effective::Gate, Verdict::Fine, None),
         Class::Running => (Effective::Running, Verdict::Fine, None),
@@ -551,7 +499,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         None
     };
 
-    // An orphan gets findings only: no φ, no verdict but fine.
     if cx.consumer == Consumer::Nobody {
         t.effective = Some(raw);
         t.close_episode();
@@ -562,9 +509,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
         return out;
     }
 
-    // A legitimate class takes effect at once after running or legit, and
-    // after 2 ticks after a suspect run (a one-tick blip keeps the suspect
-    // standing and its clock).
     let was_suspect = matches!(t.effective, Some(Effective::Capable | Effective::Capped));
     let eff = if raw == Effective::Legit {
         t.legit_streak += 1;
@@ -611,7 +555,6 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
             out.standing = Some(Standing::Legit);
             out.quiet_ms = Some(age);
             if fault(cx, Fault::AccrueOnLegit) {
-                // The defect: the legitimate wait's age accrues as if suspect.
                 let quiet = at.saturating_sub(t.suspect_from());
                 let (mu, _) = mu_of(t, cx);
                 out.phi_milli = Some(phi_milli(quiet, mu));
@@ -704,8 +647,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     out
 }
 
-/// μ and its source: the job's own median, else its class's, else the prior,
-/// never under the floor.
+/// μ and its source: the job's own median, else its class's, else the prior, never under the floor.
 fn mu_of(t: &Track, cx: &Cx) -> (u64, MuFrom) {
     let (mu, from) = match (t.own_mu(), cx.class_mu) {
         (Some(own), _) => (own, MuFrom::Own),
@@ -716,8 +658,7 @@ fn mu_of(t: &Track, cx: &Cx) -> (u64, MuFrom) {
 }
 
 impl Out {
-    /// The gate's verdict: a published stall is stuck (the gate's own word,
-    /// no φ); pending is fine.
+    /// The gate's verdict: a published stall is stuck (the gate's own word, no φ); pending is fine.
     fn input_gate_verdict(&mut self, t: &mut Track, published: bool) {
         t.prev_mu_eff = None;
         if published {

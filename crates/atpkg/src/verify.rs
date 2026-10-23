@@ -1,25 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg verify [program]` (§12): an offline drift/integrity audit of the installed store
-//! against the signed `tree_root` recorded at install/update time.
-//!
-//! It recomputes the active build dir's root ([`crate::tree::tree_root_declared`]; the plain
-//! [`crate::tree::tree_root`] wherever the inode stores modes) and compares it to the
-//! release-key-verified value in `status.toml`
-//! ([`crate::status::ProgramStatus::tree_root`]). That root came from a manifest whose
-//! signature was checked over exact bytes before parse, so this attests that what is on disk
-//! still matches what was signed — never a self-generated checksum. Read-only.
-//!
-//! A vendor-direct build is attested by its `.vendor` record instead, and a vendor program
-//! rolled back to the legacy index build its first vendor install replaced (whose row that
-//! install overwrote) by the signed root the program's stamp kept for that build. Neither
-//! asks an index.
-//!
-//! `status.toml` shares the store's trust boundary (both under the 0700 prefix), so `verify`
-//! defends against accidental corruption and non-privileged drift, not against an adversary
-//! who already owns the prefix.
-
 use crate::store::Layout;
 
 /// The result of verifying one program's active build against its recorded signed root.
@@ -30,7 +11,7 @@ pub enum VerifyOutcome {
         /// The active build audited.
         build: u64,
     },
-    /// The store tree does not match the recorded signed root (drift, tampering, corruption).
+    /// The store tree does not match the recorded signed root.
     Drift {
         /// The active build audited.
         build: u64,
@@ -39,13 +20,12 @@ pub enum VerifyOutcome {
         /// The root just recomputed over the on-disk tree.
         got: String,
     },
-    /// No signed `tree_root` was recorded (an older install, or a loose manifest). Cannot
-    /// attest: not a pass (fail-closed).
+    /// No signed `tree_root` was recorded.
     NoSignedRoot {
         /// The active build, if any.
         build: Option<u64>,
     },
-    /// The program has no active build (not installed / not on PATH).
+    /// The program has no active build.
     NotInstalled,
     /// The on-disk tree could not be read to recompute its root.
     Unreadable {
@@ -54,26 +34,21 @@ pub enum VerifyOutcome {
         /// The IO error string.
         error: String,
     },
-    /// A sysroot bundle carrying a `toolchain` symlink from the retired install-time
-    /// wiring, added after the signed root was captured over the payload, so the tree
-    /// cannot be tree-attested. Informational (exit 0), not a failure: the integrity gate
-    /// is the tree_root re-verify at install (`crate::install`), before any wiring.
+    /// A sysroot bundle carrying a `toolchain` symlink from install-time wiring.
     WiredSysroot {
         /// The active build.
         build: u64,
     },
-    /// A vendor-direct build, attested against the root folded when it was staged from its
-    /// vendor's authenticated digest (its `.vendor` record) — no index signed this root.
+    /// A vendor-direct build attested against its `.vendor` record.
     VendorRoot {
         /// The active build audited.
         build: u64,
-        /// Who published it (`Anthropic`).
+        /// Who published it.
         vendor: String,
         /// `None` when the tree matches; the recomputed root when it drifted.
         drift: Option<String>,
     },
-    /// The active build differs from the build the recorded root is for (e.g. post-rollback),
-    /// so the recorded root cannot attest the live tree.
+    /// The active build differs from the build the recorded root is for.
     BuildMismatch {
         /// The build now active on PATH.
         active: u64,
@@ -83,11 +58,9 @@ pub enum VerifyOutcome {
 }
 
 impl VerifyOutcome {
-    /// Whether `atpkg verify` counts this outcome a pass (exit 0): the tree matches its
-    /// signed root or its vendor record, or it is a wired sysroot (informational). Every
-    /// other verdict fails closed.
+    /// Whether `atpkg verify` counts this outcome a pass (exit 0).
     #[must_use]
-    pub fn passes(&self) -> bool {
+    pub const fn passes(&self) -> bool {
         matches!(
             self,
             Self::Match { .. } | Self::WiredSysroot { .. } | Self::VendorRoot { drift: None, .. }
@@ -96,11 +69,6 @@ impl VerifyOutcome {
 }
 
 /// Verify one program's active build against the signed `tree_root` recorded in `status.toml`.
-/// Fail-closed, in order: not installed ⇒ [`VerifyOutcome::NotInstalled`]; no recorded root ⇒
-/// [`VerifyOutcome::NoSignedRoot`] (not a pass); recorded root for a different build ⇒
-/// [`VerifyOutcome::BuildMismatch`]; then recompute and compare (case-insensitive, as the
-/// install-time re-verify does). A vendor program's legacy build the row does not attest is
-/// judged against the root its stamp kept for it ([`kept_legacy_root`]) before those two.
 #[must_use]
 pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     let active = crate::ops::active_builds(layout).get(program).copied();
@@ -115,14 +83,11 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     if crate::vendor_direct::is_vendor_build(build) {
         return verify_vendor_build(layout, program, build);
     }
-    // A vendor program's retained legacy build, once the recorded row no longer carries
-    // its root: the signed root the program's stamp kept for exactly that build.
     let (recorded_build, recorded_root) =
         match kept_legacy_root(layout, program, build, recorded_build, &recorded_root) {
             Some(root) => (Some(build), root),
             None => (recorded_build, recorded_root),
         };
-    // No signed record means no assurance: fail closed.
     if recorded_root.is_empty() {
         return VerifyOutcome::NoSignedRoot { build: Some(build) };
     }
@@ -133,11 +98,6 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
         };
     }
     let build_dir = layout.build_dir(program, build);
-    // A rustup-linked sysroot bundle carries a `toolchain` link from the retired
-    // install-time wiring, added after the signed root was captured, which
-    // `tree::tree_root` cannot walk: report it as such, not as drift or Unreadable.
-    // `is_reparse`, not `is_symlink`: on Windows the link is a directory junction
-    // (`is_symlink()` reports false), which the walk would otherwise descend into.
     if std::fs::symlink_metadata(build_dir.join("toolchain"))
         .is_ok_and(|m| crate::platform::is_reparse(&m))
     {
@@ -158,16 +118,6 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
 }
 
 /// The on-disk root of `build_dir`, folded the way its stage folded it.
-///
-/// The mode slot the walk folds where the filesystem stores no permission bits
-/// (Windows) is the record the stage left beside the build. Where the inode stores them
-/// (Unix) the record is an empty map the walk never consults, and no file is read. A
-/// Windows build with no record cannot be attested — the walk would fold `0` for every
-/// file and call a healthy tree drifted — so its error names the re-stage that writes
-/// one, and the caller reports it as unreadable, never as a false Drift.
-///
-/// One walk for both lanes: the plain [`crate::tree::tree_root`] folds mode `0` on Windows
-/// and would call every vendor build there drifted.
 fn walked_root(build_dir: &std::path::Path) -> std::io::Result<String> {
     let modes = crate::store::declared_modes(build_dir)?;
     crate::tree::tree_root_declared(build_dir, &modes)
@@ -210,8 +160,7 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
     }
 }
 
-/// Verify every active program (those live on PATH). An uninstalled status-only leftover is
-/// not audited, so `verify_all` never emits false [`VerifyOutcome::NotInstalled`] noise.
+/// Verify every active program on PATH.
 #[must_use]
 pub fn verify_all(layout: &Layout) -> Vec<(String, VerifyOutcome)> {
     crate::ops::active_builds(layout)
@@ -261,7 +210,6 @@ mod tests {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin").join(exe_name(program)), b"#!/bin/true\n").unwrap();
-        // The record the real stage leaves beside a build (a no-op on Unix).
         crate::store::write_declared_modes(&dir, &modes_of(program)).unwrap();
         install_shims(
             layout,
@@ -299,7 +247,7 @@ mod tests {
     fn verify_no_signed_root_is_not_a_pass() {
         let l = layout("nosigned");
         install(&l, "ay", 18);
-        record(&l, "ay", Some(18), ""); // empty recorded root
+        record(&l, "ay", Some(18), "");
         let o = verify_program(&l, "ay");
         assert_eq!(o, VerifyOutcome::NoSignedRoot { build: Some(18) });
         assert!(
@@ -318,8 +266,6 @@ mod tests {
         let l = layout("legacy-kept");
         let legacy = 2_026_091_901;
         let dir = install(&l, "claude", legacy);
-        // The root the stamp keeps is the index row's signed root: the declared-mode fold
-        // ([`signed_root`]).
         let root = signed_root(&dir, "claude");
         let vendor = crate::vendor_direct::Version::parse("2.1.280")
             .unwrap()
@@ -395,7 +341,6 @@ mod tests {
             sha256: "9dbe16dafed59da5cdabbfe11ad0335738c753fad794989b47f9446accd6de3a".into(),
             sha512: String::new(),
             size: 244_960_928,
-            // What the stage records: the fold over the modes it declared.
             tree_root: signed_root(&dir, "claude"),
             apple_team: cfg!(target_os = "macos").then(|| {
                 crate::vendor_direct::spec("claude")
@@ -447,7 +392,7 @@ mod tests {
         let l = layout("mismatch");
         let dir = install(&l, "ay", 18);
         let root = signed_root(&dir, "ay");
-        record(&l, "ay", Some(17), &root); // recorded for a different build
+        record(&l, "ay", Some(17), &root);
         assert_eq!(
             verify_program(&l, "ay"),
             VerifyOutcome::BuildMismatch {
@@ -584,7 +529,6 @@ mod tests {
         let l = layout("all");
         let ay = install(&l, "ay", 18);
         let ny = install(&l, "ny", 9);
-        // A recorded root matches in either case, as the install-time re-verify compares.
         record(
             &l,
             "ay",

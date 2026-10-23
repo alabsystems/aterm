@@ -35,9 +35,7 @@ fn is_key(text: &str) -> bool {
 
 impl FieldPath {
     /// The path `text` writes: `KEY ("[]")? ("." KEY ("[]")?)*`, with KEY `[A-Za-z0-9_]+`.
-    ///
     /// # Errors
-    ///
     /// Usage: `not a field path: {text}`.
     pub fn parse(text: &str) -> Result<FieldPath> {
         let bad = || Error::usage(format!("not a field path: {text}"));
@@ -58,8 +56,7 @@ impl FieldPath {
         Ok(FieldPath { steps })
     }
 
-    /// The path as written; the empty path, which only the output door builds (for a row
-    /// that is not an object), as `.`.
+    /// The path as written; the empty path, which only the output door builds, as `.`.
     #[must_use]
     pub fn text(&self) -> String {
         if self.steps.is_empty() {
@@ -90,9 +87,7 @@ impl FieldPath {
 }
 
 /// A comma-separated `--fields` list.
-///
 /// # Errors
-///
 /// `FieldPath::parse`'s: an empty piece is not a field path.
 pub fn parse_fields(text: &str) -> Result<Vec<FieldPath>> {
     text.split(',')
@@ -108,8 +103,7 @@ pub(crate) fn is_whole(noun: Noun) -> bool {
     )
 }
 
-/// The noun's default projection (design §8.3, and the plan's table). A whole-value noun
-/// (Route, Raw, Wait, Meta, Policy) has none: it prints whole.
+/// The noun's default projection (design §8.3, and the plan's table).
 #[must_use]
 pub fn default_fields(noun: Noun) -> &'static [&'static str] {
     match noun {
@@ -278,10 +272,7 @@ fn project_at(value: &Value, paths: &[&[Step]]) -> Value {
     }
 }
 
-/// Project `value` onto `fields`: paths that share a prefix merge (`assets[].name` and
-/// `assets[].size` give `assets: [{name, size}]`); a missing path, or a step whose type does not
-/// fit, gives `null`. The projection mirrors the source's shape, objects with sorted keys, and
-/// is always an object at the top: a source that is not an object projects every field to null.
+/// Project `value` onto `fields`.
 #[must_use]
 pub fn project(value: &Value, fields: &[FieldPath]) -> Value {
     let paths: Vec<&[Step]> = fields.iter().map(|f| f.steps.as_slice()).collect();
@@ -315,12 +306,9 @@ fn value_at_steps(value: &Value, steps: &[Step]) -> Value {
     }
 }
 
-/// Usage when a top-level name is in neither the noun's schema (its default and derived
-/// fields) nor `sample`'s keys: `no field {name} in {noun}; fields: {sorted list}`. With no
-/// sample (an empty list) every name passes: the answer is `[]` whatever is projected.
-///
+/// Usage when a top-level name is in neither the noun's schema (its default and derived fields) nor
+/// `sample`'s keys: `no field {name} in {noun}; fields: {sorted list}`.
 /// # Errors
-///
 /// As above.
 pub fn validate_fields(noun: Noun, fields: &[FieldPath], sample: Option<&Value>) -> Result<()> {
     let Some(sample) = sample else {
@@ -350,9 +338,7 @@ pub fn validate_fields(noun: Noun, fields: &[FieldPath], sample: Option<&Value>)
     Ok(())
 }
 
-/// Whether the verb must compute `field` (a derived field that costs a request): it is in
-/// `--fields`; or there is no `--fields`, no `--jq` and the default projection has it; or the
-/// `--jq` text contains it.
+/// Whether the verb must compute `field` (a derived field that costs a request).
 #[must_use]
 pub fn wants(noun: Noun, opts: &OutputOpts, field: &str) -> bool {
     let names = |text: &str| {
@@ -408,9 +394,7 @@ fn pure_derived(noun: Noun, value: &Map) -> Vec<(&'static str, Value)> {
     }
 }
 
-/// What `--fields` and the default projection read: `value` with the noun's pure derived
-/// fields set from GitHub's own keys, replacing a GitHub key of the same name. Nouns without
-/// pure derived fields: `value` unchanged.
+/// What `--fields` and the default projection read.
 #[must_use]
 pub fn with_derived(noun: Noun, value: &Value) -> Value {
     let Value::Object(map) = value else {
@@ -423,9 +407,7 @@ pub fn with_derived(noun: Noun, value: &Value) -> Value {
     Value::Object(out)
 }
 
-/// What `--jq` reads without `--fields`: GitHub's object as sent, plus each pure derived field
-/// under a name the object does not already use, so a commit keeps GitHub's `author` object
-/// and gains `date` and `subject`.
+/// What `--jq` reads without `--fields`.
 #[must_use]
 pub fn jq_input(noun: Noun, value: &Value) -> Value {
     let Value::Object(map) = value else {

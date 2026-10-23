@@ -95,7 +95,7 @@ impl StrandNotice {
     /// Whether this cycle should raise the notification, given whether the last
     /// completed check left the machine `stranded`. True on the first stranded cycle
     /// of each strand; a non-stranded cycle re-arms the latch.
-    pub(crate) fn due(&mut self, stranded: bool) -> bool {
+    pub(crate) const fn due(&mut self, stranded: bool) -> bool {
         if !stranded {
             self.notified = false;
             return false;

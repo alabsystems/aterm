@@ -130,7 +130,6 @@ fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
                 rule.contains("\u{25C6} Opus 5.5"),
                 "{what}: nor the model: {rule:?}"
             );
-            // The word's last cell is the light's: a press there presses it.
             let last = *cells.last().expect("the light");
             let (x, y) = px_of(&app, wid, last);
             app.on_cursor_moved(wid, x, y);
@@ -143,8 +142,6 @@ fn the_mode_light_names_manual_as_the_relabelled_pill_does_in_every_width() {
             );
         }
     }
-    // Too narrow for `⏸ YOLO off` and wide enough for `⏸ manual`: the light
-    // alone gives way, the Autopilot chip stays.
     for relabel in [true, false] {
         let (mut app, wid, session, _reader, _host) = claude_app(30, relabel);
         draw_claude(&app, session, &mode_row_in(MANUAL, 30));
@@ -186,7 +183,6 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
             )),
             "relabel={relabel}: the hover: {rule:?}"
         );
-        // A press nobody answers, past its deadline: where it stopped.
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
@@ -203,7 +199,6 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
             rule.contains(&format!("Permission mode: {stopped}")),
             "relabel={relabel}: the stop: {rule:?}"
         );
-        // Again, and Claude answers with bypass: the arrival on the chip.
         let (x, y) = px_of(&app, wid, hit(&app, wid, Light::Mode));
         app.on_cursor_moved(wid, x, y);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
@@ -246,7 +241,6 @@ fn the_mode_lights_titles_name_bypass_and_manual_as_the_pill_does() {
 fn the_mode_lights_word_follows_the_relabel_the_glass_takes() {
     let (mut app, wid, session, _reader, _host) = claude_app(120, true);
     draw_claude(&app, session, MANUAL);
-    // The cursor on Claude's mode row: the relabel is not taken.
     feed(&app, session, b"\x1b[24;5H");
     frame(&mut app, wid);
     let pill = pill_glass(&app, wid);
@@ -256,7 +250,6 @@ fn the_mode_lights_word_follows_the_relabel_the_glass_takes() {
     );
     let (_, text) = light_cells(&app, wid);
     assert_eq!(text, "\u{23F8} manual", "the light names it so too");
-    // CONTROL: the cursor back at the caret, the pill is relabelled.
     feed(&app, session, b"\x1b[22;3H");
     frame(&mut app, wid);
     let pill = pill_glass(&app, wid);

@@ -71,12 +71,12 @@ impl FseTable {
     }
 
     /// Whether a table has been built (a Repeat mode may reuse it).
-    pub(crate) fn is_built(&self) -> bool {
+    pub(crate) const fn is_built(&self) -> bool {
         self.accuracy_log != 0
     }
 
     /// `log2` of the table size; 0 when not built.
-    pub(crate) fn accuracy_log(&self) -> u8 {
+    pub(crate) const fn accuracy_log(&self) -> u8 {
         self.accuracy_log
     }
 
@@ -296,7 +296,7 @@ impl<'t> FseDecoder<'t> {
 
     /// The symbol of the current state.
     #[inline(always)]
-    pub(crate) fn symbol(&self) -> u8 {
+    pub(crate) const fn symbol(&self) -> u8 {
         self.state.symbol
     }
 
@@ -335,18 +335,18 @@ impl<'t> FseDecoder<'t> {
 }
 
 /// `x`'s bit length; 0 for 0.
-pub(crate) fn highest_bit_set(x: u32) -> u32 {
+pub(crate) const fn highest_bit_set(x: u32) -> u32 {
     u32::BITS - x.leading_zeros()
 }
 
 /// The next state to fill when spreading symbols (RFC 8878 §4.1.1).
-fn next_position(p: usize, table_size: usize) -> usize {
+const fn next_position(p: usize, table_size: usize) -> usize {
     (p + (table_size >> 1) + (table_size >> 3) + 3) & (table_size - 1)
 }
 
 /// The base line and bit count of a symbol's `state_number`-th state, where
 /// the symbol holds `num_states_symbol` of `num_states_total` states.
-fn calc_baseline_and_numbits(
+const fn calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,
     state_number: u32,

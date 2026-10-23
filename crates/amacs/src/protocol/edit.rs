@@ -1,28 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `edit` request and its ticket replies (design §6.2-§6.5; slice N1,
-//! with split placements in N6).
-//!
-//! A client in an aterm tab asks the window hosting the tab for a fresh
-//! Editor view of a file, then waits on the edit ticket until the person
-//! finishes, aborts or closes it. This module is the wire form both ends
-//! share. aterm-gui serves it (`@<sid> edit`, `await edit`), and any control
-//! client can send it, `aterm ctl` among them; the `amacs FILE` client that
-//! will send it is planned (design §6).
-//!
-//! The control wire splits on whitespace and never quotes, so every field is
-//! one whitespace-free token: a formatter refuses a field that holds
-//! whitespace rather than send a line the other end would read differently.
-//! Each `parse` takes what its `format` writes, and `parse(format(x)) == x`.
-//!
-//! - `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]` →
-//!   `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>`
-//! - `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` →
-//!   `OK edit done result=finished|closed|aborted saved=0|1 seq=<n>`
+//! The `edit` request and its ticket replies.
 
 /// One `edit` request's name on the server, from admission to its outcome.
-/// Opaque to the client: it is quoted back on `await edit ticket=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ticket(pub u64);
 
@@ -40,8 +21,7 @@ impl std::str::FromStr for Ticket {
     }
 }
 
-/// Why a line is not one of this module's forms. Its `Display` is the text a
-/// server answers after `ERR `.
+/// Why a line is not one of this module's forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditError {
     /// The line is not the form at all: no URI, or a missing key.
@@ -52,8 +32,7 @@ pub enum EditError {
     BadField(&'static str, String),
     /// An option the form does not have, or one given twice.
     UnknownOption(String),
-    /// A field to be written holds whitespace (or is empty), so the wire
-    /// would split it.
+    /// A field to be written holds whitespace (or is empty), so the wire would split it.
     Whitespace(&'static str),
 }
 
@@ -77,8 +56,8 @@ pub const EDIT_USAGE: &str = "edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<
 /// The `await edit` request's usage line.
 pub const AWAIT_EDIT_USAGE: &str = "await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]";
 
-/// `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`: open
-/// a fresh Editor view of the file beside the asking session.
+/// `edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`: open a fresh Editor view of
+/// the file beside the asking session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditRequest {
     /// The file, as a `file://` URI ([`super::uri::path_to_file_uri`]).
@@ -87,13 +66,10 @@ pub struct EditRequest {
     pub line: Option<(u32, Option<u32>)>,
     /// Admit a missing file as empty; the first save creates it.
     pub create: bool,
-    /// The program the edit is for (`git`), shown in the view's header row:
-    /// `[A-Za-z0-9._-]`, at most 32 characters.
+    /// The program the edit is for (`git`), shown in the view's header row: `[A-Za-z0-9._-]`, at
+    /// most 32 characters.
     pub for_word: Option<String>,
-    /// Whether the asker will wait on the ticket (`await edit`). `wait=0`
-    /// (`amacs --no-wait`) says nobody will, so the asking session is not
-    /// held while the view is open (design §6.7). On the wire only when
-    /// false: a waiting request reads as it always has.
+    /// Whether the asker will wait on the ticket (`await edit`).
     pub wait: bool,
 }
 
@@ -181,8 +157,8 @@ impl EditRequest {
     }
 }
 
-/// `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>`: the fresh view
-/// is installed and the ticket is open.
+/// `OK edit ticket=<t> view=<v> doc=<d> uri=<canonical-uri>`: the fresh view is installed and the
+/// ticket is open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditOk {
     pub ticket: Ticket,
@@ -256,8 +232,8 @@ impl EditResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EditOutcome {
     pub result: EditResult,
-    /// A save of the document was acknowledged durable during the edit, and
-    /// the file holds the text the view last showed.
+    /// A save of the document was acknowledged durable during the edit, and the file holds the text
+    /// the view last showed.
     pub saved: bool,
     /// The document's durable checkpoint sequence when the ticket resolved.
     pub seq: u64,
@@ -297,8 +273,8 @@ impl EditOutcome {
 pub enum AwaitKey {
     /// One ticket's outcome.
     Ticket(Ticket),
-    /// The file: done when no view an `edit` opened of it remains (the form a
-    /// client re-arms with after a seamless update replaced its server).
+    /// The file: done when no view an `edit` opened of it remains (the form a client re-arms with
+    /// after a seamless update replaced its server).
     Uri(String),
 }
 
@@ -306,8 +282,8 @@ pub enum AwaitKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AwaitEdit {
     pub key: AwaitKey,
-    /// The wait's bound; the server holds it to the `await` family's (600 s
-    /// at most, 30 s when absent).
+    /// The wait's bound; the server holds it to the `await` family's (600 s at most, 30 s when
+    /// absent).
     pub timeout_ms: Option<u64>,
 }
 
@@ -422,8 +398,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `for-word-byte-set` (SPECS.md), kernel-checked against the compiled
-// body: the set is the clause, byte for byte.
 verify_island! {
     clean {
         theorem for_word_byte_is_exactly_the_word_set (byte : UInt8) :

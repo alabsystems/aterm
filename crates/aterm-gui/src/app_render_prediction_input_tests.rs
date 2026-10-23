@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A key's proven prediction on glass closes its input slice, end to end: the
-//! press path tags the key's input edge with the op it armed
-//! (`PendingInputStamp::tag_newest`), the render path marks the op its frame
-//! showed whole and under its proof (`metrics::note_prediction_shown`), and
-//! that frame's present books the key (`metrics::record_present`). Each half
-//! was right alone and the whole was not (`aterm-lab predict-live`, 2026-10-20:
-//! every predicted key's slice waited for its echo, 109 ms over a 100 ms
-//! link), so these tests drive the shipping `App::input` and `redraw_window`
-//! on a scripted CPU surface, through both render paths, and read the slices
-//! the present booked on this thread (`work_counts::take_input_slices`).
-//!
-//! The echo latency `adaptive` needs is put in by the reconciles that prime
-//! the predictor, at instants the test chooses, and the press and the frames
-//! after it are stamped on that same timeline (`pin_input_clock`,
-//! `redraw_window_at`): nothing sleeps, and no stall of the test thread ages
-//! the key's guess past its glitch window.
+//! A key's proven prediction on glass closes its input slice, end to end.
 
 use crate::input::{InputEvent, Source};
 use crate::scripted_redraw_fixture::{scripted_app, surface};
@@ -132,9 +117,6 @@ fn arm_output(app: &App) {
 fn press_then_echo(app: &mut App, at: Instant) -> ((usize, usize), bool, (usize, usize)) {
     press_at(app, glyph('c'), at);
     let commits = surface(app).commits();
-    // The frame presents whatever changed (the early-out compares the last
-    // present's key): with prediction off nothing did, and that frame is
-    // still a present the key's slice could close at.
     app.windows.get_mut(&WID).expect("window").last_present = None;
     app.redraw_window_at(WID, at);
     assert!(
@@ -194,8 +176,6 @@ fn cancelled_key_then_echo(app: &mut App, at: Instant) -> ((usize, usize), (usiz
     assert!(app.windows[&WID].pred_shown, "the overlay painted");
     assert_eq!(app.windows[&WID].predictor.shown_through(), Some(e));
     let before_echo = work_counts::take_input_slices();
-    // The actual final text is `ce`; the cancelled key and its erase both
-    // echo before `e`, without changing which keys the earlier frame showed.
     feed(app, "cd\u{8} \u{8}e");
     arm_output(app);
     app.redraw_window_at(WID, at + RTT);

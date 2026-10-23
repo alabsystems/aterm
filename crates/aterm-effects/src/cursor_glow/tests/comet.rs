@@ -131,12 +131,13 @@ fn comet_debris_born_window_absolute_with_chrome_origin() {
     }
 }
 
-/// Beam stardust jump births are window-absolute: every mote lies inside the
-/// ±0.4-cell sleeve of the true leap vector.
+/// A leap's dust is born window-absolute: every mote lies inside the
+/// ±0.4-cell sleeve of the true leap vector. The comet's (a leap's dust is
+/// the comet's; the beam's leap sheds none).
 #[test]
-fn beam_stardust_strewn_along_window_absolute_leap() {
+fn leap_dust_strewn_along_window_absolute_leap() {
     let g = chrome_geom();
-    let c = cfg(GlowStyle::Beam, true);
+    let c = cfg(GlowStyle::Comet, true);
     let mut glow = CursorGlow::default();
     let t = Instant::now();
     let mut out = Vec::new();
@@ -149,7 +150,7 @@ fn beam_stardust_strewn_along_window_absolute_leap() {
         g,
         &mut out,
     );
-    assert!(!glow.particles.is_empty(), "a warp leap stirs stardust");
+    assert!(!glow.particles.is_empty(), "a leap sheds its dust");
     let (fx, fy) = (56.0 + 2.5 * 8.0, 56.0 + 0.5 * 16.0);
     let (ox, oy) = (56.0 + 20.5 * 8.0, 56.0 + 5.5 * 16.0);
     let sleeve = 0.4 * g.ch as f32 + 1e-3;

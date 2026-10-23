@@ -874,6 +874,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         person: None,
         reach: Default::default(),
         program: aterm_phase::Program::Claude,
+        seat: Default::default(),
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,

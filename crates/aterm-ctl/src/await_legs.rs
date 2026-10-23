@@ -1,31 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm ctl [@<sel>] await inbox|agent|edit …`: the inbox, agent and edit
-//! waits, RE-ARMED past the server's bound
-//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §4; `await edit`,
-//! `docs/DESIGN-amacs-2026-10-19.md` §6.4).
-//!
-//! The server parks one `await` for its `timeout=` — 30 s when none is given,
-//! at most 600 s — and answers `OK timeout` at its end. A session that listens
-//! on a channel, or waits out a peer's turn, runs the wait as a background
-//! command whose EXIT wakes it, so a wait that ended at the server's bound
-//! would wake it for no news. This client sends the request in LEGS, every
-//! other word as given (`await inbox`'s `since=`, `re=`, `kinds=`, `topic=`;
-//! `await agent`'s words and `since=`: each predicate latches only on what is
-//! past `since`, else on what stands; `await edit`'s `ticket=` or `uri=`
-//! latches on the edit's one outcome, so each leg waits for the same answer),
-//! each asking for what the whole wait has left, up to the server's bound,
-//! until a leg answers or the whole wait's deadline passes: the verb's
-//! `timeout=<ms>` (or `timeout <ms>`), else `--timeout`, else an hour
-//! ([`await_task::DEFAULT_TOTAL`]), as `await task` does. The answering leg's
-//! line is printed as one exchange prints it (`OK inbox <id>`, `OK inbox
-//! hold=<0|1>`, `OK agent <word> rev=<n>`, `OK edit done …`) on stdout, exit
-//! 0; an `ERR …` on
-//! stderr, exit 1; `OK timeout` on stdout, exit 124, at the deadline. A leg
-//! whose server hung up before it answered is judged as any blocking read's
-//! ([`replaced_before_reply`]): a successor is asked for the rest of the wait
-//! only where the request names nothing of the old process.
+//! Multi-leg `await inbox|agent|edit` client loop ([`await_task::DEFAULT_TOTAL`]).
+//! Uses [`replaced_before_reply`] to handle server handoffs.
 
 use std::io::{self, BufReader};
 use std::process::ExitCode;
@@ -37,18 +14,14 @@ use super::{
     stderr_line, validate_request_line_len,
 };
 
-/// A re-armed `[@<sel>] await inbox|agent|edit …`: the request every leg sends,
-/// its timeout words taken out, and the whole wait the verb's own timeout
-/// names.
+/// A re-armed `[@<sel>] await inbox|agent|edit …`.
 #[derive(Debug, PartialEq, Eq)]
 struct Wait {
     parts: Vec<String>,
     timeout: Option<Duration>,
 }
 
-/// `parts` (`@self` expanded) as a re-armed wait; `None` for any other
-/// request, and for one whose timeout word names no milliseconds or comes
-/// twice — the server's to refuse, in one exchange.
+/// `parts` (`@self` expanded) as a re-armed wait.
 fn parse(parts: &[String]) -> Option<Wait> {
     let at = usize::from(parts.first().is_some_and(|p| p.starts_with('@')));
     if parts.get(at).map(String::as_str) != Some("await")
@@ -88,8 +61,7 @@ fn parse(parts: &[String]) -> Option<Wait> {
     })
 }
 
-/// Whether `parts` is an `await inbox|agent|edit` this client re-arms
-/// ([`parse`]).
+/// Whether `parts` is an `await inbox|agent|edit` this client re-arms ([`parse`]).
 pub(crate) fn is_rearmed_await(parts: &[String]) -> bool {
     parse(parts).is_some()
 }
@@ -107,8 +79,7 @@ enum Leg {
         listener: Option<redial::ListenerId>,
         error: Option<io::Error>,
     },
-    /// The aterm hosting the session went away under the forward that relayed
-    /// the leg (its relay said so in place of a reply).
+    /// The hosting `aterm` exited while relaying the leg.
     HostGone { pid: u32, sock: String },
     /// An exit already explained on stderr: a refusal, a connect phase.
     Code(ExitCode),
@@ -119,8 +90,7 @@ enum Leg {
 /// One leg's round trip: `(sock, origin, request line, the wait it asks for)`.
 type LegFn<'a> = dyn FnMut(&str, TargetOrigin, &str, Duration) -> Leg + 'a;
 
-/// Send one leg to `sock` and read its line; an `ERR` is printed as one
-/// exchange prints it (the line and its tail on stderr).
+/// Send one leg to `sock` and read its line.
 fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -> Leg {
     let stream = match connect_served(sock, origin, Some(wait + await_task::LEG_SLACK)) {
         Ok(Ok(stream)) => stream,
@@ -180,8 +150,7 @@ fn socket_leg(sock: &str, origin: TargetOrigin, request: &str, wait: Duration) -
     }
 }
 
-/// The request line one leg sends: the wait's words and the leg's own
-/// `timeout=`.
+/// The request line one leg sends: the wait's words and the leg's own `timeout=`.
 fn leg_request(parts: &[String], wait: Duration) -> io::Result<String> {
     let mut parts = parts.to_vec();
     parts.push(format!("timeout={}", wait.as_millis()));
@@ -191,10 +160,7 @@ fn leg_request(parts: &[String], wait: Duration) -> io::Result<String> {
     Ok(line)
 }
 
-/// The legs of `wait` against `sock`, to `until` (`None`: no deadline): the
-/// answering leg's line, or `OK timeout` at the deadline, written through
-/// `out`; a hang-up judged as a blocking read's, its successor (where it is
-/// asked) waited on for what is left, following nothing further.
+/// Runs the legs of `wait` against `sock` until `until`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the wait, where it is asked and how far it follows, its deadline, and the two \
@@ -283,10 +249,7 @@ fn wait_legs(
     }
 }
 
-/// `[@<sel>] await inbox|agent|edit …`: the whole re-armed wait ([the
-/// module](self)). `sock` is the socket the call resolves to and `origin`
-/// how, `total` the explicit `--timeout` when one was given (`Some(None)`:
-/// `--timeout 0`, no deadline).
+/// `[@<sel>] await inbox|agent|edit …`: the whole re-armed wait ([the module](self)).
 pub(crate) fn run_rearmed_await(
     parts: &[String],
     sock: &str,
@@ -328,9 +291,6 @@ mod tests {
     /// The re-armed forms: `await inbox`, `await agent` and `await edit`, a leading
     /// selector or none, the timeout as `timeout=<ms>` or `timeout <ms>`
     /// taken out of the words every leg sends, the rest kept as given.
-    /// NEGATIVE CONTROLS: another `await`, a timeout that is no number, and
-    /// one given twice are not re-armed (one exchange, the server's to
-    /// answer).
     #[test]
     fn the_inbox_and_agent_waits_are_parsed_with_their_timeout_taken_out() {
         assert_eq!(
@@ -363,8 +323,6 @@ mod tests {
                 timeout: Some(Duration::from_secs(900)),
             })
         );
-        // An edit's wait, by ticket or by file (the `amacs` client runs its
-        // own legs, with no total limit: `crate::edit`).
         assert_eq!(
             parse(&parts("@s-ab await edit ticket=7 timeout=900000")),
             Some(Wait {
@@ -399,9 +357,7 @@ mod tests {
         code: ExitCode,
     }
 
-    /// `wait` run to `until` against scripted legs: each answers the next of
-    /// `script` after sleeping the wait it asked for where it times out (as
-    /// the server parks), and times out once the script is spent.
+    /// `wait` run to `until` against scripted legs.
     fn run(wait: &Wait, until: Option<Instant>, script: Vec<Leg>) -> Run {
         let mut script = script.into_iter();
         let mut sent = Vec::new();
@@ -445,8 +401,6 @@ mod tests {
     fn a_wait_is_re_armed_with_the_same_since_until_a_leg_answers() {
         let wait = parse(&parts("@s-ab await inbox since=4 topic=lab")).expect("re-armed");
         let until = Some(Instant::now() + Duration::from_secs(3600));
-        // These legs time out at once: one sleeping the server's bound would
-        // hold the test 20 minutes.
         let mut sent = Vec::new();
         let mut printed = Vec::new();
         let mut script = vec![

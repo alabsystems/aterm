@@ -81,7 +81,7 @@ impl VendorRecord {
 
     /// The installed-build view [`super::decide`] takes.
     #[must_use]
-    pub(crate) fn installed_view(&self) -> super::decide::InstalledView {
+    pub(crate) const fn installed_view(&self) -> super::decide::InstalledView {
         super::decide::InstalledView {
             version: self.version,
             build: self.version.build_id(),

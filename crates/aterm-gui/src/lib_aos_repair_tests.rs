@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! M2 on the host path (`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §5), in
-//! process, with every instant pinned: the `aos` verb's App methods attach the front
-//! window's momentum glow under the demonstration fault; keys typed through normal key
-//! dispatch (`App::input`) light it; the effect lane (the planner `about_to_wait` runs,
-//! its due-tick service, a real redraw onto the scripted surface) parks with the halo
-//! presented; the repair publishes the shipped code on a `Tested` witness; the lane
-//! wakes from the accepted state and presents the clearing frame; and fresh keys through
-//! the same dispatch heat, settle, wake and clear it again with no further replay,
-//! publication or reset.
+//! Host-path tests for AOS momentum glow attachment, fault detection, and live repair.
 
 use std::time::{Duration, Instant};
 
@@ -41,7 +33,6 @@ const HORIZON: Duration = Duration::from_secs(60);
 /// The scripted fixture with only the momentum glow lit: serious mode off, the
 /// cursor-effect master on, no trail style (so the glow is alone in its stream), full
 /// motion, no blink clock, the window focused on a 120 Hz panel, and a prompt drawn.
-/// `light` turns the page light (DECSCNM), where the glow is an under-ink halo.
 fn momentum_app(light: bool) -> App {
     let mut app = scripted_app();
     app.config.serious_mode = Some(false);
@@ -239,7 +230,6 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
         let t0 = Instant::now();
         let (mut app, parked) = stranded(light, t0);
 
-        // (a) Stranded: an unrelated turn later still plans no wake.
         let later = parked.at + Duration::from_millis(500);
         assert_eq!(
             app.windows
@@ -252,7 +242,6 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
         let before = status(&app);
         assert_eq!(before.revision, 0);
 
-        // (b) The repair, through the verb's App method.
         let repaired = app
             .aos_repair_at(MomentumCode::Shipped, later)
             .expect("the shipped code repairs the stranded glow");
@@ -293,7 +282,6 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
             "the accepted state is the glow as it was: still hot"
         );
 
-        // (c) The lane, re-planned from the accepted state, wakes and clears.
         let commits = surface(&mut app).commits();
         let cleared = run_lane(&mut app, later);
         assert!(
@@ -320,7 +308,6 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
             "light={light}: the last delivered tick is the inert clearing frame"
         );
 
-        // (d) Fresh keys through normal dispatch, under the published code.
         let fresh_from = cleared.at + Duration::from_millis(250);
         let last_key = type_keys(&mut app, fresh_from, 12);
         assert!(status(&app).hot, "light={light}: fresh keys heat the glow");
@@ -367,7 +354,6 @@ fn a_stranded_glow_is_repaired_through_the_host_and_fresh_keys_clear_with_no_res
             "light={light}: each fresh key reached the published pair once"
         );
 
-        // The trace the verb summarizes is the live one.
         let trace = app.aos_trace_now().expect("attached");
         assert_eq!(trace.log_len, log.len());
         assert_eq!(trace.log_len, after.log_len);

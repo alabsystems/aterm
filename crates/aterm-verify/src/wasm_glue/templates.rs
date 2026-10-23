@@ -2,18 +2,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Derived from wasm-bindgen-cli-support 0.2.108 src/js/mod.rs: the fixed JS
-// its glue carries (the string and array helpers, the cached memory views,
-// the class shape, the `--target web` loader with its init forms and
-// warnings, and the import shims), so a page or worker written against
-// wasm-bindgen's glue sees the same JS. Modified by the aterm project in
-// 2026: the allocator, the return slot and its throw check are
-// aterm-wasm-abi's, and the externref table and the start function are
-// gone. See ../../LICENSE-MIT for the upstream license; Apache-2.0 is the
-// workspace's.
+// Derived from wasm-bindgen-cli-support 0.2.108 src/js/mod.rs and modified by the aterm project.
+// See ../../LICENSE-MIT for the upstream license; Apache-2.0 is the workspace's.
 
-//! The fixed JS and TypeScript pieces of the glue; `js.rs` assembles them
-//! around what each module exports.
+//! Fixed JavaScript and TypeScript glue templates assembled by `js.rs`.
 
 /// The text after the `use strict`-free header line.
 pub(crate) const DTS_HEADER: &str = "/* tslint:disable */\n/* eslint-disable */\n";
@@ -54,8 +46,7 @@ function get{T}Memory0() {
 }
 ";
 
-/// `getArray{S}FromWasm0`: a view of `len` elements; `{T}` the typed array,
-/// `{N}` its element size.
+/// `getArray{S}FromWasm0`: a view of `len` elements; `{T}` the typed array, `{N}` its element size.
 pub(crate) const GET_ARRAY: &str = "\
 function getArray{S}FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
@@ -73,8 +64,7 @@ function passArray{S}ToWasm0(arg, malloc) {
 }
 ";
 
-/// `getStringFromWasm0` and its decoder; `{DECODE}` is the flavor's
-/// `decodeText` ([`DECODE_TEXT_WEB`], [`DECODE_TEXT_NODE`]).
+/// `getStringFromWasm0` and its decoder ([`DECODE_TEXT_WEB`], [`DECODE_TEXT_NODE`]).
 pub(crate) const GET_STRING: &str = "\
 function getStringFromWasm0(ptr, len) {
     ptr = ptr >>> 0;
@@ -85,9 +75,7 @@ let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true 
 cachedTextDecoder.decode();
 {DECODE}";
 
-/// `decodeText` for a page: Safari's `TextDecoder` stops decoding after
-/// about 2 GiB, so the decoder is replaced 1 MiB short of that
-/// (wasm-bindgen issue 4471; its `--target web` glue does the same).
+/// `decodeText` for a page.
 pub(crate) const DECODE_TEXT_WEB: &str = "\
 const MAX_SAFARI_DECODE_BYTES = 2146435072;
 let numBytesDecoded = 0;
@@ -102,16 +90,14 @@ function decodeText(ptr, len) {
 }
 ";
 
-/// `decodeText` under node, which has no such limit (wasm-bindgen's
-/// `--target nodejs` glue has no counter either).
+/// `decodeText` under node.
 pub(crate) const DECODE_TEXT_NODE: &str = "\
 function decodeText(ptr, len) {
     return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 ";
 
-/// `passStringToWasm0` and its encoder: ASCII by hand, the rest through
-/// `encodeInto`, then shrunk to the bytes written.
+/// `passStringToWasm0` and its encoder.
 pub(crate) const PASS_STRING: &str = "\
 function passStringToWasm0(arg, malloc, realloc) {
     if (realloc === undefined) {
@@ -169,10 +155,7 @@ pub(crate) const VECTOR_LEN: &str = "\
 let WASM_VECTOR_LEN = 0;
 ";
 
-/// The return slot (`crates/aterm-wasm-abi/src/mem.rs`, `Slot`) and the
-/// check after every call: an export that threw returned normally and left
-/// the throw's kind at word 1 and its message at words 2 and 3. `{FREE}`
-/// the runtime's free, `{ERROR}` the kind that is a `new Error`.
+/// The return slot (`crates/aterm-wasm-abi/src/mem.rs`, `Slot`) and the check after every call.
 pub(crate) const RET_SLOT: &str = "\
 let RET_SLOT = 0;
 function checkThrown() {
@@ -200,13 +183,12 @@ function retSlot() {
 ";
 
 /// A constructor's statements after its call: adopt the handle `ret$`.
-/// `{C}` the class.
 pub(crate) const CONSTRUCTOR_TAIL: &str = "\
 this.__wbg_ptr = ret$ >>> 0;
 {C}Finalization.register(this, this.__wbg_ptr, this);
 return this;";
 
-/// After a class: `using` frees it. `{C}` the class.
+/// After a class: `using` frees it.
 pub(crate) const DISPOSE_ALIAS: &str =
     "if (Symbol.dispose) {C}.prototype[Symbol.dispose] = {C}.prototype.free;\n";
 
@@ -216,8 +198,7 @@ function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         }";
 
-/// `aterm_host.error_stack(out)`: the stack as a string the module owns,
-/// its pointer and length written at `out`. `{PASS}` lowers `ret`.
+/// `aterm_host.error_stack(out)`.
 pub(crate) const ERROR_STACK_SHIM: &str = "\
 function(arg0) {
             const ret = new Error().stack ?? '';
@@ -227,10 +208,7 @@ function(arg0) {
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr, true);
         }";
 
-/// The object table: a JS object argument is stored here and its index
-/// passed (`addHeapObject`), an import reads it back (`getObject`), and the
-/// module releases it (`aterm_host.object_drop`). Index 0 is never handed
-/// out.
+/// The object table.
 pub(crate) const HEAP: &str = "\
 const heap = [undefined];
 const heapFree = [];
@@ -288,17 +266,14 @@ pub(crate) const CLASS_HEAD: &str = "    static __wrap(ptr) {
     }
 ";
 
-/// A class's FinalizationRegistry, inert where the host has none. The free
-/// export reports nothing to a finalizer, so it is not checked.
+/// A class's FinalizationRegistry, inert where the host has none.
 pub(crate) const FINALIZATION: &str = "\
 const {C}Finalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.{FREE}(ptr >>> 0, 1));
 ";
 
-/// The `--target nodejs` loader: the module beside the glue, instantiated
-/// synchronously at `require`. `{FILE}` the quoted filename, `{INIT}` what
-/// runs once `wasm` is set.
+/// The `--target nodejs` loader.
 pub(crate) const NODE_LOADER: &str = "\
 const wasmPath = __dirname + '/' + {FILE};
 const wasmBytes = require('fs').readFileSync(wasmPath);
@@ -306,10 +281,7 @@ const wasmModule = new WebAssembly.Module(wasmBytes);
 const wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
 {INIT}";
 
-/// The `--target web` loader: `init()` with a URL, a `Request`, a
-/// `Response`, bytes or a module (or a promise of one), the deprecated
-/// positional forms with their warnings, and `initSync`. `{RESET}` clears
-/// the cached views, `{INIT}` runs once `wasm` is set.
+/// The `--target web` loader.
 pub(crate) const WEB_LOADER: &str = "\
 let wasmModule, wasm;
 function __wbg_finalize_init(instance, module) {

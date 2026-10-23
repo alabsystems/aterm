@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT CAME DOWN, IN DONE FOR YOU (`docs/DESIGN-harness-autopilot-2026-10-15.md`
-//! §11.4; the App's half of §11.4.5): a background session's end after 45 s
-//! of its agent's busy time is a Done for you row read off the real App
-//! (`App::status_session_row`, `Glance::build`), the menu-bar title is `❯•`
-//! and `chrome`'s `statusitem` line counts it (`done=1`); an act and a trail
-//! move leave the row and the glance's fingerprint as they were; the menu
-//! bar's Go marks the end seen and the row goes, and so does a worker's Read
-//! Result, whose one row the end shares; the glance owes a rebuild where the
-//! end marks, where a look quiets it and at a rename.
+//! WHAT CAME DOWN, IN DONE FOR YOU (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.4; the App's
+//! half of §11.4.5): a background session's end after 45 s of its agent's busy time is a Done for
+//! you row read off the real App (`App::status_session_row`, `Glance::build`), the menu-bar title
+//! is `❯•` and `chrome`'s `statusitem` line counts it (`done=1`); an act and a trail move leave the
+//! row and the glance's fingerprint as they were; the menu bar's Go marks the end seen and the row
+//! goes, and so does a worker's Read Result, whose one row the end shares; the glance owes a
+//! rebuild where the end marks, where a look quiets it and at a rename.
 
 use std::sync::Arc;
 
@@ -164,12 +162,10 @@ fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
             && line.contains(" done=1 "),
         "{line}"
     );
-    // The host's "unknown" between loop runs keeps it, and its instant.
     tell(&mut app, &sid, None);
     assert_eq!(app.status_glance().done, g.done, "kept through unknown");
     drop(host);
 
-    // NEGATIVE CONTROL: the end in the tab looked at.
     let (mut front, sid, host) = desk();
     front.switch_tab_in(WindowId(0), 0);
     end_after(&mut front, &sid, 45 * SEC);
@@ -180,7 +176,6 @@ fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
     assert!(front.status_item_chrome_line().contains(" done=0 "));
     drop(host);
 
-    // NEGATIVE CONTROL: under the floor.
     let (mut quick, sid, host) = desk();
     end_after(&mut quick, &sid, 8 * SEC);
     assert!(quick.status_glance().done.is_empty(), "8 s: no end, no row");
@@ -198,8 +193,6 @@ fn a_background_end_is_a_done_for_you_row_and_chrome_counts_it() {
 fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
     let (mut app, sid, host) = desk();
     end_after(&mut app, &sid, 45 * SEC);
-    // The host's "unknown" between loop runs: the state line falls back to
-    // the trail's newest act.
     tell(&mut app, &sid, None);
     let before = app.status_glance();
     let line_before = state_line(&app);
@@ -220,7 +213,6 @@ fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
         before.fingerprint(),
         "nothing handed over"
     );
-    // CONTROL: the trail's words moved; a row carrying them would have.
     let line_after = state_line(&app);
     assert_ne!(line_after, line_before, "PRECONDITION: the trail moved");
     let carrying = |g: &Glance, words: Option<&String>| {
@@ -249,7 +241,6 @@ fn an_act_and_a_trail_move_leave_the_end_row_as_it_was() {
 fn go_marks_the_end_seen_and_the_row_goes() {
     let (mut app, sid, host) = desk();
     end_after(&mut app, &sid, 45 * SEC);
-    // The owner is in another app: aterm's window is behind it.
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
@@ -279,7 +270,6 @@ fn go_marks_the_end_seen_and_the_row_goes() {
     assert!(g.done.is_empty(), "the row goes: {:?}", g.done);
     assert_eq!(g.button_title(), "\u{276f}");
     assert!(app.status_item_chrome_line().contains(" done=0 "));
-    // A second end, nobody looking, is a row again.
     end_after(&mut app, &sid, 40 * SEC);
     assert_eq!(app.status_glance().done.len(), 1, "a new end is news");
     drop(host);
@@ -326,7 +316,6 @@ fn reading_a_workers_result_is_a_look_at_its_end() {
     assert_eq!(unended.end_serial, None, "no end was drawn yet");
     end_after(&mut app, &sid, 45 * SEC);
     assert!(app.end_unseen(0), "PRECONDITION: the end stands unseen");
-    // The owner is in another app: aterm's window is behind it.
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
@@ -372,7 +361,6 @@ fn reading_a_workers_result_is_a_look_at_its_end() {
     assert!(app.status_item_chrome_line().contains(" done=0 "));
     assert!(!app.end_unseen(0), "the tab's `•` goes with the row");
 
-    // The same SID finishes later work while the old menu stays open.
     end_after(&mut app, &sid, 40 * SEC);
     let later = app.harness_glass[&0].end().expect("a later end").serial;
     assert_ne!(later, first_end, "PRECONDITION: a new end");

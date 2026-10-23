@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What predictive echo did on glass, one stderr line per event: a DEVELOPMENT
-//! SEAM (`$ATERM_TRACE_PREDICT`, read through [`aterm_types::dev_seam!`]),
-//! compiled into test and debug builds only, so a shipped binary has none.
-//!
-//! The predictor's own safety theorem (`aterm-predict`'s
-//! `tests/reconciled_view_safety.rs`) checks every frame of a simulated host.
-//! This is the same evidence from a REAL aterm: its press path, both render
-//! paths, its shell and the link it runs over (`aterm-lab predict-live`, which
-//! reads these lines from the instance's log and holds every frame to the
-//! screen the far end's own output settles to).
-//!
-//! * `aterm-predict press t=<µs> key=<what> armed=<seq|-> pending=<n>`: a key
-//!   the press path handed the predictor (a glyph, an edit key, a line
-//!   terminator, or input it does not model), after the call; `armed` is the
-//!   op it armed (`Prediction::seq_for_test`), `-` when it armed none.
-//! * `aterm-predict frame t=<µs> mode=<m> engaged=<0|1> visible=<n>
-//!   newest=<seq|-> cursor=<r>,<c> shown=<r>,<c> row=<r> under=<text>
-//!   over=<text> …`: a frame that painted a prediction, after the paint, in the
-//!   pane's own coordinates: the engine's cursor and the drawn one, then each
-//!   row the overlay touched as the engine had it (`under`) and as it was drawn
-//!   (`over`). `newest` is the op of the newest visible key, the key whose
-//!   settled screen the frame claims to show (FRAME FIDELITY). Text is the
-//!   row's glyphs, trailing blanks trimmed, `%`, space and anything outside
-//!   printable ASCII percent-encoded as UTF-8.
-//! * `aterm-predict clear t=<µs>`: the frame after a painted one that paints
-//!   none, so glass shows the engine's screen again. Between a `frame` and
-//!   its `clear`, glass shows that frame's prediction.
-//!
-//! `t` is microseconds on one process clock: a press's is the key's handling,
-//! a frame's its paint, just before the present.
+//! What predictive echo did on glass, one stderr line per event.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -107,8 +78,7 @@ pub(crate) fn press(predictor: &Predictor, key: &str, armed: Option<u64>, at: In
 pub(crate) struct Under(Vec<(usize, String)>);
 
 impl Under {
-    /// The rows of `cells` and of the chain's cursor, as `scratch` holds them
-    /// before the paint; nothing while the trace is off.
+    /// The rows of `cells` and of the chain's cursor, as `scratch` holds them before the paint.
     pub(crate) fn read(
         scratch: &RenderInput,
         cells: &[crate::predict::Prediction],
@@ -172,17 +142,16 @@ fn frame_line(
     line
 }
 
-/// Trace the frame that ERASED the prediction the frame before it painted: it
-/// paints none, so glass shows the engine's screen again (module docs).
+/// Trace the frame that ERASED the prediction the frame before it painted.
 pub(crate) fn clear(at: Instant) {
     if on() {
         crate::logging::stderr_line!("aterm-predict clear t={}", micros(at));
     }
 }
 
-/// Trace a frame that painted a prediction (module docs), after the paint and
-/// before the caller moves the drawn cursor: `scratch`'s own cursor is still
-/// the engine's, and `shown` the one the caller is about to draw.
+/// Trace a frame that painted a prediction (module docs), after the paint and before the caller
+/// moves the drawn cursor: `scratch`'s own cursor is still the engine's, and `shown` the one the
+/// caller is about to draw.
 pub(crate) fn frame(
     predictor: &Predictor,
     under: &Under,

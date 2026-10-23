@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Preserve matching local worktrees and publish only verified, full new clones.
+//! Publish only verified, full new clones, and fast-forward each matching worktree that is
+//! clean and behind (docs/DESIGN-init-system-2026-10-20.md §4.3, S8).
 //! Clones are sequential: at most one clone/network transfer is active, with a
-//! thirty-minute bound per clone. No existing worktree is fetched, checked out or
-//! rewritten. GitHub pagination and every structured git read require complete EOF. The
+//! thirty-minute bound per clone. An existing worktree moves only through
+//! [`crate::checkout::align`], the function `develop.checkout@<path>` uses: `git fetch`,
+//! then `git merge --ff-only`, when it is on GitHub's default branch, clean and has no
+//! commit GitHub lacks. Any other worktree (dirty, ahead, diverged, detached) is left as it
+//! is, and the row says why; none is ever reset, stashed, rebased, checked out or pushed. A
+//! checkout init.toml's `[develop]` table records belongs to the develop items, never to
+//! this one. GitHub pagination and every structured git read require complete EOF. The
 //! listing reads with the token the login keychain holds (agh's read door, no gh); a clone
 //! authenticates through the osxkeychain helper git's github.com settings name.
 
 use super::{Github, auth_id, auth_ready, get};
+use crate::checkout::{Origin, Stands, git, github_origin as origin_matches};
 use crate::github_pages::Page;
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
@@ -16,18 +23,18 @@ use crate::port::{Cmd, Scratch, Secret, System};
 use aterm_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const GIT: &str = crate::items::github::CLT_GIT;
+const GIT: &str = crate::checkout::GIT;
 // Full repository objects contain many URL templates. Smaller pages leave room
 // under the strict capture bound without jq/header ordering assumptions.
 const PAGE_SIZE: usize = 30;
-const GIT_READ_BUDGET: Duration = Duration::from_secs(300);
 const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
-/// One reconciliation item for every repository owned by the configured account/org.
-pub(super) fn item(user: &User, config: &Github) -> Box<dyn Item> {
+/// One reconciliation item for every repository owned by the configured account/org,
+/// leaving the checkouts `[develop]` records (`recorded`) to the develop items.
+pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<dyn Item> {
     Box::new(Repositories {
         user: user.clone(),
         config: Github {
@@ -36,12 +43,58 @@ pub(super) fn item(user: &User, config: &Github) -> Box<dyn Item> {
             token_file: config.token_file.clone(),
             token_key: config.token_key.clone(),
         },
+        recorded,
     })
 }
 
 struct Repositories {
     user: User,
     config: Github,
+    /// The develop items' checkouts: never fetched or moved here.
+    recorded: Vec<PathBuf>,
+}
+
+/// What one scan found: every repository, the missing ones, and the matching worktrees this
+/// item aligns, each with where it stands.
+struct Scan {
+    all: usize,
+    missing: Vec<Repo>,
+    existing: Vec<(Repo, PathBuf, Stands)>,
+    /// Present worktrees `[develop]` records, left to the develop items.
+    recorded: usize,
+}
+
+/// At most this many kept worktrees are named in a row.
+const NAMED: usize = 4;
+
+impl Scan {
+    fn moving(&self) -> usize {
+        self.existing
+            .iter()
+            .filter(|(_, _, stands)| stands.moves())
+            .count()
+    }
+
+    /// What the worktrees left as they are say, a few named.
+    fn kept(&self) -> Option<String> {
+        let kept: Vec<String> = self
+            .existing
+            .iter()
+            .filter_map(|(repo, _, stands)| match stands {
+                Stands::Kept(why) => Some(format!("~/{}: {why}", repo.name)),
+                _ => None,
+            })
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        let more = kept.len().saturating_sub(NAMED);
+        let mut line = kept.into_iter().take(NAMED).collect::<Vec<_>>().join("; ");
+        if more > 0 {
+            line.push_str(&format!("; and {more} more"));
+        }
+        Some(line)
+    }
 }
 
 impl Item for Repositories {
@@ -72,21 +125,30 @@ impl Item for Repositories {
         };
         match self.scan(sys, &token) {
             Err(why) => Probe::Unusable { why },
-            Ok((all, missing)) if missing.is_empty() => Probe::Ok {
-                now: format!(
-                    "{} matching worktrees present; existing history, branches and changes preserved",
-                    all.len()
-                ),
-            },
-            Ok((all, missing)) => Probe::Change {
+            Ok(scan) if scan.missing.is_empty() && scan.moving() == 0 => {
+                let mut now = format!("{} matching worktrees present", scan.all);
+                if scan.recorded > 0 {
+                    now.push_str(&format!(
+                        "; {} recorded in [develop], which the develop items align",
+                        scan.recorded
+                    ));
+                }
+                match scan.kept() {
+                    Some(kept) => now.push_str(&format!("; left as they are: {kept}")),
+                    None => now.push_str("; the others up to date with GitHub"),
+                }
+                Probe::Ok { now }
+            }
+            Ok(scan) => Probe::Change {
                 from: format!(
-                    "{} of {} repositories missing from ~",
-                    missing.len(),
-                    all.len()
+                    "{} of {} repositories missing from ~; {} clean worktree(s) behind GitHub",
+                    scan.missing.len(),
+                    scan.all,
+                    scan.moving()
                 ),
-                to:
-                    "clone missing repositories with full history; preserve every existing worktree"
-                        .into(),
+                to: "clone missing repositories with full history; fast-forward each clean \
+                     worktree that is behind; preserve every other worktree"
+                    .into(),
             },
         }
     }
@@ -95,33 +157,96 @@ impl Item for Repositories {
         let Some(token) = auth_ready(sys, &self.user, &self.config)? else {
             return Err("GitHub authentication changed; no repositories cloned".into());
         };
-        let (_, missing) = self.scan(sys, &token)?;
-        for repo in missing {
+        let scan = self.scan(sys, &token)?;
+        for repo in scan.missing {
             clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
-        Ok(())
+        // Each worktree on its own: one that cannot be fetched leaves the others to move.
+        let mut failed = Vec::new();
+        for (repo, path, stands) in scan.existing {
+            if !stands.moves() {
+                continue;
+            }
+            if let Err(unread) = crate::checkout::align(sys, &self.user, &path, &repo.origin()) {
+                failed.push(format!("~/{}: {}", repo.name, unread.why));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
     }
 }
 
 impl Repositories {
-    fn scan(&self, sys: &dyn System, token: &Secret) -> Result<(Vec<Repo>, Vec<Repo>), String> {
+    fn scan(&self, sys: &dyn System, token: &Secret) -> Result<Scan, String> {
         admit_home(sys, &self.user)?;
         let all = enumerate(sys, &self.user, &self.config, token)?;
-        let missing = missing(sys, &self.user, &all)?;
-        Ok((all, missing))
+        let (missing, existing) = partition(sys, &self.user, &all)?;
+        let mut aligned = Vec::new();
+        let mut recorded = 0;
+        for (repo, path) in existing {
+            if self.recorded.contains(&path) {
+                recorded += 1;
+                continue;
+            }
+            // A worktree whose origin cannot be read now (offline, an SSH origin with no
+            // key loaded, access revoked) is left as it is, saying why: it never keeps the
+            // missing repositories from being cloned or the others from moving.
+            let stands = crate::checkout::read(sys, &self.user, &path, &repo.origin())
+                .unwrap_or_else(|unread| Stands::Kept(unread.why));
+            aligned.push((repo, path, stands));
+        }
+        Ok(Scan {
+            all: all.len(),
+            missing,
+            existing: aligned,
+            recorded,
+        })
     }
 }
 
+/// The checkouts the GitHub item verifies that are aterm workspaces: what `aterm init
+/// --develop` records when it runs outside one.
+pub(super) fn aterm_checkouts(
+    sys: &dyn System,
+    user: &User,
+    config: &Github,
+    token: &Secret,
+) -> Result<Vec<PathBuf>, String> {
+    admit_home(sys, user)?;
+    let all = enumerate(sys, user, config, token)?;
+    let (_, existing) = partition(sys, user, &all)?;
+    Ok(existing
+        .into_iter()
+        .filter(|(_, path)| {
+            crate::init_develop::workspace(sys, user, path).is_ok_and(|found| found.is_some())
+        })
+        .map(|(_, path)| path)
+        .collect())
+}
+
 pub(super) fn missing(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Vec<Repo>, String> {
+    partition(sys, user, all).map(|(missing, _)| missing)
+}
+
+/// The verified matching worktrees present in the home, each with its path.
+type Present = Vec<(Repo, PathBuf)>;
+
+/// The repositories missing from the home, and the verified matching worktrees present.
+fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<(Vec<Repo>, Present), String> {
     admit_home(sys, user)?;
     let home = Path::new(&user.home);
     let mut missing = Vec::new();
+    let mut existing = Vec::new();
     for repo in all {
         let path = home.join(&repo.name);
         match sys.stat(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(repo.clone()),
             Ok(stat) if stat.dir && !stat.symlink => {
-                verify_existing(sys, user, &repo.owner, repo, &path)?
+                verify_existing(sys, user, &repo.owner, repo, &path)?;
+                existing.push((repo.clone(), path));
             }
             Ok(_) => {
                 return Err(format!(
@@ -132,7 +257,7 @@ pub(super) fn missing(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Vec
             Err(_) => return Err(format!("cannot inspect ~/{}; left untouched", repo.name)),
         }
     }
-    Ok(missing)
+    Ok((missing, existing))
 }
 
 pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
@@ -154,6 +279,16 @@ pub(super) struct Repo {
     pub(super) owner: String,
     pub(super) name: String,
     pub(super) default_branch: Option<String>,
+}
+
+impl Repo {
+    /// The one origin a matching worktree of this repository has.
+    fn origin(&self) -> Origin {
+        Origin(vec![crate::checkout::Remote::Github {
+            owner: self.owner.clone(),
+            name: self.name.clone(),
+        }])
+    }
 }
 
 fn component(value: &str, owner: bool) -> bool {
@@ -231,7 +366,7 @@ pub(super) fn enumerate_pages(
     owner: Option<&str>,
     api: impl FnMut(&str) -> Result<Page, String>,
 ) -> Result<Vec<Repo>, String> {
-    let values = crate::github_pages::all(base, PAGE_SIZE, api)?;
+    let values = crate::github_pages::all(crate::github_pages::API, base, PAGE_SIZE, api)?;
     let mut repositories = Vec::new();
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
@@ -292,30 +427,6 @@ fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
         name: name.into(),
         default_branch,
     })
-}
-
-fn origin_matches(url: &str, owner: &str, name: &str) -> bool {
-    let path = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("git@github.com:"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| url.strip_prefix("ssh://git@github.com:22/"));
-    path.is_some_and(|path| {
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        path.eq_ignore_ascii_case(&format!("{owner}/{name}"))
-    })
-}
-
-fn git(user: &User, path: Option<&Path>) -> Cmd {
-    let mut command = Cmd::new(GIT)
-        .as_user(user)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .budget(GIT_READ_BUDGET);
-    if let Some(path) = path {
-        command = command.arg("-C").arg(path);
-    }
-    command
 }
 
 fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<String, String> {
@@ -960,6 +1071,336 @@ mod tests {
         );
     }
 
+    /// The reads [`crate::checkout::read`] makes of a matching worktree on `main` at `A`
+    /// whose `git status` says `status`.
+    fn script_read(sys: &Fake, who: &User, path: &Path, name: &str, status: &str) {
+        for (args, output) in [
+            (
+                vec!["ls-remote", "--get-url", "origin"],
+                format!("https://github.com/alice/{name}.git\n"),
+            ),
+            (
+                vec!["symbolic-ref", "--quiet", "HEAD"],
+                "refs/heads/main\n".to_owned(),
+            ),
+            (
+                vec!["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+                format!("{A}\n"),
+            ),
+            (
+                vec![
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignore-submodules=all",
+                ],
+                status.to_owned(),
+            ),
+        ] {
+            sys.on(&git(who, Some(path)).args(args).display(), Ran::ok(&output));
+        }
+    }
+
+    /// THE GITHUB ITEM'S FAST-FORWARD (design §4.3): a clean worktree on GitHub's default
+    /// branch, behind it, is fetched and fast-forwarded through the shared function; a dirty
+    /// one is left as it is, saying why; the one `[develop]` records is the develop items'
+    /// and is never read past its identity. Nothing is reset, stashed, checked out, pulled or
+    /// pushed. Negative control: the same scan with nothing behind reads `Ok`.
+    #[test]
+    fn a_clean_worktree_behind_github_is_fast_forwarded_and_a_recorded_one_left_to_develop() {
+        use std::sync::{Arc, Mutex};
+        for behind in [true, false] {
+            let (sys, who, config) = fixture();
+            let home = Path::new(&who.home);
+            let (moving, dirty, recorded) =
+                (home.join("moving"), home.join("dirty"), home.join("aterm"));
+            for (path, name) in [(&moving, "moving"), (&dirty, "dirty"), (&recorded, "aterm")] {
+                sys.stat_of(path.to_str().unwrap(), directory(who.uid));
+                script_existing(&sys, &who, path, name);
+            }
+            script_read(&sys, &who, &dirty, "dirty", " M README\0");
+            sys.on(
+                &git(&who, Some(&dirty))
+                    .args(["ls-remote", "--symref", "origin", "HEAD"])
+                    .display(),
+                Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n")),
+            );
+            script_read(&sys, &who, &moving, "moving", "");
+            // `moving`'s HEAD and what it fetched, as git would keep them.
+            let state = Arc::new(Mutex::new((if behind { A } else { B }.to_owned(), false)));
+            let model = {
+                let (state, moving) = (Arc::clone(&state), moving.clone());
+                move |_: &Fake, cmd: &Cmd| -> Option<Ran> {
+                    let args: Vec<String> = cmd
+                        .args
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
+                    if args.get(1).map(PathBuf::from) != Some(moving.clone()) {
+                        return None;
+                    }
+                    let mut state = state.lock().unwrap();
+                    let (head, fetched) = (state.0.clone(), state.1);
+                    Some(match args[2..].join(" ").as_str() {
+                        "rev-parse --verify --quiet HEAD^{commit}" => Ran::ok(&format!("{head}\n")),
+                        "ls-remote --symref origin HEAD" => {
+                            Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{B}\tHEAD\n"))
+                        }
+                        line if line == format!("rev-parse --verify --quiet {B}^{{commit}}") => {
+                            if fetched {
+                                Ran::ok(&format!("{B}\n"))
+                            } else {
+                                Ran::exit(1, "")
+                            }
+                        }
+                        "rev-list --count HEAD --not --remotes=origin" => Ran::ok("0\n"),
+                        "-c core.hooksPath=/dev/null fetch --quiet --no-recurse-submodules origin" =>
+                        {
+                            state.1 = true;
+                            Ran::ok("")
+                        }
+                        "rev-parse --verify --quiet refs/remotes/origin/main^{commit}" => {
+                            Ran::ok(&format!("{B}\n"))
+                        }
+                        line if line == format!("merge-base --is-ancestor {A} {B}") => Ran::ok(""),
+                        line if line == format!("rev-list --count {A}..{B}") => Ran::ok("1\n"),
+                        line if line
+                            == format!(
+                                "-c core.hooksPath=/dev/null -c submodule.recurse=false merge --ff-only --no-autostash --quiet {B}"
+                            ) =>
+                        {
+                            state.0 = B.to_owned();
+                            Ran::ok("")
+                        }
+                        _ => return None,
+                    })
+                }
+            };
+            sys.simulate(model);
+            sys.on_github_api(
+                &who,
+                &format!("{BASE}&page=1"),
+                page(
+                    vec![
+                        value("aterm", 1, true),
+                        value("dirty", 2, true),
+                        value("moving", 3, true),
+                    ],
+                    None,
+                ),
+            );
+            let probe = item(&who, &config, vec![recorded.clone()])
+                .probe(&sys, &ctx(std::slice::from_ref(&who)));
+            let rows = engine::run(
+                &[item(&who, &config, vec![recorded.clone()])],
+                Mode::Apply,
+                &sys,
+                &ctx(std::slice::from_ref(&who)),
+                &mut NoJournal,
+            );
+            let calls = sys.calls();
+            if behind {
+                assert!(
+                    matches!(&probe, Probe::Change { from, .. } if from.contains("1 clean worktree(s) behind GitHub")),
+                    "{probe:?}"
+                );
+                assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+                assert_eq!(state.lock().unwrap().0, B);
+                assert_eq!(
+                    calls.iter().filter(|call| call.contains(" fetch ")).count(),
+                    1
+                );
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|call| call.contains(" merge --ff-only "))
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(matches!(&probe, Probe::Ok { .. }), "{probe:?}");
+                assert_eq!(rows[0].outcome, Outcome::Ok, "{rows:?}");
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|call| call.contains(" fetch ") || call.contains(" merge "))
+                );
+            }
+            let after = item(&who, &config, vec![recorded.clone()])
+                .probe(&sys, &ctx(std::slice::from_ref(&who)));
+            assert!(
+                matches!(&after, Probe::Ok { now } if now.contains("1 recorded in [develop]")
+                    && now.contains("~/dirty: it has uncommitted changes")),
+                "{after:?}"
+            );
+            let recorded_reads: Vec<&String> = calls
+                .iter()
+                .filter(|call| call.contains(&format!("-C {} ", recorded.display())))
+                .collect();
+            assert!(
+                recorded_reads
+                    .iter()
+                    .all(|call| call.contains(" rev-parse --is-inside-work-tree")
+                        || call.contains(" rev-parse --show-prefix")
+                        || call.contains(" rev-parse --show-toplevel")
+                        || call.contains(" config --get-all remote.origin.url")),
+                "{recorded_reads:?}"
+            );
+            for word in [
+                "reset", "stash", "rebase", "checkout", "switch", "pull", "push",
+            ] {
+                assert!(
+                    !calls.iter().any(|call| call.contains(&format!(" {word} "))
+                        || call.ends_with(&format!(" {word}"))),
+                    "{word}: {calls:?}"
+                );
+            }
+        }
+    }
+
+    /// ONE WORKTREE WHOSE ORIGIN CANNOT BE READ STOPS NOTHING: a clean worktree whose
+    /// `ls-remote` fails (an SSH origin with no key loaded, or no network) is left as it is,
+    /// saying why, while the missing repository is still planned and cloned. Negative
+    /// control: the shared read of that worktree does fail, so the scan stood on it before.
+    #[test]
+    fn a_worktree_whose_origin_cannot_be_read_never_stops_a_clone() {
+        for (stderr, offline) in [
+            (
+                "git@github.com: Permission denied (publickey).\nfatal: Could not read from \
+                 remote repository.\n",
+                false,
+            ),
+            (
+                "fatal: unable to access 'https://github.com/alice/present.git/': Could not \
+                 resolve host: github.com\n",
+                true,
+            ),
+        ] {
+            let (sys, who, config) = fixture();
+            let present = Path::new(&who.home).join("present");
+            sys.stat_of(present.to_str().unwrap(), directory(who.uid));
+            script_existing(&sys, &who, &present, "present");
+            script_read(&sys, &who, &present, "present", "");
+            sys.on(
+                &git(&who, Some(&present))
+                    .args(["ls-remote", "--symref", "origin", "HEAD"])
+                    .display(),
+                Ran::exit(128, stderr),
+            );
+            let (_, _, clone_key) = script_clone(&sys, &who, false);
+            sys.on_github_api(
+                &who,
+                &format!("{BASE}&page=1"),
+                page(vec![value("new", 1, true), value("present", 2, true)], None),
+            );
+            let origin = Origin(vec![crate::checkout::Remote::Github {
+                owner: "alice".into(),
+                name: "present".into(),
+            }]);
+            let unread = crate::checkout::read(&sys, &who, &present, &origin).unwrap_err();
+            assert_eq!(unread.offline, offline);
+            let ctx = ctx(std::slice::from_ref(&who));
+            let item = item(&who, &config, Vec::new());
+            match item.probe(&sys, &ctx) {
+                Probe::Change { from, .. } => {
+                    assert!(from.starts_with("1 of 2 repositories missing"), "{from}");
+                }
+                other => panic!("{other:?}"),
+            }
+            let scan = Repositories {
+                user: who.clone(),
+                config: config.clone(),
+                recorded: Vec::new(),
+            }
+            .scan(&sys, &token())
+            .unwrap();
+            assert!(
+                scan.kept().is_some_and(
+                    |kept| kept.starts_with("~/present: ") && kept.contains(&unread.why)
+                ),
+                "{:?}",
+                scan.kept()
+            );
+            item.apply(&sys, &ctx).unwrap();
+            assert_eq!(
+                sys.calls()
+                    .iter()
+                    .filter(|call| **call == clone_key)
+                    .count(),
+                1
+            );
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| !call.contains(" fetch ") && !call.contains(" merge ")),
+                "{:?}",
+                sys.calls()
+            );
+        }
+    }
+
+    /// THE GITHUB ITEM LEAVES `[develop]`'S CHECKOUTS TO THE DEVELOP ITEMS, as init.toml
+    /// records them: `items` hands the table to the repository item, which reads the
+    /// recorded `~/aterm` no further than its identity. Negative control: the same profile
+    /// without `[develop]` reads `~/aterm`'s origin.
+    #[test]
+    fn the_profile_s_develop_checkouts_are_left_to_the_develop_items() {
+        for develop in [true, false] {
+            let (sys, who, _) = fixture();
+            let aterm = Path::new(&who.home).join("aterm");
+            sys.stat_of(aterm.to_str().unwrap(), directory(who.uid));
+            script_existing(&sys, &who, &aterm, "aterm");
+            script_read(&sys, &who, &aterm, "aterm", "");
+            let remote_head = git(&who, Some(&aterm))
+                .args(["ls-remote", "--symref", "origin", "HEAD"])
+                .display();
+            sys.on(
+                &remote_head,
+                Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{A}\tHEAD\n")),
+            );
+            sys.on_github_api(
+                &who,
+                &format!("{BASE}&page=1"),
+                page(vec![value("aterm", 1, true)], None),
+            );
+            let mut profile = "[github]\naccount = \"alice\"\nowner = \"alice\"\ntoken_file = \
+                               \"/unread-credential-source\"\n"
+                .to_owned();
+            if develop {
+                profile.push_str("\n[develop]\ncheckouts = [\"~/aterm\"]\n");
+            }
+            sys.write_user_file(
+                &who,
+                &Path::new(&who.home).join(".config/aterm/init.toml"),
+                profile.as_bytes(),
+                0o600,
+            )
+            .unwrap();
+            let ctx = ctx(std::slice::from_ref(&who));
+            let items = crate::init_github::items(&sys, &ctx).unwrap();
+            let repositories = items
+                .iter()
+                .find(|item| item.id().starts_with("init.github.repositories@"))
+                .unwrap();
+            let probe = repositories.probe(&sys, &ctx);
+            let read = sys.calls().contains(&remote_head);
+            if develop {
+                assert!(
+                    matches!(&probe, Probe::Ok { now } if now.contains("1 recorded in [develop]")),
+                    "{probe:?}"
+                );
+                assert!(!read, "{:?}", sys.calls());
+            } else {
+                assert!(
+                    matches!(&probe, Probe::Ok { now } if !now.contains("[develop]")),
+                    "{probe:?}"
+                );
+                assert!(read, "{:?}", sys.calls());
+            }
+        }
+    }
+
     #[test]
     fn plan_and_check_probe_do_not_clone_or_change_existing_branches_or_files() {
         let (sys, who, config) = fixture();
@@ -971,6 +1412,7 @@ mod tests {
             b"owner changes",
         );
         script_existing(&sys, &who, &existing, "existing");
+        script_read(&sys, &who, &existing, "existing", "?? dirty.txt\0");
         sys.on_github_api(
             &who,
             &format!("{BASE}&page=1"),
@@ -980,7 +1422,7 @@ mod tests {
             ),
         );
         let rows = engine::run(
-            &[item(&who, &config)],
+            &[item(&who, &config, Vec::new())],
             Mode::Plan,
             &sys,
             &ctx(std::slice::from_ref(&who)),
@@ -1030,7 +1472,7 @@ mod tests {
                 page(vec![value("one", 1, true)], None),
             );
             let row = engine::run(
-                &[item(&who, &config)],
+                &[item(&who, &config, Vec::new())],
                 Mode::Apply,
                 &sys,
                 &ctx(std::slice::from_ref(&who)),

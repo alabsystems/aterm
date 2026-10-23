@@ -2,19 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The untyped document model: [`Value`], [`Number`] and [`Map`].
-//!
-//! Roughly half the JSON in this tree is read WITHOUT a model — an LLM
-//! response whose shape is the provider's business, a recording index, a
-//! metrics reply an assertion pokes at — so the untyped half is not an
-//! afterthought. It is deliberately the same shape as `serde_json`'s, down to
-//! the two decisions that are visible in output:
-//!
-//! * [`Map`] is a `BTreeMap`, so an object serializes with its keys in SORTED
-//!   order. That is what `serde_json` does without its `preserve_order`
-//!   feature, and it is why a request body built with [`json!`](crate::json)
-//!   is byte-identical between the two.
-//! * [`Number`] keeps integers as integers. A `u64` that survived the parse
-//!   round-trips exactly; it is not silently widened to `f64` and back.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -77,9 +64,7 @@ impl Number {
         }
     }
 
-    /// The value as `f64`. Always succeeds; integers are widened, which may
-    /// lose precision past 2^53 exactly as it would in any JSON reader that
-    /// only has doubles.
+    /// The value as `f64`, widening integers to floating-point.
     #[inline]
     #[must_use]
     pub const fn as_f64(&self) -> Option<f64> {
@@ -101,8 +86,6 @@ impl From<u64> for Number {
 impl From<i64> for Number {
     #[inline]
     fn from(v: i64) -> Self {
-        // Normalised the way `serde_json` normalises: a non-negative `i64` is
-        // held as unsigned, so `-0` and `0` are the same number.
         if v < 0 {
             Self(N::Signed(v))
         } else {
@@ -139,17 +122,7 @@ impl Value {
         }
     }
 
-    /// Resolve an RFC 6901 JSON Pointer against this value.
-    ///
-    /// `""` is the whole document; otherwise the pointer must start with `/`
-    /// and each `/`-separated token selects an object key or an array index.
-    /// `~1` in a token means `/` and `~0` means `~`, so a key containing a
-    /// slash is still addressable.
-    ///
-    /// An array index must be a plain decimal with no `+` and no leading zero,
-    /// so `/0` is the first element and `/00` resolves to nothing — the same
-    /// rule `serde_json` applies, and the reason a token that is not an index
-    /// cannot accidentally select one.
+    /// Resolves an RFC 6901 JSON Pointer against this value.
     #[must_use]
     pub fn pointer(&self, pointer: &str) -> Option<&Value> {
         if pointer.is_empty() {
@@ -160,8 +133,6 @@ impl Value {
         }
         let mut target = self;
         for raw in pointer.split('/').skip(1) {
-            // Unescape in this order: `~1` first, then `~0`, so a literal `~01`
-            // means `~1` rather than `/`.
             let token = raw.replace("~1", "/").replace("~0", "~");
             target = match target {
                 Self::Object(map) => map.get(&token)?,
@@ -419,7 +390,6 @@ impl<'de> Visitor<'de> for ValueVisitor {
 
     fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut out = Map::new();
-        // Last key wins, which is `serde_json`'s rule and `BTreeMap::insert`'s.
         while let Some((key, value)) = map.next_entry::<String, Value>()? {
             out.insert(key, value);
         }
@@ -437,10 +407,6 @@ fn array_index(token: &str) -> Option<usize> {
 }
 
 /// The immutable `value["key"]` / `value[0]` sugar.
-///
-/// A miss yields `Null` rather than panicking — the same total behaviour
-/// `serde_json` gives its `Index` impl, which is what lets
-/// `value["rows"].is_null()` be a question rather than a crash.
 static NULL: Value = Value::Null;
 
 impl std::ops::Index<&str> for Value {

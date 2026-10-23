@@ -130,7 +130,8 @@ pub struct LeadIdentity {
     pub pid: u32,
     /// Its birth, unix ms: the identity is of this process, not of a later one given the same pid.
     pub birth_ms: i64,
-    /// Its image's basename (data, never an instruction).
+    /// Its image's basename (data, never an instruction), empty for a
+    /// current unreadable identity that replaces an earlier reading.
     pub exe: String,
     /// What its signature vouches for.
     pub voucher: Voucher,
@@ -475,7 +476,7 @@ pub fn name(
                 pid,
                 birth_ms,
                 uid,
-                exe: Some(id.exe.clone()),
+                exe: (!id.exe.is_empty()).then(|| id.exe.clone()),
                 voucher: id.voucher,
                 signing_id: id.signing_id.clone(),
                 team: id.team.clone(),
@@ -500,9 +501,9 @@ pub fn name(
 pub(crate) struct WhyState {
     base: Option<CoalBase>,
     names: HashMap<u64, Named>,
-    /// Each lead identity the host read, by pid and birth: the host sends
-    /// one once, and it is kept while that process is swept (or, on a sweep
-    /// cut at its cap, while it leads a listed coalition).
+    /// Each lead's last identity, by pid and birth, replaced by each host
+    /// reading (including a current unknown). Kept while that process is
+    /// swept, or while it leads a listed coalition on a truncated sweep.
     identities: HashMap<(u32, i64), LeadIdentity>,
     facts: Option<Arc<WhyFacts>>,
     episodes: Episodes,

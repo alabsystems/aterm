@@ -1,38 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `cursor_trail_style` vocabulary: the one table of spellings every host
-//! reads.
-//!
-//! [`TRAIL_STYLES`] lists the canonical styles in the order the Settings
-//! Cursor Styles page lists them, each with the name and the one-line
-//! description Settings shows. [`TRAIL_STYLE_ALIASES`] maps every other
-//! accepted spelling to one of those rows in a single step. [`canonical`]
-//! applies both tables.
-//!
-//! [`GlowStyle::parse`] and the `GlowStyle::style_names_*` predicates
-//! canonicalise through this module first. So the native app, its Settings
-//! picker and validator, and a web page calling `set_cursor_glow` all read a
-//! spelling the same way. The one alias that draws differently from its
-//! canonical is the old `classic mono` face: it resolves to `classic`, and
-//! [`GlowStyle::style_names_classic_mono`] reads the authored spelling to
-//! keep drawing it in the cursor's colour.
+//! Canonical `cursor_trail_style` table and alias resolution.
 
 use super::GlowStyle;
 
 /// One canonical `cursor_trail_style`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrailStyleRow {
-    /// The canonical spelling: what Settings writes, what the picker offers
-    /// and what every alias resolves to. Lower case, single spaces.
+    /// Canonical lower-case spelling saved by Settings and returned by [`canonical`].
     pub name: &'static str,
-    /// The engine style it draws. `None` for `off` alone.
+    /// The engine style it draws, or `None` for `off`.
     pub style: Option<GlowStyle>,
-    /// The name Settings lists it by. Itself a spelling: [`canonical`] reads
-    /// it back to [`Self::name`].
+    /// Display label shown in Settings.
     pub label: &'static str,
-    /// One line saying what the look is, for Settings and accessibility. True
-    /// on a dark and a light ground alike.
+    /// One-line description for Settings and accessibility.
     pub blurb: &'static str,
 }
 
@@ -50,18 +32,8 @@ const fn row_of(
     }
 }
 
-/// Every canonical trail style, in the order the Settings Cursor Styles page
-/// lists them: Off first, then the companions, then the trails. Each group
-/// opens with the owner's top set (the rainbow kitty and its underline; the
-/// phaser, fire, water and lightning); the flat rainbow, the A/B control, and
-/// the classic restoration close their groups. Nothing is hidden.
-///
-/// The rainbow rows are one engine style ([`GlowStyle::RainbowKitty`]). Their
-/// spellings choose only the companion and the ribbon body, through the
-/// `GlowStyle::style_names_*` predicates.
+/// Canonical trail styles in Settings Cursor Styles display order.
 pub const TRAIL_STYLES: &[TrailStyleRow] = &[
-    // `off` turns off the trail and its companion only: the separate typing
-    // momentum glow (`cursor_momentum_glow`) has its own switch.
     row_of("off", None, "Off", "No trail; the cursor stays plain"),
     row_of(
         "rainbow kitty pet",
@@ -87,10 +59,6 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "Flying kitty",
         "The rainbow ribbon; a kitty flies in after a few seconds of steady typing",
     ),
-    // The flat body (2026-09-13): the owner's A/B control against the
-    // default's comet body and its vivid rail
-    // (`docs/design/RAINBOW-KITTY-V2.md` §30), the same ribbon and pet with
-    // the body as it was before.
     row_of(
         "rainbow kitty flat",
         Some(GlowStyle::RainbowKitty),
@@ -115,8 +83,6 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "Water",
         "A rolling blue wave with droplets and a water-drop caret",
     ),
-    // Labelled "Lightning": it draws lightning, not a beam. The saved value
-    // stays `laser`.
     row_of(
         "laser",
         Some(GlowStyle::Laser),
@@ -147,11 +113,6 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "Beam",
         "A steady tube of cool light that powers down",
     ),
-    // The v0.28 trail, restored as an option: a thin four-layer comet under a
-    // soft square bloom, with the long diagonal jump comet the modern
-    // engine's shape gates no longer mint. Last, because it is a
-    // restoration. Its one-colour face is a colour choice, not a style: a
-    // trail colour draws it.
     row_of(
         "classic",
         Some(GlowStyle::Classic),
@@ -160,17 +121,12 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
     ),
 ];
 
-/// Every other accepted spelling, mapped in ONE step to a [`TRAIL_STYLES`]
-/// name. No alias names another alias.
+/// Accepted aliases mapped in one step to a [`TRAIL_STYLES`] canonical name.
 pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("classic wake", "classic"),
-    // Classic in one colour is Classic with a trail colour; the old
-    // spellings still draw it in the cursor's colour
-    // (`GlowStyle::style_names_classic_mono` reads the authored spelling).
     ("classic mono", "classic"),
     ("classic lumen", "classic"),
     ("mono classic", "classic"),
-    // The historical `nyan` / `rainbow` spellings keep the flying head.
     ("nyan rainbow", "rainbow kitty flying"),
     ("nyan", "rainbow kitty flying"),
     ("rainbow", "rainbow kitty flying"),
@@ -179,7 +135,6 @@ pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("kitty", "rainbow kitty pet"),
     ("kitty pet", "rainbow kitty pet"),
     ("pet kitty", "rainbow kitty pet"),
-    // The Cursor Styles list's name for the row.
     ("rainbow dog", "rainbow dog pet"),
     ("dog pet", "rainbow dog pet"),
     ("pet dog", "rainbow dog pet"),
@@ -187,9 +142,6 @@ pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("rainbow underline", "rainbow kitty underline"),
     ("underline rainbow", "rainbow kitty underline"),
     ("nyan underline", "rainbow kitty underline"),
-    // The bare name and the `… tall` spellings draw exactly what the default
-    // draws (the tall body is the default geometry), so they are spellings of
-    // it rather than entries of their own.
     ("rainbow kitty", "rainbow kitty pet"),
     ("rainbow kitty tall", "rainbow kitty pet"),
     ("rainbow tall", "rainbow kitty pet"),
@@ -205,7 +157,6 @@ pub const TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("embers", "fire"),
     ("ocean", "water"),
     ("wave", "water"),
-    // What the laser row draws, and what Settings calls it.
     ("lightning", "laser"),
     ("lightbeam", "beam"),
     ("light-beam", "beam"),
@@ -221,13 +172,10 @@ const fn row_names<const N: usize>() -> [&'static str; N] {
     out
 }
 
-/// Every [`TRAIL_STYLES`] name in table order: the save-time domain of
-/// `cursor_trail_style` and the Settings picker's options.
+/// Canonical [`TRAIL_STYLES`] names in table order.
 pub const TRAIL_STYLE_NAMES: [&str; TRAIL_STYLES.len()] = row_names();
 
-/// The canonical [`TRAIL_STYLES`] name a spelling resolves to (a canonical
-/// name or an alias; trimmed, ASCII case-insensitive), or `None` for a
-/// spelling nothing recognises.
+/// Resolves `raw` (trimmed, ASCII case-insensitive) to its canonical [`TRAIL_STYLES`] name.
 #[inline]
 #[must_use]
 pub fn canonical(raw: &str) -> Option<&'static str> {
@@ -301,7 +249,6 @@ mod tests {
     #[test]
     fn spellings_every_alias_lands_on_a_row_in_one_step() {
         assert_eq!(check_vocabulary(TRAIL_STYLES, TRAIL_STYLE_ALIASES), Ok(()));
-        // Negative controls: a chained alias and a duplicate are both caught.
         let chained = [
             ("kitty", "rainbow kitty"),
             ("rainbow kitty", "rainbow kitty pet"),
@@ -324,14 +271,11 @@ mod tests {
             assert_eq!(canonical(alias), Some(target), "{alias:?}");
             assert_eq!(canonical(target), Some(target), "{target:?} is canonical");
         }
-        // The Cursor Styles list's own names resolve to their rows.
         assert_eq!(canonical("Rainbow dog"), Some("rainbow dog pet"));
         assert_eq!(canonical("lightning"), Some("laser"));
         for row in TRAIL_STYLES {
             assert_eq!(canonical(row.label), Some(row.name), "{:?}", row.label);
         }
-        // The retired spellings (the seam-era `v2` word, the release names of
-        // the classic wake, Trail Packs) are unknown words.
         for unknown in [
             "",
             "plasma",

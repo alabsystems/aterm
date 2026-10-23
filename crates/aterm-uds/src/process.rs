@@ -3,6 +3,45 @@
 
 //! Process facts from the kernel.
 
+/// What a process-existence query established, independently of readable identity data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessPresence {
+    /// The pid exists, including when access to it is refused.
+    Present,
+    /// The kernel positively reported that no process has this pid.
+    Absent,
+    /// The query failed or this platform has no reader.
+    Unknown,
+}
+
+/// Query one positive pid without delivering a signal. Only `ESRCH` proves absence.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn process_presence(pid: i32) -> ProcessPresence {
+    if pid <= 0 {
+        return ProcessPresence::Unknown;
+    }
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // SAFETY: a positive pid addresses one process; signal zero only queries existence.
+        if unsafe { kill(pid, 0) } == 0 {
+            return ProcessPresence::Present;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => ProcessPresence::Present,
+            Some(libc::ESRCH) => ProcessPresence::Absent,
+            _ => ProcessPresence::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        ProcessPresence::Unknown
+    }
+}
+
 /// Whether `pid` names a live process.
 #[must_use]
 #[cfg(unix)]
@@ -58,18 +97,19 @@ pub struct ProcessBirth {
 
 /// Who a process is, re-read before every pid-addressed signal
 /// (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4): a pid wraps in about ten minutes
-/// (M14), so a token names the pid, its birth and its pid version, and a signal refuses the
-/// moment any of the three has moved. The token's wire form is
+/// (M14), so a token names the pid, its birth and its pid version; an observed mismatch
+/// refuses the next signal. The token's wire form is
 /// `<pid>@<birth_us>:<idversion>` (design §11 Q5); its reader is [`read_identity`], its
-/// enforcer [`end_proven`].
+/// enforcer [`end_proven`]. The final identity read and pid-addressed signal are separate
+/// kernel calls: an exec or pid reuse after that read cannot be excluded by this token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The pid.
     pub pid: i32,
     /// Its birth, which tells it from the next process given the same number.
     pub birth: ProcessBirth,
-    /// Its pid version, which moves at each exec (M22), so a signal reaches the program the
-    /// token was proven about and not another the pid has since exec'd. `0` on a platform with
+    /// Its pid version, which moves at each exec (M22), detecting changes observed before a
+    /// signal. `0` on a platform with
     /// no version (Linux, where the token is `<pid>@<start_ticks>`: the leftover design's
     /// slice 7).
     pub idversion: i32,
@@ -110,8 +150,9 @@ pub struct Ended {
     pub termed: bool,
     /// A `SIGKILL` was sent (the process outlived the grace).
     pub killed: bool,
-    /// The process was gone by the time this returned: its pid read nothing, or a process of
-    /// another birth. One that exec'd another program is still there, and not gone.
+    /// Identity reads no longer named the process: no identity, or another birth. A failed
+    /// identity read also yields no identity; callers requiring confirmed absence must query
+    /// [`process_presence`]. An exec under the same birth is not gone.
     pub gone: bool,
 }
 
@@ -120,7 +161,7 @@ pub struct Ended {
 /// changes between the judgment and the signal, the negative control the `EndByProof` model
 /// names, so no signal goes out.
 pub trait EndControl {
-    /// `pid`'s identity now, or `None` when it names no live process of this uid.
+    /// `pid`'s identity now, or `None` when gone, unreadable, or not of this uid.
     fn identity(&mut self, pid: i32) -> Option<Identity>;
     /// Send `sig` to `pid` (never a group; [`end_proven`] signals by pid alone).
     ///
@@ -149,9 +190,10 @@ const END_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// and `SIGKILL` by pid, and a poll within `grace` again. A read that moved ends the sequence
 /// with nothing more sent, and a lost tier leaves the process unkilled for the caller to name.
 ///
-/// Gone is a read's to say, never a signal's error's: the pid reads nothing, or a process of
-/// another birth holds the number. A read of the same birth under another pid version is the
-/// same process running another program, which is not gone. Never `killpg`, never a bare pid
+/// `gone` describes identity reads, not confirmed absence: a missing read may have failed,
+/// while a known different birth establishes that the original process left. A read of the
+/// same birth under another pid version is the same process running another program. Never
+/// `killpg`, never a bare pid
 /// acted on without this re-read. The actor that calls it owns the whole sequence; nothing
 /// waits for a later reading. `grace` is a bound, not a wait, so a caller may pass a shorter
 /// one; a test passes [`std::time::Duration::ZERO`] to reach the `SIGKILL` with no real wait.
@@ -159,6 +201,7 @@ const END_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// It is the `EndByProof` machine's one implementation (`crates/aterm-models-misc`, bound by
 /// `crates/aterm-verify/tests/conformance_end_by_proof.rs`): every signal follows its own
 /// judgment that held, and none follows a read whose identity moved or a tier that was lost.
+/// This is an ordering of observed reads, not an atomic identity-conditioned kernel signal.
 ///
 /// # Errors
 /// [`EndRefusal`]: stale or not proven before the `SIGTERM`, or a `SIGTERM` the kernel refused
@@ -731,7 +774,7 @@ pub fn translator() -> Option<String> {
 /// See the Linux twin: no test depends on a translator here.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
-pub fn translator() -> Option<String> {
+pub const fn translator() -> Option<String> {
     None
 }
 

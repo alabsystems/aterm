@@ -2,21 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The holder fence's sub-projection of a
-//! [`TerminalCheckpoint`](super::TerminalCheckpoint): the
-//! [`HolderFence`](super::HolderFence) and the main grid's span anchors, beside
-//! the command marks they share the absolute row numbering with.
-//!
-//! These ride the keyframes the crash journal and the seamless rungs restore
-//! from; no tail record carries them (an older reader stops at an unknown
-//! kind). A replay does not observe holder cuts; output before host adoption
-//! taints its carried current mark and disables the old command-start seed,
-//! including across an intermediate checkpoint.
-//!
-//! A restore installs the fence only whole: a repr whose spans do not name
-//! the anchors it carries, or that breaks a bound, installs as no fence at
-//! all, so a forged or damaged carry can only leave a card bare.
-
 use aterm_grid::{Anchor, AnchorId, AnchorRole, AnchorSet, MAX_ANCHORS};
 
 use super::Terminal;
@@ -85,9 +70,7 @@ pub struct HolderMarkRepr {
     pub suspended_at: u64,
 }
 
-/// The holder fence and the main grid's anchors. `Default` (no mark, no
-/// anchor and no seed uncertainty) is a session in which no drawer ran; the
-/// wire omits it. An otherwise empty uncertain carry keeps its one bit.
+/// The holder fence and the main grid's anchors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HolderRepr {
@@ -112,9 +95,7 @@ pub struct HolderRepr {
     /// The anchor set's seal epoch.
     #[cfg_attr(feature = "serde", serde(default))]
     pub seal_epoch: u64,
-    /// Output arrived while a restored fence awaited host adoption. The
-    /// carried command's C cannot seed a range in this restored lineage.
-    /// Older checkpoints omit it; older readers ignore this new qualification.
+    /// Output arrived while a restored fence awaited host adoption.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "core::ops::Not::not")
@@ -134,8 +115,6 @@ impl HolderRepr {
     /// the checkpoint carries) clamped to it, as the restored grid will hold
     /// it.
     fn capture(fence: &HolderFence, anchors: &AnchorSet, floor: u64) -> Self {
-        // No mark, anchor or seed uncertainty: nothing a restore needs (the
-        // clock orders only marks, the seal epoch only seals).
         if fence.is_empty() && anchors.is_empty() && !fence.seed_untrusted {
             return Self::default();
         }
@@ -253,7 +232,6 @@ impl HolderRepr {
                 suspended_at: m.suspended_at,
             });
         }
-        // Every live anchor bounds exactly one span.
         if slots.iter().zip(&held).any(|(a, &h)| a.live != h) {
             return None;
         }
@@ -282,9 +260,6 @@ impl Terminal {
             .holder_carried_at
             .is_some_and(|at| at != self.transient.screen_mutations)
         {
-            // A recovery reader may checkpoint its replay before the actual
-            // host adopts it. Do not re-arm that stale current mark as an
-            // untouched carry at the next restore. Suspended marks stay put.
             repr.seed_untrusted = true;
             if let Some(mark) = repr
                 .current
@@ -307,7 +282,6 @@ impl Terminal {
         let (mut fence, anchors) = match repr.install() {
             Some(pair) => pair,
             None => {
-                // A structurally invalid fence is not seed authority either.
                 let fence = HolderFence {
                     seed_untrusted: true,
                     ..HolderFence::default()
@@ -316,8 +290,6 @@ impl Terminal {
             }
         };
         fence.seed_untrusted |= repr.seed_untrusted;
-        // Track a restore even when a predecessor carried no mark: its old
-        // signed C must not become a seed after an unobserved replay tail.
         self.holder_carried_at = Some(self.transient.screen_mutations);
         let (slot, main) = self.fence_and_main_grid();
         *slot = fence;

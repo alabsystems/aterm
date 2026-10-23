@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The IOKit and CoreFoundation calls the macOS arm makes to read the
-//! IORegistry: the GPU's `PerformanceStatistics` (`IOAccelerator`) and the
-//! device tree's CPU nodes (`IODeviceTree:/cpus`). Registry reads only: no
-//! user client is opened, nothing reaches WindowServer.
-//!
-//! DECLARATIONS ONLY, under Apple's names, in the grammar of the shared SDK
-//! probe (`crates/aterm-objc/tests/support/sdk_decls.rs`): `tests/iokit_sdk.rs`
-//! reads this file as source and has clang hold every alias, constant and
-//! prototype to `IOKit/IOKitLib.h` and the CoreFoundation headers, for `arm64`
-//! and `x86_64`. The readers that call them live in `macos.rs`.
-//!
-//! Tiny-FFI posture, like `aterm-gui`'s `hid_idle`: both are system
-//! frameworks every aterm process already loads, so no crate joins the
-//! dependency surface. Each opaque `…Ref` points at its own zero-sized type,
-//! so a `CFDataRef` does not pass where a `CFStringRef` is wanted.
+//! IOKit and CoreFoundation declarations for reading macOS GPU and CPU IORegistry entries.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -62,9 +48,7 @@ pub const kCFStringEncodingUTF8: CFStringEncoding = 0x0800_0100;
 /// `CFNumber.h`: every number is read out as a 64-bit signed integer.
 pub const kCFNumberSInt64Type: CFNumberType = 4;
 
-/// `IOKitLib.h`: `MACH_PORT_NULL` names the default main port
-/// (`kIOMainPortDefault`, which is itself a variable that macOS 11, the arm64
-/// floor, does not export).
+/// Default main port (`MACH_PORT_NULL`, replacing `kIOMainPortDefault` on macOS 11).
 pub(crate) const MAIN_PORT_DEFAULT: mach_port_t = 0;
 
 #[link(name = "IOKit", kind = "framework")]

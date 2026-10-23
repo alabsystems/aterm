@@ -42,7 +42,15 @@ pub struct CursorFx {
     pub phaser: CursorPhaser,
     /// The additive light this tick produced — the aurora first, then every body's halo appended in tick order.
     pub glow_scratch: Vec<GlowQuad>,
-    /// The comet cells this tick produced, already projected through the load-shed envelope × the bed brightness ([`CursorFxInput::trail_brightness`]) × the bed's legibility share ([`bed_legible_share`]).
+    /// Test-only: lay the momentum halo as round 2 laid it, the negative
+    /// control of its colour's tests: a fire's left the momentum ramp's grey
+    /// on a dark page, sparkle's on paper its caret's colour.
+    #[cfg(test)]
+    pub(crate) momentum_unwarmed: bool,
+    /// The comet cells this tick produced, already projected through the
+    /// load-shed envelope × the bed brightness
+    /// ([`CursorFxInput::trail_brightness`]) × the bed's legibility share
+    /// ([`bed_legible_share`]).
     pub trail_scratch: Vec<TrailCell>,
 }
 
@@ -1024,6 +1032,10 @@ impl CursorFx {
             rainbow_owns_caret,
         );
         let momentum_from = self.glow_scratch.len();
+        #[cfg(test)]
+        let warm = !self.momentum_unwarmed;
+        #[cfg(not(test))]
+        let warm = true;
         let momentum_frame = self.momentum.tick(
             cur,
             now,
@@ -1035,10 +1047,17 @@ impl CursorFx {
                 radius_cells: MOMENTUM_GLOW_RADIUS_CELLS,
                 base: f.live_cursor,
                 dark_theme: dark,
-                hue: if glow_cfg.enabled {
-                    rod_color
-                } else {
+                // On a light page the glow is the style's own hue, the one
+                // its caret wears (sparkle's, the paper gold its body lays,
+                // not its caret's brown, which walked toward the paper read
+                // as a caramel smear round the caret); with no trail drawn
+                // (`off`), the caret's own colour.
+                hue: if !glow_cfg.enabled {
                     f.live_cursor & 0x00FF_FFFF
+                } else if warm && matches!(glow_cfg.style, GlowStyle::Sparkle) && !dark {
+                    crate::cursor_glow::CursorGlow::sparkle_paper_gold_at(glow_cfg, 1.0)
+                } else {
+                    rod_color
                 },
                 theme_fg: glow_cfg.theme_fg,
                 theme_bg: glow_cfg.theme_bg,
@@ -1053,6 +1072,28 @@ impl CursorFx {
             self.glow.under_sink(),
         );
         let momentum_to = self.glow_scratch.len();
+        // A fire's halo on a dark page is the forge's warm light, not the
+        // momentum ramp's white-hot grey.
+        if warm && dark && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire)
+        {
+            crate::cursor_momentum::warm_halo(
+                &mut self.glow_scratch[momentum_from..momentum_to],
+                rod_color,
+                crate::cursor_momentum::MOMENTUM_FIRE_WARMTH,
+            );
+        }
+        // On a dark page the glow lights the caret's line and the page round
+        // it, never the prompt's bar or the line above as a band of fog.
+        let held_print = if dark {
+            self.glow.hold_off_neighbour_ink(
+                &mut self.glow_scratch[momentum_from..momentum_to],
+                cur,
+                geom,
+                glow_cfg.theme_bg,
+            )
+        } else {
+            0
+        };
         let momentum_steady = momentum_frame
             .hot
             .then_some(match f.cursor_style {
@@ -1062,7 +1103,10 @@ impl CursorFx {
                 other => other,
             })
             .filter(|s| *s != f.cursor_style);
-        let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53);
+        let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53) ^ held_print.rotate_left(31);
+        // Comet nucleus cursor (the `comet` body), riding the aurora's blaze in
+        // the frame's resolved glow colours: its coma is light on a dark
+        // ground and ink under the letters on a light one.
         let blaze = self.glow.blaze();
         let body_from = self.glow_scratch.len();
         let comet_frame = self.comet.tick(

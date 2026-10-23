@@ -315,6 +315,31 @@ fn claude_code_half_frame_is_the_fl8_shape() {
     assert!(r[rule + 1].contains("esc to interrupt"), "{}", dump(&t));
 }
 
+/// An update park holds the hang detector, as it holds the idle clocks: the frame's close may be
+/// waiting unread, so the detector neither fires nor names a deadline until `watch_expire`.
+#[test]
+fn an_update_park_holds_the_hang_detector() {
+    let base = minted_now();
+    let mut t = before(&CLAUDE, base);
+    t.process_at(CLAUDE.half, clock(base, 2_000));
+    let frame = t
+        .watch(WatcherSpec::FrameWhole, at(base, 2_500))
+        .expect("arm");
+    let hang = at(base, 2_000) + FRAME_HANG;
+    assert_eq!(t.watch_next_deadline(), Some(hang), "NEGATIVE CONTROL");
+    let parked = hang + Duration::from_secs(5);
+    t.watch_restart_idle(parked);
+    assert_eq!(
+        t.watch_next_deadline(),
+        None,
+        "a detector gone by while parked is no deadline"
+    );
+    assert!(t.watch_poll(frame).is_none(), "nor is the frame read");
+    assert!(t.watch_expire(parked), "the first look that reads fires it");
+    assert!(t.watch_poll(frame).is_some());
+    assert_eq!(t.watch_next_deadline(), None, "and nothing is owed after");
+}
+
 /// The hang detector: a program that opens a frame, writes into it and never closes it holds
 /// a whole-frame wait FRAME_HANG past its first write, then the frame is read as it stands.
 #[test]

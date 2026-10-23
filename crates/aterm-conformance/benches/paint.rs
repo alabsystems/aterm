@@ -2,14 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The release binary's paint acceptance matrix, run explicitly by `verify measure`.
-//!
-//! Every row boots the handed release `aterm` headless, stages its scene,
-//! types real keys, captures the take and judges its pixels. The matrix runs
-//! sequentially, once per row; an instrument refusal is never a pass.
-//! `ATERM_PAINT_BIN` names the bundle's `Contents/MacOS/aterm`;
-//! `ATERM_PAINT_KEEP=1` keeps each scratch world for diagnostic inspection.
-//! Run verdict-bearing sweeps on a quiet machine. Capture perturbations are
-//! documented in `aterm_conformance::measure::paint_probe`.
 
 #[cfg(unix)]
 mod support;
@@ -55,15 +47,10 @@ mod measuring {
     }
 
     const ROWS: &[(&str, PaintRow)] = &[
-        // Row 1: a human typing at a main-screen `/bin/sh` prompt leaves trail ink.
         (
             "main_screen_prompt_typing_paints_trail_ink",
             trail(Scene::Prompt, MATURE_RUN, Expect::Ink, Capture::PinnedVideo),
         ),
-        // Row 1's matched control: the same prompt, focus and recording with the
-        // off style keeps real cursor and echo pixels and no ribbon witness, so
-        // row 1 cannot pass on cursor motion or echoed text. The static window's
-        // frame gaps are read against the recorder's tick ledger.
         (
             "main_screen_prompt_with_effect_off_has_no_ribbon",
             PaintRow {
@@ -76,7 +63,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 2: typing into the fake-Claude alt-screen scene leaves trail ink.
         (
             "alt_screen_fake_claude_typing_paints_trail_ink",
             trail(
@@ -86,9 +72,6 @@ mod measuring {
                 Capture::PinnedVideo,
             ),
         ),
-        // Row 3, the dark control: an alt-screen spinner repainting on its own
-        // with nothing typed earns no trail, which makes the other rows
-        // falsifiable.
         (
             "alt_screen_cold_spinner_paints_zero_ink",
             trail(
@@ -98,9 +81,6 @@ mod measuring {
                 Capture::PinnedVideo,
             ),
         ),
-        // Row 4: typing beside an ESC7/ESC8 token streamer (unowned batches away
-        // from the caret) leaves trail ink, continuity judged in wall-clock time
-        // inside the driven window.
         (
             "alt_screen_esc7_esc8_streamer_typing_paints_trail_ink",
             trail(
@@ -110,9 +90,6 @@ mod measuring {
                 Capture::PinnedVideo,
             ),
         ),
-        // Row 5, the row that can go red on the motion gate: an unfocused window
-        // typed into, captured unpinned. Hue spread is the witness: without the
-        // typed-wake term the trail collapses to one bucket.
         (
             "unfocused_typed_window_paints_its_trail_under_an_unpinned_capture",
             trail(
@@ -122,7 +99,6 @@ mod measuring {
                 Capture::UnpinnedUnfocused,
             ),
         ),
-        // Row 5's effect-off twin on the same path.
         (
             "unfocused_typed_window_with_effect_off_has_no_ribbon",
             PaintRow {
@@ -135,9 +111,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 6, row 5's control: the same window and capture with nothing typed
-        // is not scored as ink. `Quiet`, not `Dark`: a capture inside the
-        // client's bracket sees one hidden-caret cell differ.
         (
             "unfocused_idle_window_paints_nothing_under_an_unpinned_capture",
             trail(
@@ -147,8 +120,6 @@ mod measuring {
                 Capture::UnpinnedUnfocused,
             ),
         ),
-        // Row 6a: focused, unrecorded, typing into a TUI that repaints on its
-        // own: the configuration users are actually in.
         (
             "focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin",
             trail(
@@ -158,7 +129,6 @@ mod measuring {
                 Capture::UnpinnedFocused,
             ),
         ),
-        // Row 6a's effect-off twin.
         (
             "focused_typed_window_with_effect_off_has_no_ribbon",
             PaintRow {
@@ -171,8 +141,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 6b: the same beside a token streamer; carries the ribbon bind (a
-        // driven mature claim held against the raster over at least two frames).
         (
             "focused_streamer_typing_paints_trail_ink_without_a_recording_pin",
             trail(
@@ -182,7 +150,6 @@ mod measuring {
                 Capture::UnpinnedFocused,
             ),
         ),
-        // Row 6c, the dark control for 6a/6b.
         (
             "focused_cold_spinner_paints_zero_ink_without_a_recording_pin",
             trail(
@@ -192,9 +159,6 @@ mod measuring {
                 Capture::UnpinnedFocused,
             ),
         ),
-        // Row 7, the shipped default: the resident pet is whole in the first
-        // still, present in every paired frame, and rides a rainbow while a word
-        // is typed.
         (
             "shipped_default_first_still_and_typing_carry_the_resident_pet",
             PaintRow {
@@ -203,8 +167,6 @@ mod measuring {
                 ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
             },
         ),
-        // The explicit underline spelling resolves to the rainbow engine through
-        // the shipped config loader, reports underline geometry, and paints.
         (
             "explicit_underline_spelling_paints_an_underline_ribbon",
             PaintRow {
@@ -217,8 +179,6 @@ mod measuring {
                 )
             },
         ),
-        // The explicit `rainbow kitty tall` spelling is inside the validator's
-        // domain: it resolves and paints.
         (
             "explicit_tall_short_word_paints_four_hues",
             PaintRow {
@@ -226,7 +186,6 @@ mod measuring {
                 ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
             },
         ),
-        // The tall row's exact off twin.
         (
             "explicit_tall_short_word_control_has_no_ribbon_when_effect_is_off",
             PaintRow {
@@ -239,8 +198,6 @@ mod measuring {
                 )
             },
         ),
-        // The absolute-zero control: a companion-free style, cold output, and
-        // literally no ink in any frame.
         (
             "cold_output_paints_literally_nothing_for_a_companion_free_style",
             trail(
@@ -250,9 +207,6 @@ mod measuring {
                 Capture::UnpinnedFocused,
             ),
         ),
-        // Row 8: a sustained run earns the flying head, which must be claimed
-        // four times and drawn whole in the three isolated final stills, with no
-        // resident claimed.
         (
             "flying_style_sustained_typing_earns_and_paints_the_flying_kitty",
             PaintRow {
@@ -265,9 +219,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 9: a cold stream walking a shown caret with nothing typed, the shape
-        // only the keyboard licence keeps dark. The caret is verified visible and
-        // moving first.
         (
             "alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink",
             trail(
@@ -277,8 +228,6 @@ mod measuring {
                 Capture::PinnedVideo,
             ),
         ),
-        // Row 10: the `"rainbow kitty"` line carries the resident pet, not the
-        // flying head.
         (
             "the_owners_rainbow_kitty_spelling_carries_the_resident_pet",
             PaintRow {
@@ -287,8 +236,6 @@ mod measuring {
                 ..trail(Scene::Prompt, WORD, Expect::Ink, Capture::UnpinnedFocused)
             },
         ),
-        // Row 11: one companion body per frame on the `"rainbow kitty"` line, over
-        // a run long enough for both companions to be active at once.
         (
             "the_owners_spelling_never_draws_two_companions_in_one_frame",
             PaintRow {
@@ -302,8 +249,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 12: a split window being typed into paints through the composed
-        // path in the new focused pane.
         (
             "split_window_typing_paints_the_rainbow_body_in_the_focused_pane",
             PaintRow {
@@ -316,8 +261,6 @@ mod measuring {
                 )
             },
         ),
-        // Row 12's off twin: the divider, the second pane and the echo are no
-        // ribbon.
         (
             "split_window_typing_with_effect_off_has_no_ribbon",
             PaintRow {

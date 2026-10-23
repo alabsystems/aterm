@@ -1,34 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Presence with meaning: the fields the bridge writes on every hosted session's presence
-//! row beside `attention=`, so a manager reads what a session is doing off the bus:
-//!
-//! ```text
-//! role=<meta role> detail=<the running program, as `ls` prints it>
-//! phase=<busy|idle|prompt|question|survey|unknown|wall:<kind>> title=<the user title>
-//! ```
-//!
-//! `phase=` is the server's agent verdict (`status agent=` and the `EVENT <local> agent <word>`
-//! push), relayed as one word: the fabric reads no screen itself, and vendor screen knowledge
-//! stays in the server. `role=` and `attention=` are the session's `meta`; `detail=` is the
-//! sanitized running command `status`/`sessions` report (`claude`, `targo test`, `-` at a
-//! prompt). The server publishes no context figure, so a row carries no `context=`.
-//!
-//! The fabric reads no screen itself: vendor screen knowledge stays in the
-//! server (the harness audit's law 3). The server publishes no context figure,
-//! so a row carries no `context=` (`aterm link ls` prints `-` for it).
-//!
-//! Rules:
-//!
-//! ## The three rules, and where each is enforced
-//!
-//! Every value is clamped to its own cap on an escape boundary (`clamp_pct`).
-
 use std::time::{Duration, Instant};
 
-/// The least time between two presence records for one session that differ only in these
-/// fields. A change inside the window is carried by the next roster round (2 s).
+/// Minimum time between two presence records for one session.
 pub const REPUBLISH_MIN: Duration = Duration::from_secs(2);
 
 /// [`REPUBLISH_MIN`] at test pace: a quarter, as the round it is matched to
@@ -54,21 +29,16 @@ pub const ROLE_CAP: usize = 64;
 pub const DETAIL_CAP: usize = 128;
 /// The byte cap on `title=`.
 pub const TITLE_CAP: usize = 128;
-/// The byte cap on `attention=`: aterm's own (§4.1) and glance's, one number.
+/// The byte cap on `attention=`.
 pub const ATTENTION_CAP: usize = crate::glance::ATTENTION_CAP;
 
-/// The words `phase=` can carry beside a wall: the server's `agent=` vocabulary. `unknown` is
-/// an identified agent whose screen its reader cannot vouch for (never "idle"); a wall is
-/// `wall:<kind>` ([`is_wall`]).
+/// The words `phase=` can carry beside a wall.
 pub const PHASES: [&str; 6] = ["busy", "idle", "prompt", "question", "survey", "unknown"];
 
-/// The word an older server sends for an agent at a limit; carried so a bridge newer than its
-/// instance loses nothing.
+/// Legacy `phase=` words from older servers.
 pub const LEGACY_PHASES: [&str; 1] = ["limited"];
 
-/// `wall:<kind>` with `<kind>` of 1..=32 bytes of `[a-z0-9_-]`, the shape the server's
-/// `await agent` admits (aterm-gui `control_session`): a kind a newer reader names is carried,
-/// and text riding on it is not.
+/// Returns true if `word` is `wall:<kind>` with `<kind>` of 1..=32 bytes of `[a-z0-9_-]`.
 #[must_use]
 pub fn is_wall(word: &str) -> bool {
     word.strip_prefix("wall:").is_some_and(|k| {
@@ -78,13 +48,13 @@ pub fn is_wall(word: &str) -> bool {
     })
 }
 
-/// The value an absent field renders as — the same dash every reader prints.
+/// The value an absent field renders as.
 pub const ABSENT: &str = "-";
 
-/// `[fabric] presence` / `--presence`: what a session's row carries.
+/// What a session's presence row carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// The default: `role= detail= phase= title=` beside `attention=`.
+    /// `role= detail= phase= title=` beside `attention=`.
     #[default]
     Meta,
     /// `attention=` alone.
@@ -92,7 +62,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The spelling in the config and on the command line.
+    /// Parse a presence mode from config or CLI.
     #[must_use]
     pub fn parse(s: &str) -> Option<Mode> {
         match s.trim() {
@@ -104,7 +74,7 @@ impl Mode {
 
     /// The word for the config and the report.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Mode::Meta => "meta",
             Mode::Minimal => "minimal",
@@ -112,8 +82,7 @@ impl Mode {
     }
 }
 
-/// The meaning fields of one session, each a bounded pct-encoded token or
-/// [`ABSENT`].
+/// The meaning fields of one session, each a bounded pct-encoded token or [`ABSENT`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fields {
     /// `meta attention=`.
@@ -122,11 +91,9 @@ pub struct Fields {
     pub role: String,
     /// The running program, as `ls` prints it.
     pub detail: String,
-    /// `meta user_title=` when the owner set one, else [`ABSENT`]; never the
-    /// terminal's title (module doc).
+    /// `meta user_title=` when set, else [`ABSENT`].
     pub title: String,
-    /// One of [`PHASES`], a wall or a [`LEGACY_PHASES`] word ([`Fields::set_agent`]), or
-    /// [`ABSENT`] when the server names no agent verdict for the session.
+    /// The session's agent phase word, or [`ABSENT`].
     pub phase: String,
 }
 
@@ -143,26 +110,21 @@ impl Default for Fields {
 }
 
 impl Fields {
-    /// Take `attention=`, `role=` and the title off a `meta` reply's header
-    /// (`OK title= user_title= description= icon= role= attention= cwd=
-    /// state=`, every value pct-encoded, `-` unset).
+    /// Populate `attention`, `role`, and `title` from a `meta` reply header.
     pub fn read_meta(&mut self, header: &str) {
         let kv = |key: &str| crate::fabric::kv(header, key);
         self.attention = token(kv("attention").unwrap_or(ABSENT), ATTENTION_CAP);
         self.role = token(kv("role").unwrap_or(ABSENT), ROLE_CAP);
-        // The user's title only, never the terminal title (module doc).
         let user = kv("user_title").filter(|v| *v != ABSENT && !v.is_empty());
         self.title = token(user.unwrap_or(ABSENT), TITLE_CAP);
     }
 
-    /// Take `detail=` as `status`/`sessions` report it (already pct-encoded).
+    /// Take `detail=` as `status`/`sessions` report it.
     pub fn set_detail(&mut self, raw: Option<&str>) {
         self.detail = token(raw.unwrap_or(ABSENT), DETAIL_CAP);
     }
 
-    /// Take `phase=` from the server's agent verdict (`status agent=`, or the word of an
-    /// `EVENT <local> agent <word> …` push). Only one of [`PHASES`], a `wall:<kind>`
-    /// ([`is_wall`]) or [`LEGACY_PHASES`] is carried; anything else reads [`ABSENT`].
+    /// Take `phase=` from the server's agent verdict.
     pub fn set_agent(&mut self, word: Option<&str>) {
         self.phase = word
             .filter(|w| PHASES.contains(w) || LEGACY_PHASES.contains(w) || is_wall(w))
@@ -170,8 +132,7 @@ impl Fields {
             .to_string();
     }
 
-    /// The tokens for the presence body, each led by a space, in the order
-    /// the readers print them. `minimal` writes `attention=` alone.
+    /// Format the tokens for the presence body in `mode`.
     #[must_use]
     pub fn tokens(&self, mode: Mode) -> String {
         let mut out = format!(" attention={}", self.attention);
@@ -186,9 +147,7 @@ impl Fields {
     }
 }
 
-/// One presence token: printable ASCII only, at most `cap` bytes, cut on a `%XX` boundary
-/// (`clamp_pct`), [`ABSENT`] when nothing is left. Whether the input is aterm's pct-encoded
-/// reply or a stranger's bytes, what leaves is one whitespace-free token of graphic ASCII.
+/// Clamp `raw` to printable ASCII on a `%XX` boundary, or [`ABSENT`] if empty.
 #[must_use]
 pub fn token(raw: &str, cap: usize) -> String {
     let out = clamp_pct(raw, cap);
@@ -219,15 +178,12 @@ pub(crate) fn clamp_pct(raw: &str, cap: usize) -> String {
     out
 }
 
-/// What the bridge remembers per hosted session: the fields as last read or
-/// pushed, and the row on the bus.
+/// Per-session presence state remembered by the bridge.
 #[derive(Debug, Clone, Default)]
 pub struct Slot {
     /// The fields as last sampled.
     pub fields: Fields,
-    /// Whether `meta` has been read into `fields`: a slot the round's `status` created holds
-    /// only `detail=` and `phase=`, and no row is published off it. Cleared on a `GAP` (a
-    /// `meta` push may have been coalesced away), so the next round re-reads.
+    /// Whether `meta` has been read into `fields`.
     pub sampled: bool,
     /// The tokens on the bus ([`Fields::tokens`] in the mode the row was published in) and
     /// when. Tokens, not fields: a row is owed only when the row would differ.
@@ -247,22 +203,20 @@ pub enum Due {
     Changed,
     /// The fields are what the bus already says.
     Unchanged,
-    /// The fields moved, but the row on the bus is younger than
-    /// [`REPUBLISH_MIN`]; the next round carries the change.
+    /// The fields moved inside the [`REPUBLISH_MIN`] window.
     Capped,
 }
 
 impl Due {
     /// Whether a publish is owed now.
     #[must_use]
-    pub fn now(self) -> bool {
+    pub const fn now(self) -> bool {
         matches!(self, Due::First | Due::Changed)
     }
 }
 
 impl Slot {
-    /// Whether the fields owe a record now, as a row in `mode` — see
-    /// [`Due`]. A field `mode` does not write cannot make a row due.
+    /// Whether the fields owe a record now in `mode`.
     #[must_use]
     pub fn due(&self, mode: Mode, now: Instant) -> Due {
         match &self.published {
@@ -279,12 +233,6 @@ impl Slot {
     /// ([`Slot::landed`], [`Slot::unmark`]). The one way a row is recorded:
     /// there is no "it landed" without the send before it, so a refusal always
     /// has a row that did land to fall back to.
-    ///
-    /// Marked at the send, not the answer, so the [`REPUBLISH_MIN`] window
-    /// counts from when the row left, exactly as it counted from a blocking
-    /// publish's answer a round trip later; marked at the answer instead, a
-    /// field that moved again in between would read the row as not yet on the
-    /// bus and send a second one inside the window.
     pub(crate) fn mark_published(&mut self, mode: Mode, now: Instant) -> Marked {
         let sent = (self.fields.tokens(mode), now);
         self.published = Some(sent.clone());
@@ -331,8 +279,6 @@ mod tests {
             assert_eq!(f.phase, word);
             assert!(f.tokens(Mode::Meta).contains(&format!(" phase={word} ")));
         }
-        // Negative controls: the absence spellings, a future word, text riding on a word,
-        // and screen text all read `-`.
         for other in [
             None,
             Some("-"),
@@ -391,8 +337,6 @@ mod tests {
         );
         assert_eq!(f.role, ABSENT);
         assert_eq!(f.attention, ABSENT);
-        // A program title carrying a secret, no user title: not one byte of
-        // it is published, in either mode.
         f.read_meta("OK title=Rotating%20the%20sk-live-OSCSECRET42%20key%20for%20acme user_title=- description=- icon=- role=- attention=- cwd=- state=alive");
         assert_eq!(f.title, ABSENT);
         for mode in [Mode::Meta, Mode::Minimal] {
@@ -402,12 +346,9 @@ mod tests {
         f.read_meta("OK title=x user_title=worker%3Aclaude-satcomp description=- icon=- role=worker attention=- cwd=- state=alive");
         assert_eq!(f.title, "worker%3Aclaude-satcomp");
         assert_eq!(f.role, "worker");
-        // A user title that is cleared again clears the field: nothing falls
-        // back to the program's.
         f.read_meta("OK title=Rotating%20the%20key user_title=- description=- icon=- role=worker attention=- cwd=- state=alive");
         assert_eq!(f.title, ABSENT);
 
-        // Each field at its cap, never cut inside `%XX`.
         let long = "%C3%A9".repeat(400);
         f.read_meta(&format!(
             "OK title=- user_title={long} description=- icon=- role={} attention={} cwd=- state=alive",
@@ -420,8 +361,6 @@ mod tests {
         assert_eq!(f.attention.len(), ATTENTION_CAP);
         f.set_detail(Some(&"d".repeat(300)));
         assert_eq!(f.detail.len(), DETAIL_CAP);
-        // No whitespace or control byte survives, so a row stays one token per column; an
-        // empty or absent value is the dash.
         f.set_detail(Some("targo\u{1b}[2J test\n"));
         assert_eq!(f.detail, "targo[2Jtest");
         f.set_detail(Some(""));
@@ -448,9 +387,7 @@ mod tests {
         assert_eq!(slot.due(m, t0), Due::First);
         slot.fields.set_agent(Some("busy"));
         published(&mut slot, m, t0);
-        // The same fields again: nothing.
         assert_eq!(slot.due(m, t0 + Duration::from_secs(5)), Due::Unchanged);
-        // A change inside the window is capped, not dropped: the next round sees it.
         slot.fields.set_agent(Some("idle"));
         assert_eq!(slot.due(m, t0 + Duration::from_millis(500)), Due::Capped);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Changed);
@@ -458,7 +395,6 @@ mod tests {
         assert!(!Due::Capped.now() && !Due::Unchanged.now());
         published(&mut slot, m, t0 + REPUBLISH_MIN);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
-        // A verdict the server retracts is a change too.
         slot.fields.set_agent(None);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }
@@ -491,8 +427,6 @@ mod tests {
             "refused: nothing is on the bus"
         );
 
-        // `idle` lands; then `busy` and `prompt` go out, and BOTH are refused,
-        // in send order, as their answers arrive.
         let idle = slot.mark_published(m, t0);
         slot.landed(idle);
         slot.fields.set_agent(Some("busy"));
@@ -527,7 +461,6 @@ mod tests {
         );
         published(&mut slot, m, t0);
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN), Due::Unchanged);
-        // Every unpublished field moves; the row does not.
         slot.fields.read_meta("OK title=two user_title=two description=- icon=- role=worker attention=- cwd=- state=alive");
         slot.fields.set_detail(Some("claude"));
         slot.fields.set_agent(Some("busy"));
@@ -536,9 +469,7 @@ mod tests {
             Due::Unchanged,
             "minimal writes attention= alone, so nothing else can make a row due"
         );
-        // In `meta` mode the same move is a change.
         assert_eq!(slot.due(Mode::Meta, t0 + REPUBLISH_MIN * 2), Due::Changed);
-        // The one field it does write moves: due.
         slot.fields.read_meta("OK title=two user_title=two description=- icon=- role=worker attention=stuck cwd=- state=alive");
         assert_eq!(slot.due(m, t0 + REPUBLISH_MIN * 2), Due::Changed);
     }

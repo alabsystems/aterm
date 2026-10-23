@@ -129,7 +129,7 @@ struct Schedule {
 }
 
 impl Schedule {
-    fn word(on: bool) -> &'static str {
+    const fn word(on: bool) -> &'static str {
         if on { "on" } else { "off" }
     }
 }

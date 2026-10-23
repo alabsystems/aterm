@@ -303,7 +303,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  lifted; --clear: `/clear` settles `step=done:taskless`; --land: landed tab stays
                                  `task=landed` with `step=done:said-done`; --land-open: mid-work Land settles
                                  `step=done:landing` without typing Cruise nudges)
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L17, C1-C2, P4, N1-N4, Off control, plus Settings >
@@ -312,6 +312,12 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
                                  - wall / wall-hid / wall-day / wall-climb: usage walls (W1 visible, W2 scrolled/dismissed,
                                    Gemini per-day quota rung 30m and climbed 2h)
+                                 - wall-shift / wall-redraw / wall-switch / wall-unread: W3 a reset moved after each try,
+                                   W4 the wall redrawn on a typed resume, W5 another agent in the tab under the wall, W6 an
+                                   unread limit told an hour past its reset (~30 min each; wall-unread ~90 min)
+                                 - wall-day-stop / wall-cruise / wall-relaunch / wall-bucket: W7 Gemini per-day dialog
+                                   answered Stop, W8 Cruise at a wall, W9 a relaunch under a wall, W10 Gemini per-model
+                                   bucket (Stop then resume, never the switch)
                                  - resid / ladder: residual and backoff-ladder scenario slices
                                  - --window (with land-p; refused under LAB_RESTORE=1): opens a real window and types L13's
                                    person prompt via NSEvent `hwkey` (`human_seq=` verified)

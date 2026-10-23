@@ -1,31 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The declared side of an indirect struct return, driven. The send side is
-//! [`aterm_objc::msg`], which picks `objc_msgSend_stret` from the prototype's return type
-//! (`tests/abi.rs` checks the threshold). This file covers `declare_class!` trampolines that
-//! return a struct by value, such as `crates/aterm-window`'s
-//! `-firstRectForCharacterRange:actualRange:`: a 32-byte `NSRect` return beside a by-value
-//! `NSRange` and an `NSRange *` out-parameter.
-//!
-//! AAPCS64 returns a homogeneous floating-point aggregate of up to four members in `v0`–`v3`, so
-//! `NSRect` is a register return on arm64; only a >16-byte non-HFA aggregate is indirect, through
-//! `x8`. Measured with clang (`-O1 -S`, the IMP's prologue):
-//!
-//! ```text
-//! IMP                       arm64                         x86_64
-//! -(NSRect)rectFor:out:     d0-d3, args x0..x4            RDI=sret->RAX, args RSI..R9
-//! -(Triple{qqq})tripleFor:  x8 = result ptr, args x0..x3  RDI=sret->RAX, args RSI..R8
-//! -(NSRange)markedRange     x0/x1                         RAX/RDX
-//! ```
-//!
-//! So the file executes three return classes on arm64: HFA (`NSRect`), indirect (`Triple`) and
-//! two-register (`NSRange`); the x86_64 column is codegen-only.
-//!
-//! Each row is also driven through `NSInvocation`: a send carries no encoding string, but
-//! Foundation lays out the frame from what `class_addMethod` was handed, so a lie in the encoding
-//! shows up there and nowhere else.
-
 #![cfg(target_os = "macos")]
 #![expect(
     clippy::disallowed_methods,
@@ -41,8 +16,7 @@ use aterm_objc::{
 
 /// The witness, minted unchecked: libtest runs every test on a worker.
 fn mtm() -> aterm_objc::MainThread {
-    // SAFETY: no main-thread affinity; the (empty) ivars are born and dropped
-    // on this one thread.
+    // SAFETY: no main-thread affinity; the empty ivars live and drop on this thread.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
 
@@ -57,12 +31,10 @@ struct Triple {
     c: i64,
 }
 
-// SAFETY: three `i64`s; all-zero is `{0, 0, 0}`, a valid `Triple`, which is what a contained
-// `tripleForCharacterRange:` answers.
+// SAFETY: three `i64`s; all-zero is `{0, 0, 0}`, a valid `Triple`.
 unsafe impl aterm_objc::InertZero for Triple {}
 
-// SAFETY: clang emits `{?=qqq}` for an anonymous `struct { long a, b, c; }`; `NSMethodSignature`
-// reads the fields, not the tag. `#[repr(C)]` with three `i64`s matches the C layout, unpacked.
+// SAFETY: `#[repr(C)]` with three `i64`s matches `{?=qqq}` unpacked.
 unsafe impl Encode for Triple {
     const ENCODING: &'static str = "{?=qqq}";
 }
@@ -80,9 +52,7 @@ declare_class! {
         @sel(firstRectForCharacterRange:actualRange:)
         fn first_rect(&self, range: NSRange, actual: *mut NSRange) -> CGRect {
             if !actual.is_null() {
-                // SAFETY: the caller (a direct send below, or `NSInvocation`) passes null or a
-                // live, writable `NSRange` it owns for the call, as `NSTextInputClient` states
-                // for `actualRange:`.
+                // SAFETY: caller passes null or a live writable `NSRange` for the call.
                 unsafe { actual.write(range) };
             }
             CGRect {
@@ -119,12 +89,9 @@ declare_class! {
     }
 }
 
-// ---------------------------------------------------------------- reflection
-
 /// `+[NSObject instanceMethodSignatureForSelector:]`, +0.
 fn signature_for(cls: ClassPtr, s: Sel) -> Id {
-    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on NSObject and
-    // returns an autoreleased `NSMethodSignature` (+0), borrowed for the enclosing pool.
+    // SAFETY: `+instanceMethodSignatureForSelector:` is `-(id)(Class, SEL)` on NSObject.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
         f(cls.as_id(), sel!(instanceMethodSignatureForSelector:), s)
@@ -135,9 +102,7 @@ fn signature_for(cls: ClassPtr, s: Sel) -> Id {
 fn invocation(target: Id, cls: ClassPtr, s: Sel) -> Id {
     let sig = signature_for(cls, s);
     assert!(!sig.is_null(), "the class implements the selector");
-    // SAFETY: `+invocationWithMethodSignature:` is `-(id)(Class, SEL, id)` and
-    // returns an autoreleased invocation; the two setters are `-(void)(id)` and
-    // `-(void)(SEL)`.
+    // SAFETY: `+invocationWithMethodSignature:`, `-setTarget:`, and `-setSelector:` match ABI.
     unsafe {
         let new: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
         let inv = new(
@@ -154,14 +119,12 @@ fn invocation(target: Id, cls: ClassPtr, s: Sel) -> Id {
     }
 }
 
-/// `-[NSInvocation setArgument:atIndex:]`. Index 0 is `self`, 1 is `_cmd`.
+/// `-[NSInvocation setArgument:atIndex:]`.
 ///
 /// # Safety
-/// `slot` must point at a value of exactly the type the signature records for
-/// `index`; `NSInvocation` copies that many bytes out of it.
+/// `slot` must point at a value of the type recorded for `index`.
 unsafe fn set_argument(inv: Id, slot: *const c_void, index: isize) {
-    // SAFETY: the caller pins `slot`'s type and the prototype is
-    // `-(void)(void *, NSInteger)`.
+    // SAFETY: caller pins `slot`'s type and prototype is `-(void)(void *, NSInteger)`.
     unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, isize) = msg();
         f(inv, sel!(setArgument:atIndex:), slot, index);
@@ -171,13 +134,10 @@ unsafe fn set_argument(inv: Id, slot: *const c_void, index: isize) {
 /// `-invoke`, then `-getReturnValue:` into a `T`.
 ///
 /// # Safety
-/// `T` must be exactly the return type the signature records, or Foundation
-/// writes `methodReturnLength` bytes into too small a slot.
+/// `T` must be the exact return type recorded in the signature.
 unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
     let mut out = T::default();
-    // SAFETY: `-invoke` is `-(void)`; `-getReturnValue:` is `-(void)(void *)`
-    // and writes exactly `methodReturnLength` bytes, which the caller has
-    // pinned to `size_of::<T>()`.
+    // SAFETY: `-invoke` is `-(void)` and `-getReturnValue:` writes `size_of::<T>()` bytes.
     unsafe {
         let go: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         go(inv, sel!(invoke));
@@ -191,19 +151,11 @@ unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
     out
 }
 
-// --------------------------------------------------------------------- tests
-
 /// Each row's registered encoding is clang's for the same C signature, minus offsets.
 #[test]
 fn the_registered_encodings_are_what_clang_emits_for_the_same_signatures() {
     let cls = StretProbe::class();
 
-    // `method_getTypeEncoding` of a clang-built class (`-fobjc-arc -framework Foundation`) with
-    // these signatures:
-    //
-    //   -(NSRect)rectFor:(NSRange)r out:(NSRangePointer)o
-    //   -(Triple)tripleFor:(NSRange)r
-    //   -(NSRange)markedRange
     for (s, clang_emitted) in [
         (
             sel!(firstRectForCharacterRange:actualRange:),
@@ -232,7 +184,6 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     let obj = StretProbe::alloc_init(mtm(), ()).expect("the probe instantiates");
     let this = obj.as_id();
 
-    // --- HFA(4) on arm64, `sret` on x86_64, with the full argument shape.
     let mut actual = NSRange::default();
     let rect = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
@@ -268,7 +219,6 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
          the first casualty of a hidden-result-pointer shift"
     );
 
-    // --- Indirect on both ABIs.
     let triple = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange) -> Triple = msg();
         f(
@@ -282,7 +232,6 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     };
     assert_eq!(triple, Triple { a: 5, b: 6, c: 42 });
 
-    // --- two registers, no indirection.
     let marked = unsafe {
         let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
         f(this, sel!(markedRange))
@@ -295,8 +244,6 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
         }
     );
 
-    // `msg`'s model agrees: on arm64 no row needs `_stret` (the result pointer is `x8`, which no
-    // argument occupies); on x86_64 the first two do.
     assert_eq!(
         aterm_objc::returns_indirectly::<CGRect>(),
         cfg!(target_arch = "x86_64")
@@ -318,7 +265,6 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
         let this = obj.as_id();
         let cls = StretProbe::class();
 
-        // --- 32-byte return, by-value NSRange, NSRange* out-parameter.
         let s = sel!(firstRectForCharacterRange:actualRange:);
         let inv = invocation(this, cls, s);
         let range = NSRange {
@@ -327,15 +273,12 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
         };
         let mut actual = NSRange::default();
         let mut actual_ptr: *mut NSRange = &raw mut actual;
-        // SAFETY: index 2 is the `NSRange` and index 3 the `NSRange *`, which
-        // is what the signature records; the slots hold exactly those types.
+        // SAFETY: indices 2 and 3 match the `NSRange` and `NSRange *` slots.
         unsafe {
             set_argument(inv, std::ptr::from_ref(&range).cast(), 2);
             set_argument(inv, std::ptr::from_mut(&mut actual_ptr).cast(), 3);
         }
-        // SAFETY: `CGRect` is the return type the signature records, as
-        // `the_registered_encodings_are_what_clang_emits_for_the_same_signatures`
-        // checks.
+        // SAFETY: `CGRect` is the return type the signature records.
         let rect: CGRect = unsafe { invoke_returning(inv) };
         assert_eq!(
             rect,
@@ -358,7 +301,6 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
             "and the out-parameter survived the reflective frame"
         );
 
-        // --- the indirect-on-both-ABIs return.
         let s = sel!(tripleForCharacterRange:);
         let inv = invocation(this, cls, s);
         let range = NSRange {
@@ -371,7 +313,6 @@ fn nsinvocation_drives_every_return_class_through_the_registered_encoding() {
         let triple: Triple = unsafe { invoke_returning(inv) };
         assert_eq!(triple, Triple { a: 8, b: 9, c: 42 });
 
-        // --- the two-register control, so a reads-zero failure cannot pass all three.
         let inv = invocation(this, cls, sel!(markedRange));
         // SAFETY: `NSRange` is the recorded return type, 16 bytes.
         let marked: NSRange = unsafe { invoke_returning(inv) };

@@ -214,6 +214,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn agent_started(&self) -> Option<i64> {
         None
     }
+    /// Whether the agent's last relaunch is this host's own, its continuation
+    /// still owed ([`crate::harness::relaunch::owed`]), so the relaunched
+    /// process sits on the same seat; asked only at the first point of an
+    /// agent relaunched under a limit. The default: none is ours.
+    fn relaunch_owed(&self) -> bool {
+        false
+    }
     /// Returns the conversation session ID held by the agent process, if known.
     fn agent_conversation(&self) -> Option<String> {
         None
@@ -371,6 +378,31 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// Returns the machine's CPU/GPU/memory occupancy reading for this session.
     fn occupancy(&self) -> crate::supervise::occupancy::OccupancyReading {
         crate::supervise::occupancy::OccupancyReading::default()
+    }
+
+    /// Notifies the host that the occupancy door typed its line at a break (the occupancy
+    /// design's §2.1): the break was taken, as one [`Self::at_background`] steps at is. Called
+    /// under `occupancy = "prompt"` alone.
+    fn break_taken(&self) {}
+
+    /// Returns whether the upgrade's notice is due for this session: a nudge waits for it (the
+    /// occupancy red-team's F11). Asked under `occupancy = "prompt"` alone, after the grant, of
+    /// a due line.
+    fn upgrade_due(&self) -> bool {
+        false
+    }
+
+    /// Takes the machine's pace for a line of `rule` in a hold begun at `hold_since_ms` (unix
+    /// ms), with one free build slot's reservation for a slot rule, together; or holds or refuses
+    /// the line ([`crate::supervise::occupancy::PaceGrant`]). Asked under `occupancy = "prompt"`
+    /// alone, last before the intent row. The default host keeps no machine pace.
+    act fn occupancy_pace(
+        &self,
+        rule: crate::supervise::occupancy::RuleId,
+        hold_since_ms: i64,
+    ) -> crate::supervise::occupancy::PaceGrant {
+        let _ = (rule, hold_since_ms);
+        crate::supervise::occupancy::PaceGrant::Local
     }
 
     /// Reports usage-credit and quota-warning notices read from the agent's screen.

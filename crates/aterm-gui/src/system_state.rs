@@ -350,6 +350,7 @@ pub(crate) struct SystemStateApp {
     clock_repaint: bool,
     /// The vault lines' press came before setup's first read: that read takes the preset.
     vault_sync_on_read: bool,
+    anim_ticks: u64,
 }
 
 impl SystemStateApp {
@@ -377,6 +378,7 @@ impl SystemStateApp {
             clock: Clock::default(),
             clock_repaint: false,
             vault_sync_on_read: false,
+            anim_ticks: 0,
         }
     }
 
@@ -469,7 +471,11 @@ impl SystemStateApp {
                 self.apply();
             }
         }
+        if self.status.busy {
+            self.anim_ticks = self.anim_ticks.wrapping_add(1);
+        }
         std::mem::take(&mut self.clock_repaint)
+            || self.status.busy
             || before
                 != (
                     self.clock.seconds(),
@@ -852,12 +858,20 @@ impl NativeAppModel for SystemStateApp {
         let mut rows = Vec::new();
         for (index, setting) in Setting::ALL.iter().enumerate() {
             let key = format!("system-state/setting/{index}");
+            let label_w = (inner - 94.0).max(30.0);
+            let natural_lines =
+                crate::native_ui::native_button_label_lines(setting.label(), label_w)
+                    .map_or(1, |lines| lines.len().max(1));
+            let (_, current_state, desired_state) =
+                self.setting_station_state(*setting, &reviewed_plan);
+            let state_summary = format!("Current: {current_state} → Desired: {desired_state}");
+            let full_label = format!("{}  ·  {state_summary}", setting.label());
             let (label, label_h) = wrapped_text(
                 format!("{key}/label"),
-                setting.label(),
+                &full_label,
                 StyleRef::Plain,
-                (inner - 94.0).max(30.0),
-                None,
+                label_w,
+                Some(natural_lines),
             );
             let row_h = (label_h + 8.0).max(38.0);
             let toggle = UiNode::new(
@@ -866,7 +880,7 @@ impl NativeAppModel for SystemStateApp {
                     Control::new(
                         SwitchSpec {
                             label: setting.label().to_owned(),
-                            description: None,
+                            description: Some(state_summary),
                         },
                         ActionId::new(key.clone()),
                     )
@@ -1036,7 +1050,7 @@ impl NativeAppModel for SystemStateApp {
                     audit_id: RAINBOW_BANNER_AUDIT,
                     role: SemanticRole::Text,
                     label: "aterm rainbow banner".to_owned(),
-                    value: None,
+                    value: Some(self.village_banner_spec(&reviewed_plan, cx.animation_phase_ms)),
                     action: None,
                     focusable: false,
                     focused: false,
@@ -1133,6 +1147,120 @@ impl NativeAppModel for SystemStateApp {
 }
 
 impl SystemStateApp {
+    fn setting_station_state(
+        &self,
+        setting: Setting,
+        plan: &Plan,
+    ) -> (char, &'static str, &'static str) {
+        let selected = plan.selection.contains(setting);
+        let desired = if selected {
+            match setting {
+                Setting::CapsLock => "Control",
+                Setting::NaturalScrolling => "off",
+                Setting::TrackpadScrolling => "3-axis + momentum",
+                Setting::Desktop => "icons shown",
+                Setting::Widgets => "hidden",
+                Setting::Dock => "minimal Dock",
+                Setting::Messages => "signed out",
+                Setting::FaceTime => "signed out",
+                Setting::Spotlight => "minimal + .noindex",
+                Setting::Permissions => "all grants ready",
+                Setting::Secrets => "vault synced",
+                Setting::Repositories => "repos cloned",
+            }
+        } else {
+            "unchanged"
+        };
+        let matches_setting = |name: &str| -> bool {
+            match setting {
+                Setting::CapsLock => name.contains("Caps Lock"),
+                Setting::NaturalScrolling => {
+                    name.contains("natural scrolling") || name.contains("Natural scrolling")
+                }
+                Setting::TrackpadScrolling => {
+                    name.contains("trackpad") || name.contains("Trackpad")
+                }
+                Setting::Desktop => {
+                    (name.contains("desktop")
+                        || name.contains("Desktop")
+                        || name.contains("wallpaper"))
+                        && !name.contains("widget")
+                        && !name.contains("Widget")
+                }
+                Setting::Widgets => name.contains("widget") || name.contains("Widget"),
+                Setting::Dock => name.contains("Dock"),
+                Setting::Messages => name.contains("Messages"),
+                Setting::FaceTime => name.contains("FaceTime"),
+                Setting::Spotlight => {
+                    name.contains("Spotlight")
+                        || name.contains("rustup")
+                        || name.contains("rust-docs")
+                        || name.contains(".noindex")
+                }
+                Setting::Permissions => {
+                    name.contains("Permissions")
+                        || name.contains("Command Line Tools")
+                        || name.contains("Full Disk Access")
+                        || name.contains("Debugger")
+                        || name.contains("Developer Tools")
+                        || name.contains("Accessibility")
+                }
+                Setting::Secrets => name.contains("Secrets") || name.contains("vault"),
+                Setting::Repositories => name.contains("GitHub") || name.contains("repositories"),
+            }
+        };
+        let mut saw_ok = false;
+        let mut saw_drift = false;
+        let mut saw_running = false;
+        let mut saw_error = false;
+        for row in self.status.rows_for(Some(plan)) {
+            if !matches_setting(&row.name) {
+                continue;
+            }
+            match row.status.as_str() {
+                "error" | "failed" | "blocked" | "not started" => saw_error = true,
+                "running" => saw_running = true,
+                "drift" | "unverified" | "pending" => saw_drift = true,
+                "ok" | "applied" => saw_ok = true,
+                _ => {}
+            }
+        }
+        if saw_error {
+            ('E', "needs action", desired)
+        } else if saw_running {
+            ('W', "assembling…", desired)
+        } else if saw_drift {
+            ('D', "drift", desired)
+        } else if self.status.busy && selected && !saw_ok {
+            ('W', "assembling…", desired)
+        } else if saw_ok || (self.status.finished && selected) {
+            ('G', "verified", desired)
+        } else if !selected {
+            ('_', "skipped", desired)
+        } else {
+            ('D', "pending", desired)
+        }
+    }
+
+    fn village_banner_spec(&self, plan: &Plan, phase_ms: u64) -> String {
+        let mut states = String::with_capacity(Setting::ALL.len());
+        let mut done = 0usize;
+        let mut total = 0usize;
+        for setting in Setting::ALL {
+            let (code, _, _) = self.setting_station_state(setting, plan);
+            states.push(code);
+            if plan.selection.contains(setting) {
+                total += 1;
+                if code == 'G' {
+                    done += 1;
+                }
+            }
+        }
+        let phase = phase_ms.wrapping_add(self.anim_ticks.wrapping_mul(120));
+        let busy = u8::from(self.status.busy);
+        format!("phase={phase};busy={busy};done={done};total={total};states={states}")
+    }
+
     fn field(
         &self,
         view: &SystemStateViewState,
@@ -2223,5 +2351,87 @@ mod tests {
         };
         assert!(app.actions.is_empty());
         assert!(app.clock.interacted());
+    }
+
+    #[test]
+    fn rainbow_kitty_village_and_current_desired_state_animate_across_parallel_init() {
+        use crate::native_app::ViewMotionCx;
+        use crate::native_ui::LogicalRect;
+        let viewport = LogicalRect::new(0.0, 0.0, 999.0, 740.0);
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(SetupStatus {
+            busy: true,
+            rows: vec![
+                SetupStatusRow {
+                    name: "Caps Lock is Control on attached keyboards".into(),
+                    status: "ok".into(),
+                    detail: "0x700000039 -> 0x7000000E0".into(),
+                },
+                SetupStatusRow {
+                    name: "Natural scrolling is off".into(),
+                    status: "drift".into(),
+                    detail: "true → false".into(),
+                },
+            ],
+            ..SetupStatus::default()
+        });
+        let view = SystemStateViewState::default();
+        let frame0 = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    animation_phase_ms: 0,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 13.0,
+                    terminal_scale: 1.0,
+                    semantic_font: None,
+                    document: None,
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let setting0 = frame0
+            .semantic(&UiKey::new("system-state/setting/0"))
+            .unwrap();
+        assert_eq!(
+            setting0.description.as_deref(),
+            Some("Current: verified → Desired: Control")
+        );
+        let rainbow0 = frame0
+            .semantic(&UiKey::new("system-state/rainbow"))
+            .unwrap();
+        assert_eq!(
+            rainbow0.value,
+            SemanticValue::Text("phase=0;busy=1;done=1;total=12;states=GDWWWWWWWWWW".into())
+        );
+
+        assert!(app.tick(Instant::now(), true));
+        let frame1 = app
+            .view(
+                &view,
+                &ViewCx {
+                    viewport,
+                    animation_phase_ms: 0,
+                    motion: ViewMotionCx::default(),
+                    terminal_font_px: 13.0,
+                    terminal_scale: 1.0,
+                    semantic_font: None,
+                    document: None,
+                },
+            )
+            .compile(viewport)
+            .unwrap();
+        let rainbow1 = frame1
+            .semantic(&UiKey::new("system-state/rainbow"))
+            .unwrap();
+        assert_eq!(
+            rainbow1.value,
+            SemanticValue::Text("phase=120;busy=1;done=1;total=12;states=GDWWWWWWWWWW".into())
+        );
+        assert_ne!(
+            frame0.paint, frame1.paint,
+            "animated rainbow kitty village advances paint commands across busy ticks"
+        );
     }
 }

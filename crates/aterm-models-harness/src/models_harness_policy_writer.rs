@@ -2,23 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The supervisor's `[harness]` policy has one writer: the config watcher.
-//!
-//! The derived twin of the `clean { … }` island in aterm-gui's `config_watcher_island.rs`;
-//! `config_watcher`'s `the_watcher_is_the_policys_one_writer` and `app_native`'s
-//! `a_late_admission_never_moves_the_watchers_harness_policy` drive the real code against it.
-//!
-//! `disk` is the file's policy (0: `enabled = false`, the kill switch; 1: approvals on). The
-//! watcher posts a read's policy once per change (`has_posted`, `last_posted`: its dedupe)
-//! into the event loop's queue (`queued`, `queued_val`: one post in flight); `Deliver` is the
-//! window handling it, which runs it (`in_force`) only once `committed`, since a seamless
-//! successor drops every wake handled before its Commit. The Commit handler raises
-//! `forget_pending` (`REPOST_AFTER_COMMIT`); the watcher consumes it on its next loop
-//! (`Forget`). The config lane admits generations carrying either policy at any time and
-//! writes none of them.
-//!
-//! `Buggy = 1` mutants: an admission that adopts its own `[harness]` (a stale one landing
-//! after a posted kill switch lifts it, and the deduped poll never puts it back), and a Commit
-//! that raises no forget.
 
 use aterm_spec::derive::{Liveness, Model, eq, int, or_, var};
 
@@ -61,7 +44,6 @@ pub fn harness_policy_one_writer_model() -> Model {
                 queued = 0;
                 queued_val = 0;
             }
-            // The lane's admissions carry either policy and write none.
             action AdmitOff when (committed == 1) { in_force = in_force; }
             action AdmitOn when (committed == 1) { in_force = in_force; }
             action Commit when (committed == 0) {
@@ -73,11 +55,8 @@ pub fn harness_policy_one_writer_model() -> Model {
                 forget_pending = 0;
             }
 
-            // Mutants (dead at Buggy = 0). A second writer: an admission adopting its own
-            // `[harness]`.
             action SecondWriterOff when (Buggy == 1 && committed == 1) { in_force = 0; }
             action SecondWriterOn when (Buggy == 1 && committed == 1) { in_force = 1; }
-            // A Commit that raises no forget (`REPOST_AFTER_COMMIT` missing).
             action CommitWithoutForget when (Buggy == 1 && committed == 0) { committed = 1; }
 
             invariant Agrees: committed == 0
@@ -89,11 +68,8 @@ pub fn harness_policy_one_writer_model() -> Model {
     }
 }
 
-/// The window catches up with the file (`[]<>`): once committed, the policy it runs keeps
-/// returning to the one on disk, so after the last edit it runs that one for good. Each
-/// fairness is load-bearing: the watcher polls (`Poll`), the window handles its queue
-/// (`Deliver`), the watcher consumes the Commit's flag (`Forget`). Edits are bounded
-/// (`MaxEdits`): a file rewritten forever outruns any reader. Each mutant alone breaks it.
+/// The window catches up with the file (`[]<>`): once committed, the policy it runs keeps returning
+/// to the one on disk, so after the last edit it runs that one for good.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(harness_policy_one_writer_model)]

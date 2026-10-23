@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Tier-1 conformance: binds the armed tray card ring's bookkeeping
-//! (`aterm_gpu::tray_card_ring`: `TrayCardRing` and `present_may_read`) to
-//! `aterm_models_render::metal_tray_card_ring_model` (`MetalTrayCardRing`).
-//!
-//! The model proves that a rewrite of the slot not shown leaves no present that
-//! samples it in flight and waits for no present later than its last reader (one
-//! that samples the other slot). Here the real ring is driven through every
-//! sequence of frames, bakes, other windows' presents, completions and re-mints
-//! up to a depth, against a simulated queue that completes presents in order and
-//! knows which slot each present really sampled; each settle waits exactly for the
-//! in-flight presents `present_may_read` names, as `await_presents_through` does,
-//! and every observed transition is checked against the model's named action.
-//!
-//! Negative controls, each refused by the committed model and admitted by its
-//! mutant: the rule before 969c8abb08 (every present from the slot's reader on,
-//! `Buggy = 1`), which waits for the in-flight present that shows the other slot;
-//! no settle at all (`Buggy = 2`); a bake that records the next present as its
-//! slot's reader (`Buggy = 3`), which makes a later rewrite wait for that present
-//! though it samples the other slot; and a refused present that hands its number
-//! back for the next present to take too (`Buggy = 4`), which does the same.
+
+//! Tier-1 conformance tests binding `TrayCardRing` to `MetalTrayCardRing`.
 
 use std::collections::BTreeMap;
 
@@ -37,11 +18,10 @@ const DEPTH: usize = 7;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// Which presents a rewrite of a slot whose last reader was `last` waits for.
+/// Predicate selecting presents that a rewrite of `last`'s slot awaits.
 type Rule = fn(u64, u64) -> bool;
 
-/// The rule before 969c8abb08: every present numbered from the slot's last
-/// reader on (`await_presents_since`).
+/// The rule before 969c8abb08.
 fn old_rule(seq: u64, last: u64) -> bool {
     seq >= last
 }
@@ -51,8 +31,7 @@ fn no_settle(_seq: u64, _last: u64) -> bool {
     false
 }
 
-/// The reader a readback's tray bake records: none, as its command buffer is
-/// waited inline (`Some(next present)` is the mutant).
+/// The reader a readback's tray bake records.
 type BakeReader = fn(u64) -> Option<u64>;
 
 fn bake_records_none(_next: u64) -> Option<u64> {
@@ -63,16 +42,12 @@ fn bake_records_next(next: u64) -> Option<u64> {
     Some(next)
 }
 
-/// The rules a drive runs: which presents a settle waits for, the reader a
-/// bake records, and a refused present's number.
+/// The rules a drive runs.
 #[derive(Clone, Copy)]
 struct Rules {
     settle: Rule,
     bake: BakeReader,
-    /// Whether an on-glass present refused after its Submit B was committed
-    /// keeps the number its slot recorded (`MetalArmLive::take_present_seq`,
-    /// taken before Submit B), or hands it back for the next present to take
-    /// too (the mutant).
+    /// Whether a refused present after Submit B retains its sequence number.
     refused_keeps: bool,
 }
 
@@ -98,8 +73,7 @@ enum Step {
     Complete,
     /// The card changed size: a fresh ring, and this window presents it.
     Remint,
-    /// This window presents the card unchanged, and the drawable's present is
-    /// refused after its Submit B was committed, so Submit B is waited inline.
+    /// This window presents the card unchanged.
     Refused,
 }
 
@@ -141,8 +115,7 @@ impl Sim {
         }
     }
 
-    /// The present that really last sampled `slot` of the current ring, in the
-    /// model's numbering (plus one; `0` none).
+    /// Model index of the last present that sampled `slot` (`0` if none).
     fn real(&self, slot: usize) -> i64 {
         self.sampled
             .iter()
@@ -186,8 +159,7 @@ impl Sim {
         if self.band_flip { (1, 3) } else { (5, 7) }
     }
 
-    /// Run `step`, returning each transition it makes as `(before, after,
-    /// action)`; empty when the step is not possible here.
+    /// Run `step`, returning each transition it makes as `(before, after, action)`.
     fn step(&mut self, step: Step, rules: Rules) -> Vec<(State, State, String)> {
         let start = self.project(0, 0);
         match step {
@@ -209,18 +181,11 @@ impl Sim {
                 if self.seq >= MAX_SEQ {
                     return Vec::new();
                 }
-                // The present's Submit B samples the shown slot, which records
-                // the present's number as its reader.
                 ring.read_unchanged(Some(self.seq));
                 if !rules.refused_keeps {
-                    // The number handed back: the next present takes it too.
-                    // Waited inline, the refused Submit B completes every
-                    // present committed before it.
                     self.done = self.seq;
                     return vec![(start, self.project(0, 0), "Refuse".into())];
                 }
-                // The number spent: a present that samples the slot, then the
-                // inline wait, which completes it and every one before it.
                 self.present(true);
                 let mut transitions = vec![(start, self.project(0, 0), "Draw".into())];
                 while self.done < self.seq {
@@ -261,9 +226,6 @@ impl Sim {
                 let band = self.band();
                 let write = self.ring.as_ref().expect("checked above").plan_change(band);
                 let target = write.slot;
-                // `await_presents_through`: wait for every in-flight present
-                // the rule names; the queue completes in order, so waiting
-                // for one completes every earlier one.
                 let before = self.done;
                 if let Some(last) = write.settle_through {
                     for seq in self.done..self.seq {
@@ -272,7 +234,6 @@ impl Sim {
                         }
                     }
                 }
-                // `writing` names the slot under rewrite: 1 for slot 1, 2 for slot 0.
                 let settled = self.project(if target == 1 { 1 } else { 2 }, before as i64);
                 let ring = self.ring.as_mut().expect("checked above");
                 let reader = if shows {
@@ -338,7 +299,6 @@ fn with_buggy(model: &Model, buggy: i64) -> Model {
 fn the_real_tray_card_ring_conforms_to_the_metal_tray_card_ring_model() {
     let model = metal_tray_card_ring_model();
     let seen = drive(RULES);
-    // Every action the model has is driven, so no part of it goes unchecked.
     for action in [
         "Draw", "Settle0", "Settle1", "Show0", "Show1", "Bake0", "Bake1", "Bare", "Complete",
         "Remint",
@@ -401,8 +361,6 @@ fn the_old_rule_no_settle_a_reading_bake_and_a_reused_number_are_refused() {
             Vec::<String>::new(),
             "{name}: the Buggy = {buggy} mutant admits every transition"
         );
-        // Not only a transition the model does not name: the drive reaches a
-        // state that breaks one of its laws.
         let broken = model
             .invariants
             .iter()

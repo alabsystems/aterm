@@ -772,7 +772,7 @@ impl FrameReach {
 
     /// The first row the search read ([`FrameReach`]).
     #[must_use]
-    pub fn from(&self) -> usize {
+    pub const fn from(&self) -> usize {
         self.from
     }
 
@@ -859,7 +859,7 @@ pub fn is_rule(row: &str) -> bool {
 }
 
 /// Whether `t` holds ten `─` or more and none of the box's joins and sides (`┬ ┴ ┼ ├ ┤ ┌ ┐ └ ┘ │`).
-fn rule_run(t: &str) -> bool {
+const fn rule_run(t: &str) -> bool {
     let b = t.as_bytes();
     let mut dashes = 0usize;
     let mut i = 0;
@@ -1356,7 +1356,7 @@ pub struct CompletionMenu {
 impl CompletionMenu {
     /// Whether the selected entry is drawn IN colour.
     #[must_use]
-    pub fn colour_only(&self) -> bool {
+    pub const fn colour_only(&self) -> bool {
         self.pointed.is_none() && self.entries.len() > 1
     }
 
@@ -1443,7 +1443,7 @@ pub fn composer_text(rows: &[String]) -> Option<String> {
 
 /// Whether the cursor sits inside the composer's typed text.
 #[must_use]
-pub fn cursor_inside_text(cursor: Option<(usize, usize)>, caret: usize) -> bool {
+pub const fn cursor_inside_text(cursor: Option<(usize, usize)>, caret: usize) -> bool {
     matches!(cursor, Some((row, col)) if row == caret && col != 2)
 }
 

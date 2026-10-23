@@ -2,21 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `hwkey` is answered by the App lane whatever the front tab shows (xa-20).
-//!
-//! The verb posts a real NSEvent to the front window, so it needs no terminal
-//! session; it is an App-target row of the verb table. The App lane had no arm
-//! for it, so with a native view such as Settings in front the request fell
-//! through to the session resolver and was refused as "no active terminal", a
-//! refusal naming the wrong cause, before the hwkey parser ever ran; and with a
-//! terminal in front, the session path handed it its tail with `unread=ok`
-//! still on, so the documented override was refused as a usage error.
-//!
-//! A headless instance has no NSApplication, so a real post is refused there
-//! ("no frontmost AppKit window"); that refusal is the proof the request
-//! reached `cmd_hwkey` (off macOS, its "implemented on macOS only").
-//!
-//! ISOLATION: `support/launch_isolation.rs`; a headless instance opens no
-//! window. An environment refusal is COULD NOT RUN, never a pass.
 
 #![cfg(unix)]
 
@@ -58,8 +43,6 @@ fn hwkey_reaches_its_handler_with_a_native_view_in_front() {
     );
     assert!(!reached_hwkey(&bad), "a malformed key posts nothing: {bad}");
 
-    // A terminal in front: the leading `unread=ok` is taken by the App lane's
-    // gate, so the parser never sees it.
     headless_boot::ctl_ok(&inst, &["tab", "prev"]);
     let tabs = headless_boot::ctl_ok(&inst, &["inspect", "app/v1", "tabs"]);
     assert!(

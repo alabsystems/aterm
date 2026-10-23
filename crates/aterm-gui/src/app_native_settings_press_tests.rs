@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NO PRESS IS DROPPED: a Settings control takes a press while its last
-//! change is still saving. These run the real Settings reducer, the host's
-//! enqueue and the serialized config lane; only the worker's file write is
-//! stood in for, by landing each queued request in order.
+//! Tests that Settings controls accept presses while an earlier change is still saving.
 
 use super::*;
 use crate::native_app::{ActionInvocation, SemanticInput};
@@ -17,8 +14,6 @@ fn settings_app(text: &str, route: SettingsRoute) -> App {
         crate::native_config_service::VersionedConfigService::new(text.to_string()).unwrap();
     app.config = (*app.native_config_service.snapshot().config).clone();
     assert!(app.open_settings_tab(route));
-    // The worker owns a write: every press from here waits in the lane, as
-    // a second click within one save does.
     app.native_config_inflight = true;
     app
 }
@@ -81,8 +76,6 @@ fn land_next(app: &mut App, refuse: Option<&str>) -> ConfigPatchOutcome {
         return outcome;
     }
     let (origin, result) = app.reduce_native_config_request(request);
-    // A request the lane head refuses is answered as the lane answers it:
-    // refused, with what the service holds.
     let result = result.unwrap_or_else(|message| ConfigPatchResult::Rejected {
         snapshot: app.native_config_service.snapshot(),
         message,
@@ -138,7 +131,6 @@ fn a_second_click_on_a_saving_switch_is_a_second_toggle() {
     let action = "settings/set/cursor_blink";
     for follow in [true, false] {
         let mut app = settings_app("", SettingsRoute::CursorMotion);
-        // The keyboard on the switch brings its row onto the screen.
         app.dispatch_native_event(
             WindowId(0),
             AppEvent::FocusChanged(Some(UiKey::new(switch))),
@@ -200,7 +192,6 @@ fn a_second_click_on_a_saving_switch_is_a_second_toggle() {
 fn a_failed_save_goes_back_and_says_so() {
     let switch = "settings/control/cursor_blink";
     let action = "settings/set/cursor_blink";
-    // One click, refused.
     let mut app = settings_app("", SettingsRoute::CursorMotion);
     press(&mut app, action, None);
     assert_eq!(control(&app, switch).0, SemanticValue::Bool(false));
@@ -217,8 +208,6 @@ fn a_failed_save_goes_back_and_says_so() {
     );
     assert_eq!(file(&app), "");
 
-    // Two clicks, the first refused: the second was composed over a value
-    // the file never held, so it lands nothing, and the reason stays.
     let mut app = settings_app("", SettingsRoute::CursorMotion);
     press(&mut app, action, None);
     press(&mut app, action, None);
@@ -302,7 +291,6 @@ fn every_control_kind_takes_a_press_while_it_saves() {
         assert_eq!(file(&app), after, "{name}");
     }
 
-    // A slider's arrow keys: two steps within one save are two steps.
     let mut app = settings_app("font_px = 14\n", SettingsRoute::Home);
     app.dispatch_native_event(
         WindowId(0),
@@ -319,8 +307,6 @@ fn every_control_kind_takes_a_press_while_it_saves() {
     }
     assert_eq!(file(&app), "font_px = 16\n", "two steps up from 14");
 
-    // A picker: Color theme chosen twice, the second from the picker the
-    // page draws after the first, before the first has saved.
     let mut app = settings_app("theme = \"Dracula\"\n", SettingsRoute::Appearance);
     for theme in ["Nord", "Dracula"] {
         press(&mut app, "settings/set/theme", None);
@@ -419,8 +405,6 @@ fn an_undo_pressed_while_its_change_saves_takes_it_back() {
         assert_eq!(status(&app).as_deref(), Some("Restored Cursor blink: On"));
         assert_eq!(undo_button(&app).as_deref(), Some("Redo"));
 
-        // Redo, then Undo at once while the Redo saves (a double click on
-        // the button): two steps, the second taking back the first.
         app.native_config_inflight = true;
         press(&mut app, "settings/undo", None);
         assert_eq!(control(&app, switch).0, SemanticValue::Bool(false));

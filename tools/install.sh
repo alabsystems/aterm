@@ -2482,7 +2482,7 @@ env_twin_on() { # <VAR>
 #
 # The flag writes `[packages] auto_install = false`, the install consent atpkg
 # reads (crates/atpkg/src/config.rs `auto_install`), so the app's first launch
-# does not install the set anyway (docs/DESIGN-cli-toolchain-seed-2026-08-31.md).
+# does not install the set anyway (docs/GOLDEN-INSTALL-PATH.md §3.1).
 # It never overwrites a value the person set: an existing `auto_install` (or its
 # retired spelling `seed_install`) under [packages], or a [packages] this
 # line-oriented edit cannot read safely (an inline table, a dotted `packages.`

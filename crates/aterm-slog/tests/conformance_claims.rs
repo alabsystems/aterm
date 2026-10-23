@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: what [`aterm_slog::Fold::apply`] does with claims,
-//! against the derived `SessionLogClaims` model
-//! (`aterm_models_session::session_log_claims_model`, checked at Tier-0 in
+//! Tier-1 conformance: what [`aterm_slog::Fold::apply`] does with claims, against the derived
+//! `SessionLogClaims` model (`aterm_models_session::session_log_claims_model`, checked at Tier-0 in
 //! `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk writes real records into a log: a command that fails (an
-//! observed `failure` need) and a later one that succeeds (the observation
-//! that lifts it), `need` marks of one word from the harness, a `ctl` client
-//! and an edge's session, each author's claim `clear` (`src=mark`) and a
-//! non-claim `clear` (the owner's meta flag, the 2A rule), and labels and
-//! verdicts from the harness, a `ctl` client and an edge. After every record
-//! the fold's state is projected onto the model and the step must be the
-//! model's. NEGATIVE CONTROLS: a projection in which a claim's clear lifted
-//! the failure (the 2A rule), one that shows the edge's label, one in which
-//! the edge's verdict took the trusted slot, one in which a `ctl` verdict
-//! took the harness's, one that shows a `ctl` label over the harness's, and
-//! one in which an edge's raise took the harness's need over, are each
-//! rejected.
 
 use aterm_models_session::session_log_claims_model;
 use aterm_slog::{
@@ -172,7 +157,6 @@ impl World {
             "HarnessVerdict",
             "CtlVerdict",
             "OtherVerdict",
-            // Twice as likely: the claim slots' order is what they judge.
             "CtlVerdict",
             "CtlLabel",
             "EdgeNeed",
@@ -199,7 +183,6 @@ impl World {
                 self.run(RunOut::Ok);
                 self.live = false;
             }
-            // One word from every author: each its own need.
             "HarnessNeed" => {
                 self.mark(Kind::Need, Src::Mark, Actor::Harness, word("help"));
                 self.hlive = true;
@@ -314,9 +297,6 @@ fn fold_claims_conformance_rejects_what_a_claim_may_never_do() {
         "displaced"
     );
 
-    // The worker, a `ctl` client inside its session, marks `done` after the
-    // harness's `off-track`: the trusted slot is the worker's, the proven one
-    // stays the harness's.
     let prev = w.project();
     w.mark(Kind::Verdict, Src::Mark, Actor::Ctl, word("done"));
     let honest = w.project();

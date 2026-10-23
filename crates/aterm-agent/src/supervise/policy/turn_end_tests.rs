@@ -112,6 +112,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
+        seat: Default::default(),
         account: None,
         autopilot: Autopilot::Cruise,
         login_label: None,
@@ -17080,6 +17081,50 @@ fn a_sign_in_at_a_usage_limit_is_no_switch_until_the_worker_works_past_it() {
     }
 }
 
+/// A LIMIT ENDED WHERE ANOTHER PROGRAM'S SCREEN IS READ SAYS SO
+/// ([`TurnEndState::limit_ended_elsewhere`], X4 of the walls-3 stage): Claude
+/// Code's session limit, then Muse Code's or Gemini CLI's idle point in the
+/// same tab, which did no work — the track ends there
+/// ([`met_under_another`]), and the end is another program's, so the loop's
+/// end row names that, not the worker's work or another wall. Measured
+/// before: the row the loop wrote there read `work, or another wall`.
+/// NEGATIVE CONTROLS: Claude Code's own point after work ends the same track
+/// as work, never another program; and the limit standing (no end) is
+/// neither.
+#[test]
+fn a_limit_ended_at_another_programs_screen_is_said_as_such() {
+    use aterm_phase::Program;
+    let t = t0();
+    for (next, worked, elsewhere) in [
+        (Program::Muse, None, true),
+        (Program::Gemini, None, true),
+        (Program::Claude, Some(5 * MIN), false),
+    ] {
+        let mut limit = walled(
+            WallKind::UsageSession,
+            "You've hit your session limit · resets 3pm (America/Los_Angeles)",
+            Some(JOB),
+        );
+        limit.reset_at = Some(t + 90 * MIN);
+        let mut st = TurnEndState::default();
+        let _ = act(&mut st, &limit, t);
+        assert!(!st.limit_ended(), "{next:?}: the limit stands at its wall");
+        assert!(!st.limit_ended_elsewhere(), "{next:?}");
+        let mut after = idle("The suite passes.", worked);
+        after.program = next;
+        let _ = act(&mut st, &after, t + MIN);
+        assert!(st.limit_ended(), "{next:?}: the limit's track ended");
+        assert_eq!(
+            st.limit_ended_elsewhere(),
+            elsewhere,
+            "{next:?}: ended by another program's screen"
+        );
+        // The flag is the fold's: the next fold, with nothing ended, clears it.
+        let _ = act(&mut st, &after, t + 2 * MIN);
+        assert!(!st.limit_ended() && !st.limit_ended_elsewhere(), "{next:?}");
+    }
+}
+
 #[test]
 fn login_back_at_a_limit_a_landed_task_met_keeps_the_landing() {
     let (mut st, now) = landed_at(t0());
@@ -18389,5 +18434,134 @@ fn a_launch_card_read_with_nothing_submitted_is_the_conversation_redrawn() {
     assert!(
         !st.redrawn_fresh(Some(3), Some(7)),
         "read so again after the /clear: no task"
+    );
+}
+
+/// THE OCCUPANCY DOOR'S LINE KEEPS THE TASK'S STATE (`TurnEndState::fact_typed`): a Land
+/// episode's landing and its seeded rule stand across it. The negative control is the host's
+/// turn in its place (`host_typed(Notice)`), which ends both.
+#[test]
+fn the_doors_line_keeps_the_land_state_a_host_turn_resets() {
+    let now = t0();
+    let seeded = || {
+        let mut st = TurnEndState::default();
+        st.seed_land(2, true, false, false);
+        st.seeded_land = Some(RULE_LAND);
+        st
+    };
+    let mut st = seeded();
+    st.fact_typed();
+    assert_eq!(
+        (st.landing, st.seeded_land, st.land_episode()),
+        (true, Some(RULE_LAND), (true, 2))
+    );
+    assert!(
+        st.act_untaken() && st.typed_untaken(),
+        "the line stands untaken"
+    );
+    let mut control = seeded();
+    control.host_typed(now, HostTurn::Notice);
+    assert_eq!((control.landing, control.seeded_land), (false, None));
+}
+
+/// THE ACT AWAITED BEFORE THE DOOR'S LINE IS KEPT (the red-team's F12): a continuation typed at a
+/// point and taken still awaits its answer after a line at the following break, and the line's
+/// own state is apart: untaken until the agent's next turn is read, then let go at the break
+/// after it. The control: the host's turn in its place takes the act's record.
+#[test]
+fn the_doors_line_keeps_the_taken_act_awaited_before_it() {
+    let now = t0();
+    let typed_and_taken = || {
+        let mut st = TurnEndState::default();
+        assert_eq!(
+            act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now),
+            typed(RULE_CONTINUE)
+        );
+        st.took();
+        st
+    };
+    let mut st = typed_and_taken();
+    assert!(!st.act_untaken());
+    st.fact_typed();
+    assert_eq!(
+        st.awaiting.map(|a| (a.rule, a.taken)),
+        Some((RULE_CONTINUE, true))
+    );
+    assert!(st.act_untaken(), "the line holds the next break");
+    st.took();
+    assert!(!st.act_untaken() && !st.typed_untaken(), "taken");
+    assert!(!st.other_turn, "its answer is the harness's turn");
+    st.fact_answered();
+    assert_eq!(st.fact, None, "its answer ended at the break after it");
+    let mut control = typed_and_taken();
+    control.host_typed(now, HostTurn::Notice);
+    assert_eq!(
+        control.awaiting.map(|a| (a.rule, a.taken)),
+        Some((RULE_HOST_TURN, false))
+    );
+}
+
+/// THE DOOR'S LINE'S ANSWER (`HostTurn::Fact`) is never a done report, never a short turn, and
+/// moves no streak; the point after it is a new one. The control is the same answer with no line
+/// typed: the agent's own turn, a done report and a short one.
+#[test]
+fn the_doors_lines_answer_is_no_done_report_and_moves_no_streak() {
+    let short = Duration::from_secs(25);
+    let answered = |line: bool| {
+        let mut st = TurnEndState::default();
+        let now = t0();
+        st.observe(&idle("Stage 2 landed; stage 3 next.", Some(5 * MIN)), now);
+        assert_eq!(st.awaiting, None, "no act awaited");
+        let (streak, point) = (st.short_streak(), st.point_number());
+        if line {
+            st.fact_typed();
+            st.took();
+        }
+        st.observe(&idle("All done.", Some(short)), now + MIN);
+        (
+            st.done_reports(),
+            st.short_streak() - streak,
+            st.point_number() != point,
+        )
+    };
+    assert_eq!(answered(true), (0, 0, true), "the line's answer");
+    assert_eq!(answered(false), (1, 1, true), "the agent's own turn");
+}
+
+/// THE DOOR'S LINE'S ANSWER IS THE HARNESS'S TURN WITH NO ACT AWAITED BEFORE IT
+/// (`TurnEndState::took`): no one else's turn is read, and no landed task's own wake is kept
+/// landing over it, until the break after it ends the answer (`fact_answered`). CONTROL: the
+/// same reads with no line typed are someone else's turn, and the landed task's own wake.
+#[test]
+fn the_doors_lines_answer_is_no_other_turn_and_no_landed_wake() {
+    let landed = || {
+        let mut st = TurnEndState {
+            autopilot: Some(Autopilot::Land),
+            ..TurnEndState::default()
+        };
+        assert!(st.seed_task_done());
+        assert_eq!(st.awaiting, None, "no act awaited");
+        st
+    };
+    let mut control = landed();
+    assert!(
+        control.wake_may_keep_landing(),
+        "the landed task's own wake"
+    );
+    control.took();
+    assert!(control.other_turn, "someone else's turn");
+    let mut st = landed();
+    st.fact_typed();
+    assert!(!st.wake_may_keep_landing(), "the line stands untaken");
+    st.took();
+    assert!(!st.other_turn, "its answer is the harness's turn");
+    assert!(
+        !st.wake_may_keep_landing(),
+        "its answer is no landed task's wake"
+    );
+    st.fact_answered();
+    assert!(
+        st.wake_may_keep_landing(),
+        "the break after it ended the answer"
     );
 }

@@ -18534,3 +18534,6 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         );
     }
 }
+
+#[path = "control_whole_frame_tests.rs"]
+mod whole_frame;

@@ -285,24 +285,24 @@ impl Region {
 
     /// Region length in bytes.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the region is empty (always `false` since regions are at least one page).
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Whether this mapping is writable.
     #[must_use]
-    pub fn is_writable(&self) -> bool {
+    pub const fn is_writable(&self) -> bool {
         self.writable
     }
 
     /// `[at, at + len)` if it lies inside the region.
-    fn span(&self, at: usize, len: usize) -> Result<(), AccessError> {
+    const fn span(&self, at: usize, len: usize) -> Result<(), AccessError> {
         match at.checked_add(len) {
             Some(end) if end <= self.len => Ok(()),
             _ => Err(AccessError::OutOfBounds { at, len }),

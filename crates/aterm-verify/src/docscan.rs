@@ -1,28 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH LIBRARIES HOLD A DOCTEST, read off their sources, so the doctests stage's
-//! stand-in doc driver skips the rustdoc pass of every library that holds none
-//! ([`crate::stages::doctest_split`], [`crate::docdriver`]; most crates have
-//! none). A scan, never a manifest flag, and it FAILS WIDE: whatever it cannot
-//! read counts as a doctest, because a crate it wrongly leaves out is a doctest
-//! that silently never runs, while one it wrongly keeps costs one rustdoc pass.
-//!
-//! What counts, as rustdoc reads docs:
-//! * a fenced block (```` ``` ```` or `~~~`, any length) whose info string rustdoc
-//!   compiles ([`info_runs`]): no info, a rustdoc tag (`rust`, `no_run`,
-//!   `compile_fail,E0308`, `ignore-wasm32`, `edition2021` …), or any word that is
-//!   not a language ([`NOT_RUST`]); `ignore` alone or with `rust` never runs;
-//! * an indented code block (four spaces past the doc text, after a blank doc line
-//!   or at its start, outside a list item's own indent), which rustdoc compiles as
-//!   Rust;
-//! * in `///`, `//!`, `/** */` and `/*! */` doc comments;
-//! * a doc attribute whose text the scan cannot see (`#[doc = include_str!(…)]`,
-//!   `concat!`, a macro's `$doc`, a string holding a fence or spanning lines);
-//! * in every `.rs` file under the library's `src/`, and in each file a scanned
-//!   file pulls in by `#[path = "…"]`, `include!("…")` or
-//!   `include!(concat!(env!("CARGO_MANIFEST_DIR"), "…"))` (aterm-gpu-web's library
-//!   is partly aterm-wasm's files); an `include!` of any other computed path counts.
+//! WHICH LIBRARIES HOLD A DOCTEST, read off their sources, so the doctests stage's stand-in doc
+//! driver skips the rustdoc pass of every library that holds none
+//! ([`crate::stages::doctest_split`], [`crate::docdriver`]; most crates have none).
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -40,9 +21,8 @@ const RUSTDOC_TAGS: [&str; 7] = [
     "allow_fail",
 ];
 
-/// Info-string words that name a block rustdoc does not compile: the languages the
-/// tree's docs show, and `notest`, which vendored code writes for "not a test". A
-/// word in neither list counts as Rust (fail wide).
+/// Info-string words that name a block rustdoc does not compile: the languages the tree's docs
+/// show, and `notest`, which vendored code writes for "not a test".
 pub const NOT_RUST: [&str; 34] = [
     "text",
     "txt",
@@ -80,9 +60,7 @@ pub const NOT_RUST: [&str; 34] = [
     "notest",
 ];
 
-/// Does the library whose sources are under `src` hold a doctest? Every `.rs` file
-/// under `src`, then every file those pull in ([`pulled_in`]), each read once. An
-/// unreadable directory or file, or a pull of a computed path, counts as one.
+/// Does the library whose sources are under `src` hold a doctest?
 #[must_use]
 pub fn src_holds_a_doctest(src: &Path) -> bool {
     let mut files: Vec<PathBuf> = Vec::new();
@@ -149,14 +127,13 @@ fn normalized(path: &Path) -> PathBuf {
 pub enum Pull {
     /// Relative to the pulling file's directory: `#[path = "…"]`, `include!("…")`.
     Beside(String),
-    /// Relative to the compiling crate's directory:
-    /// `include!(concat!(env!("CARGO_MANIFEST_DIR"), "…"))`.
+    /// Relative to the compiling crate's directory: `include!(concat!(env!("CARGO_MANIFEST_DIR"),
+    /// "…"))`.
     InCrate(String),
 }
 
-/// The files `text` pulls in: each `#[path = "…"]` and each `include!(…)` that
-/// opens a line, the call read across the lines it spans. `None` when an
-/// `include!` names a path computed any other way, whose text the scan cannot see.
+/// The files `text` pulls in: each `#[path = "…"]` and each `include!(…)` that opens a line, the
+/// call read across the lines it spans.
 #[must_use]
 pub fn pulled_in(text: &str) -> Option<Vec<Pull>> {
     /// How many lines an `include!` call is read across.
@@ -201,7 +178,6 @@ pub fn docs_hold_a_doctest(text: &str) -> bool {
                 Some(i) => (&line[..i], true),
                 None => (line, false),
             };
-            // ` * text` (a starred block) reads as `text`; an unstarred line as is.
             let body = match body.trim_start().strip_prefix('*') {
                 Some(after) => after,
                 None => body,
@@ -248,7 +224,6 @@ pub fn docs_hold_a_doctest(text: &str) -> bool {
             if doc_attribute_hides_text(t) {
                 return true;
             }
-            // An attribute between doc lines keeps the item's doc text going.
             continue;
         }
         doc = DocText::default();
@@ -274,7 +249,6 @@ impl DocText {
     /// Read one line of doc text (`raw`, after its comment marker): is a doctest
     /// open here?
     fn line(&mut self, raw: &str) -> bool {
-        // rustdoc strips the doc text's common indent, which is one space by habit.
         let text = raw.strip_prefix(' ').unwrap_or(raw);
         let body = text.trim_start();
         let indent: usize = text[..text.len() - body.len()]
@@ -343,10 +317,7 @@ fn list_marker(body: &str) -> Option<usize> {
     }
 }
 
-/// Does rustdoc compile a fenced block with this info string? Never when it says
-/// `ignore`; always when it carries a rustdoc tag ([`RUSTDOC_TAGS`], an error code,
-/// `edition*`, `ignore-<target>`); otherwise unless a word names a language
-/// ([`NOT_RUST`]). `{.class}` and `key=value` attributes are neither.
+/// Does rustdoc compile a fenced block with this info string?
 #[must_use]
 pub fn info_runs(info: &str) -> bool {
     let words: Vec<String> = info
@@ -383,7 +354,6 @@ fn doc_attribute_hides_text(attr: &str) -> bool {
         let Some(rhs) = attr[from..].trim_start().strip_prefix('=') else {
             continue;
         };
-        // `==`, or `doc = \"…` inside a string literal: no attribute.
         if rhs.starts_with('=') || rhs.trim_start().starts_with('\\') {
             continue;
         }

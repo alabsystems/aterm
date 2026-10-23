@@ -988,7 +988,14 @@ pub const VERBS: &[VerbSpec] = &[
          `\"submits\":<n>` (Enters written over typed input since the previous Enter), \
          `\"trimmed\"` and `\"first\"` when set, `\"order\":\"display\"` and `\"display_map\"` \
          under `order=display`, and `\"frame\":\"open\"` when the program's DEC 2026 frame was \
-         unfinished (`await frame`). Anything else is `ERR usage: text [--json] [trim] \
+         still unfinished at the read's bound (`await frame`). Every form waits, holding nothing, \
+         for an unfinished frame to close, up to the sync timeout (1 s) from the frame's run; one \
+         still open then is read as it stands, the plain header saying `frame=open` after the \
+         count (`aterm ctl` notes it on stderr). `--json`'s person stamps and first `inputs` \
+         count are taken after that wait, just before the rows. `cursor`, `cell`, `screen`, \
+         `line` of a screen row, `search`, `offscreen screen=1`, `blocktext`, `select`, \
+         `selection`, `copy`, `turn` and `cast drift` read so too; `blocks` and `wait` never \
+         wait for a frame. Anything else is `ERR usage: text [--json] [trim] \
          [tail=<n>|rows=<a>-<b>] [order=<logical|display>]`.",
     )
     .json(Json::Emits),
@@ -1002,7 +1009,9 @@ pub const VERBS: &[VerbSpec] = &[
          dimensions, cursor, colours, palette, selection, style policy and viewport. While \
          unchanged, `since=<etag>` returns `OK 1` then \
          `{\"unchanged\":true,\"seq\":<n>,\"gen\":\"<epoch>.<seq>\",\"etag\":\"<etag>\"}` without \
-         reading the grid. Anything else is `ERR usage: screen [--json] [since=<etag>]`.",
+         reading the grid. Read on a whole frame as `text` is: a reply on one still unfinished, \
+         the `unchanged` one too, ends with `\"frame\":\"open\"` after the etag. Anything else is \
+         `ERR usage: screen [--json] [since=<etag>]`.",
     )
     .json(Json::Emits),
     v(
@@ -1013,7 +1022,8 @@ pub const VERBS: &[VerbSpec] = &[
         "line <n>: one physical line of scrollback+screen",
         "`n` is an absolute row (`search` coordinates). `ERR evicted`: older than retained \
          history; `ERR unreadable`: retained row could not be read; `ERR out of range`: past the \
-         live screen's end.",
+         live screen's end. A screen row is read on a whole frame as `text` is, with no word for \
+         one still open; a history row at once.",
     )
     .json(Json::Refused),
     v(
@@ -1042,8 +1052,9 @@ pub const VERBS: &[VerbSpec] = &[
          evicted/wiped after `since`; `breaks=` counts discontinuities (no-overlap redraw, \
          resize, alt-screen exit, reset); `back=` counts archived rows visible on screen again at \
          rows `pin..pin+back` from `back_at`. `screen=1` appends the current screen under the \
-         same lock as the last `screen_rows=<m>` lines (`frame=open` when the DEC 2026 frame was \
-         unfinished; see `await frame`). Seamless updates carry up to 1 MiB after the last 8 \
+         same lock as the last `screen_rows=<m>` lines, read on a whole frame as `text` is \
+         (`frame=open` when the DEC 2026 frame was still unfinished at the read's bound; see \
+         `await frame`). Seamless updates carry up to 1 MiB after the last 8 \
          turns' marks. Anything else is `ERR usage: offscreen [since=<i>] [tail=<n>] [max=<n>] \
          [screen=1]`.",
     )
@@ -1068,10 +1079,12 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "cell <r> <c>|abs=<n> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=]",
+        "cell <r> <c>|abs=<n> <c>: OK <grapheme%enc> <fg> <bg> <attrs>[ link=][ frame=open]",
         "`abs=<n>` reads absolute row `n` (`line`/`search` coordinates, history or live screen, \
          without `link=`); `ERR evicted` if older than retained history, `ERR out of range` past \
-         the screen.",
+         the screen. A screen row is read on a whole frame as `text` is, ` frame=open` coming \
+         last when the frame was still unfinished at the read's bound; a history row at once, \
+         with no word.",
     )
     .json(Json::Refused),
     v(
@@ -1079,8 +1092,10 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "OK <row> <col> <visible> <style>",
-        "",
+        "OK <row> <col> <visible> <style>[ frame=open]",
+        "Read on a whole frame as `text` is; ` frame=open` comes last (`--json`: \
+         \"frame\":\"open\") when the program's DEC 2026 frame was still unfinished after \
+         the read's bound",
     )
     .json(Json::Emits),
     v(
@@ -1216,7 +1231,9 @@ pub const VERBS: &[VerbSpec] = &[
          only), `long-line` (regex budget or >1 MiB row), `moving` (screen switched, resized or \
          renumbered rows during the scan), `older` (older history not searched). Rows are \
          absolute (`line` coordinates). Soft-wrapped hits can run past `col+len > cols` into the \
-         next row; regex `^` and `$` bind to the logical line.",
+         next row; regex `^` and `$` bind to the logical line. The search starts on a whole frame \
+         as `text` reads; ` frame=open` before `screen_first=` says a read of it found the frame \
+         unfinished, which is no `incomplete` cause.",
     ),
     v(
         "find",
@@ -1243,8 +1260,10 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "OK <n> + the selected text",
-        "",
+        "OK <n>[ incomplete][ frame=open] + the selected text",
+        "Read on a whole frame as `text` is (as are `select`, `copy` and `blocktext`); ` \
+         frame=open` ends the header when the program's DEC 2026 frame was still unfinished at \
+         the read's bound.",
     )
     .json(Json::Refused),
     v(
@@ -1252,8 +1271,8 @@ pub const VERBS: &[VerbSpec] = &[
         ClipboardWrite,
         Status,
         Session,
-        "copy the selection to the system clipboard, OK <bytes>",
-        "",
+        "copy the selection to the system clipboard, OK <bytes>[ incomplete][ frame=open]",
+        "Read as `selection` is.",
     )
     .json(Json::Refused)
     .input(Input::NONE),
@@ -1273,7 +1292,8 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "blocktext <id> [trim]: one command block's output",
         "`trim` drops trailing all-blank rows (`OK <n> trimmed=<k>`); any other argument is `ERR \
-         usage: blocktext <id> [trim]`.",
+         usage: blocktext <id> [trim]`. ` frame=open` after the count says the program's DEC 2026 \
+         frame was still unfinished at the read's bound, as `text` says it.",
     )
     .json(Json::Refused),
     v(
@@ -1673,7 +1693,8 @@ pub const VERBS: &[VerbSpec] = &[
          after `anchor=` (last full clear) or alt-screen resizes whose displaced rows were not \
          restored before returning to the original size. `culprit=` names the candidate whose \
          faithful replay demoted alt-screen rows (else varies the newest `max_runs`, default 8, \
-         max 16). `cut=racy` compares replays (`against=replay fidelity=-`); `unknown \
+         max 16). `cut=racy` (a screen still moving, or a frame still unfinished at the read's \
+         bound) compares replays (`against=replay fidelity=-`); `unknown \
          seed=ambiguous` or `law=ambiguous` means seeds or `aterm_resize_undo` headers disagree; \
          `carried=0 from_build=` marks a recording starting at a seamless update; `undo=off` \
          replays without resize undo. At most 2 analyses run at once (`ERR busy` after 10 s); \
@@ -1706,7 +1727,8 @@ pub const VERBS: &[VerbSpec] = &[
         "— `id/submitted/status/dur_ms/seq/hash/by/arch/text` per completed turn (newest 512; \
          harness turns evict first above half so non-harness callers keep >= 255). `by=` is \
          `harness|ctl|bridge|<sid>|-`; `status=` is `settled|timeout|hangup|pressed` (`pressed` \
-         when Enter was sent without awaiting settle, or `turn settle=submitted`). \
+         when Enter was sent without awaiting settle, its `seq`/`hash` read on a whole frame as \
+         `text` reads, or `turn settle=submitted`). \
          `arch=<origin>:<last>` feeds `offscreen since=`. Seamless updates and crash-restore \
          journals (`status journal=off` when disabled; `started_ms` and `seq` from the old \
          instance, rewritten every 2 s with `status journal_ledger_lag=`) carry records with \
@@ -1795,7 +1817,9 @@ pub const VERBS: &[VerbSpec] = &[
          integration=<active|unconfigured|inactive|lost|unsupported> integration_rev=<n> \
          detail=<pct|-> program=<name|-> \
          program_state=<idle|working|blocked|done|error|->:[permission|question|auth] \
-         since_ms=<ms> revision=<n> seq=<n> gen=<epoch>.<seq>`. Input & human fences: \
+         since_ms=<ms> revision=<n> seq=<n> gen=<epoch>.<seq>` (`seq=` and `hash=` are `-` on a \
+         contended lock or an unfinished DEC 2026 frame, which `status` never waits for; `gen=` \
+         stands). Input & human fences: \
          `human_ms=<ms|-> human_seq=<n> typed_ms=<ms|-> \
          typed_by=<human|harness|ctl|bridge|<sid>|-> input=<idle|writing|spill|frame> \
          input_bytes=<n> input_wait_ms=<ms> editing=<0|1> \
@@ -2031,21 +2055,26 @@ pub const VERBS: &[VerbSpec] = &[
          arriving before bytes land answers `ERR halted …`, or mid-turn stops immediately (`OK 0 \
          turn skipped reason=halted submitted=0 seq=<n> id=<n>`). Reply: verdict line (`id= \
          submitted=<0|1> status=settled|timeout|submitted seq= dur_ms= hash=<FNV16>[ \
-         task_rev=<n>][ agent_rev=<n>][ trimmed=<k>]`; `agent_rev=` feeds `await agent <words> \
-         since=<n>`) then rows (`trim=1` drops trailing blank rows while `hash=` hashes the \
-         untrimmed screen). `typed=1` types key-by-key at `cadence=<ms>` (default 70) up to \
-         `cap=<n>` graphemes (default 240, max 4096) and pastes any remainder (`typed=<keys> \
+         task_rev=<n>][ agent_rev=<n>][ frame=open][ trimmed=<k>]`; `agent_rev=` feeds `await \
+         agent <words> since=<n>`) then rows (`trim=1` drops trailing blank rows while `hash=` \
+         hashes the untrimmed screen). `typed=1` types key-by-key at `cadence=<ms>` (default 70) \
+         up to `cap=<n>` graphemes (default 240, max 4096) and pastes any remainder (`typed=<keys> \
          pasted=<graphemes>`), stopping with `OK 0 turn skipped reason=<deadline|person|changed> \
-         typed=<k> pasted=<p> submitted=0 seq=<n> id=<n>` if overtaken by timeout, a human key, \
-         or a screen/input-frame change. `yield=<floor 0..=1>` waits for `trail status` \
-         `momentum=` to drop to `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout \
+         typed=<k> pasted=<p> submitted=0 seq=<n> id=<n>` if overtaken by timeout, a human key, or \
+         a screen/input-frame change. `yield=<floor 0..=1>` waits for `trail status` `momentum=` \
+         to drop to `<floor>` before typing (`yielded_ms=<n>`, or `ERR yield timeout \
          momentum=<v>`). `if-gen=<epoch>.<seq>` (`status gen=`) and \
          `if-rows=<first>-<last>:<hex16>` fence on the screen generation or row-range FNV-1a-64 \
-         hash before typing (`reason=changed` on mismatch); `if-supervisor=<holder>` fences on \
-         the live supervisor claim. Leading `id=<epoch>:<producer>:<seq>` enables exactly-once \
-         replay (`OK 0 dup=1` on duplicate; see `send`). Refused with `ERR busy input-unread …` \
-         into a `stalled` or stopped program (`turn` takes no `unread=ok`), or appends \
-         `warn=input-unread input_bytes=<n> input_wait_ms=<ms>` when input is >= 1 s old.",
+         hash before typing (`reason=changed` on mismatch). `if-rows=` never vouches for half a \
+         frame: a `typed=1` turn whose first look finds its input frame in a DEC 2026 frame still \
+         within the sync timeout waits within `timeout=` for that frame to close and judges the \
+         fence on it; any other turn waits as `text` does, and a frame still open then has moved; \
+         the settled screen is read on a whole frame too (` frame=open` when not); \
+         `if-supervisor=<holder>` fences on the live supervisor claim. Leading \
+         `id=<epoch>:<producer>:<seq>` enables exactly-once replay (`OK 0 dup=1` on duplicate; see \
+         `send`). Refused with `ERR busy input-unread …` into a `stalled` or stopped program \
+         (`turn` takes no `unread=ok`), or appends `warn=input-unread input_bytes=<n> \
+         input_wait_ms=<ms>` when input is >= 1 s old.",
     )
     .lane(Wait)
     .input(
@@ -2135,16 +2164,19 @@ pub const VERBS: &[VerbSpec] = &[
          busy sink` (or `ERR write failed partial accepted=<n>`). `if-gen=<epoch>.<seq>` (`status \
          gen=`, `agent_gen=`) and `if-fp=<hex16>` (`status hash=`, `agent_fp=`, `turn hash=`) \
          reply `OK skipped reason=changed seq=<n>` if the screen moved (`if-seq=` is rejected as \
-         `ERR usage`). `if-human=<n>` (`status human_seq=`) replies `OK skipped reason=person \
-         seq=<n>` if a person gave input since `<n>`. `if-supervisor=<holder>` requires \
-         `<holder>` to hold `meta set supervisor` (`ERR busy supervisor=<holder|->` otherwise). \
-         Refusal order: `ERR halted`, `ERR rate`, `ERR busy turn=`, `ERR usage`, `ERR busy \
-         input-unread bytes=<n> wait_ms=<ms> input=<stalled|stopped>`, `ERR badregex`, \
-         guards/fences, then `id=`. On macOS, raw input unread >= 1 s appends `warn=input-unread \
-         input_bytes=<n> input_wait_ms=<ms>`; stalled or stopped programs refuse unless \
-         `unread=ok` or an ISIG signal char (`ctrl+c`) can be taken immediately. Trailing tokens: \
-         `mods=<ctrl+shift+...>` (on `type=release`, `mods=` names the modifiers remaining held), \
-         `type=press|repeat|release` (`down`/`up`), and `base=<c>`.",
+         `ERR usage`). A row fence (`if=`, `if-fp=`) waits as `text` does for an unfinished DEC \
+         2026 frame to close and answers `OK skipped reason=changed` on one still open; `if-gen=` \
+         and `if-human=` are decided as the screen stands. `if-human=<n>` (`status human_seq=`) \
+         replies `OK skipped reason=person seq=<n>` if a person gave input since `<n>`. \
+         `if-supervisor=<holder>` requires `<holder>` to hold `meta set supervisor` (`ERR busy \
+         supervisor=<holder|->` otherwise). Refusal order: `ERR halted`, `ERR rate`, `ERR busy \
+         turn=`, `ERR usage`, `ERR busy input-unread bytes=<n> wait_ms=<ms> \
+         input=<stalled|stopped>`, `ERR badregex`, guards/fences, then `id=`. On macOS, raw input \
+         unread >= 1 s appends `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`; stalled or \
+         stopped programs refuse unless `unread=ok` or an ISIG signal char (`ctrl+c`) can be taken \
+         immediately. Trailing tokens: `mods=<ctrl+shift+...>` (on `type=release`, `mods=` names \
+         the modifiers remaining held), `type=press|repeat|release` (`down`/`up`), and \
+         `base=<c>`.",
     )
     .input(
         DRIVEN
@@ -2271,7 +2303,9 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "select region / word <r> <c> / line <r> / block <r1> <c1> <r2> <c2> / extend / clear",
         "`extend <r> <c>` grows the current selection (shift-click). `word` and `line` select \
-         across soft wraps (except ragged double-width wraps) up to hard newlines.",
+         across soft wraps (except ragged double-width wraps) up to hard newlines. Made on a \
+         whole frame as `text` reads one; `OK frame=open` says the program's DEC 2026 frame was \
+         still unfinished at the read's bound.",
     ),
     v(
         "signal",
@@ -2736,7 +2770,9 @@ pub const VERBS: &[VerbSpec] = &[
         "wait [<ms>]: block until the running command completes (OSC 133)",
         "Answers `OK complete <id> exit=<code|->`; with nothing running it returns the newest \
          completed block at once. `ERR exited` once the session exits or is closed; `OK timeout` \
-         after 30 s by default (max 600 s); without shell integration it can only time out or end.",
+         after 30 s by default (max 600 s); without shell integration it can only time out or end. \
+         It reads the shell's marks alone, so a program's unfinished DEC 2026 frame never holds \
+         it past its timeout.",
     )
     .lane(Wait)
     .json(Json::Refused),
@@ -2768,7 +2804,10 @@ pub const VERBS: &[VerbSpec] = &[
          fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
          id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` (filtered by `mail:kinds=<k,..>`, \
          `mail:from=<class|principal>`, `mail:topic=<t>`) and `GAP <local> mail-dropped=<n>`. \
-         Capped at 1/16 of fd limit (`ERR subscription capacity busy; retry`).",
+         `screen`, `cursor` and `cells` push only whole DEC 2026 frames: a target's unfinished \
+         frame puts its content push off (to the frame's 60 s hang detector at most, then as it \
+         stands) and holds up no other target or stream. Capped at 1/16 of fd limit (`ERR \
+         subscription capacity busy; retry`).",
     ),
     va(
         "topic",
@@ -3089,10 +3128,10 @@ pub const VERBS: &[VerbSpec] = &[
          bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->`, plus under `content` (the \
          local default; `needs=ask` selects the ask excerpt and `by=harness` turns are skipped in \
          `prompt=`): `user_title= title= cwd= branch= prompt= said= cmd= rows=` (<= 400 B per \
-         excerpt, credentials/fleet codes redacted, fleet replies capped at 256 KiB). `aterm ctl \
-         survey [--json] [--budget <chars>] [--sid <s>] [--fleet | --host <h>] [--timeout <s>]` \
-         and `survey --brief [--budget <chars>]` (`log n` + `brief all`) format multi-instance \
-         and fleet digests.",
+         excerpt, credentials/fleet codes redacted, fleet replies capped at 256 KiB; `rows=-` on \
+         an unfinished DEC 2026 frame, never waited for). `aterm ctl survey [--json] [--budget \
+         <chars>] [--sid <s>] [--fleet | --host <h>] [--timeout <s>]` and `survey --brief \
+         [--budget <chars>]` (`log n` + `brief all`) format multi-instance and fleet digests.",
     )
     .for_fleet(),
     va(

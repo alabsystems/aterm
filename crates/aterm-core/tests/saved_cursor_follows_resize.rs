@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The DECSC / 1049 saved cursor follows its text through a resize, on the synchronous and
-//! the offloaded path, for both slots. A full-screen app enters the alternate screen (1049
-//! saves the main cursor), the window resizes, the app exits (1049 restores it) and the shell
-//! prints its prompt; the resize rewraps or re-seats the saved primary screen, so a slot left
-//! at its old row and column would put the prompt over earlier output. xterm
-//! (`AdjustSavedCursor`), Alacritty, kitty, Ghostty and WezTerm move the slot with its text
-//! too; a bare DECRC and the 1049 exit still clamp what they read to the grid.
+//! The DECSC / 1049 saved cursor follows its text through a resize, on the synchronous and the
+//! offloaded path, for both slots.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -122,7 +117,6 @@ fn a_bare_decsc_follows_its_line_through_a_rewrap() {
     ] {
         let mut term = terminal(tiered, 6, 20);
         term.process(b"0123456789abcdefghijKLMNOPQRST\r\ntail\x1b7");
-        // Move away so DECRC has to restore something.
         term.process(b"\x1b[1;1H");
         path.resize(&mut term, 6, 10);
         term.process(b"\x1b8X");
@@ -164,8 +158,6 @@ fn a_width_round_trip_under_the_alternate_screen_leaves_the_saved_cursor_in_plac
         (true, Path::Sync),
         (true, Path::Offloaded),
     ] {
-        // Four rows: the narrowing pushes `$ ls` into history and the widening
-        // pulls it back (on the offloaded path at the re-attach).
         let mut term = terminal(tiered, 4, 40);
         term.process(b"$ ls\r\nCargo.toml  README.md  src  target  tests\r\n$ vim");
         term.process(b"\x1b[?1049h\x1b[2J\x1b[Hvim");
@@ -194,7 +186,6 @@ fn the_alternate_screens_saved_cursor_follows_a_demoting_shrink() {
     for r in 0..10u16 {
         term.process(format!("\x1b[{};1Hr{r}", r + 1).as_bytes());
     }
-    // Save on `r5`, then park the cursor on the last row so the shrink demotes.
     term.process(b"\x1b[6;3H\x1b7\x1b[10;1H");
     term.resize(8, 20);
     term.process(b"\x1b8X");
@@ -256,7 +247,6 @@ fn a_slot_past_the_grid_rides_a_reveal_below_the_content() {
             for i in 0..9 {
                 term.process(format!("line {i}\r\n").as_bytes());
             }
-            // DECSC on the blank last row, then up onto `line 8`.
             term.process(b"\x1b7\x1b[A");
             path.resize(&mut term, 5, 20);
             let slot = |term: &Terminal| {
@@ -335,7 +325,6 @@ fn a_slot_past_the_grid_stays_below_the_content_through_a_widening() {
     for path in [Path::Sync, Path::Offloaded] {
         let mut term = Terminal::new(6, 10);
         term.process(b"h0\r\nh1\r\n0123456789abcdefghij\r\nx2\r\nx3\r\n");
-        // DECSC on the blank last row, then up onto `x3`.
         term.process(b"\x1b7\x1b[A");
         path.resize(&mut term, 5, 10);
         path.resize(&mut term, 5, 20);
@@ -369,10 +358,8 @@ fn a_move_that_follows_the_content_in_the_offload_window_keeps_the_owed_rows() {
         }
         term.process(b"\x1b[2J\x1b[H");
         term.process(format!("{}\r\n{}\r\n", "a".repeat(27), "b".repeat(27)).as_bytes());
-        // DECSC on `top`, then the prompt on the last row: a full screen.
         term.process(b"\x1b7top\r\n$ ");
     };
-    // (name, before the resize, inside the window)
     for (name, before, step) in [
         ("DECRC", &b""[..], &b"\x1b8X"[..]),
         ("1049 exit after 47", b"\x1b[?47h", b"\x1b[?1049lX"),

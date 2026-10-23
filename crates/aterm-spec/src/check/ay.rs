@@ -32,7 +32,7 @@ pub(crate) enum Want {
 }
 
 impl Want {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Want::Unsat => "unsat",
             Want::Sat => "sat",

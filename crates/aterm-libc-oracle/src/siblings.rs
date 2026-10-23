@@ -16,9 +16,10 @@ use std::path::Path;
 
 use crate::cells::{self, Os};
 
-/// Where a cell source's hand-written section starts.
-pub const BODY_MARKER: &str =
-    "// ------------------------------------------------------------------------\n// The C macros.";
+/// Where a cell source's hand-written section starts: the first line of code
+/// the generator writes there (`regen::shim::bodies` writes it from this), never
+/// a comment, so pruning a cell source's comments cannot undefine the section.
+pub const BODY_MARKER: &str = "type fd_word = ";
 
 /// A sibling-body defect.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,7 +54,7 @@ impl fmt::Display for SiblingFinding {
         match self {
             Self::Marker { file, count } => write!(
                 f,
-                "{file}: {count} hand-written-body markers (`// The C macros.`), not exactly one"
+                "{file}: {count} hand-written-body markers (`{BODY_MARKER}`), not exactly one"
             ),
             Self::Differs {
                 os,
@@ -175,7 +176,7 @@ mod tests {
                 os: Os::Darwin,
                 left: "darwin_aarch64.rs".into(),
                 right: "darwin_x86_64.rs".into(),
-                line: 4,
+                line: 3,
             }]
         );
     }

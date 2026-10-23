@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fish row (docs/DESIGN-init-system-2026-10-20.md §6.2): upstream's release source
-//! tarball, pinned by sha256, built here with Trust into a `*.noindex` target directory
-//! under the tooling cache, held to `/usr/lib` and `/System` for every library it loads,
-//! and stamped with the tarball's sha256, `fish --version` and the features it names.
-//!
-//! The build names its features (`--no-default-features`, then the row's list): fish's
-//! defaults probe the host (`embed-manpages` runs a `sphinx-build` if one is found,
-//! `localize-messages` a `msgfmt`), so the same tag would build another program on
-//! another host. `FISH_BUILD_DOCS=0`, `PCRE2_SYS_STATIC=1` and `CARGO_TARGET_DIR` are
-//! the variables the child is handed, and every variable that would change what cargo,
-//! rustc or the C compiler builds is removed from what it inherits
-//! ([`BUILD_ENV_REMOVED`]): the build links PCRE2 from the source pcre2-sys carries,
-//! never a dynamic one from Homebrew. A cargo config file the person wrote
-//! (`~/.cargo/config.toml`) still applies, as it does to every build under their home.
-//!
-//! Nothing is redistributed: each machine builds its own copy from upstream's source.
+//! Provisioning builder for the pinned `fish` shell from source.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -24,22 +9,7 @@ use std::path::{Path, PathBuf};
 use super::place::{self, Scratch};
 use super::{Host, Machine, Spawn, Target};
 
-/// What the build child is never handed, besides `cargo run`'s words about this process
-/// (`crate::CHILD_ENV_REMOVED`): every variable that would change what the pinned source
-/// builds into, a name ending in `*` standing for each that starts so
-/// ([`super::Spawn::remove`]).
-///
-/// - the flags that replace every config source: `RUSTFLAGS`, `RUSTDOCFLAGS` and their
-///   encoded forms;
-/// - cargo's config in the environment (`CARGO_BUILD_*`: rustflags, target, target and
-///   build dirs, rustc and its wrappers; `CARGO_TARGET_*`: a triple's rustflags, linker
-///   and runner; `CARGO_PROFILE_*`), the build re-setting `CARGO_TARGET_DIR` to its own
-///   ([`build_spawn`]);
-/// - the compiler a build runs instead of the toolchain's: `RUSTC`, `RUSTDOC` and the
-///   two wrappers;
-/// - the C compiler and its flags pcre2-sys's build reads (cc's `CC`, `CFLAGS`, …, with
-///   their `_<target>`, `TARGET_` and `HOST_` forms), the include and library paths a
-///   Homebrew shell exports, and the deployment target, which changes the binary.
+/// Environment variables stripped from the `fish` provisioning build.
 pub(super) const BUILD_ENV_REMOVED: [&str; 31] = [
     "RUSTFLAGS",
     "RUSTDOCFLAGS",
@@ -74,8 +44,7 @@ pub(super) const BUILD_ENV_REMOVED: [&str; 31] = [
     "MACOSX_DEPLOYMENT_TARGET",
 ];
 
-/// Every variable a provisioning build removes: [`BUILD_ENV_REMOVED`], then `cargo
-/// run`'s ([`crate::CHILD_ENV_REMOVED`]).
+/// Returns all environment variables removed from a provisioning build.
 pub(super) fn removed() -> Vec<String> {
     BUILD_ENV_REMOVED
         .iter()
@@ -84,11 +53,7 @@ pub(super) fn removed() -> Vec<String> {
         .collect()
 }
 
-/// The build of `manifest` (the unpacked tree's `Cargo.toml`) with `targo`, into
-/// `target` (a `*.noindex` directory), from `cwd` outside the tree, naming `features`.
-/// `target` is `--target-dir` and `CARGO_TARGET_DIR` both: fish's build helper reads the
-/// variable when it compiles (`option_env!`) and canonicalizes it, falling back to
-/// `<tree>/target`, which does not exist (measured: build.rs:22 panics `NotFound`).
+/// Builds the `Spawn` command that compiles `manifest` with `targo` into `target`.
 pub(super) fn build_spawn(
     targo: &Path,
     manifest: &Path,
@@ -130,8 +95,7 @@ pub(super) fn build_spawn(
     }
 }
 
-/// Fetch, check, unpack, build, hold and stamp the row's source `archive` at `t`'s version
-/// and features, then place it in `t`'s directory; the placed `bin/fish`.
+/// Fetches, verifies, builds, checks, and installs `fish` from `archive` into `t`.
 pub(super) fn build(
     archive: &super::rows::Archive,
     t: &Target,

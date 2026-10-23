@@ -2,40 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! The canonical wire codec every Aos encoding is written in.
-//!
-//! # The law
-//!
-//! All integers are little-endian and fixed-width. A decoder accepts exactly the bytes the
-//! encoder writes for some value and refuses every other byte string — the encoding is
-//! *canonical*, so equal values have equal bytes and a digest over the bytes is a digest
-//! over the value:
-//!
-//! * `bool` and `opt` tags are `0` or `1`; any other byte is [`WireFault::BadTag`].
-//! * `duration` is `secs: u64, nanos: u32` with `nanos < 1_000_000_000`; a larger `nanos`
-//!   is [`WireFault::NonCanonical`] (it names a duration another encoding also names).
-//! * `offset` is a signed `i128` count of nanoseconds (16 bytes): time enters an Aos task as
-//!   a checked offset from a declared logical epoch, never as an `Instant`.
-//! * `bytes` and `str` carry a `u32` length prefix. A length of `u32::MAX` or more is written
-//!   as `u32::MAX` followed by its `u64` length, and the long form is refused for any length
-//!   the short form can hold, so every length has exactly one encoding. A `str` that is not
-//!   UTF-8 is [`WireFault::NonCanonical`].
-//! * An artifact is `kind: u8 | name: str | version: u32 | digest: [u8; 32]`; a kind byte no
-//!   [`ArtifactKind`] uses is [`WireFault::BadTag`]. An identity is its five artifacts in the
-//!   order task, code, contract, schema, profile, and each must carry the kind of its slot.
-//! * [`Dec::finish`] refuses trailing bytes ([`WireFault::Trailing`]).
-//!
-//! Decoding is a pure, panic-free function of the bytes: every read is bounds-checked, every
-//! length is checked against the bytes that remain before anything is copied, so a hostile
-//! length can never make the decoder allocate more than its input. Every read names the
-//! field it refused. Encoding cannot fail: [`Enc`] only appends.
 
 use core::fmt;
 use core::time::Duration;
 
 use crate::ident::{ArtifactId, ArtifactKind, Digest, TaskIdentity, len_u64};
 
-/// Why a byte string is not the canonical encoding of the value asked for. The bytes are
-/// only read; nothing is decoded past the refused field.
+/// Why a byte string is not the canonical encoding of the value asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireFault {
     /// The bytes ended inside `field`: it needs `need` bytes and `have` remain.
@@ -68,8 +41,7 @@ pub enum WireFault {
         /// The most the field may hold.
         limit: u64,
     },
-    /// Bytes the encoder never writes for any value (an over-long length form, a
-    /// `nanos ≥ 10⁹`, a `str` that is not UTF-8, a value that re-encodes differently).
+    /// Bytes the encoder never writes for any value.
     NonCanonical {
         /// The field being read.
         field: &'static str,
@@ -105,8 +77,7 @@ impl fmt::Display for WireFault {
 
 impl std::error::Error for WireFault {}
 
-/// The canonical encoder: an append-only byte buffer. Every field method appends one field
-/// and cannot fail; [`Enc::clear`] starts a new encoding in the same room.
+/// The canonical encoder: an append-only byte buffer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Enc {
     buf: Vec<u8>,
@@ -150,20 +121,18 @@ impl Enc {
         &self.buf
     }
 
-    /// Forgets every byte written, keeping the room they took: the next field starts a new
-    /// encoding, which is then exactly what a fresh encoder would write. For an encoder reused
-    /// across many values (one per replayed step, one per input of a trace digest).
+    /// Forgets every byte written, keeping the room they took.
     pub fn clear(&mut self) {
         self.buf.clear();
     }
 
-    /// Makes room for at least `additional` more bytes, so the next writes up to that many
-    /// do not grow the buffer one doubling at a time. Writes nothing.
+    /// Makes room for at least `additional` more bytes, so the next writes up to that many do not
+    /// grow the buffer one doubling at a time.
     pub fn reserve(&mut self, additional: usize) {
         self.buf.reserve(additional);
     }
 
-    /// Fixed bytes with no length prefix (a magic). The reader must know their length.
+    /// Fixed bytes with no length prefix (a magic).
     #[inline]
     pub fn raw(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
@@ -298,8 +267,7 @@ impl Enc {
     }
 }
 
-/// The canonical decoder over a borrowed byte string. Every read names its field; a refused
-/// read leaves the decoder where it was.
+/// The canonical decoder over a borrowed byte string.
 #[derive(Clone, Debug)]
 pub struct Dec<'a> {
     bytes: &'a [u8],
@@ -478,8 +446,7 @@ impl<'a> Dec<'a> {
         })
     }
 
-    /// An option: tag `0` is `None`; tag `1` is `Some` of what `f` reads; any other tag is
-    /// `BadTag`.
+    /// An option: tag `0` is `None`.
     #[inline]
     pub fn opt<T>(
         &mut self,
@@ -498,8 +465,7 @@ impl<'a> Dec<'a> {
         r
     }
 
-    /// A count of `limit` or fewer items, as `u64`: `TooLong` past `limit`. Read a count
-    /// with this before allocating for the items.
+    /// A count of `limit` or fewer items, as `u64`: `TooLong` past `limit`.
     #[inline]
     pub fn count(&mut self, field: &'static str, limit: u64) -> Result<usize, WireFault> {
         let at = self.pos;

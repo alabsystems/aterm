@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SYNC 3.1's counter requests: the window system's `_NET_WM_SYNC_REQUEST`
-//! counter (EWMH), which a window manager waits on before it shows a resized
-//! window again. Written against the X Synchronization Extension Protocol
-//! 3.1 (xcbproto `sync.xml`); bytes held to x11rb-protocol 0.13.2's
-//! (`tests/recorded/`).
-//!
-//! An INT64 travels as its high half (INT32) and then its low half (CARD32),
-//! each in the connection's byte order; here it is an `i64`.
-//!
-//! Every request takes the extension's major opcode, which the server assigns
-//! (QueryExtension `SYNC`). The protocol asks a client to send Initialize
-//! before any other of its requests.
+//! X Synchronization Extension (SYNC 3.1) counter requests for
+//! `_NET_WM_SYNC_REQUEST` resize synchronization.
 
 use super::{ParseError, Reader, Reply, Request, Void, Writer, reply_head};
 

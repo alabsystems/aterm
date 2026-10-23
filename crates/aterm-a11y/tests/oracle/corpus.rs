@@ -1,34 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The semantics oracle's input: windows' accessibility trees and what
-//! happens to them, the same source compiled twice.
-//!
-//! `tests/recorder` (outside the workspace) compiles this file against the
-//! registry `accesskit` 0.24.1, and the replay in `src/atspi/oracle.rs`
-//! against aterm's own model. Both see it as a sibling of a `model` module,
-//! so every name used here exists, with the same meaning, in both: that is
-//! the model's compatibility contract, held by compiling this file.
-//!
-//! Two kinds of scenario:
-//!
-//! * fixtures shaped like the trees aterm-gui publishes (the terminal grid
-//!   and its rows, the tab strip, chrome messages and dialogs, the find field,
-//!   menus, the palette, Settings' controls), with the edits a session makes;
-//! * generated ones: random trees over the same roles and properties, changed
-//!   by random edits, from a fixed seed, so the input is the same on both
-//!   sides and every run.
-//!
-//! And the blank-line documents ([`blank_line_documents`]): small text
-//! inputs with empty runs anywhere, for the text navigation table the
-//! scenarios cannot hold (the registry crates' paragraph search hangs on
-//! them, see `transcript::blank_line_answer`).
-//!
-//! Every update is valid for both models: each node but the root has one
-//! parent, focus and selections name live nodes, a run's character lengths
-//! sum to its text's bytes and its positions and widths match them. A node is
-//! always built by [`NodeSpec::build`], in one setter order, so two equal
-//! specs build equal nodes under either model's equality.
+//! Accessibility tree scenario corpus and blank-line documents.
+//! Provides [`blank_line_documents`] and [`NodeSpec::build`].
 
 use std::collections::BTreeMap;
 
@@ -74,10 +48,8 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
     all
 }
 
-/// How many generated scenarios there are.
+/// Number of generated scenarios in the corpus.
 const GENERATED: u64 = 40;
-
-// --- the node description both sides build from ----------------------------
 
 /// Everything a node can carry here, built into a model node in one order.
 #[derive(Clone, Debug, PartialEq)]
@@ -92,12 +64,10 @@ pub(crate) struct NodeSpec {
     /// `translate(dx, dy) * scale(s)`.
     transform: Option<(f64, f64, f64)>,
     selection: Option<((u64, usize), (u64, usize))>,
-    /// A run's characters, each one selectable unit (a combining sequence or
-    /// a CRLF is one).
+    /// A run's characters, each one selectable unit (a combining sequence or a CRLF is one).
     chars: Option<Vec<String>>,
     word_starts: Vec<u8>,
-    /// Character positions and widths: each character `cell` wide, the hard
-    /// line break zero-wide.
+    /// Character positions and widths: each character `cell` wide, the hard line break zero-wide.
     cell: Option<f32>,
     direction: Option<TextDirection>,
     numeric: Option<f64>,
@@ -171,8 +141,7 @@ impl NodeSpec {
         self
     }
 
-    /// A text run of `text` split into characters (a `\r\n` is one), its
-    /// words starting after each space.
+    /// Creates a text run of `text` split into characters and word starts.
     fn run(text: &str) -> Self {
         let mut spec = Self::new(Role::TextRun);
         spec.set_text(split(text));
@@ -299,8 +268,7 @@ impl NodeSpec {
     }
 }
 
-/// `text` as selectable characters: a `\r\n` and a base letter with its
-/// combining acute accent are one character each.
+/// `text` as selectable characters.
 fn split(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for c in text.chars() {
@@ -399,8 +367,7 @@ impl Snapshot {
     }
 }
 
-/// Records a scenario as snapshots: each change is sent as the difference
-/// from the last one sent, or whole.
+/// Records a scenario as snapshots.
 struct Script {
     name: String,
     steps: Vec<Step>,
@@ -469,8 +436,6 @@ impl Script {
     }
 }
 
-// --- fixtures ------------------------------------------------------------------
-
 const ROOT: u64 = 0;
 const TERMINAL: u64 = 1;
 const TAB_LIST: u64 = 2;
@@ -514,8 +479,7 @@ fn row(index: u64, text: &str) -> (u64, NodeSpec) {
     (ROW_BASE + index * 256, run)
 }
 
-/// aterm's grid: a read-only terminal document of `lines`, the caret at
-/// `caret` (row, column), under the window with a two-tab strip.
+/// Builds a read-only terminal grid document of `lines` with the caret at `caret`.
 fn grid(lines: &[&str], caret: Option<(u64, usize)>, selected_tab: u64) -> Snapshot {
     let mut nodes: Vec<(u64, NodeSpec)> = Vec::new();
     let mut rows = Vec::new();
@@ -586,18 +550,15 @@ fn terminal() -> Scenario {
         Rect::new(100.0, 50.0, 452.0, 400.0),
         Rect::new(102.0, 80.0, 450.0, 398.0),
     );
-    // Typing at the prompt: the row's run grows and the caret follows.
     for typed in ["user@host:~$ c", "user@host:~$ ca", "user@host:~$ cat"] {
         let caret = typed.chars().count();
         tree = grid(&[lines[0], lines[1], typed], Some((2, caret)), TAB_BASE);
         s.update(0, &tree);
     }
-    // A selection from the second row into the third, and back to a caret.
     tree.node(TERMINAL).selection = Some(((ROW_BASE + 256, 2), (ROW_BASE + 512, 4)));
     s.update(0, &tree);
     tree.node(TERMINAL).selection = Some(((ROW_BASE + 512, 16), (ROW_BASE + 512, 16)));
     s.update(0, &tree);
-    // Output scrolls the screen: every row's text moves up one run.
     let scrolled = [
         "notes  todo.txt\n",
         "user@host:~$ cat todo.txt\n",
@@ -606,15 +567,12 @@ fn terminal() -> Scenario {
     ];
     tree = grid(&scrolled, Some((3, 13)), TAB_BASE);
     s.update(0, &tree);
-    // The caret hidden (DECTCEM): no selection at all.
     tree.node(TERMINAL).selection = None;
     s.update(0, &tree);
-    // The other tab is selected, and the whole tree is sent again.
     tree = grid(&scrolled, Some((3, 13)), TAB_BASE + 1);
     s.resend(0, &tree);
     s.focus(0, false);
     s.focus(0, true);
-    // Focus moves to a tab, then back.
     tree.focus = TAB_BASE + 1;
     s.update(0, &tree);
     tree.focus = TERMINAL;
@@ -624,7 +582,6 @@ fn terminal() -> Scenario {
         Rect::new(300.0, 250.0, 652.0, 600.0),
         Rect::new(302.0, 280.0, 650.0, 598.0),
     );
-    // The screen clears to an empty prompt row.
     tree = grid(&["\n", ""], Some((1, 0)), TAB_BASE + 1);
     s.update(0, &tree);
     s.done()
@@ -654,17 +611,14 @@ fn chrome() -> Scenario {
     tree.nodes.insert(overflow, link);
     tree.node(ROOT).children = vec![TAB_LIST, TERMINAL, status, progress, overflow];
     s.open(0, &tree, true);
-    // The status band says something else: a name change and an announcement.
     tree.node(status).label = Some("Pasted 3 lines".to_owned());
     tree.node(status).value = Some("Pasted 3 lines".to_owned());
     s.update(0, &tree);
-    // The meter moves, then loses its value (indeterminate, busy).
     tree.node(progress).numeric = Some(75.0);
     s.update(0, &tree);
     tree.node(progress).numeric = None;
     tree.node(progress).busy = true;
     s.update(0, &tree);
-    // An assertive alert appears, is replaced, and goes.
     let alert = MESSAGE_BASE + 4;
     let mut alert_spec = NodeSpec::new(Role::Alert).label("Disk almost full");
     alert_spec.live = Some(Live::Assertive);
@@ -677,7 +631,6 @@ fn chrome() -> Scenario {
     tree.nodes.remove(&alert);
     tree.node(ROOT).children.retain(|&c| c != alert);
     s.update(0, &tree);
-    // A paste confirmation: a dialog with two buttons takes the focus.
     let dialog = MESSAGE_BASE + 5;
     let ok = MESSAGE_BASE + 6;
     let cancel = MESSAGE_BASE + 7;
@@ -717,7 +670,6 @@ fn chrome() -> Scenario {
     tree.node(toggle).toggled = Some(Toggled::Mixed);
     s.update(0, &tree);
     s.focus(0, false);
-    // The dialog closes while the window is in the background.
     for id in tree.subtree(dialog) {
         tree.nodes.remove(&id);
     }
@@ -751,22 +703,18 @@ fn find() -> Scenario {
     let mut s = Script::new("fixture find field");
     let base = grid(&["foo bar\n", "foo\n", "$ "], Some((2, 2)), TAB_BASE);
     s.open(0, &base, true);
-    // Find opens empty: the run has no characters.
     let mut tree = with_find(base.clone(), "", 0, "");
     s.update(0, &tree);
     for (query, status) in [("f", "3 matches"), ("fo", "2 matches"), ("foo", "1 of 2")] {
         tree = with_find(base.clone(), query, query.chars().count(), status);
         s.update(0, &tree);
     }
-    // The caret moves inside the query, then a selection of all of it.
     tree.node(FIND).selection = Some(((FIND_RUN, 1), (FIND_RUN, 1)));
     s.update(0, &tree);
     tree.node(FIND).selection = Some(((FIND_RUN, 0), (FIND_RUN, 3)));
     s.update(0, &tree);
-    // A deletion of the whole query.
     tree = with_find(base.clone(), "", 0, "no query");
     s.update(0, &tree);
-    // Find closes: the field goes and the focus returns to the grid.
     s.update(0, &base);
     s.done()
 }
@@ -822,10 +770,8 @@ fn menu() -> Scenario {
         tree = menu_tree(0, checked, focus, 3);
         s.update(0, &tree);
     }
-    // The rows move under the menu: a new epoch renames every item.
     tree = menu_tree(1, 1, 0, 2);
     s.update(0, &tree);
-    // The menu closes.
     let closed = grid(&["$ claude\n", "> "], Some((1, 2)), TAB_BASE);
     s.update(0, &closed);
     s.done()
@@ -1007,28 +953,23 @@ fn settings() -> Scenario {
     tree = settings_tree(0.55, true, "work", 1.0);
     tree.focus = 22;
     s.update(0, &tree);
-    // Typing into the name field, focused.
     for name in ["work2", "wor", ""] {
         tree = settings_tree(0.55, true, name, 1.0);
         tree.focus = 24;
         s.update(0, &tree);
     }
-    // The window moves to a 2x display: every transform doubles.
     tree = settings_tree(0.55, true, "", 2.0);
     tree.focus = 24;
     s.update(0, &tree);
-    // Another page is selected and the label becomes the read-out.
     tree.node(100).selected = Some(false);
     tree.node(101).selected = Some(true);
     tree.node(21).value = Some("Keys".to_owned());
     tree.focus = 101;
     s.update(0, &tree);
-    // The viewport's selection collapses, and the status speaks.
     tree.node(27).selection = Some(((41, 9), (41, 9)));
     tree.node(28).label = Some("Saved config.toml".to_owned());
     tree.focus = 27;
     s.update(0, &tree);
-    // Read-only and disabled controls.
     tree.node(24).read_only = true;
     tree.node(23).disabled = true;
     tree.node(22).disabled = true;
@@ -1103,8 +1044,6 @@ fn two_windows() -> Scenario {
 
 fn unicode() -> Scenario {
     let mut s = Script::new("fixture unicode text");
-    // Multibyte characters, a combining sequence, an emoji, a CRLF, and
-    // runs laid out in every direction.
     let lines = [
         "caf\u{e9} na\u{ef}ve r\u{e9}sum\u{e9}\n",
         "e\u{301}clair \u{4e2d}\u{6587} \u{1f642} ok\r\n",
@@ -1117,7 +1056,6 @@ fn unicode() -> Scenario {
     s.open(0, &tree, true);
     tree.node(TERMINAL).selection = Some(((ROW_BASE, 2), (ROW_BASE + 256, 6)));
     s.update(0, &tree);
-    // An edit inside the multibyte run, keeping its neighbours.
     let edited = [
         lines[0],
         "e\u{301}clair \u{4e2d}\u{6587}\u{6587} \u{1f642}\u{1f642} ok\r\n",
@@ -1143,7 +1081,6 @@ fn hyperlink_and_dialog_root() -> Scenario {
     link_spec.url = Some("https://example.org/aterm".to_owned());
     let mut label_spec = NodeSpec::new(Role::Label).bounds(10.0, 10.0, 90.0, 30.0);
     label_spec.value = Some("aterm docs".to_owned());
-    // A button named by its label child, not by a label of its own.
     let button_spec = NodeSpec::new(Role::Button)
         .children(&[label + 10])
         .bounds(10.0, 40.0, 90.0, 60.0)
@@ -1173,14 +1110,11 @@ fn hyperlink_and_dialog_root() -> Scenario {
     tree.node(label + 10).value = Some("Close".to_owned());
     tree.focus = button;
     s.update(0, &tree);
-    // The root stops being a window: a group root has no window events.
     tree.node(ROOT).role = Role::Group;
     s.update(0, &tree);
     s.focus(0, false);
     s.done()
 }
-
-// --- generated -------------------------------------------------------------------
 
 /// xorshift64*: the same numbers on every machine.
 struct Rng(u64);
@@ -1288,7 +1222,6 @@ struct Generator {
 impl Generator {
     fn id(&mut self) -> u64 {
         self.next_id += 1 + self.rng.below(3) as u64;
-        // Now and then an id from aterm-gui's high ranges.
         if self.rng.chance(15) {
             self.next_id + (1 << 48)
         } else {
@@ -1317,8 +1250,7 @@ impl Generator {
         chars
     }
 
-    /// A run: ending in a line break, or (a viewport's line, `end_line`
-    /// false) never empty unless it is its document's last.
+    /// Generates a random text run.
     fn run(&mut self, end_line: bool, last: bool) -> NodeSpec {
         let mut spec = NodeSpec::new(Role::TextRun);
         let mut chars = self.chars(end_line);
@@ -1415,8 +1347,6 @@ impl Generator {
                 spec = NodeSpec::new(self.rng.pick(TEXT_ROLES));
                 self.decorate(&mut spec);
                 let runs = 1 + self.rng.below(4);
-                // A viewport's lines carry no line break (aterm-gui's
-                // Settings editor); a grid's rows end in one.
                 let viewport = self.rng.chance(30);
                 for i in 0..runs {
                     let run_id = self.id();
@@ -1506,7 +1436,6 @@ impl Generator {
         let ids: Vec<u64> = tree.nodes.keys().copied().collect();
         let id = self.rng.pick(&ids);
         match self.rng.below(10) {
-            // Text edits in a run, its document's selection kept valid.
             0 | 1 => {
                 let runs: Vec<u64> = ids
                     .iter()
@@ -1526,9 +1455,6 @@ impl Generator {
                         chars.insert(at + k, piece);
                     }
                 } else {
-                    // A run without a line break keeps a character: an empty
-                    // run inside a document sends the registry crates'
-                    // paragraph search into an endless loop.
                     let keep = usize::from(!line_end);
                     if body <= keep {
                         return;
@@ -1550,7 +1476,6 @@ impl Generator {
                     }
                 }
             }
-            // A new caret or selection in some document.
             2 => {
                 let docs: Vec<u64> = ids
                     .iter()
@@ -1565,7 +1490,6 @@ impl Generator {
                 self.select(&tree.nodes, &mut spec);
                 tree.nodes.insert(doc, spec);
             }
-            // New properties on a node.
             3 | 4 => {
                 let mut spec = tree.nodes[&id].clone();
                 let children = std::mem::take(&mut spec.children);
@@ -1583,7 +1507,6 @@ impl Generator {
                 }
                 tree.nodes.insert(id, spec);
             }
-            // A new subtree under a non-run node.
             5 => {
                 if tree.nodes[&id].role == Role::TextRun
                     || TEXT_ROLES.contains(&tree.nodes[&id].role)
@@ -1595,7 +1518,6 @@ impl Generator {
                 let at = self.rng.below(spec.children.len() + 1);
                 spec.children.insert(at, child);
             }
-            // A subtree removed (never the root, never a document's only run).
             6 => {
                 if id == ROOT {
                     return;
@@ -1628,15 +1550,12 @@ impl Generator {
                     tree.focus = parent;
                 }
             }
-            // Children reordered (never a document's runs: an empty last
-            // run must stay last, see above).
             7 => {
                 let spec = tree.node(id);
                 if spec.children.len() > 1 && !TEXT_ROLES.contains(&spec.role) {
                     spec.children.reverse();
                 }
             }
-            // The focus moves.
             _ => tree.focus = id,
         }
     }
@@ -1683,28 +1602,20 @@ fn generated(seed: u64) -> Scenario {
     s.done()
 }
 
-// --- blank lines ---------------------------------------------------------------
-
-/// The runs the blank-line documents are made of: a blank line as aterm-gui's
-/// Settings and Manual viewports send one (an empty run: their runs carry no
-/// line break), two words, a line ending in a break, and a break alone.
+/// Candidate text runs used to build blank-line documents.
 const BLANK_LINE_RUNS: [&str; 4] = ["", "a b", "x\n", "\n"];
 
 /// The text input of a blank-line document's window.
 const BLANK_LINE_INPUT: u64 = 1;
 
-/// A document of the blank-line table: one run per line, with word starts
-/// (as the corpus's runs carry) or without (as aterm-gui's viewports send).
+/// A document of the blank-line table.
 #[derive(Clone, Debug)]
 pub(crate) struct Document {
     lines: Vec<&'static str>,
     words: bool,
 }
 
-/// Every document of one to three runs over [`BLANK_LINE_RUNS`], with word
-/// starts and without: the shapes accesskit_consumer 0.37.0's paragraph
-/// search never returned from, and the ones around them. The fixtures and
-/// generated scenarios keep an empty run last, where it hangs nothing.
+/// Every document of one to three runs over [`BLANK_LINE_RUNS`], with word starts and without.
 pub(crate) fn blank_line_documents() -> Vec<Document> {
     let mut all = Vec::new();
     for words in [true, false] {
@@ -1730,8 +1641,7 @@ pub(crate) fn blank_line_documents() -> Vec<Document> {
 }
 
 impl Document {
-    /// The document as a row key: its runs, and `words` when they carry
-    /// word starts.
+    /// The document as a row key: its runs, and `words` when they carry word starts.
     pub(crate) fn label(&self) -> String {
         format!("{:?}{}", self.lines, if self.words { " words" } else { "" })
     }
@@ -1741,8 +1651,7 @@ impl Document {
         self.lines.iter().map(|l| l.chars().count()).sum::<usize>() as i32
     }
 
-    /// Its window's first tree: a window whose one child, focused, is a
-    /// multi-line text input of one run per line.
+    /// Its window's first tree.
     pub(crate) fn update(&self) -> TreeUpdate {
         let runs: Vec<u64> = (0..self.lines.len() as u64)
             .map(|i| BLANK_LINE_INPUT + 1 + i)

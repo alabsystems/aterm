@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ship tap deploy <tap checkout> [--dry-run]`: the public Homebrew tap's structure,
-//! from this repo's source of truth ([`SOURCE`]), mirrored into a checkout of
-//! `alabsystems/homebrew-tap` and committed there.
-//!
-//! What it writes: `README.md`, `MAINTENANCE.md` and each `Casks/*.rb`, nothing else
-//! (no deletion: a file the tap holds and the source does not is left alone). A cask
-//! the tap already serves keeps its live `version` and `sha256` lines — those are
-//! `pub tap --bump`'s, in the publication engine — and one it does not is seeded as
-//! the source has it.
-//!
-//! What it refuses: a tap path that is no git checkout, a tap whose index already
-//! holds staged changes (they would ride in the deploy's commit), a source that has
-//! grown a `.github/` (the tap carries no workflow: MAINTENANCE.md), and a source
-//! carrying internal-only wording ([`INTERNAL_WORDING`]), which must never reach the
-//! public tree.
-//!
-//! What it leaves to the owner: the push. The commit is made in the tap checkout with
-//! its own identity, holds only the files it planned, and the deploy names the push to
-//! run with the owner's credential.
+//! `ship tap deploy <tap checkout> [--dry-run]`: the public Homebrew tap's structure, from this
+//! repo's source of truth ([`SOURCE`]), mirrored into a checkout of `alabsystems/homebrew-tap` and
+//! committed there.
 
 use std::path::{Path, PathBuf};
 
@@ -39,8 +23,8 @@ pub const SOURCE: &str = "distribution/homebrew-tap";
 /// The documents mirrored as they are.
 pub const DOCS: [&str; 2] = ["README.md", "MAINTENANCE.md"];
 
-/// Wording only an internal document carries (lowercase): a source holding any of it
-/// is refused, so an internal doc never leaks into the public tap.
+/// Wording only an internal document carries (lowercase): a source holding any of it is refused, so
+/// an internal doc never leaks into the public tap.
 pub const INTERNAL_WORDING: [&str; 3] = [
     "private dev repo",
     "private aterm dev repo",
@@ -60,7 +44,6 @@ pub struct Options {
 }
 
 /// Parse `tap …` (`Ok(None)` is `--help`).
-///
 /// # Errors
 /// No `deploy`, no tap checkout, or an argument it does not know.
 pub fn parse_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Option<Options>, String> {
@@ -104,10 +87,9 @@ pub struct Planned {
     pub change: Change,
 }
 
-/// `source`, a cask stanza, with `live`'s `version` and `sha256` lines kept: the first
-/// `  version "<digits and dots>"` and `  sha256 "<lowercase hex>"` lines of the live
-/// cask replace the source's own.
-///
+/// `source`, a cask stanza, with `live`'s `version` and `sha256` lines kept: the first `  version
+/// "<digits and dots>"` and `  sha256 "<lowercase hex>"` lines of the live cask replace the
+/// source's own.
 /// # Errors
 /// The live cask has no such line to keep.
 pub fn keep_live(source: &str, live: &str) -> Result<String, String> {
@@ -155,10 +137,9 @@ fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// THE PLAN: the tap's files as `src` says them, each against what `tap` holds.
-///
 /// # Errors
-/// A source with a `.github/` or internal-only wording, a document or cask that
-/// cannot be read, a source with no cask, or a live cask with nothing to keep.
+/// A source with a `.github/` or internal-only wording, a document or cask that cannot be read, a
+/// source with no cask, or a live cask with nothing to keep.
 pub fn plan(src: &Path, tap: &Path) -> Result<Vec<Planned>, String> {
     if src.join(".github").exists() {
         return Err(format!(
@@ -237,10 +218,9 @@ pub enum Deployed {
 }
 
 /// Deploy `src` into the tap checkout `opts.tap`, saying each step on `out`.
-///
 /// # Errors
-/// What [`plan`] refuses, a tap that is no git checkout or whose index already holds
-/// staged changes, a write or a git step that failed.
+/// What [`plan`] refuses, a tap that is no git checkout or whose index already holds staged
+/// changes, a write or a git step that failed.
 pub fn deploy(
     src: &Path,
     opts: &Options,
@@ -286,7 +266,6 @@ pub fn deploy(
             .and_then(|()| std::fs::write(&path, &p.bytes))
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
-    // Only the planned files are staged and committed: nothing else of the tap rides in.
     let paths: Vec<&str> = planned.iter().map(|p| p.path.as_str()).collect();
     let mut add = vec!["add", "--"];
     add.extend(&paths);
@@ -398,9 +377,6 @@ mod tests {
     fn tap(root: &Path) -> PathBuf {
         let tap = root.join("tap");
         std::fs::create_dir_all(tap.join("Casks")).unwrap();
-        // The deploy commits with its own git, which reads this machine's global config:
-        // the checkout's own config keeps a person's identity, signing, hooks and global
-        // ignore and attributes files (an ignored cask is refused by `git add`) out of it.
         crate::ledger::testing::init(
             &tap,
             &[

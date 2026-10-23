@@ -26,17 +26,17 @@ pub(crate) struct BitReader<'s> {
 }
 
 impl<'s> BitReader<'s> {
-    pub(crate) fn new(source: &'s [u8]) -> Self {
+    pub(crate) const fn new(source: &'s [u8]) -> Self {
         Self { idx: 0, source }
     }
 
     /// Bits read so far, including any returned with [`Self::return_bit`].
-    pub(crate) fn bits_read(&self) -> usize {
+    pub(crate) const fn bits_read(&self) -> usize {
         self.idx
     }
 
     /// Un-reads the last bit read. A no-op before the first read.
-    pub(crate) fn return_bit(&mut self) {
+    pub(crate) const fn return_bit(&mut self) {
         self.idx = self.idx.saturating_sub(1);
     }
 
@@ -87,7 +87,7 @@ impl Default for BitReaderReversed<'_> {
 }
 
 impl<'s> BitReaderReversed<'s> {
-    pub(crate) fn new(source: &'s [u8]) -> Self {
+    pub(crate) const fn new(source: &'s [u8]) -> Self {
         Self {
             index: source.len(),
             bits_consumed: 64,
@@ -192,7 +192,7 @@ impl<'s> BitReaderReversed<'s> {
     }
 
     #[inline(always)]
-    fn peek_bits(&self, n: u8) -> u64 {
+    const fn peek_bits(&self, n: u8) -> u64 {
         if n == 0 {
             return 0;
         }
@@ -204,7 +204,7 @@ impl<'s> BitReaderReversed<'s> {
     /// The next `n1`, `n2` and `n3` bits without consuming them, where
     /// `sum = n1 + n2 + n3` bits are loaded.
     #[inline(always)]
-    fn peek_bits_triple(&self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+    const fn peek_bits_triple(&self, sum: u8, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
         if sum == 0 {
             return (0, 0, 0);
         }
@@ -217,7 +217,7 @@ impl<'s> BitReaderReversed<'s> {
     }
 
     #[inline(always)]
-    fn consume(&mut self, n: u8) {
+    const fn consume(&mut self, n: u8) {
         self.bits_consumed += n;
     }
 

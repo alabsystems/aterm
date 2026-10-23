@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What an arena run must not leave behind when it is interrupted, and the
-//! one thread that retires it.
-//!
-//! A terminal under test leads its own process group, so it is stopped by its
-//! own pgid and never by a name a person's windows could share; that also
-//! puts it beyond the reach of the tty's Ctrl-C. So every group a lane
-//! launches, every scratch directory it makes and every ghostty copy it opens
-//! is registered here while it lives, and [`guard`] turns SIGINT, SIGTERM and
-//! SIGHUP into: kill and reap every live group, stop the ghostty copies,
-//! remove the scratch directories, exit `128 + signal`.
-//!
-//! A scratch directory holding a program copied there and started, which has
-//! not yet shown it ran ([`starting_from`]), is kept instead, by [`remove_dir`]
-//! and by an interrupt: macOS assesses a new file at its first exec, and
-//! removing the file before that assessment is done crashes `syspolicyd`,
-//! stranding every launch on the host until each is killed.
+//! What an arena run must not leave behind when it is interrupted, and the one thread that retires
+//! it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -93,8 +79,7 @@ impl Group {
             .and_then(|c| c.try_wait().ok().flatten())
     }
 
-    /// SIGTERM the group, wait for the leader's exit, SIGKILL on the grace
-    /// running out. The wait is the exit itself, never a sleep.
+    /// SIGTERM the group, wait for the leader's exit, SIGKILL on the grace running out.
     pub(crate) fn retire(mut self) -> Result<(), String> {
         self.retire_inner()
     }
@@ -134,9 +119,7 @@ impl Drop for Group {
     }
 }
 
-/// A fresh private directory `<base>/<prefix><pid>.<n>`, registered for
-/// removal on interrupt. `create_dir`, not `create_dir_all`: a directory a
-/// dead process of the same pid left behind is skipped, never shared.
+/// A fresh private directory `<base>/<prefix><pid>.<n>`, registered for removal on interrupt.
 pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt as _;
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -160,12 +143,7 @@ pub(crate) fn make_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// Remove a directory [`make_dir`] made, and forget it; kept instead (and
-/// named) while a program started from a copy in it has not shown it ran.
-/// The decision, the removal and the forgetting of both marks happen under
-/// one hold of the table: two holds would let an interrupt between them find
-/// the directory still listed but no longer unproven, and remove the one this
-/// had just decided to keep.
+/// Remove a directory [`make_dir`] made, and forget it.
 pub(crate) fn remove_dir(dir: &Path) {
     let mut live = live();
     if live.unproven.remove(dir) {
@@ -176,15 +154,12 @@ pub(crate) fn remove_dir(dir: &Path) {
     live.dirs.remove(dir);
 }
 
-/// A program copied into `dir` (a [`make_dir`] directory) is about to start:
-/// until [`ran_from`] says it ran, `dir` is kept rather than removed (module
-/// docs).
+/// A program copied into `dir` (a [`make_dir`] directory) is about to start.
 pub(crate) fn starting_from(dir: &Path) {
     live().unproven.insert(dir.to_path_buf());
 }
 
-/// The program [`starting_from`] noted in `dir` has shown it ran (it printed
-/// its line): `dir` may go.
+/// The program [`starting_from`] noted in `dir` has shown it ran: `dir` may go.
 pub(crate) fn ran_from(dir: &Path) {
     live().unproven.remove(dir);
 }
@@ -204,8 +179,7 @@ pub(crate) fn opening(app: &Path) {
     live().apps.insert(app.to_path_buf());
 }
 
-/// Stop every ghostty the arena opened from `app`: matched by the arena's
-/// OWN copy's path, which no ghostty a person runs shares.
+/// Stop every ghostty the arena opened from `app`.
 pub(crate) fn stop_app(app: &Path) {
     let _ = command("pkill")
         .arg("-f")
@@ -217,8 +191,8 @@ pub(crate) fn stop_app(app: &Path) {
 
 fn interrupts() -> libc::sigset_t {
     let mut set = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
-    // SAFETY: sigemptyset initialises the set it is handed; sigaddset adds a
-    // valid signal number to that initialised set.
+    // SAFETY: sigemptyset initialises the set it is handed; sigaddset adds a valid signal number to
+    // that initialised set.
     unsafe {
         libc::sigemptyset(set.as_mut_ptr());
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -228,13 +202,7 @@ fn interrupts() -> libc::sigset_t {
     }
 }
 
-/// Install the interrupt guard, once. Call it before this process starts any
-/// thread: the three signals are blocked in the calling thread, every thread
-/// started after inherits that, and one thread takes them with `sigwait`.
-/// Children start with an empty mask (`spawnfd` resets it), so a terminal
-/// under test still dies by the SIGTERM a retire sends it. A signal this
-/// process inherited as ignored (a non-interactive shell's background job
-/// ignores SIGINT) stays ignored: the kernel discards it before `sigwait`.
+/// Install the interrupt guard, once.
 pub(crate) fn guard() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
@@ -251,7 +219,6 @@ pub(crate) fn guard() {
                 interrupted(sig)
             });
         if spawned.is_err() {
-            // No thread to take them: the signals keep their default action.
             // SAFETY: as above.
             unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
         }
@@ -267,7 +234,6 @@ fn interrupted(sig: i32) -> ! {
         killpg(*pgid, libc::SIGKILL);
         children.extend(child.take());
     }
-    // A SIGKILLed leader exits at once; the reap is bounded all the same.
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for mut child in children {
@@ -330,7 +296,6 @@ mod tests {
         let kept = unproven.join("aterm").is_file();
         let forgotten = !live().dirs.contains(&unproven);
         let unmarked = !live().unproven.contains(&unproven);
-        // Nothing ran from this copy: the test's own cleanup is safe.
         let _ = std::fs::remove_dir_all(&unproven);
         assert!(kept, "kept while unproven");
         assert!(forgotten && unmarked, "and forgotten, both marks");

@@ -2,26 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The window: what a match may copy from.
-//!
-//! This replaces ruzstd's `RingBuffer` / `DecodeBuffer`, whose copies are
-//! `unsafe`, with two safe pieces:
-//!
-//! * the block being decoded goes into a [`BlockBuf`]: `Block_Maximum_Size`
-//!   bytes plus [`SLACK`], so a short copy can move a whole 16-byte chunk and
-//!   run past its end into bytes nothing has claimed yet (libzstd's
-//!   "wildcopy", here with every index checked);
-//! * the history before the block is a ring of at most the frame's window
-//!   ([`Window`]), grown as output arrives, so a small frame never allocates
-//!   its whole declared window.
-//!
-//! A match that reaches back past the block's start copies its head out of the
-//! ring and the rest from the block, which is the same copy libzstd makes when
-//! a match crosses into its previous segment.
 
 use super::error::DecodeError;
 
-/// Bytes a [`BlockBuf`] keeps past the block's maximum (and a literals buffer
-/// past its literals) for chunked copies to overshoot into.
+/// Bytes a [`BlockBuf`] keeps past the block's maximum for chunked copies to overshoot into.
 pub(crate) const SLACK: usize = 32;
 
 /// The unit of a chunked copy.
@@ -48,7 +32,6 @@ fn copy_chunk(buf: &mut [u8], from: usize, to: usize) -> Result<(), DecodeError>
 /// Writes `src[from..from + n]` to `dst[to..]` in 16-byte chunks while both
 /// slices hold a whole chunk at the cursor (reading and writing up to 15
 /// bytes past the copy, into room the callers keep), then the rest exactly.
-/// `src` and `dst` are distinct, so no chunk overlaps another.
 #[inline(always)]
 fn wild_copy(
     dst: &mut [u8],
@@ -89,8 +72,7 @@ pub(crate) struct Window {
 }
 
 impl Window {
-    /// Empties the window for a frame whose window is `cap` bytes (at least
-    /// one). The allocation is kept for the next frame.
+    /// Empties the window for a frame whose window is `cap` bytes (at least one).
     pub(crate) fn reset(&mut self, cap: usize) {
         self.ring.clear();
         self.cap = cap.max(1);
@@ -98,13 +80,12 @@ impl Window {
     }
 
     /// Bytes of history held: everything decoded so far, up to the window.
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.ring.len()
     }
 
-    /// The frame's maximum match distance. Bytes added inside a block do
-    /// not extend this limit, even while the history still holds them.
-    pub(crate) fn max_offset(&self) -> usize {
+    /// The frame's maximum match distance.
+    pub(crate) const fn max_offset(&self) -> usize {
         self.cap
     }
 
@@ -117,7 +98,6 @@ impl Window {
             let n = data.len().min(self.cap - self.ring.len());
             let (now, rest) = data.split_at_checked(n).unwrap_or((data, &[]));
             if self.ring.capacity() < self.ring.len() + n {
-                // Grow geometrically but never past the window.
                 let target = (self.ring.len() * 2).max(self.ring.len() + n).min(self.cap);
                 self.ring.reserve_exact(target - self.ring.len());
             }
@@ -188,12 +168,11 @@ impl BlockBuf {
         self.buf.get(..self.len).unwrap_or_default()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
-    /// Room for the whole block, to be filled by the caller (a raw block):
-    /// the buffer then holds `n` bytes.
+    /// Room for the whole block, to be filled by the caller: the buffer then holds `n` bytes.
     pub(crate) fn fill_with(&mut self, n: usize) -> Result<&mut [u8], DecodeError> {
         if n > self.max {
             return Err(DecodeError::Corrupt("block decodes past its maximum size"));
@@ -204,14 +183,11 @@ impl BlockBuf {
 
     /// Whether `n` more bytes fit the block.
     #[inline(always)]
-    pub(crate) fn has_room(&self, n: usize) -> bool {
+    pub(crate) const fn has_room(&self, n: usize) -> bool {
         n <= self.max - self.len
     }
 
-    /// Appends `lits[from..from + n]`. The caller has checked [`has_room`]
-    /// and that `lits` holds [`SLACK`] bytes past every literal.
-    ///
-    /// [`has_room`]: Self::has_room
+    /// Appends `lits[from..from + n]`.
     #[inline(always)]
     pub(crate) fn copy_literals(
         &mut self,
@@ -224,9 +200,7 @@ impl BlockBuf {
         Ok(())
     }
 
-    /// Appends a match of `n` bytes from `offset` bytes before the end of the
-    /// output (counting back into `history` once past the block's start).
-    /// The caller has checked [`has_room`](Self::has_room).
+    /// Appends a match of `n` bytes from `offset` bytes before the end of the output.
     #[inline(always)]
     pub(crate) fn copy_match(
         &mut self,
@@ -249,24 +223,17 @@ impl BlockBuf {
             if left == 0 {
                 return Ok(());
             }
-            // More is left, so the head copied was all `back` bytes: the
-            // output now ends exactly `offset` bytes past the block's start.
         }
         let dst = self.len;
         let src = dst - offset;
         self.len += left;
         if offset >= CHUNK {
-            // Each 16-byte chunk reads bytes at least 16 behind what it
-            // writes, so forward chunks are the byte-by-byte copy; the last
-            // may run up to 15 bytes into the room past the match.
             let mut k = 0;
             while k < left {
                 copy_chunk(&mut self.buf, src + k, dst + k)?;
                 k += CHUNK;
             }
         } else {
-            // A period shorter than a chunk: the first 16 bytes one at a time,
-            // then chunks from a whole number of periods back (16 to 30).
             let first = left.min(CHUNK);
             for i in 0..first {
                 let byte = *self.buf.get(src + i).ok_or(OUT_OF_BOUNDS)?;
@@ -311,14 +278,11 @@ mod tests {
 
     #[test]
     fn matches_agree_with_a_byte_by_byte_copy_across_the_ring() {
-        // A window of 13 bytes, filled past wrapping several times, then a
-        // block of 6 bytes; every offset and length a match can take.
         let cap = 13;
         for fed in [0usize, 5, 13, 14, 30, 41] {
             let history: Vec<u8> = (0..fed).map(|i| (i * 7 + 3) as u8).collect();
             let mut window = Window::default();
             window.reset(cap);
-            // Feed in uneven pieces.
             for piece in history.chunks(4) {
                 window.push(piece);
             }

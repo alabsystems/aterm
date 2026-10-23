@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Optional local GitHub bootstrap. Configuration contains source locations only;
-//! credentials travel through private stdin and never enter a report or command line.
-//!
-//! No gh (docs/DESIGN-init-system-2026-10-20.md S14, §6.1 row 22): the token's `GET /user`
-//! check and the repository listing go through agh's read door over aterm-http
-//! ([`System::github_api`]), the token is stored in the login keychain by `git credential
-//! approve` through CLT git's osxkeychain helper and read back, and git's github.com settings
-//! are pointed at that helper and read back ([`crate::git_credential`]).
+//! Optional local GitHub bootstrap for keychain credentials, git HTTPS helper, and repositories.
 
 use crate::git_credential::{GITHUB, Git, Lookups};
 use crate::items::{Ctx, Item};
@@ -21,13 +14,10 @@ use std::path::{Component, Path, PathBuf};
 mod native;
 mod repos;
 
-/// Reconcile repositories after the selected secrets stage has synchronized.
-/// Uses the admitted explicit profile, or the known development token source;
-/// no GitHub CLI login is needed. Plan performs no keychain/config/clone writes.
+/// Reconciles repositories after the selected secrets stage has synchronized.
 ///
 /// # Errors
-/// A source, identity, inventory, destination or native operation is unsafe or
-/// incomplete. Credential values and child credential output are never included.
+/// A source, identity, inventory, destination or native operation is unsafe or incomplete.
 pub fn run_initial_repositories(
     sys: &dyn System,
     ctx: &Ctx,
@@ -42,6 +32,10 @@ const INPUT_MAX: usize = 64 * 1024;
 #[serde(deny_unknown_fields)]
 struct Config {
     github: Option<Github>,
+    /// The develop profile's checkouts ([`crate::init_develop`]), which the repository item
+    /// leaves to the develop items.
+    #[serde(default)]
+    develop: Option<crate::init_develop::Table>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -62,13 +56,10 @@ pub fn items(sys: &dyn System, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
-    let path = Path::new(&user.home).join(".config/aterm/init.toml");
-    let bytes = match sys.read_owned_file(&path, user.uid, INPUT_MAX, false) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err("cannot safely read ~/.config/aterm/init.toml (requires an owned regular file, no links or group/other writes, at most 64 KiB)".into()),
+    let Some(mut profile) = profile(sys, user)? else {
+        return Ok(Vec::new());
     };
-    let mut profile = decode(&bytes, user)?;
+    let recorded = crate::init_develop::recorded(user, profile.develop.as_ref())?;
     let Some(config) = profile.github.take() else {
         return Ok(Vec::new());
     };
@@ -77,15 +68,46 @@ pub fn items(sys: &dyn System, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> 
             user: user.clone(),
             config: config.clone(),
         }),
-        repos::item(user, &config),
+        repos::item(user, &config, recorded),
     ])
+}
+
+/// The admitted, decoded `~/.config/aterm/init.toml`; `None` when there is none.
+fn profile(sys: &dyn System, user: &User) -> Result<Option<Config>, String> {
+    let path = Path::new(&user.home).join(".config/aterm/init.toml");
+    let bytes = match sys.read_owned_file(&path, user.uid, INPUT_MAX, false) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("cannot safely read ~/.config/aterm/init.toml (requires an owned regular file, no links or group/other writes, at most 64 KiB)".into()),
+    };
+    decode(&bytes, user).map(Some)
+}
+
+/// The checkouts the GitHub item verifies (a top-level worktree in the home whose one origin
+/// is the configured owner's repository) that are aterm workspaces: what `aterm init
+/// --develop` records when it runs outside one (design §4.1). None without a `[github]`
+/// table, or before the login keychain holds a token that signs in as its account.
+///
+/// # Errors
+/// The profile cannot be admitted, or the listing or a worktree cannot be read.
+pub(crate) fn aterm_checkouts(sys: &dyn System, ctx: &Ctx) -> Result<Vec<PathBuf>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("aterm init --develop requires exactly one local user".into());
+    };
+    let Some(config) = profile(sys, user)?.and_then(|mut profile| profile.github.take()) else {
+        return Ok(Vec::new());
+    };
+    let Some(token) = auth_ready(sys, user, &config)? else {
+        return Ok(Vec::new());
+    };
+    repos::aterm_checkouts(sys, user, &config, &token)
 }
 
 fn decode(bytes: &[u8], user: &User) -> Result<Config, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "init.toml must be UTF-8; no configuration contents were printed")?;
     let mut profile: Config = aterm_toml::from_str(text)
-        .map_err(|_| "invalid init.toml; expected [github] account, owner, token_file and optional token_key (credential values do not belong in this file)")?;
+        .map_err(|_| "invalid init.toml; expected [github] account, owner, token_file and optional token_key, and [develop] checkouts (credential values do not belong in this file)")?;
     if let Some(config) = &mut profile.github {
         if !login(&config.account) || !login(&config.owner) {
             return Err("GitHub account and owner must be valid login names".into());
@@ -112,7 +134,6 @@ fn decode(bytes: &[u8], user: &User) -> Result<Config, String> {
                 "GitHub token_file must be an absolute or ~/ path without dot components".into(),
             );
         }
-        // This file is never an input to init, even through an accidentally broad profile.
         if config
             .token_file
             .file_name()
@@ -147,8 +168,7 @@ pub(super) fn auth_id(user: &User) -> String {
     format!("init.github.auth@{}", user.name)
 }
 
-/// One GitHub read as `user` with `token`, through agh's read door over aterm-http: a whole
-/// 200 answer or an error.
+/// Performs one GitHub GET request as `user` with `token`.
 pub(super) fn get(
     sys: &dyn System,
     user: &User,
@@ -202,8 +222,7 @@ fn readiness(
     Ok((helper, stored(sys, user, &config.account)?))
 }
 
-/// The keychain's token for the configured account once git's settings name it too: what
-/// the repository listing reads with and the clones authenticate with.
+/// Returns the keychain token for the configured account when git's helper is also ready.
 pub(super) fn auth_ready(
     sys: &dyn System,
     user: &User,
@@ -257,7 +276,6 @@ impl Item for Auth {
         if held.is_none() {
             crate::port::no_core_dumps();
             let token = read_token(sys, &self.user, &self.config)?;
-            // The identity first: nothing is stored for a token that is not the account's.
             let account = identity(sys, &self.user, &token).map_err(|_| {
                 "GitHub did not verify the supplied token (output withheld); nothing was stored"
             })?;
@@ -272,9 +290,6 @@ impl Item for Auth {
         if !helper.ready() {
             git.configure(sys, &self.user, &self.config.account)?;
         }
-        // The read-back, each half failing for its own reason: git's settings (a setting
-        // configure does not own can still hand github.com lookups elsewhere), then the
-        // keychain's token, which must still sign in as the account.
         if let Lookups::Not(why) = git.configured(sys, &self.user, &self.config.account)? {
             return Err(format!(
                 "git's GitHub HTTPS settings did not read back after setup: {why}"
@@ -338,8 +353,6 @@ fn token(bytes: &[u8], key: Option<&str>) -> Result<Secret, String> {
     } else {
         text.trim()
     };
-    // GitHub token characters need no shell expansion or curl-config escaping.
-    // Quoted env assignments are literal: substitutions/backslashes never execute.
     if value.is_empty()
         || value.len() > crate::port::SECRET_MAX
         || !value
@@ -501,7 +514,6 @@ mod tests {
             &mut NoJournal,
         );
         assert_eq!(rows[0].outcome, Outcome::Planned);
-        // Reads only: git's settings, then the keychain, which holds nothing to check.
         let calls = sys.calls();
         assert_eq!(calls.first(), Some(&script::helpers(&u)), "{calls:?}");
         assert_eq!(calls.last(), Some(&fill(&u)), "{calls:?}");
@@ -527,7 +539,6 @@ mod tests {
                 .stat_of(path, stat(0o644, profile.len()));
             script::unconfigured(&sys, &u);
             script::holds_nothing(&sys, Some(&u));
-            // GitHub refuses the source's token: nothing is stored or cloned.
             sys.on_github_api(&u, "/user", Err("refused (output withheld)".into()));
             let rows = engine::run(
                 &items(&sys, &context).unwrap(),
@@ -647,7 +658,6 @@ mod tests {
         script::unconfigured(&sys, &u);
         script::configured(&sys, &u, "octocat");
         let writes = script::configure(&sys, &u, "octocat");
-        // Nothing stored, then the source's token once approve stored it.
         script::holds_nothing(&sys, Some(&u));
         script::holds(&sys, Some(&u), GITHUB, "octocat", VALUE);
         signs_in(&sys, &u, "octocat");
@@ -658,8 +668,6 @@ mod tests {
         let last = |key: &str| calls.iter().rposition(|c| c == key).unwrap();
         assert!(at("alice$ agh GET /user") < at(&approve), "{calls:?}");
         assert!(at(&approve) < at(&writes[0]), "{calls:?}");
-        // The read-back: git's settings after the writes, then the keychain's token, which
-        // GitHub checks again.
         assert!(at(&writes[3]) < last(&script::helpers(&u)), "{calls:?}");
         assert!(last(&script::helpers(&u)) < last(&fill(&u)), "{calls:?}");
         assert!(last(&fill(&u)) < last("alice$ agh GET /user"), "{calls:?}");
@@ -669,7 +677,6 @@ mod tests {
     /// The read-back after setup fails for its own reason, named. A setting configure does not
     /// own that still hands github.com lookups to another helper is git's; a keychain token
     /// GitHub does not vouch for on the second check is the credential's, not the helper's.
-    /// Negative control: the successful apply above, whose read-back passes.
     #[test]
     fn the_read_back_after_setup_names_what_did_not_read_back() {
         let (sys, auth, context) = fixture();
@@ -743,7 +750,6 @@ mod tests {
         script::configured(&sys, &u, "octocat");
         sys.refuse_complete_stdout(&script::helpers(&u), "rejected partial tail");
         assert!(matches!(auth.probe(&sys, &context), Probe::Unusable { .. }));
-        // A stored token that signs in as another account is not this one's.
         let (sys, auth, context) = fixture();
         script::configured(&sys, &u, "octocat");
         script::holds(&sys, Some(&u), GITHUB, "octocat", STORED);

@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Live-headless conformance: THE LAUNCH'S PRIMER PASS STARTS FROM THE EVENT LOOP AND
-//! PRIMES THE CONFIGURED AGENT HOME.
-//!
-//! `aterm-gui`'s `spawn::agent_prime_tests` walk the launch's hold on their
-//! own clock over scratch folders. A real boot verifies that the first park
-//! releases the pass and primes the configured agent home. A headless instance
-//! primes only under `ATERM_DEBUG_HEADLESS_AGENT_PRIME` with private HOME/XDG roots.
-//!
-//! NEGATIVE CONTROL: with the release taken out of `about_to_wait`, the held pass never
-//! started, and the boot's wait for the primer failed at the hang detector.
-//!
-//! ISOLATION: scratch HOME/XDG roots, a private control socket, every automatic lane off
-//! but the primer, `--no-reroute`, `SHELL=/bin/sh` and a lifeline
-//! (`support/launch_isolation.rs`). A headless instance opens no window.
+//! Live-headless conformance: THE LAUNCH'S PRIMER PASS STARTS FROM THE EVENT LOOP AND PRIMES THE
+//! CONFIGURED AGENT HOME.
 
 #![cfg(unix)]
 
@@ -38,7 +26,6 @@ fn the_launchs_primer_pass_starts_from_the_first_park() {
     let inst = headless_boot::boot_with(
         "aterm-agent-prime",
         |root, cmd| {
-            // The isolation's table turns the primer off; this boot is about it.
             std::fs::write(
                 root.join("cfg/aterm/aterm.toml"),
                 format!("agents_auto_prime = true\n{}", launch_isolation::CONFIG_OFF),

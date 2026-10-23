@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Time zone and network time through `systemsetup` (design §5.1).
-//!
-//! Measured in the macOS 27.0 VM: `systemsetup -settimezone`, `-setusingnetworktime` and
-//! `-setnetworktimeserver` (and their `-get…`) work as root over SSH, and also from a root
-//! launchd job that could not open the system TCC database, so none of them needs Full
-//! Disk Access. Not as root, every verb prints `You need administrator access to run this
-//! tool... exiting!` and exits **0**, so a run is judged by its words and its read-back,
-//! never by its exit status alone. A set also writes an `### Error:-99 …
-//! InternetServices.m` line to standard error and exits 0; that line is noise. An unknown
-//! zone answers `Mars/Base is not a valid timezone.` and exits 1.
-//!
-//! The zone is read back from `/etc/localtime`'s link (`/var/db/timezone/zoneinfo/GMT` in
-//! the VM), the network-time state and server from `systemsetup -get…`.
+//! Time zone and network time configuration via `systemsetup` and `/etc/localtime`.
 
 use super::{Ctx, Item};
 use crate::model::Probe;
@@ -88,8 +76,7 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     Ok(items)
 }
 
-/// The zone a `/etc/localtime` link target names: what follows its `zoneinfo` directory
-/// (`/var/db/timezone/zoneinfo/America/Los_Angeles` is `America/Los_Angeles`).
+/// Extract the IANA zone name following `zoneinfo/` in a `/etc/localtime` link target.
 #[must_use]
 pub fn zone_of_link(target: &str) -> Option<String> {
     let parts: Vec<&str> = target.trim().split('/').collect();
@@ -460,7 +447,6 @@ mod tests {
 
     #[test]
     fn systemsetup_refusing_a_non_root_caller_with_exit_0_is_not_read_as_an_answer() {
-        // `systemsetup -gettimezone` as the admin, not root, in the VM: exit 0.
         let sys = Fake::root();
         sys.on(
             "/usr/sbin/systemsetup -getusingnetworktime",

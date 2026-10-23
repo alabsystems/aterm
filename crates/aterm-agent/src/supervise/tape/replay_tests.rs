@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The replay's core on tapes made by hand: what each door serves, that a
-//! divergence unwinds from the door it is found at and nothing is served after
-//! it, the progress guard, and the classes a divergence is sorted into.
+//! Tests for [`ReplayCore`] door dispatch, divergence unwinding, progress bounds, and classes.
 
 use super::*;
 use crate::supervise::tape::header::VERBATIM;
@@ -110,8 +108,6 @@ fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
         reason: "the limit reset",
         box_seq: 3,
     };
-    // The act as the loop writes it, replayed off a tape whose count is
-    // `reply` and whose ledger row is `recorded`.
     let replay_act = |reply: &[u8], recorded: &str| {
         let core = core_of(vec![
             exchange(doors::PROBE_ASLEEP, b"", reply),
@@ -193,8 +189,6 @@ fn an_acts_row_replays_in_the_boot_spelling_its_tape_recorded() {
         assert!(emitted.is_ok(), "{boot:?}: {:?}", core.diverged());
         assert_eq!(core.consumed(), (3, 3));
         assert!(core.diverged().is_none());
-        // Captured text cannot substitute another id or turn an unknown
-        // id into this count, even when it is passed directly to the writer.
         let mut ledger = Ledger::named(Some(Path::new("/not-opened/ledger")), Some("s-1"));
         for other in [
             "00000000-0000-0000-0000-000000000000",
@@ -325,8 +319,6 @@ fn a_divergence_is_sorted_by_what_differs() {
         class_of(&Asked::Emit, Some(&mark), Some(doors::DECIDE_APPROVAL)),
         Class::Decision
     );
-    // The host's acts are decisions, its other answers drift, and a
-    // notification told otherwise is an output.
     let step = exchange(
         "host.at_idle_on",
         b"point=IdlePoint { done_under_land: false }",

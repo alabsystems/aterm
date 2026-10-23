@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -355,100 +355,6 @@ pub fn unix_now() -> u64 {
 pub(crate) fn channel_token_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".secrets/gh_access_token_alabsystems"))
-}
-
-/// Read + canonicalize the release-org token.
-pub(crate) fn channel_token() -> Option<String> {
-    let token = fs::read_to_string(channel_token_path()?).ok()?;
-    let token = token.trim().to_string();
-    (!token.is_empty() && !token.bytes().any(|b| b.is_ascii_control())).then_some(token)
-}
-
-static CHANNEL_CRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// RAII scope.
-pub(crate) struct ChannelCred {
-    previous: bool,
-}
-
-impl ChannelCred {
-    pub(crate) fn enter() -> Self {
-        Self {
-            previous: CHANNEL_CRED.swap(true, Ordering::SeqCst),
-        }
-    }
-}
-
-impl Drop for ChannelCred {
-    fn drop(&mut self) {
-        CHANNEL_CRED.store(self.previous, Ordering::SeqCst);
-    }
-}
-
-fn active_channel_token() -> Option<String> {
-    CHANNEL_CRED
-        .load(Ordering::SeqCst)
-        .then(channel_token)
-        .flatten()
-}
-
-fn downloads_by_name(args: &[&str]) -> bool {
-    args.windows(2).any(|w| w == ["release", "download"])
-}
-
-/// One `gh` invocation, captured.
-pub fn gh_raw(args: &[&str]) -> Result<RunOut> {
-    if downloads_by_name(args) {
-        return Err(Error::new(format!(
-            "refused `gh {}`: a release asset is read by its id, never by its name",
-            args.join(" ")
-        )));
-    }
-    let mut command = Command::new("gh");
-    command.args(args);
-    if let Some(token) = active_channel_token() {
-        command.env("GH_TOKEN", token);
-    }
-    let out = command
-        .output()
-        .map_err(|e| Error::new(format!("failed to spawn gh {}: {e}", args.join(" "))))?;
-    Ok(RunOut {
-        status: out.status.code().unwrap_or(-1),
-        stdout: out.stdout,
-        stderr: out.stderr,
-    })
-}
-
-/// `gh` with success required, retried 3 times with backoff (2s, 5s).
-pub fn gh_retry(args: &[&str]) -> Result<RunOut> {
-    gh_retry_guarded(args, || Ok(()))
-}
-
-/// Mutation retry seam.
-pub(crate) fn gh_retry_guarded(
-    args: &[&str],
-    mut before_each_attempt: impl FnMut() -> Result<()>,
-) -> Result<RunOut> {
-    let mut last = String::new();
-    for (attempt, backoff) in [(1u32, 2u64), (2, 5), (3, 0)] {
-        before_each_attempt()?;
-        let out = gh_raw(args)?;
-        if out.success() {
-            return Ok(out);
-        }
-        last = out.stderr_utf8().trim().to_string();
-        if attempt < 3 {
-            eprintln!(
-                "    gh {} failed (attempt {attempt}/3): {last} — retrying in {backoff}s",
-                args.first().unwrap_or(&"")
-            );
-            std::thread::sleep(std::time::Duration::from_secs(backoff));
-        }
-    }
-    Err(Error::new(format!(
-        "gh {} failed after 3 attempts: {last}",
-        args.join(" ")
-    )))
 }
 
 /// Dedicated cooperative lock for every real release cut.
@@ -1150,7 +1056,7 @@ pub fn fence_liveness(identity: &FenceIdentity, probe: &dyn PublisherProbe) -> F
         return FenceLiveness::Unprovable(format!(
             "{publisher_gone} — but the fence records no process group (fence-format {format}, \
              written before groups were recorded), and every GitHub request that publisher \
-             made ran in a spawned gh or curl that a killed parent does not stop. Whether one \
+             made ran in a spawned child that a killed parent does not stop. Whether one \
              is still running cannot be read from this fence"
         ));
     };
@@ -1431,7 +1337,6 @@ pub fn pre_publish_gates(
             return out;
         }
     };
-    let _cred = ChannelCred::enter();
     if let Err(e) = preflight_channel_target(&slug, false) {
         out.push(("channel", e.to_string()));
     }
@@ -2283,129 +2188,8 @@ impl Drop for DurablePostPermit {
     fn drop(&mut self) {}
 }
 
-fn issue_nonidempotent_post(_permit: DurablePostPermit, args: &[&str]) -> Result<RunOut> {
-    let out = Command::new("curl")
-        .args(args)
-        .output()
-        .map_err(|error| Error::new(format!("spawn one-shot curl POST: {error}")))?;
-    Ok(RunOut {
-        status: out.status.code().unwrap_or(-1),
-        stdout: out.stdout,
-        stderr: out.stderr,
-    })
-}
-
-struct GithubAuthHeaders {
-    _dir: PrivateTempDir,
-    curl_header_arg: String,
-}
-
-pub const GITHUB_AUTH_HOST: &str = "github.com";
-pub const GITHUB_API_ORIGIN: &str = "https://api.github.com";
-pub const GITHUB_UPLOAD_ORIGIN: &str = "https://uploads.github.com";
-
-#[must_use]
-pub const fn github_auth_token_args() -> [&'static str; 4] {
-    ["auth", "token", "--hostname", GITHUB_AUTH_HOST]
-}
-
-pub fn validate_one_shot_curl_help(help: &str) -> Result<()> {
-    for option in [
-        "--data-binary",
-        "--fail-with-body",
-        "--header",
-        "--request",
-        "--retry",
-        "--show-error",
-        "--silent",
-        "--upload-file",
-        "--url",
-    ] {
-        if !help
-            .split_whitespace()
-            .any(|token| token.trim_matches(',') == option)
-        {
-            return Err(Error::new(format!(
-                "curl transport lacks required one-shot POST option {option}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn curl_transport_preflight() -> Result<()> {
-    static VERDICT: std::sync::OnceLock<std::result::Result<(), String>> =
-        std::sync::OnceLock::new();
-    VERDICT
-        .get_or_init(|| {
-            let curl = Command::new("curl")
-                .args(["--help", "all"])
-                .output()
-                .map_err(|error| format!("spawn curl transport preflight: {error}"))?;
-            if !curl.status.success() {
-                return Err("curl transport preflight failed before durable POST intent".into());
-            }
-            let curl_help = std::str::from_utf8(&curl.stdout)
-                .map_err(|_| "curl transport help is not UTF-8".to_string())?;
-            validate_one_shot_curl_help(curl_help).map_err(|error| error.to_string())
-        })
-        .clone()
-        .map_err(Error::new)
-}
-
-fn prepare_github_auth_headers() -> Result<GithubAuthHeaders> {
-    curl_transport_preflight()?;
-    let owned = match active_channel_token() {
-        Some(token) => token,
-        None => {
-            let out = Command::new("gh")
-                .args(github_auth_token_args())
-                .output()
-                .map_err(|error| Error::new(format!("spawn GitHub token preflight: {error}")))?;
-            if !out.status.success() {
-                return Err(Error::new(
-                    "GitHub authentication token is unavailable before durable POST intent",
-                ));
-            }
-            std::str::from_utf8(&out.stdout)
-                .map_err(|_| Error::new("GitHub authentication token is not UTF-8"))?
-                .trim()
-                .to_string()
-        }
-    };
-    let token = owned.as_str();
-    if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(Error::new(
-            "GitHub authentication token is empty or non-canonical",
-        ));
-    }
-    let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-        "aterm-release-auth-{}-{}",
-        std::process::id(),
-        RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    )))?;
-    let header_path = dir.path().join("headers");
-    fs::write(
-        &header_path,
-        format!(
-            "Authorization: Bearer {token}\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n"
-        ),
-    )
-    .map_err(|error| Error::new(format!("write private GitHub auth headers: {error}")))?;
-    let header_path = header_path
-        .to_str()
-        .ok_or_else(|| Error::new("private GitHub auth-header path is not UTF-8"))?;
-    Ok(GithubAuthHeaders {
-        _dir: dir,
-        curl_header_arg: format!("@{header_path}"),
-    })
-}
-
-struct OneShotPost {
-    _payload_dir: Option<PrivateTempDir>,
-    _auth: GithubAuthHeaders,
-    args: Vec<String>,
-}
+/// A fully prepared one-shot POST ([`crate::github::prepare`]): every fallible preflight is done before the caller persists its durable intent, and the token rides curl's stdin (`-H @-`), never its argv, environment or a file.
+struct OneShotPost(aterm_update_core::github_rest::Prepared);
 
 const CURL_EXIT_FAILED_INIT: i32 = 2;
 
@@ -2609,103 +2393,37 @@ fn release_create_payload(tag: &str, title: &str, body: &ReleaseBody) -> Result<
     .map_err(|error| Error::new(format!("serialize release request: {error}")))
 }
 
-/// How curl is told to find the request body.
-#[derive(Clone, Copy)]
-pub(crate) enum BodySource<'a> {
-    Buffered(&'a str),
-    Streamed(&'a str),
-}
-
-impl<'a> BodySource<'a> {
-    pub(crate) const fn curl_pair(self) -> (&'static str, &'a str) {
-        match self {
-            Self::Buffered(arg) => ("--data-binary", arg),
-            Self::Streamed(path) => ("--upload-file", path),
-        }
-    }
-}
-
 impl OneShotPost {
-    fn prepare_json(
-        temp_label: &str,
-        subject: &str,
-        endpoint: &str,
-        payload: &[u8],
-    ) -> Result<Self> {
-        let payload_dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
-            "aterm-release-{temp_label}-{}-{}",
-            std::process::id(),
-            RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        )))?;
-        let payload_path = payload_dir.path().join("request.json");
-        fs::write(&payload_path, payload)
-            .map_err(|error| Error::new(format!("write {subject}: {error}")))?;
-        let payload_arg = payload_path
-            .to_str()
-            .ok_or_else(|| Error::new(format!("{subject} path is not UTF-8")))?;
-        let data_arg = format!("@{payload_arg}");
-        let auth = prepare_github_auth_headers()?;
-        Ok(Self {
-            args: Self::curl_args(
-                &auth.curl_header_arg,
-                "Content-Type: application/json",
-                BodySource::Buffered(&data_arg),
-                endpoint,
-            ),
-            _payload_dir: Some(payload_dir),
-            _auth: auth,
-        })
+    /// JSON-body POST to `path` on the API origin (the channel draft's create). A draft
+    /// body is a few hundred bytes, written to a private scratch file curl reads.
+    fn prepare_json(path: &str, payload: &[u8]) -> Result<Self> {
+        crate::github::prepare(
+            crate::github::OneShotUrl::Api(path),
+            aterm_update_core::github_rest::Body::Json(payload),
+        )
+        .map(Self)
     }
 
-    fn prepare_binary(subject: &str, endpoint: &str, file: &Path) -> Result<Self> {
-        let file_arg = file
-            .to_str()
-            .ok_or_else(|| Error::new(format!("{subject} path is not UTF-8")))?;
-        let auth = prepare_github_auth_headers()?;
-        Ok(Self {
-            args: Self::curl_args(
-                &auth.curl_header_arg,
-                "Content-Type: application/octet-stream",
-                BodySource::Streamed(file_arg),
-                endpoint,
-            ),
-            _payload_dir: None,
-            _auth: auth,
-        })
+    /// Raw file-body POST to `path` on the uploads origin (an asset upload), streamed by `--upload-file`, never buffered: the DMG is over a gigabyte.
+    fn prepare_binary(path: &str, file: &Path) -> Result<Self> {
+        crate::github::prepare(
+            crate::github::OneShotUrl::Uploads(path),
+            aterm_update_core::github_rest::Body::File(file),
+        )
+        .map(Self)
     }
 
-    fn curl_args(
-        auth_header_arg: &str,
-        content_type: &str,
-        body: BodySource<'_>,
-        endpoint: &str,
-    ) -> Vec<String> {
-        let (body_flag, body_arg) = body.curl_pair();
-        [
-            "--silent",
-            "--show-error",
-            "--fail-with-body",
-            "--retry",
-            "0",
-            "--request",
-            "POST",
-            "--header",
-            auth_header_arg,
-            "--header",
-            content_type,
-            body_flag,
-            body_arg,
-            "--url",
-            endpoint,
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    /// curl's argv as a process listing would show it: the whole security- and
+    /// memory-relevant surface of a one-shot POST.
+    #[cfg(test)]
+    fn argv(&self) -> Vec<String> {
+        self.0.argv()
     }
 
     fn issue(self, permit: DurablePostPermit) -> Result<RunOut> {
-        let args: Vec<&str> = self.args.iter().map(String::as_str).collect();
-        issue_nonidempotent_post(permit, &args)
+        let out = crate::github::run_once(self.0);
+        drop(permit);
+        out
     }
 }
 
@@ -2855,15 +2573,29 @@ pub fn canonical_channel_tag_version(tag: &str) -> Result<String> {
     Ok(format!("{major}.{minor}.{patch}"))
 }
 
-const APPCAST_ASSET_LIST_JQ: &str = r#".[] | . as $r |
-    {release_id: $r.id,
-     tag: $r.tag_name,
-     draft: $r.draft,
-     target_commitish: $r.target_commitish,
-     assets: [$r.assets[]? |
-       select(.name == "aterm-appcast.toml" or .name == "aterm-appcast.toml.sig") |
-       {id: .id, name: .name}]}
-    | @json"#;
+/// One appcast-listing row of `release`, as [`parse_appcast_asset_listing`] reads it: its id, tag, draft flag, target and its exact appcast pair's ids and names.
+fn appcast_listing_row(release: &aterm_json::Value) -> String {
+    let assets: Vec<aterm_json::Value> = release["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| {
+            matches!(
+                a["name"].as_str(),
+                Some("aterm-appcast.toml" | "aterm-appcast.toml.sig")
+            )
+        })
+        .map(|a| aterm_json::json!({"id": a["id"].clone(), "name": a["name"].clone()}))
+        .collect();
+    aterm_json::json!({
+        "release_id": release["id"].clone(),
+        "tag": release["tag_name"].clone(),
+        "draft": release["draft"].clone(),
+        "target_commitish": release["target_commitish"].clone(),
+        "assets": assets,
+    })
+    .to_string()
+}
 
 /// Parse the bounded GitHub listing [`list_appcast_releases`] reads.
 pub fn parse_appcast_asset_listing(listing: &str) -> Result<Vec<AppcastRelease>> {
@@ -2887,25 +2619,22 @@ pub fn parse_appcast_asset_listing(listing: &str) -> Result<Vec<AppcastRelease>>
 }
 
 fn list_appcast_releases(slug: &str) -> Result<Vec<AppcastRelease>> {
-    const PER_PAGE: usize = 100;
-    const MAX_PAGES: u32 = 10;
-    let mut releases = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
-        let out = gh_retry(&["api", &path, "--jq", APPCAST_ASSET_LIST_JQ])?;
-        let page_releases = parse_appcast_asset_listing(&out.stdout_utf8())?;
-        let page_len = page_releases.len();
-        releases.extend(page_releases);
-        if page_len < PER_PAGE {
-            break;
-        }
-        if page == MAX_PAGES {
-            return Err(Error::new(format!(
-                "GitHub release listing reached the {MAX_PAGES}-page safety cap"
-            )));
-        }
-    }
-    Ok(releases)
+    let listing = release_listing(slug)?;
+    parse_appcast_asset_listing(&crate::github::rows(
+        listing.iter().map(appcast_listing_row),
+    ))
+}
+
+/// Releases per listing page: GitHub's most.
+const RELEASES_PER_PAGE: usize = 100;
+
+/// Every release object of `slug`, the listing read whole (drafts included when the token
+/// can push).
+pub(crate) fn release_listing(slug: &str) -> Result<Vec<aterm_json::Value>> {
+    crate::github::pages(
+        &format!("repos/{slug}/releases?per_page={RELEASES_PER_PAGE}"),
+        RELEASES_PER_PAGE,
+    )
 }
 
 fn update_key_fingerprint(encoded: &str) -> Result<String> {
@@ -3303,41 +3032,22 @@ pub fn parse_release_object_identity_rows(rows: &str) -> Result<Vec<ReleaseObjec
         .collect()
 }
 
-const RELEASE_IDENTITY_OBJECT_JQ: &str =
-    r#"[.id, .tag_name, (.draft | tostring), .target_commitish] | @tsv"#;
-const RELEASE_IDENTITY_LIST_JQ: &str =
-    r#".[] | [.id, .tag_name, (.draft | tostring), .target_commitish] | @tsv"#;
-
-/// Pin the GitHub JSON shape at each endpoint.
-pub(crate) const fn release_identity_jq(listing: bool) -> &'static str {
-    if listing {
-        RELEASE_IDENTITY_LIST_JQ
-    } else {
-        RELEASE_IDENTITY_OBJECT_JQ
-    }
+/// The identity rows of `releases` ([`crate::github::identity_row`] each), as
+/// [`parse_release_object_identity_rows`] reads them.
+pub(crate) fn release_identity_rows<'a>(
+    releases: impl IntoIterator<Item = &'a aterm_json::Value>,
+) -> String {
+    crate::github::rows(releases.into_iter().map(crate::github::identity_row))
 }
 
 /// Exhaustively resolve a tag to release objects.
 pub fn release_objects_by_tag(slug: &str, tag: &str) -> Result<Vec<ReleaseObjectIdentity>> {
-    const PER_PAGE: usize = 100;
-    const MAX_PAGES: u32 = 10;
-    let mut matches = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let endpoint = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
-        let out = gh_retry(&["api", &endpoint, "--jq", release_identity_jq(true)])?;
-        let rows = parse_release_object_identity_rows(&out.stdout_utf8())?;
-        let page_len = rows.len();
-        matches.extend(rows.into_iter().filter(|release| release.tag == tag));
-        if page_len < PER_PAGE {
-            break;
-        }
-        if page == MAX_PAGES {
-            return Err(Error::new(format!(
-                "release identity listing reached the {MAX_PAGES}-page safety cap before exhaustion"
-            )));
-        }
-    }
-    Ok(matches)
+    let listing = release_listing(slug)?;
+    let rows = parse_release_object_identity_rows(&release_identity_rows(&listing))?;
+    Ok(rows
+        .into_iter()
+        .filter(|release| release.tag == tag)
+        .collect())
 }
 
 pub fn unique_release_object_by_tag(
@@ -3356,19 +3066,13 @@ pub fn unique_release_object_by_tag(
 }
 
 pub fn release_object_by_id(slug: &str, id: u64) -> Result<Option<ReleaseObjectIdentity>> {
-    let endpoint = format!("repos/{slug}/releases/{id}");
-    let out = gh_raw(&["api", &endpoint, "--jq", release_identity_jq(false)])?;
-    if !out.success() {
-        let stderr = out.stderr_utf8();
-        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-            return Ok(None);
-        }
-        return Err(Error::new(format!(
-            "read exact GitHub release ID {id} failed: {}",
-            stderr.trim()
-        )));
-    }
-    let rows = parse_release_object_identity_rows(&out.stdout_utf8())?;
+    // A 404 is an answer (the object is absent), never retried.
+    let Some(object) = crate::github::get_optional(&format!("repos/{slug}/releases/{id}"))
+        .map_err(|e| Error::new(format!("read exact GitHub release ID {id} failed: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let rows = parse_release_object_identity_rows(&release_identity_rows([&object]))?;
     let [identity] = rows.as_slice() else {
         return Err(Error::new(format!(
             "exact GitHub release ID {id} returned {} identity rows",
@@ -3391,61 +3095,22 @@ pub struct ReleaseObjectAndAsset {
     pub asset: Option<(u64, u64)>,
 }
 
-const RELEASE_OBJECT_AND_ASSETS_JQ: &str = r#"(["R", .id, .tag_name,
-      (.draft | tostring), .target_commitish] | @tsv),
-    (.assets[]? | ["A", .name, (.id | tostring), (.size | tostring)] | @tsv)"#;
-
-fn split_release_object_and_asset_rows(rows: &str) -> Result<(String, String)> {
-    let mut object_rows = String::new();
-    let mut asset_rows = String::new();
-    for (index, line) in rows.lines().enumerate() {
-        let (kind, fields) = line.split_once('\t').ok_or_else(|| {
-            Error::new(format!("malformed fused GitHub release row {}", index + 1))
-        })?;
-        let block = match kind {
-            "R" => &mut object_rows,
-            "A" => &mut asset_rows,
-            _ => {
-                return Err(Error::new(format!(
-                    "fused GitHub release row {} has unknown kind {kind:?}",
-                    index + 1
-                )));
-            }
-        };
-        block.push_str(fields);
-        block.push('\n');
-    }
-    Ok((object_rows, asset_rows))
-}
-
 /// The release-object identity and the exact-name asset binding from one read of `repos/{slug}/releases/{id}`.
 pub fn release_object_and_asset_identity(
     slug: &str,
     release_id: u64,
     name: &str,
 ) -> Result<ReleaseObjectAndAsset> {
-    let endpoint = format!("repos/{slug}/releases/{release_id}");
-    let args = [
-        "api",
-        endpoint.as_str(),
-        "--jq",
-        RELEASE_OBJECT_AND_ASSETS_JQ,
-    ];
-    let out = gh_raw(&args)?;
-    let out = if out.success() {
-        out
-    } else {
-        let stderr = out.stderr_utf8();
-        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-            return Ok(ReleaseObjectAndAsset {
-                release: None,
-                asset: None,
-            });
-        }
-        gh_retry(&args)?
+    // A 404 is an answer, never retried (`release_object_by_id`'s rule); any other failure retries.
+    let Some(object) = crate::github::get_optional(&format!("repos/{slug}/releases/{release_id}"))?
+    else {
+        return Ok(ReleaseObjectAndAsset {
+            release: None,
+            asset: None,
+        });
     };
-    let (object_rows, asset_rows) = split_release_object_and_asset_rows(&out.stdout_utf8())?;
-    let rows = parse_release_object_identity_rows(&object_rows)?;
+    let asset_rows = crate::github::asset_rows(&object);
+    let rows = parse_release_object_identity_rows(&release_identity_rows([&object]))?;
     let [identity] = rows.as_slice() else {
         return Err(Error::new(format!(
             "exact GitHub release ID {release_id} returned {} identity rows",
@@ -3610,27 +3275,28 @@ pub fn drain_bounded_diagnostic(
     Ok((retained, truncated))
 }
 
-fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Child> {
-    let endpoint = format!("repos/{slug}/releases/assets/{id}");
-    let mut command = Command::new("gh");
-    command
-        .args([
-            "api",
-            "--method",
-            "GET",
-            "--header",
-            "Accept: application/octet-stream",
-            &endpoint,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(token) = active_channel_token() {
-        command.env("GH_TOKEN", token);
-    }
-    command
-        .spawn()
-        .map_err(|error| Error::new(format!("spawn exact GitHub asset-ID download: {error}")))
+/// The bytes of asset `id` on `slug`, streaming ([`crate::github::open_asset`]): the asset
+/// API's redirect, held to the asset CDN's origins (any other `Location` is refused and never
+/// asked), then an anonymous curl of the CDN with its stdout and stderr piped.
+fn exact_release_asset_download(slug: &str, id: u64) -> Result<aterm_uds::spawnfd::Child> {
+    exact_release_asset_child(slug, id).map_err(|error| {
+        Error::new(format!(
+            "exact GitHub asset-ID {id} download on {slug} could not start: {error}"
+        ))
+    })
 }
+
+/// [`exact_release_asset_download`], its failure as the REST client classed it.
+fn exact_release_asset_child(
+    slug: &str,
+    id: u64,
+) -> std::result::Result<aterm_uds::spawnfd::Child, aterm_update_core::github_rest::RestError> {
+    crate::github::open_asset(slug, id)
+}
+
+// A lost body (curl: "transfer closed with N bytes remaining to read") and a server that
+// answered "no" both end the CDN curl non-zero. A 404, a 401 and a permission refusal are
+// answers; only a transport failure can come out differently the second time.
 
 /// Whether repeating a bounded asset transfer can possibly change its outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3661,19 +3327,25 @@ impl TransferAttemptFailure {
     }
 }
 
-/// Sleeps between attempts (so one more attempt than entries).
+/// Sleeps between attempts (so one more attempt than entries), the same 2s/5s shape as [`crate::github::retried`].
 pub(crate) const ASSET_TRANSFER_BACKOFFS: &[u64] = &[2, 5];
 
-/// Decide, from a `gh` diagnostic, whether the transport failed or the server answered.
+/// Decide, from a diagnostic (the CDN curl's stderr, or the REST client's message), whether the transport failed or the server answered; unrecognised is `Answered`.
 #[must_use]
 pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransferFault {
     let d = diagnostic.to_ascii_lowercase();
     const ANSWERED: &[&str] = &[
+        // The REST client's words for GitHub's answer (`HTTP 404: Not Found`).
         "http 401",
         "http 403",
         "http 404",
         "http 410",
         "http 422",
+        // curl's `--fail` words for the CDN's (`The requested URL returned error: 404`).
+        "returned error: 401",
+        "returned error: 403",
+        "returned error: 404",
+        "returned error: 410",
         "not found",
         "bad credentials",
         "requires authentication",
@@ -3681,34 +3353,47 @@ pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransfer
         "must have admin rights",
         "forbidden",
         "permission",
-        "gh auth login",
         "no such release",
         "saml enforcement",
+        "refused, never asked",
+        "maximum file size exceeded",
     ];
     const TRANSPORT: &[&str] = &[
-        "unexpected end of json input",
+        // curl read a body that stopped short.
+        "transfer closed with",
+        "partial file",
         "unexpected eof",
         "unexpected end of stream",
+        "recv failure",
+        "send failure",
+        "empty reply from server",
         "connection reset",
         "connection refused",
         "connection closed",
+        "failed to connect",
         "broken pipe",
-        "i/o timeout",
+        "operation timed out",
+        "operation too slow",
         "timed out",
         "timeout",
+        "ssl connect error",
         "tls handshake",
         "handshake failure",
+        "could not resolve host",
         "temporary failure in name resolution",
-        "no such host",
         "network is unreachable",
         "network is down",
+        "http/2 stream",
         "http 500",
         "http 502",
         "http 503",
         "http 504",
+        "returned error: 500",
+        "returned error: 502",
+        "returned error: 503",
+        "returned error: 504",
+        "curl reached no answer",
         "server error",
-        "goaway",
-        "stream error",
     ];
     if ANSWERED.iter().any(|m| d.contains(m)) {
         return AssetTransferFault::Answered;
@@ -3762,8 +3447,16 @@ fn attempt_exact_release_asset_transfer(
     expected_size: u64,
     limit: usize,
 ) -> std::result::Result<Vec<u8>, TransferAttemptFailure> {
-    let mut child = exact_release_asset_download(slug, id)
-        .map_err(|error| TransferAttemptFailure::answered(error.to_string()))?;
+    // The asset API's own failure is classed as the client read it: a definitive answer is
+    // not asked again, a transport failure or a 5xx is.
+    let mut child = exact_release_asset_child(slug, id).map_err(|error| {
+        let message = format!("exact GitHub asset-ID {id} download on {slug}: {error}");
+        if crate::github::definitive(&error) {
+            TransferAttemptFailure::answered(message)
+        } else {
+            TransferAttemptFailure::transport(message)
+        }
+    })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         TransferAttemptFailure::answered("exact GitHub asset-ID download has no stdout pipe")
     })?;
@@ -3832,7 +3525,8 @@ mod asset_transport_retry_tests {
     use super::*;
     use std::cell::RefCell;
 
-    const TRUNCATED: &str = "unexpected end of JSON input";
+    /// The CDN curl's stderr for a truncated body.
+    const TRUNCATED: &str = "curl: (18) transfer closed with 1048576 bytes remaining to read";
 
     fn run(
         script: Vec<std::result::Result<&'static str, TransferAttemptFailure>>,
@@ -3863,10 +3557,12 @@ mod asset_transport_retry_tests {
             "the measured killer must be the retried class, or this fix is inert"
         );
         for answered in [
-            "gh: Not Found (HTTP 404)",
+            "HTTP 404: Not Found",
             "HTTP 403: Resource not accessible by integration",
-            "gh: Bad credentials (HTTP 401)",
-            "To get started with GitHub CLI, please run: gh auth login",
+            "HTTP 401: Bad credentials",
+            "curl: (22) The requested URL returned error: 404",
+            "the asset API redirected off the asset CDN, to https://example.com; refused, never \
+             asked",
         ] {
             assert_eq!(
                 classify_asset_transfer_failure(answered),
@@ -3875,9 +3571,12 @@ mod asset_transport_retry_tests {
             );
         }
         for transport in [
-            "read tcp 10.0.0.2:443: connection reset by peer",
-            "Post \"https://api.github.com\": net/http: TLS handshake timeout",
-            "gh: Server Error (HTTP 502)",
+            "curl: (56) Recv failure: Connection reset by peer",
+            "curl: (28) SSL connection timeout",
+            "curl: (6) Could not resolve host: release-assets.githubusercontent.com",
+            "HTTP 502: Server Error",
+            "curl: (22) The requested URL returned error: 503",
+            "curl reached no answer (exit 7): curl: (7) Failed to connect to api.github.com",
         ] {
             assert_eq!(
                 classify_asset_transfer_failure(transport),
@@ -3923,7 +3622,7 @@ mod asset_transport_retry_tests {
     #[test]
     fn a_real_404_fails_fast_and_says_it_was_not_retried() {
         let (out, seen, slept) = run(vec![Err(TransferAttemptFailure::answered(
-            "gh: Not Found (HTTP 404)",
+            "curl: (22) The requested URL returned error: 404",
         ))]);
         out.expect_err("a 404 is a failure");
         assert_eq!(
@@ -4174,15 +3873,9 @@ pub fn release_asset_identity_for_release_id_optional(
     release_id: u64,
     name: &str,
 ) -> Result<Option<(u64, u64)>> {
-    let endpoint = format!("repos/{slug}/releases/{release_id}");
-    let out = gh_retry(&[
-        "api",
-        &endpoint,
-        "--jq",
-        r#".assets[] | [.name, (.id | tostring), (.size | tostring)] | @tsv"#,
-    ])?;
+    let release = crate::github::get(&format!("repos/{slug}/releases/{release_id}"))?;
     parse_release_asset_identity_rows(
-        &out.stdout_utf8(),
+        &crate::github::asset_rows(&release),
         &format!("release-ID:{release_id}"),
         name,
     )
@@ -4211,15 +3904,9 @@ pub fn release_asset_inventory_for_release_id(
     slug: &str,
     release_id: u64,
 ) -> Result<Vec<ReleaseAssetInventoryEntry>> {
-    let endpoint = format!("repos/{slug}/releases/{release_id}");
-    let out = gh_retry(&[
-        "api",
-        &endpoint,
-        "--jq",
-        r#".assets[] | [.name, (.id | tostring), (.size | tostring)] | @tsv"#,
-    ])?;
+    let release = crate::github::get(&format!("repos/{slug}/releases/{release_id}"))?;
     let mut inventory = Vec::new();
-    for (index, line) in out.stdout_utf8().lines().enumerate() {
+    for (index, line) in crate::github::asset_rows(&release).lines().enumerate() {
         let mut fields = line.split('\t');
         let (Some(name), Some(id), Some(size), None) =
             (fields.next(), fields.next(), fields.next(), fields.next())
@@ -5270,6 +4957,20 @@ pub const fn exact_delete_absence_is_converged(
     preexisting_absence_is_converged || delete_attempted
 }
 
+/// One DELETE of `endpoint`, asked once: what GitHub or curl said when it failed, else
+/// nothing. The caller re-reads the object to learn whether it is gone, so a failure is
+/// only words here.
+fn github_delete(endpoint: &str) -> String {
+    match crate::github::send_once(
+        aterm_update_core::github_rest::Method::Delete,
+        endpoint,
+        None,
+    ) {
+        Ok(_) => String::new(),
+        Err(error) => error.to_string(),
+    }
+}
+
 pub fn delete_release_object_by_id_with_guard(
     slug: &str,
     expected: &ReleaseObjectIdentity,
@@ -5296,12 +4997,12 @@ pub fn delete_release_object_by_id_with_guard(
         validate_release_object_snapshot(adjacent.as_ref(), expected)?;
         immediately_before_delete()?;
         let endpoint = format!("repos/{slug}/releases/{}", expected.id);
-        let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+        let said = github_delete(&endpoint);
         delete_attempted = true;
         if release_object_by_id(slug, expected.id)?.is_none() {
             return Ok(true);
         }
-        last = out.stderr_utf8().trim().to_string();
+        last = said;
         if attempt < 3 {
             eprintln!(
                 "    exact release-ID delete failed (attempt {attempt}/3): {last} — retrying in {backoff}s"
@@ -5447,14 +5148,13 @@ pub fn withdraw_unpublished_release(
         validate_release_object_snapshot(observed.as_ref(), &release)?;
         assert_publisher_session(&git, lease, fence)?;
         let endpoint = format!("repos/{slug}/releases/assets/{}", asset.id);
-        let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+        let said = github_delete(&endpoint);
         if release_asset_identity_for_release_id_optional(slug, release.id, name)?
             .is_some_and(|(id, _)| id == asset.id)
         {
             return Err(Error::new(format!(
-                "delete {name} (asset ID {}) from {tag} on {slug} failed: {}",
+                "delete {name} (asset ID {}) from {tag} on {slug} failed: {said}",
                 asset.id,
-                out.stderr_utf8().trim()
             )));
         }
     }
@@ -5646,7 +5346,6 @@ pub fn run_recover_lost(
     let slug = channel_slug(&cargo_text)?;
     let git = GitCli::new(repo);
     assert_origin_repo_binding(&git, &origin_slug)?;
-    let _cred = ChannelCred::enter();
     let journal_path = repo.join("dist/cut-state.toml");
     let header = JournalHeader::read(&journal_path)?;
     if let Some(header) = &header
@@ -6487,7 +6186,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         assert_origin_repo_binding(&git, &origin_slug)?;
     }
     let publish_slug = channel_slug(&cargo_text)?;
-    let _cred = (kind == CutKind::Real).then(ChannelCred::enter);
     let release_version = release_version_from_workspace(&full)?;
     set_publisher_fence_version(&release_version);
 
@@ -6566,8 +6264,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
-            "gh auth ({}) · disk ok ({} GiB free)",
-            gr.gh_account.as_deref().unwrap_or("account unknown"),
+            "GitHub as {} · disk ok ({} GiB free)",
+            gr.github_login
+                .as_deref()
+                .unwrap_or("no one (this run publishes nothing)"),
             gr.free_disk_gib,
         ),
     );
@@ -6987,7 +6687,6 @@ fn discard_staged(ctx: &CutCtx) {
 }
 
 fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
-    let _cred = (ctx.kind == CutKind::Real).then(ChannelCred::enter);
     if ctx.linux.is_some()
         && ctx
             .journal
@@ -8068,26 +7767,21 @@ fn step_tag(ctx: &mut CutCtx) -> Result<()> {
 
 /// Proof that the release channel is reachable, public and writable by this operator's credential.
 pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
-    let endpoint = format!("repos/{slug}");
-    let out = gh_retry(&[
-        "api",
-        &endpoint,
-        "--jq",
-        r#"[(.private | tostring), (.permissions.push // false | tostring)] | @tsv"#,
-    ])
-    .map_err(|error| {
+    let repository = crate::github::get(&format!("repos/{slug}")).map_err(|error| {
         Error::new(format!(
             "cannot read the release channel {slug}: {error}. A 404 here means the \
              repository does not exist or this credential cannot see it; create it (public) \
              and grant the release account write access."
         ))
     })?;
-    let row = out.stdout_utf8();
-    let row = row.trim();
-    let mut fields = row.split('\t');
-    let (Some(private), Some(push), None) = (fields.next(), fields.next(), fields.next()) else {
+    // `.permissions` is GitHub's answer for the identity that asked; an anonymous read
+    // carries none, so it never reads as push.
+    let (Some(private), push) = (
+        repository["private"].as_bool(),
+        repository["permissions"]["push"].as_bool().unwrap_or(false),
+    ) else {
         return Err(Error::new(format!(
-            "release channel {slug} returned a malformed repository row {row:?}"
+            "release channel {slug} returned a repository with no `private` flag"
         )));
     };
     let then = if claimed {
@@ -8095,23 +7789,24 @@ pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
     } else {
         "; nothing was claimed".to_string()
     };
-    if push != "true" {
+    if !push {
         let token_path = channel_token_path().map_or_else(
             || "~/.secrets/gh_access_token_alabsystems".to_string(),
             |path| path.display().to_string(),
         );
-        return Err(Error::new(if channel_token().is_some() {
+        // With no token loaded the read went anonymously: the token was never asked.
+        return Err(Error::new(if crate::github::has_token() {
             format!(
                 "the release token ({token_path}) cannot write {slug}: grant it write access{then}"
             )
         } else {
             format!(
-                "no release token in {token_path}, and gh auth cannot write {slug}: put the \
-                 release-org token there{then}"
+                "no release token in {token_path}, and an anonymous read cannot write {slug}: \
+                 put the release-org token there{then}"
             )
         }));
     }
-    if private == "true" {
+    if private {
         return Err(Error::new(format!(
             "{slug} is private, so no install can read it: make it public{then}"
         )));
@@ -8284,7 +7979,7 @@ fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
                  upload would land on the channel's live head, where a client can elect the \
                  appcast before the asset proof and the second floor read, and `--abandon` \
                  could no longer withdraw it. Nothing was bound or uploaded. Mark it a \
-                 prerelease (`gh release edit {tag} --prerelease --repo {slug}`), confirm the \
+                 prerelease (its Edit page on github.com: \"Set as a pre-release\"), confirm the \
                  evergreen pointer names the previous app release again, fix the engine side \
                  so the next source release is created as one, then `{CUT_COMMAND}`.",
                 tag = ctx.tag
@@ -8294,9 +7989,9 @@ fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
 }
 
 fn release_prerelease_by_id(slug: &str, id: u64) -> Result<bool> {
-    let endpoint = format!("repos/{slug}/releases/{id}");
-    let out = gh_retry(&["api", &endpoint, "--jq", ".prerelease | tostring"])?;
-    parse_prerelease_flag(&out.stdout_utf8())
+    let release = crate::github::get(&format!("repos/{slug}/releases/{id}"))?;
+    let flag = crate::github::tostring(&release["prerelease"]);
+    parse_prerelease_flag(flag.as_str().unwrap_or_default())
         .map_err(|why| Error::new(format!("release ID {id} on {slug}: {why}")))
 }
 
@@ -8416,18 +8111,22 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         let (release_id, adopted) = self.bound()?;
         let (slug, expect_draft) = (self.slug, !adopted);
         let ctx = &*self.ctx;
-        let argv = channel::head_patch_argv(&format!("repos/{slug}/releases/{release_id}"));
-        gh_retry_guarded(&argv.iter().map(String::as_str).collect::<Vec<_>>(), || {
-            let current = release_object_by_id(slug, release_id)?;
-            validate_channel_release_capability(
-                current.as_ref(),
-                release_id,
-                &ctx.tag,
-                expect_draft,
-            )?;
-            ensure_ctx_release_lease(ctx)?;
-            Ok(())
-        })?;
+        crate::github::send(
+            aterm_update_core::github_rest::Method::Patch,
+            &format!("repos/{slug}/releases/{release_id}"),
+            Some(&channel::head_patch_body()),
+            || {
+                let current = release_object_by_id(slug, release_id)?;
+                validate_channel_release_capability(
+                    current.as_ref(),
+                    release_id,
+                    &ctx.tag,
+                    expect_draft,
+                )?;
+                ensure_ctx_release_lease(ctx)?;
+                Ok(())
+            },
+        )?;
         step(
             "publish",
             &format!(
@@ -8939,9 +8638,8 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
     let notes = release_body_for_post("publish", &ctx.notes_path())?;
     let posted_body_len = notes.len();
     let title = format!("aterm {}", ctx.version);
-    let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
     let payload = release_create_payload(ctx.tag.as_str(), &title, &notes)?;
-    let post = OneShotPost::prepare_json("create", "release request", &endpoint, &payload)?;
+    let post = OneShotPost::prepare_json(&format!("repos/{slug}/releases"), &payload)?;
     ensure_ctx_release_lease(ctx)?;
     let permit = ctx.persist_release_intent()?;
     let out = post.issue(permit)?;
@@ -9018,11 +8716,13 @@ fn upload_channel_asset(
                     );
                     ensure_ctx_release_lease(ctx)?;
                     let endpoint = format!("repos/{slug}/releases/assets/{stale_id}");
-                    let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
-                    if !out.success() {
+                    if let Err(error) = crate::github::send_once(
+                        aterm_update_core::github_rest::Method::Delete,
+                        &endpoint,
+                        None,
+                    ) {
                         return Err(Error::new(format!(
-                            "failed to delete stale {name} (asset ID {stale_id}) on {slug}: {}",
-                            out.stderr_utf8().trim()
+                            "failed to delete stale {name} (asset ID {stale_id}) on {slug}: {error}"
                         )));
                     }
                 }
@@ -9039,7 +8739,7 @@ fn upload_channel_asset(
     }
 
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
-    let post = OneShotPost::prepare_binary("release asset", &endpoint, file)?;
+    let post = OneShotPost::prepare_binary(&endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
     validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
     ensure_ctx_release_lease(ctx)?;
@@ -9177,6 +8877,8 @@ fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Re
     Ok(())
 }
 
+/// The upload path of asset `name` on release `release_id` of `slug`, on the uploads
+/// origin: every part canonical, so nothing in it can reach another endpoint.
 pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Result<String> {
     let valid_slug = slug.split_once('/').is_some_and(|(owner, repo)| {
         !owner.is_empty()
@@ -9200,7 +8902,7 @@ pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Resu
         ));
     }
     Ok(format!(
-        "{GITHUB_UPLOAD_ORIGIN}/repos/{slug}/releases/{release_id}/assets?name={name}"
+        "repos/{slug}/releases/{release_id}/assets?name={name}"
     ))
 }
 
@@ -9253,21 +8955,6 @@ mod release_body_post_tests {
             oversized.len()
         );
     }
-
-    #[test]
-    fn a_name_based_asset_download_is_refused_before_gh_runs() {
-        for args in [
-            &["release", "download", "v0.87.0", "--pattern", "aterm.dmg"][..],
-            &["-R", "alabsystems/aterm", "release", "download", "v0.87.0"],
-        ] {
-            let Err(refused) = gh_raw(args) else {
-                panic!("a download by name ran: {args:?}");
-            };
-            assert!(refused.to_string().contains("by its id"), "{refused}");
-        }
-        assert!(!downloads_by_name(&["api", "repos/o/r/releases/assets/7"]));
-        assert!(!downloads_by_name(&["release", "view", "download"]));
-    }
 }
 
 #[cfg(test)]
@@ -9275,17 +8962,30 @@ mod transport_body_tests {
 
     use super::*;
 
-    const AUTH: &str = "@/private/tmp/headers";
-    const ENDPOINT: &str = "https://uploads.github.com/repos/o/r/releases/1/assets?name=x.dmg";
+    /// A one-shot POST prepared against a loopback GitHub with a token (nothing is sent).
+    fn prepared(body: impl FnOnce() -> Result<OneShotPost>) -> Vec<String> {
+        let _github = crate::github::Fixture {
+            origins: aterm_update_core::github_rest::Origins::loopback(1, 2, 3, 4),
+            token: Some("ghs_fixtureOneShot0123".to_string()),
+            spawn: None,
+        }
+        .enter();
+        body().expect("prepared").argv()
+    }
 
     #[test]
     fn an_asset_upload_streams_off_disk_and_never_buffers() {
-        let args = OneShotPost::curl_args(
-            AUTH,
-            "Content-Type: application/octet-stream",
-            BodySource::Streamed("/dist/aterm-0.33.0.dmg"),
-            ENDPOINT,
-        );
+        let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
+            "aterm-release-oneshot-{}-{}",
+            std::process::id(),
+            RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )))
+        .expect("scratch");
+        let dmg = dir.path().join("aterm-0.33.0.dmg");
+        fs::write(&dmg, b"dmg").expect("the asset");
+        let args = prepared(|| {
+            OneShotPost::prepare_binary("repos/o/r/releases/1/assets?name=aterm-0.33.0.dmg", &dmg)
+        });
         assert!(
             args.iter().any(|a| a == "--upload-file"),
             "the asset leg must stream: {args:?}"
@@ -9294,20 +8994,29 @@ mod transport_body_tests {
             !args.iter().any(|a| a == "--data-binary"),
             "a gigabyte payload must never be buffered: {args:?}"
         );
-        let request = args.iter().position(|a| a == "--request").unwrap();
+        let request = args.iter().position(|a| a == "-X").unwrap();
         assert_eq!(args[request + 1], "POST");
+        // No `@` prefix: that spelling is --data-binary's, and curl would look for a file named "@/…".
         let flag = args.iter().position(|a| a == "--upload-file").unwrap();
-        assert_eq!(args[flag + 1], "/dist/aterm-0.33.0.dmg");
-
-        let args = OneShotPost::curl_args(
-            AUTH,
-            "Content-Type: application/json",
-            BodySource::Buffered("@/private/tmp/request.json"),
-            ENDPOINT,
+        assert_eq!(args[flag + 1], dmg.to_str().unwrap());
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("http://127.0.0.1:2/repos/o/r/releases/1/assets?name=aterm-0.33.0.dmg"),
+            "the uploads origin"
         );
+        // A JSON body still buffers from its private temp file, and either way the token
+        // is read from stdin, never the argv.
+        let args = prepared(|| OneShotPost::prepare_json("repos/o/r/releases", b"{}"));
         let flag = args.iter().position(|a| a == "--data-binary").unwrap();
-        assert_eq!(args[flag + 1], "@/private/tmp/request.json");
+        assert!(args[flag + 1].starts_with('@'), "{args:?}");
         assert!(!args.iter().any(|a| a == "--upload-file"));
+        assert!(args.iter().any(|a| a == "--fail-with-body"), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-H", "@-"]), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("ghs_fixtureOneShot0123")),
+            "{args:?}"
+        );
+        assert_eq!(args.first().map(String::as_str), Some("/usr/bin/curl"));
     }
 
     fn out(status: i32, stderr: &str) -> RunOut {
@@ -9988,7 +9697,11 @@ mod anonymous_readability_tests {
                 "the channel's anonymous proof spent the metered API: {url}"
             );
         }
-        let retired = format!("{GITHUB_API_ORIGIN}/repos/{SLUG}/releases/tags/{TAG}");
+        // Negative control: the predicate flags an API-host URL (`<api origin>/repos/<slug>/releases/tags/<tag>`).
+        let retired = format!(
+            "{}/repos/{SLUG}/releases/tags/{TAG}",
+            aterm_update_core::github_rest::Origins::github().api
+        );
         assert!(aterm_update_core::cdn::is_api_host(&retired));
     }
 

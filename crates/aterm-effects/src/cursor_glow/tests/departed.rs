@@ -226,3 +226,139 @@ fn the_light_laser_leap_is_gone_with_its_strike() {
         "control: the typed laser lays its ink under its letters"
     );
 }
+
+/// The laser's Enter at the bottom of a full pane, at a host's geometry (a
+/// 14 × 26 cell, a 12 px pad, 14 rows): `$ ` and 24 typed keys on the last
+/// row, then Enter carries the command up two rows over its 19-cell output
+/// and the caret leaps home to `(13, 2)`. The leap's path crosses the blank
+/// after the output (`(12, 19)`). Returns the engine `after_ms` past the
+/// Enter, the geometry and the caret's centre. `unheld` lays the aura on
+/// every air sample at its full radii, as it once was.
+fn laser_enter_on_a_host_pane(unheld: bool, after_ms: u64) -> (CursorGlow, Geom, (f32, f32)) {
+    let g = Geom {
+        cw: 14,
+        ch: 26,
+        rows: 14,
+        cols: 72,
+        origin_x: 12,
+        origin_y: 2,
+        win_w: 1032,
+        win_h: 378,
+        head: 0,
+    };
+    let bottom = g.rows as u16 - 1;
+    let (start, keys) = (2u16, 24u16);
+    let mut c = cfg(GlowStyle::Laser, true);
+    c.intensity = 1.0;
+    c.color = LASER_DEFAULT_COLOR;
+    (c.theme_fg, c.theme_bg) = (0x00D0_D0D0, 0x0011_1318);
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let frame = |lines: &[(u16, &[char])]| {
+        let mut rows = vec![vec![RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(c.theme_fg), rgb(c.theme_bg));
+            }
+        }
+        for &(row, text) in lines {
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+            }
+        }
+        rows
+    };
+    let mut glow = CursorGlow {
+        laser_aura_unheld: unheld,
+        ..CursorGlow::default()
+    };
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    text[0] = '$';
+    let mut t = Instant::now();
+    for k in 0..=keys {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            text[usize::from(start + k - 1)] = 'm';
+            glow.note_synthetic_typed(t, 1);
+        }
+        let caret = start + k;
+        glow.observe_row(bottom, caret, &text, t);
+        glow.observe_frame_text(Some((bottom, caret)), &frame(&[(bottom, &text)]), t);
+        glow.tick(Some((bottom, caret)), t, &c, g, &mut out);
+    }
+    t += Duration::from_millis(57);
+    let mut output = vec![' '; g.cols];
+    output[..19].fill('m');
+    let mut prompt = vec![' '; g.cols];
+    prompt[0] = '$';
+    glow.note_scroll(2);
+    let rows = frame(&[
+        (bottom - 2, &text),
+        (bottom - 1, &output),
+        (bottom, &prompt),
+    ]);
+    glow.note_synthetic_move(t);
+    let landing = (bottom, 2u16);
+    let mut k = 0;
+    while k <= after_ms {
+        let at = t + Duration::from_millis(k);
+        glow.observe_row(landing.0, landing.1, &prompt, at);
+        glow.observe_frame_text(Some(landing), &rows, at);
+        glow.tick(Some(landing), at, &c, g, &mut out);
+        k += 16;
+    }
+    let caret = g.cell_center(landing.0, landing.1);
+    (glow, g, caret)
+}
+
+/// A LASER'S AURA IS ITS HEAD'S: after an Enter at the bottom of a full
+/// pane, at 32 and 128 ms, every halo of the frame stands within
+/// [`CursorGlow::LASER_AURA_REACH_CELLS`] of the caret (the landing ring's
+/// bloom, fitted a cell inward at the edge, included), and none reaches past
+/// the grid's bottom edge, where it would be cut square. The aura laid on
+/// every air sample of the leap stood as a fat white-lilac slab along the
+/// prompt row, cut at the grid's bottom, and as a detached grey-violet block
+/// on the blank after the printed output. Negative control: the unheld aura
+/// lays halos farther out (on that blank and along the prompt) and past the
+/// bottom edge.
+#[test]
+fn the_laser_aura_stays_on_its_head() {
+    let far = |glow: &CursorGlow, g: Geom, (hx, hy): (f32, f32)| -> (usize, usize) {
+        let reach = CursorGlow::LASER_AURA_REACH_CELLS;
+        let mut far = 0;
+        let mut cut = 0;
+        for h in glow.halos() {
+            let d =
+                ((f32::from(h.cx) - hx) / g.cw as f32).hypot((f32::from(h.cy) - hy) / g.ch as f32);
+            if d > reach {
+                far += 1;
+            }
+            if i32::from(h.cy) + i32::from(h.ry) > g.fx_bot() + 1 {
+                cut += 1;
+            }
+        }
+        (far, cut)
+    };
+    for ms in [32u64, 128] {
+        let (glow, g, caret) = laser_enter_on_a_host_pane(false, ms);
+        assert!(
+            !glow.halos().is_empty(),
+            "+{ms} ms: the head shows its light"
+        );
+        let (far_n, cut) = far(&glow, g, caret);
+        assert_eq!(
+            far_n, 0,
+            "+{ms} ms: {far_n} halo bands stand off the laser's head"
+        );
+        assert_eq!(
+            cut, 0,
+            "+{ms} ms: {cut} halo bands reach past the grid's bottom edge"
+        );
+        let (glow, g, caret) = laser_enter_on_a_host_pane(true, ms);
+        let (far_n, cut) = far(&glow, g, caret);
+        assert!(
+            far_n > 0 && cut > 0,
+            "control +{ms} ms: the unheld aura stands off the head ({far_n}) and past the edge ({cut})"
+        );
+    }
+}

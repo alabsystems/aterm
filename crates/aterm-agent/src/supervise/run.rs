@@ -368,11 +368,21 @@ pub enum Guard {
     Draft,
     /// Launch card is on screen with no user task beneath it.
     Taskless,
+    /// A manager waits on the session (`TurnEndState::managed`): the occupancy door types it
+    /// nothing until a manager's own note can carry the fact.
+    Managed,
+    /// The host withholds the session's continuations (`IdleHost::withholds_turn_end`: a full
+    /// disk) or owns its turn ends (`IdleHost::owns_turn_end`: the upgrade's wind-down).
+    HostWithheld,
+    /// The upgrade's notice is due (`IdleHost::upgrade_due`): a nudge waits for it.
+    UpgradeDue,
+    /// This break's one line went already: the host's (the upgrade's notice).
+    HostLine,
 }
 
 impl Guard {
     /// All guards in [`Self::code`] order.
-    pub const ALL: [Guard; 21] = [
+    pub const ALL: [Guard; 25] = [
         Guard::NotBusy,
         Guard::NoBackgroundWait,
         Guard::Wall,
@@ -394,6 +404,10 @@ impl Guard {
         Guard::Reach,
         Guard::Draft,
         Guard::Taskless,
+        Guard::Managed,
+        Guard::HostWithheld,
+        Guard::UpgradeDue,
+        Guard::HostLine,
     ];
 
     /// Returns the short token (`guard=`) for this guard.
@@ -421,10 +435,14 @@ impl Guard {
             Guard::Reach => "reach",
             Guard::Draft => "draft",
             Guard::Taskless => "taskless",
+            Guard::Managed => "managed",
+            Guard::HostWithheld => "host-withheld",
+            Guard::UpgradeDue => "upgrade-due",
+            Guard::HostLine => "host-line",
         }
     }
 
-    /// Returns the non-zero numeric code (`1..=21`) for this guard.
+    /// Returns the non-zero numeric code (`1..=25`) for this guard.
     #[must_use]
     pub fn code(self) -> u8 {
         Guard::ALL
@@ -1940,6 +1958,15 @@ pub struct Session<'a, C: Ctl> {
     changed_streak: u32,
     press_retry: Option<approval_loop::PressRetry>,
     limit_retry: Option<approval_loop::LimitRetry>,
+    /// Gemini CLI's usage-limit dialog as the last read that drew it showed
+    /// it, kept till a point that is neither the dialog nor the error its
+    /// `Stop` leaves, or a read of another box
+    /// ([`approval_loop::LimitDialogRead`]).
+    limit_dialog_read: Option<approval_loop::LimitDialogRead>,
+    /// The key of the point the limit episode's badge was carried to that is
+    /// not its dialog nor its `Stop`'s error ([`Self::limit_badge_carry`]):
+    /// it goes once a point's fold ends the episode.
+    limit_badge_away: Option<String>,
     driver: bool,
     question: approval_loop::QuestionMemory,
     decline: approval_loop::DeclineMemory,
@@ -2182,6 +2209,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             changed_streak: 0,
             press_retry: None,
             limit_retry: None,
+            limit_dialog_read: None,
+            limit_badge_away: None,
             driver: false,
             question: approval_loop::QuestionMemory::default(),
             decline: approval_loop::DeclineMemory::default(),
@@ -2851,6 +2880,10 @@ impl<'a, C: Ctl> Session<'a, C> {
         } else if self.footer.is_none() && !self.busy_read {
             self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
         }
+        // Gemini CLI's usage-limit dialog read, a point or not, and the
+        // worker working past it ([`Self::note_limit_dialog`]).
+        let busy = self.limit_dialog_read.is_some() && reader.phase(&screen.rows) == Phase::Busy;
+        self.note_limit_dialog(reader.program(), &screen.rows, busy);
         let credits = reader.credits(&screen.rows);
         self.note_credits(reader, credits.as_ref(), &screen.rows);
         self.note_usage(reader, credits, &screen.rows);
@@ -3522,7 +3555,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                         &mut background_since,
                         opts.map(|o| &o.policy),
                         review,
-                    );
+                    )?;
                 }
                 self.stuck_busy_note(&screen, background_since, review);
             }
@@ -4307,7 +4340,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             .as_ref()
             .is_some_and(|b| b.key != *turn_key.get_or_insert_with(|| self.review_key(&turn)))
         {
-            self.close_box(turn.screen.seq, review)?;
+            let key = turn_key
+                .get_or_insert_with(|| self.review_key(&turn))
+                .clone();
+            if !self.limit_badge_carry(&turn, &key) {
+                self.close_box(turn.screen.seq, review)?;
+            }
         }
         if turn.timed_out || self.fx.mono() >= *deadline {
             return Ok(Some(End::Timeout(turn)));
@@ -4382,6 +4420,11 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else {
                 TurnEndAction::Nothing
             };
+            // The limit episode's badge carried to a point off its screen,
+            // its episode ended by this point's fold: it goes now.
+            if self.limit_badge_off_ended() {
+                self.close_box(point.screen.seq, review)?;
+            }
             if review.unattended()
                 && self.limit.is_some()
                 && self.turn_end.limit_ended()
@@ -4414,6 +4457,18 @@ impl<'a, C: Ctl> Session<'a, C> {
                         }
                     }
                     _ => {}
+                }
+                // GEMINI CLI'S USAGE LIMIT THAT NAMES NO RESET, ITS DIALOG
+                // ANSWERED `Stop` with no badge of the dialog's carried here
+                // (no point decided it): raised now, while its resume is
+                // typed on the ladder ([`Self::limit_stopped_badge`]).
+                if !point_escalated && self.limit_retry.is_some() {
+                    let key = self.review_key(&point);
+                    if let Some(reason) = self.limit_stopped_badge(&point, &key) {
+                        let raised = self.escalate_point(&point, Some(&reason), review);
+                        self.said_before_fail(&point, raised, review)?;
+                        self.limit_badge_raised(&key);
+                    }
                 }
             }
             if !self.say_point(&point, review)? {
@@ -5692,13 +5747,17 @@ impl<C: Ctl> Session<'_, C> {
         Some(words)
     }
 
+    /// A BUSY READ OF THE AGENT'S OWN BACKGROUND WORK: the break offered to the host's step,
+    /// or withheld, and the hold's clock and the occupancy door fed. Under `prompt` alone the
+    /// door's write is the break's last step (§2.1: the brakes, then the host's line, then the
+    /// door), and only its reads and its write can fail here.
     fn host_steps_in_background(
         &mut self,
         screen: &Screen,
         since: &mut Option<Instant>,
         cfg: Option<&SupervisorConfig>,
         review: &mut dyn Review,
-    ) {
+    ) -> Result<(), Fail> {
         let reader = self.reader(&screen.rows);
         let carried = self.transcript_wait_seq == Some(screen.seq);
         let unfit = if carried {
@@ -5733,8 +5792,10 @@ impl<C: Ctl> Session<'_, C> {
             self.withhold(host.as_ref(), guard);
             let hold = (guard == Guard::Wall).then_some(HoldSaid::Held(guard));
             self.say_hold(screen.seq, hold, review);
-            return;
+            return Ok(());
         }
+        // A break read after the door's line was taken: its answer ended here.
+        self.turn_end.fact_answered();
         let at = *since.get_or_insert_with(|| self.fx.mono());
         let Some(host) = host.filter(|h| h.wants()) else {
             self.withheld = None;
@@ -5744,14 +5805,20 @@ impl<C: Ctl> Session<'_, C> {
                 self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
             }
             self.hold_background(screen, at, waited, settled, cfg, review);
-            return;
+            if self.occupancy_write(screen, None, cfg, review)? {
+                *since = None;
+            }
+            return Ok(());
         };
         let waited = self.fx.since(at);
         let settled = waited >= self.setup.background_settle;
         self.hold_background(screen, at, waited, settled, cfg, review);
         let held = if !settled {
             Some(Guard::Settle)
-        } else if self.limit.is_some() && !self.limit_spent(Some(host.as_ref()), notice) {
+        } else if self.limit.is_some() && !self.limit_spent(Some(host.as_ref()), notice)
+            || self.policy_limit_holds()
+            || self.limit_retry_is_away()
+        {
             Some(Guard::LimitEpisode)
         } else if self.stalled.is_some() {
             Some(Guard::Stall)
@@ -5771,16 +5838,24 @@ impl<C: Ctl> Session<'_, C> {
             if guard != Guard::Settle {
                 self.say_hold(screen.seq, Some(HoldSaid::Held(guard)), review);
             }
-            return;
+            self.occupancy_write(screen, Some(guard), cfg, review)?;
+            return Ok(());
         }
         self.withheld = None;
         self.hold_said = None;
+        let mut line_gone = None;
         if let Some((line, kind)) = host.at_background() {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
             self.host_turn(kind, screen.seq);
             self.hold_line(screen.seq, cfg, review);
             *since = None;
+            // The break's one line went: the host's (§2.1, the upgrade's notice first).
+            line_gone = Some(Guard::HostLine);
         }
+        if self.occupancy_write(screen, line_gone, cfg, review)? {
+            *since = None;
+        }
+        Ok(())
     }
 
     fn host_steps_here(
@@ -5839,6 +5914,13 @@ impl<C: Ctl> Session<'_, C> {
         } else if reading.prompt.is_some() {
             Some(Guard::Prompt)
         } else if self.limit.is_some() && !spent {
+            Some(Guard::LimitEpisode)
+        } else if self.policy_limit_holds() || self.limit_retry_is_away() {
+            // A limit the turn-end policy still waits on, met under a
+            // screen-alone agent: through its relaunch, where the episode
+            // closed ([`TurnEndState::limit_holds_host`]); or Gemini CLI's
+            // dialog held when the agent left the tab, before its relaunch's
+            // start-up is read as that limit ([`Self::limit_retry_away`]).
             Some(Guard::LimitEpisode)
         } else if self.turn_end.act_in_flight() {
             Some(Guard::ActInFlight)
@@ -5914,6 +5996,13 @@ impl<C: Ctl> Session<'_, C> {
             self.host_passed = key.filter(|_| (stood || !typed) && self.host_follows.is_none());
         }
         Ok(idle)
+    }
+
+    /// [`TurnEndState::limit_holds_host`] now, with the grace a limit's notice
+    /// gets past its reset ([`crate::harness::upgrade_drive::LIMIT_GRACE_S`]).
+    fn policy_limit_holds(&self) -> bool {
+        let grace = Duration::from_secs(crate::harness::upgrade_drive::LIMIT_GRACE_S);
+        self.turn_end.limit_holds_host(self.fx.mono(), grace)
     }
 
     fn standing_holds(&self, host: &dyn IdleHost) -> bool {

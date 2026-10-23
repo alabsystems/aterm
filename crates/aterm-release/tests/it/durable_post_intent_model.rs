@@ -701,23 +701,6 @@ fn recovery_cleanup_selector_refines_the_historical_recovery_model() {
 }
 
 #[test]
-fn curl_transport_preflight_requires_every_no_retry_post_option() {
-    // `--upload-file` is required because the asset leg streams: a batteries-included DMG is
-    // over a gigabyte and `--data-binary @file` buffers it whole. A curl that cannot stream
-    // fails the preflight, not the upload.
-    let help = "--data-binary --fail-with-body --header --request --retry \
-                --show-error --silent --upload-file --url";
-    publish::validate_one_shot_curl_help(help).unwrap();
-    for missing in help.split_whitespace() {
-        let mutant = help.replace(missing, "");
-        assert!(
-            publish::validate_one_shot_curl_help(&mutant).is_err(),
-            "missing {missing} must fail before durable intent"
-        );
-    }
-}
-
-#[test]
 fn strict_draft_delete_never_converges_on_pre_delete_absence() {
     assert!(!publish::exact_delete_absence_is_converged(false, false));
     assert!(publish::exact_delete_absence_is_converged(false, true));

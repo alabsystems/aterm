@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Setup Assistant's per-user panes: the DidSee*/LastSeen* keys at this build's versions (design §5.1).
-//!
-//! Setup Assistant shows a user's panes at login (Apple Account, Siri, Screen Time,
-//! Intelligence, what's new, …) unless that user's `com.apple.SetupAssistant` domain
-//! says they were seen: a `DidSee<Pane>` boolean, or a `LastSeen<Pane>ProductVersion`
-//! at this macOS version. Each key is one [`Pref`], written as the user. A version key
-//! follows `ctx.facts.os_version`, so after a macOS update the keys read as changed and
-//! are written again (the controller marks such a host `os-changed`).
-//!
-//! The key list is what macOS 27 reads: the names in 27.0's (26A428) Setup Assistant
-//! and its helpers (`mbuseragent`, `MiniLauncher`), plus the two a 27.0.1 (26A434) Mac's
-//! domain held that those binaries do not name (`DidSeeAvatarSetup`,
-//! `DidSeeNewFeaturesProductVersion`). The 27.0 VM's admin domain was empty; every key
-//! below was written there as admin from root, read back with its type, and deleted
-//! again. Left out: `LastPreLoginTasksPerformedVersion`/`Build`, which record the
-//! system's own post-update tasks rather than a pane, and `LastSeenFDERecoveryFlow`,
-//! whose type 27 does not show.
+//! Setup Assistant's per-user panes: the DidSee*/LastSeen* keys at this build's versions (design
+//! §5.1).
 
 use super::defaults::{Pref, Target, Unmet, Want};
 use super::{Ctx, Item};
@@ -31,7 +16,8 @@ pub const DOMAIN: &str = "com.apple.SetupAssistant";
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// Mark every per-user pane seen, so no Apple Account, Siri, Screen Time, Intelligence or what's-new pane appears at login.
+    /// Mark every per-user pane seen, so no Apple Account, Siri, Screen Time, Intelligence or
+    /// what's-new pane appears at login.
     pub skip_assistant: Option<bool>,
 }
 
@@ -113,9 +99,7 @@ const BOTH: &str = "named by macOS 27.0 (26A428) Setup Assistant and held by a 2
 const DOMAIN_271: &str =
     "held by a macOS 27.0.1 (26A434) domain; written, read back and deleted in the 27.0 VM";
 
-/// The items `table` asks for: every key, for every user. `skip_assistant = false`
-/// leaves Setup Assistant alone.
-///
+/// The items `table` asks for: every key, for every user.
 /// # Errors
 /// One line naming what cannot be expanded.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {

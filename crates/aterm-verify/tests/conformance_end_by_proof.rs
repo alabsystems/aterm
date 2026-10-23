@@ -5,17 +5,8 @@
 //! `aterm_uds::process::end_proven` runs over a scripted `EndControl` and tier judgment, every
 //! identity read, judgment and signal it makes is logged, and the log is replayed through the
 //! model: a read that shows the identity moved fires `Move`, a tier judgment that holds fires
-//! `Judge` and one that fails `Lose`, a `SIGTERM` fires `Term`, a `SIGKILL` fires `Kill`, and a
-//! run that returns before a `SIGKILL` fires `Stop`. Each action must be ENABLED where the real
-//! run took it, and the law must hold after each, so a signal the log shows no judgment for is
-//! refused by the replay itself, whatever the run returned.
-//!
-//! NEGATIVE CONTROLS: the traces an end that skipped its judgment would log (a `SIGTERM` after a
-//! moved read, a signal with no judgment of its own, a `SIGKILL` after a lost tier) are
-//! rejected at Buggy 0, admitted by the mutant, and that mutant's run breaks
-//! `NoUnprovenSignal`, so a projection that accepts everything fails here.
-//!
-//! No `#[refines]` anchors (as `StuckVerdict`): the binding is this conformance test.
+//! `Judge` and one that fails `Lose`, a `SIGTERM` fires `Term`, a `SIGKILL` fires `Kill`, and a run
+//! that returns before a `SIGKILL` fires `Stop`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,7 +121,6 @@ fn replay(m: &Model, events: &[Event], fired: &mut BTreeSet<&'static str>) -> Re
             }
         }
     }
-    // The run returned: unless its SIGKILL ended it, it stopped with nothing more sent.
     if s["v"] < 2 {
         fire(m, &mut s, "Stop", fired).map_err(|e| format!("at the return: {e}"))?;
     }

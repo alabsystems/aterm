@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The live upgrade's ladder bound to Claude Code's lane: prefer a natural pause, wait less the
-//! longer the session has been behind, and never move over a draft, a box or a running turn.
-//!
-//! * Tier-1: the derived `HarnessUpgradeLadder` machine against the real Claude Code step
-//!   (`upgrade::next_step` over the facts the lane's own `look_facts` assembles, the gate it
-//!   reaches `upgrade::gate`), over every state the model reaches. The machine is this lane's
-//!   alone since the Codex live upgrade was retired (2026-10-16), and this is its one bind.
-//! * The repaint-proof settle, looked at on a Claude Code screen.
+//! The live upgrade's ladder bound to Claude Code's lane.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -252,11 +245,6 @@ fn real_moves(f: &Facts, now: bool) -> bool {
 /// built from real looks by `look_facts`), and the real facts project back onto their state
 /// (`upgrade_drive::ladder_projection`) wherever the reader read the look idle. The `Advance`,
 /// `Look` and `Move` anchors are entered.
-///
-/// Negative controls, every `Buggy` member caught alone in a reachable state ([`MUTANTS`],
-/// checked to be the model's whole set): a move over a draft, a box or a running turn, `NowWaivesThePerson` (the real
-/// `--now` waits out a keystroke within KEYS_GAP_S), `SeqSettle` (the real one moves where it
-/// waited), and the grace that never narrows.
 #[test]
 fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
     use aterm_spec::xref;
@@ -265,8 +253,6 @@ fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
     let states = reach(&model);
     assert!(states.len() > 200, "the lane has a space: {}", states.len());
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    // The model's Buggy members are exactly the mutants caught below: the actions no state
-    // of the faithful model ever fires.
     let fired = aterm_spec::interp::fired_actions(&model);
     let dead: BTreeSet<&str> = model
         .actions
@@ -315,7 +301,6 @@ fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
             }
             if idle_read {
                 let mut want: BTreeMap<&str, i64> = vars.iter().map(|&k| (k, s[k])).collect();
-                // One look is no run: the projection reads none, as the gate does.
                 want.insert("seen", if s["seen"] == 2 { 2 } else { 0 });
                 assert_eq!(ladder_projection(&f), want, "{s:?}\n{h:?}");
                 projected += 1;
@@ -342,7 +327,6 @@ fn the_real_ladder_is_the_derived_machine_on_the_claude_lane() {
     );
     assert_eq!(caught, BTreeSet::from(MUTANTS), "every mutant caught alone");
 
-    // The anchors this lane enters are linked, name the one projection, and were entered.
     for (action, method) in [("Advance", "rung"), ("Look", "still"), ("Move", "gate")] {
         assert!(
             xref::refinements().any(|a| a.machine == "HarnessUpgradeLadder"
@@ -383,12 +367,10 @@ fn the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints() {
         0,
         "the screen's own quiet restarts at the repaint"
     );
-    // New words begin it again.
     assert_eq!(
         at(&mut st, tab_rows("Now the tests.", false, "", 52), 1_060),
         0
     );
-    // A look not idle ends it.
     let busy = ladder_look(
         &mut st,
         "claude",
@@ -407,7 +389,6 @@ fn the_still_run_counts_claude_looks_at_the_same_words_and_not_repaints() {
         at(&mut st, tab_rows("Now the tests.", false, "", 53), 1_150),
         30
     );
-    // A look after a long gap begins it again.
     assert_eq!(
         at(
             &mut st,

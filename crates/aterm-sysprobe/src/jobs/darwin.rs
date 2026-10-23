@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! libproc's descriptor layouts (`sys/proc_info.h`), decoded from bytes.
-//!
-//! The reference `libc` 0.2.186 declares `proc_fdinfo` and `proc_pidfdinfo`
-//! (they come through the first-party `libc`, with the oracle's rows), but
-//! not the per-kind answers `proc_pidfdinfo` writes: `vnode_fdinfowithpath`,
-//! `pipe_fdinfo`, `socket_fdinfo` (whose protocol part is a union),
-//! `kqueue_fdinfo`. Rather than declare those structs here unchecked, the
-//! macOS arm reads each answer into a byte buffer of the SDK's size and these
-//! pure functions pick out the few fields the engine needs at named offsets.
-//! Every size and offset is a row of [`SDK_ROWS`], which
-//! `tests/proc_info_sdk.rs` compiles as `_Static_assert`s against the SDK
-//! for `arm64` and `x86_64` (with a negative control); the decoders
-//! themselves are tested on every host from bytes the tests write.
-//!
-//! A zombie answers no `proc_pidinfo` flavor at all (measured on macOS 27:
-//! `PROC_PIDTASKALLINFO`, `PROC_PIDTBSDINFO` and `PROC_PIDT_SHORTBSDINFO`
-//! each return 0 once the process has exited), while `proc_listallpids`
-//! still lists it; its parent, group and `p_stat` come from
-//! `sysctl(KERN_PROC_PID)`'s `struct kinfo_proc`, which the reference `libc`
-//! does not declare either, so [`kinfo`] decodes it the same way.
-//!
-//! Two facts are not in the public SDK and are held by a live self-check
-//! instead (the macOS arm's lanes): the private `PROC_PIDFDKQUEUE_EXTINFO`
-//! flavor (9) and its `struct kevent_extinfo` (a `kevent_qos_s`, 72 bytes,
-//! then `kqext_sdata`, `kqext_status`, `kqext_sfflags` and two reserved
-//! words: 104 bytes); and the pipe state bits `PIPE_WANTR` (`0x8`) and
-//! `PIPE_WANTW` (`0x10`), kernel-internal, measured (design §5.3, L6 and L7).
-//! Both arches are little-endian, so the fields are read native-endian.
+//! Decoders for `libproc` descriptor layouts and `kinfo_proc` ([`SDK_ROWS`], [`kinfo`]).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -42,8 +15,7 @@ pub const PROC_PIDFDSOCKETINFO: i32 = 3;
 pub const PROC_PIDFDPIPEINFO: i32 = 6;
 /// `PROC_PIDFDKQUEUEINFO`: a kqueue descriptor.
 pub const PROC_PIDFDKQUEUEINFO: i32 = 7;
-/// `PROC_PIDFDKQUEUE_EXTINFO` (private, `sys/proc_info_private.h`): a
-/// kqueue's knotes; the call returns how MANY it wrote, not bytes.
+/// `PROC_PIDFDKQUEUE_EXTINFO` (private, `sys/proc_info_private.h`): a kqueue's knotes.
 pub const PROC_PIDFDKQUEUE_EXTINFO: i32 = 9;
 /// `PROC_KQUEUE_SLEEP`: a thread sleeps on the kqueue.
 pub const PROC_KQUEUE_SLEEP: u32 = 2;
@@ -114,8 +86,7 @@ pub const SOCKET_FAMILY_AT: usize = 184;
 pub const SOCKET_RCV_CC_AT: usize = 208;
 /// `… psi.soi_kind`.
 pub const SOCKET_KIND_AT: usize = 256;
-/// `… psi.soi_proto.pri_tcp.tcpsi_ini.insi_fport` (network order, low 16
-/// bits).
+/// `… psi.soi_proto.pri_tcp.tcpsi_ini.insi_fport` (network order, low 16 bits).
 pub const SOCKET_FPORT_AT: usize = 264;
 /// `… insi_lport`.
 pub const SOCKET_LPORT_AT: usize = 268;
@@ -126,8 +97,7 @@ pub const SOCKET_FADDR_AT: usize = 296;
 /// `… psi.soi_proto.pri_tcp.tcpsi_state`.
 pub const SOCKET_TCP_STATE_AT: usize = 344;
 
-/// `CTL_KERN`, `KERN_PROC`, `KERN_PROC_PID`: the sysctl name of one
-/// process's `kinfo_proc`.
+/// `CTL_KERN`, `KERN_PROC`, `KERN_PROC_PID`: the sysctl name of one process's `kinfo_proc`.
 pub const KERN_PROC: i32 = 14;
 /// `KERN_PROC_PID`.
 pub const KERN_PROC_PID: i32 = 1;
@@ -174,9 +144,7 @@ pub const KNOTE_IDENT_AT: usize = 0;
 /// `kqext_kev.filter` (`int16_t`).
 pub const KNOTE_FILTER_AT: usize = 8;
 
-/// Every public size, offset and constant above, as the C expression the
-/// SDK must agree with: `tests/proc_info_sdk.rs` asserts each on `arm64` and
-/// `x86_64`.
+/// Public struct sizes, field offsets, and constants verified against the macOS SDK.
 pub const SDK_ROWS: &[(&str, i64)] = &[
     ("PROC_PIDLISTTHREADS", PROC_PIDLISTTHREADS as i64),
     ("PROC_PIDFDVNODEPATHINFO", PROC_PIDFDVNODEPATHINFO as i64),
@@ -345,8 +313,6 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         "offsetof(struct kqueue_fdinfo, kqueueinfo.kq_state)",
         KQUEUE_STATE_AT as i64,
     ),
-    // The public prefix of the private `kevent_extinfo`: a `kevent_qos_s`
-    // begins with the same `ident` and `filter` as `kevent64_s`.
     ("offsetof(struct kevent64_s, ident)", KNOTE_IDENT_AT as i64),
     (
         "offsetof(struct kevent64_s, filter)",
@@ -387,8 +353,7 @@ pub struct VnodeFd {
     pub ino: u64,
     /// `vst_size`, never negative.
     pub size: u64,
-    /// `vip_path`, up to its NUL: the kernel's name for it, read from its
-    /// name cache (no file system is asked).
+    /// `vip_path`, up to its NUL.
     pub path: Vec<u8>,
 }
 
@@ -406,8 +371,7 @@ impl VnodeFd {
     }
 }
 
-/// Decode a `vnode_fdinfowithpath`; `None` when `b` is shorter than the
-/// struct.
+/// Decode a `vnode_fdinfowithpath`; `None` when `b` is shorter than the struct.
 #[must_use]
 pub fn vnode(b: &[u8]) -> Option<VnodeFd> {
     if b.len() < VNODE_PATH_SIZE {
@@ -468,8 +432,7 @@ pub fn pipe(b: &[u8]) -> Option<PipeFd> {
 pub struct TcpFd {
     /// `tcpsi_state` (`TSI_S_*`).
     pub state: i32,
-    /// The peer, when the socket has one (`None` for a listener's
-    /// wildcard, or a family this reader does not name).
+    /// Remote peer address when the socket is connected.
     pub remote: Option<SocketAddr>,
     /// The local port.
     pub local_port: u16,
@@ -477,9 +440,7 @@ pub struct TcpFd {
     pub queued_read: u64,
 }
 
-/// Decode a `socket_fdinfo`: `Some(Some(tcp))` for a TCP socket,
-/// `Some(None)` for any other socket, `None` when `b` is shorter than the
-/// struct.
+/// Decode a `socket_fdinfo`.
 #[must_use]
 pub fn socket(b: &[u8]) -> Option<Option<TcpFd>> {
     if b.len() < SOCKET_SIZE {
@@ -506,7 +467,6 @@ pub fn socket(b: &[u8]) -> Option<Option<TcpFd>> {
     } else {
         None
     };
-    // A listener's peer is the wildcard on port 0: no peer.
     let remote = ip
         .filter(|_| fport != 0)
         .map(|ip| SocketAddr::new(ip, fport));
@@ -580,7 +540,6 @@ pub fn kqueue_state(b: &[u8]) -> Option<u32> {
 }
 
 /// Decode the first `n` `kevent_extinfo`s of `b`: `(ident, filter)` each.
-/// Stops early where `b` runs out.
 #[must_use]
 pub fn knotes(b: &[u8], n: usize) -> Vec<(u64, i16)> {
     (0..n)

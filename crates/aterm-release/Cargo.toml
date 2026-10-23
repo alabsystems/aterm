@@ -88,6 +88,9 @@ aterm-messages = { workspace = true }
 # The updater's own reading of a bundle's dev mark: `ship dev-app`'s tests hold the
 # plist it stamps to it, so the mark it seals is the one the updater leaves alone.
 aterm-update = { workspace = true }
+# A loopback GitHub (api, uploads, web and CDN origins): the release's REST lane
+# (src/github.rs) is tested against it through the real /usr/bin/curl, never the network.
+agh-fake = { workspace = true }
 
 [lints]
 workspace = true

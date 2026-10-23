@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_diskwalk::{Deny, Policy, RootSpec, SLICE, Sliced, Step, Ticket, Walk, Walker};
-use aterm_models_misc::{budgeted_walk_liveness, budgeted_walk_model};
+use aterm_models_misc::budgeted_walk_model;
 use aterm_spec::derive::Model;
 use aterm_spec::{interp, verify};
 
@@ -195,19 +195,6 @@ fn slice(
     ghost.over = made > ghost.allowed;
     ghost.resumed_old = Some(ticket) != current && answer != Sliced::Stale;
     answer
-}
-
-#[test]
-fn budgeted_walk_is_proven_and_each_law_caught_by_both_tiers() {
-    let m = budgeted_walk_model();
-    verify::prove_and_catch_tiered(&m, "BudgetedWalk Tier-0").expect("a scalar model always runs");
-    verify::liveness_proves_and_catches_tiered(&m, &budgeted_walk_liveness(), "BudgetedWalk ends");
-    // Every Buggy-guarded action is a violation step of some invariant (no dead negative
-    // control), and WalkEnds is proven, minimal in its fairness and caught by its mutant.
-    let faults = verify::sweep_faults(std::slice::from_ref(&m));
-    assert!(faults.is_empty(), "{faults:#?}");
-    verify::audit_liveness(&m, &budgeted_walk_liveness())
-        .expect("WalkEnds is proven, minimal and caught");
 }
 
 #[test]

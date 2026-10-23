@@ -15,31 +15,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 /// Read an integer.
-///
-/// LZ4 lengths extend by summing bytes up to and including the first non-0xFF byte.
-///
-/// # Example
-///
-/// ```notest
-///     255, 255, 255, 4, 2, 3, 4, 6, 7
-/// ```
-///
-/// is encoded to _255 + 255 + 255 + 4 = 769_. The bytes after the first 4 is ignored, because
-/// 4 is the first non-0xFF byte.
 #[inline]
 fn read_integer(input: &[u8], input_pos: &mut usize) -> Result<u32, DecompressError> {
     let mut n: u32 = 0;
     loop {
-        // A match, not `.ok_or(..)?`: `Option::ok_or` is a std absent callee
-        // the verifier cannot prove panic-free.
         let extra: u8 = match input.get(*input_pos) {
             Some(&byte) => byte,
             None => return Err(DecompressError::ExpectedAnotherByte),
         };
-        // Never saturates: the `get` proved `*input_pos < input.len()`.
         *input_pos = input_pos.saturating_add(1);
-        // A corrupt long `0xFF` run saturates; the caller's bounds checks
-        // then reject the length.
         n = n.saturating_add(extra as u32);
 
         if extra != 0xFF {
@@ -53,9 +37,7 @@ fn read_integer(input: &[u8], input_pos: &mut usize) -> Result<u32, DecompressEr
 /// Read a little-endian 16-bit integer from the input stream.
 #[inline]
 fn read_u16(input: &[u8], input_pos: &mut usize) -> Result<u16, DecompressError> {
-    // A cursor into `input`: `+ 2` never saturates.
     let end = input_pos.saturating_add(2);
-    // Byte `get`s, not `ok_or` + `try_into` (std absent callees).
     let lo = match input.get(*input_pos) {
         Some(&byte) => byte,
         None => return Err(DecompressError::ExpectedAnotherByte),
@@ -71,8 +53,7 @@ fn read_u16(input: &[u8], input_pos: &mut usize) -> Result<u16, DecompressError>
 const FIT_TOKEN_MASK_LITERAL: u8 = 0b00001111;
 const FIT_TOKEN_MASK_MATCH: u8 = 0b11110000;
 
-/// True when both token nibbles (literal length high, match length low) are below 15, so no
-/// extension bytes follow.
+/// True when both token nibbles (literal length high, match length low) are below 15.
 #[inline]
 const fn does_token_fit(token: u8) -> bool {
     !((token & FIT_TOKEN_MASK_LITERAL) == FIT_TOKEN_MASK_LITERAL
@@ -80,13 +61,8 @@ const fn does_token_fit(token: u8) -> bool {
 }
 
 /// Decompress all bytes of `input` into `output`.
-///
-/// Returns the number of bytes written (decompressed) into `output`.
 #[inline(always)]
-// `always`: best performance in non-LTO builds.
-// Skip: the fast path's 16-byte `try_into().unwrap()` read is in bounds by the
-// `input_pos <= safe_input_pos` guard (len - 16 - 2), which the verifier cannot
-// follow.
+// Skip: fast-path 16-byte read is guarded by input_pos <= safe_input_pos.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
     input: &[u8],
@@ -104,33 +80,23 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
         .saturating_sub(16 /* literal copy */ + 18 /* match copy */);
 
     if USE_DICT {
-        // In the dictionary case the output pointer is moved by the match length in the dictionary.
-        // This may be up to 17 bytes without exiting the loop. So we need to ensure that we have
-        // at least additional 17 bytes of space left in the output buffer in the fast loop.
         safe_output_pos = safe_output_pos.saturating_sub(17);
     };
 
-    // Exhaust the decoder by reading and decompressing all blocks until the remaining buffer is
-    // empty.
     loop {
-        // The token: literal length in the high nibble, match length in the low.
         let token = *input
             .get(input_pos)
             .ok_or(DecompressError::ExpectedAnotherByte)?;
         input_pos += 1;
 
-        // Fast path: the common token fits in one byte and we are far from the end.
-        // `<` (not `<=`) on the output side covers a `safe_output_pos` saturated to 0.
         if does_token_fit(token) && input_pos <= safe_input_pos && output.pos() < safe_output_pos {
             let literal_length = (token >> 4) as usize;
 
             let input: &[u8; 16] = input[input_pos..input_pos + 16].try_into().unwrap();
 
-            // The literal is at most 14 bytes; the guard leaves room to copy 16.
             output.extend_from_slice_wild(input, literal_length);
             input_pos += literal_length;
 
-            // clone as we don't want to mutate
             let offset = read_u16(input, &mut literal_length.clone())? as usize;
             input_pos += 2;
 
@@ -141,14 +107,9 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
                 if copied == match_length {
                     continue;
                 }
-                // match crosses ext_dict and output, offset is still correct as output pos
-                // increased
                 match_length -= copied;
             }
 
-            // In this branch we know that match_length is at most 18 (14 + MINMATCH).
-            // But the blocks can overlap, so make sure they are at least 18 bytes apart
-            // to enable an optimized copy of 18 bytes.
             let start = output.pos().saturating_sub(offset);
             if offset >= match_length {
                 output.extend_from_within(start, 18, match_length);
@@ -159,7 +120,6 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             continue;
         }
 
-        // Literal section; a nibble of 15 means extension bytes follow.
         let mut literal_length = (token >> 4) as usize;
         if literal_length != 0 {
             if literal_length == 15 {
@@ -179,13 +139,11 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             input_pos += literal_length;
         }
 
-        // Input exhausted: the last sequence has no match.
         if input_pos >= input.len() {
             break;
         }
 
         let offset = read_u16(input, &mut input_pos)? as usize;
-        // Match length: MINMATCH plus the low nibble; 19 means extension bytes follow.
         let mut match_length = MINMATCH + (token & 0xF) as usize;
         if match_length == MINMATCH + 15 {
             match_length += read_integer(input, &mut input_pos)? as usize;
@@ -202,19 +160,15 @@ pub(crate) fn decompress_internal<const USE_DICT: bool, S: Sink>(
             if copied == match_length {
                 continue;
             }
-            // match crosses ext_dict and output, offset is still correct as output_len was
-            // increased
             match_length -= copied;
         }
-        // Copy the match from already-decompressed output.
         duplicate_slice(output, offset, match_length)?;
     }
     Ok(output.pos() - initial_output_pos)
 }
 
 #[inline]
-// Skip: one residual panic-freedom row the verifier cannot transport; the
-// arithmetic is guarded and the `get` fails closed.
+// Skip: arithmetic is guarded and slice indexing fails closed.
 #[cfg_attr(trust_verify, trust::skip)]
 fn copy_from_dict(
     output: &mut impl Sink,
@@ -222,7 +176,6 @@ fn copy_from_dict(
     offset: usize,
     match_length: usize,
 ) -> Result<usize, DecompressError> {
-    // If we're here we know offset > output.pos
     debug_assert!(offset > output.pos());
     let (back, back_overflow) = offset.overflowing_sub(output.pos());
     if back_overflow {
@@ -232,10 +185,7 @@ fn copy_from_dict(
     if did_overflow {
         return Err(DecompressError::OffsetOutOfBounds);
     }
-    // The match may cross from dict into output; `back == len - dict_offset`.
     let dict_match_length = match_length.min(back);
-    // In bounds (`<= len`), but the verifier loses that relation: `get`
-    // needs no proof and fails closed, as does a (impossible) wrap.
     let ext_match = match ext_dict.get(dict_offset..dict_offset.wrapping_add(dict_match_length)) {
         Some(slice) => slice,
         None => return Err(DecompressError::OffsetOutOfBounds),
@@ -244,14 +194,13 @@ fn copy_from_dict(
     Ok(dict_match_length)
 }
 
-/// Extends output by self-referential copies
+/// Extends output by self-referential copies.
 #[inline(always)] // (always) necessary otherwise compiler fails to inline it
 fn duplicate_slice(
     output: &mut impl Sink,
     offset: usize,
     match_length: usize,
 ) -> Result<(), DecompressError> {
-    // This function assumes output will fit match_length, it might panic otherwise.
     if match_length > offset {
         duplicate_overlapping_slice(output, offset, match_length)?;
     } else {
@@ -260,7 +209,6 @@ fn duplicate_slice(
             return Err(DecompressError::OffsetOutOfBounds);
         }
 
-        // `pos() + 64` cannot overflow; saturating is for the verifier.
         match match_length {
             0..=32 if output.pos().saturating_add(32) <= output.capacity() => {
                 output.extend_from_within(start, 32, match_length)
@@ -281,7 +229,6 @@ fn duplicate_overlapping_slice(
     offset: usize,
     match_length: usize,
 ) -> Result<(), DecompressError> {
-    // This function assumes output will fit match_length, it might panic otherwise.
     let (start, did_overflow) = sink.pos().overflowing_sub(offset);
     if did_overflow {
         return Err(DecompressError::OffsetOutOfBounds);
@@ -296,14 +243,12 @@ fn duplicate_overlapping_slice(
 }
 
 /// Decompress all bytes of `input` into `output`.
-/// `output` should be preallocated to the uncompressed size.
 #[inline]
 pub fn decompress_into(input: &[u8], output: &mut [u8]) -> Result<usize, DecompressError> {
     decompress_internal::<false, _>(input, &mut SliceSink::new(output, 0), b"")
 }
 
-/// Decompress all bytes of `input` into a new vec. The first 4 bytes are the uncompressed size in
-/// little endian. Can be used in conjunction with `compress_prepend_size`
+/// Decompress all bytes of `input` into a new vec.
 #[inline]
 pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, DecompressError> {
     let (uncompressed_size, input) = super::uncompressed_size(input)?;
@@ -311,15 +256,10 @@ pub fn decompress_size_prepended(input: &[u8]) -> Result<Vec<u8>, DecompressErro
 }
 
 /// Decompress all bytes of `input` into a new vec.
-/// The passed parameter `min_uncompressed_size` needs to be equal or larger than the uncompressed size.
 ///
 /// # Panics
-/// May panic if the parameter `min_uncompressed_size` is smaller than the
-/// uncompressed data.
+/// May panic if the parameter `min_uncompressed_size` is smaller than the uncompressed data.
 #[cfg_attr(trust_verify, trust::skip)]
-// allocation panic (vec!)
-// #[inline] so callers' Trust gates (aterm-scrollback) verify this body
-// instead of assuming an absent callee.
 #[inline]
 pub fn decompress(input: &[u8], min_uncompressed_size: usize) -> Result<Vec<u8>, DecompressError> {
     let mut decompressed: Vec<u8> = vec![0; min_uncompressed_size];
@@ -335,7 +275,6 @@ mod test {
 
     #[test]
     fn corrupt_integer_run_errors_without_panic() {
-        // A long `0xFF` length-extension run must decode to `Err`, not overflow or panic.
         let mut corrupt = vec![0xF0u8]; // token: literal nibble 15 ⇒ read extra integer
         corrupt.extend(std::iter::repeat_n(0xFFu8, 4096));
         let result = decompress(&corrupt, 64);
@@ -345,7 +284,6 @@ mod test {
             result.map(|v| v.len())
         );
 
-        // Token 0xFF keeps reading 0xFF extension bytes past the 64-byte input.
         assert!(
             decompress(&[0xFFu8; 64], 64).is_err(),
             "pure 0xFF garbage must decode to Err, not panic or wrongly Ok"

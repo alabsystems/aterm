@@ -1,30 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The effect frontier (plan §3): how a task's external effects are recorded live and
-//! compared in shadow replay.
-//!
-//! # The law
-//!
-//! Every external effect a step proposes is an [`EffectRequest`]: a target capability, an
-//! operation and an immutable payload. The record pass ([`RecordingPort`]) hands each request
-//! to the host's live sink and keeps an [`EffectRecord`] of it — its sequence number, target,
-//! op, the digest of its payload, and the result the task observed.
-//!
-//! Shadow replay ([`ShadowPort`]) never submits anything: it holds no live sink, so it cannot.
-//! Each request is compared with the next recorded one — target, op and payload digest —
-//! **before** the recorded result is handed back. The first mismatch is the *frontier*: the
-//! point where continuing would need a new external action. The frontier is sticky: every
-//! later request is answered with the same divergence, even one that would match a later
-//! record, and nothing past it is ever answered from the recording. A run that ends with
-//! records it never asked for has *deleted* an effect, and [`ShadowPort::finish`] refuses it
-//! ([`EffectDivergence::Unreached`]) — omitting an earlier effect is a divergence even when
-//! nothing new was submitted.
-//!
-//! A task that declares no external effects runs with [`NoEffects`]: any submission is
-//! [`EffectDivergence::Undeclared`].
-//!
-//! Positions are 0-based indices into the shadowed sequence: the `n`-th request of the run.
+//! The effect frontier (plan §3): how a task's external effects are recorded live and compared in
+//! shadow replay.
 
 use core::fmt;
 
@@ -70,12 +48,12 @@ pub struct EffectRecord {
 
 /// Where a step submits its external effects.
 pub trait EffectPort {
-    /// Submits one request and returns the result the task observes, or the divergence that
-    /// stopped it.
+    /// Submits one request and returns the result the task observes, or the divergence that stopped
+    /// it.
     fn submit(&mut self, req: EffectRequest) -> Result<Vec<u8>, EffectDivergence>;
 }
 
-/// Why a run's effects are not the recorded ones. Nothing was submitted live.
+/// Why a run's effects are not the recorded ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectDivergence {
     /// The run asked for an effect past the end of the recording (an insertion).
@@ -110,8 +88,7 @@ pub enum EffectDivergence {
         /// The asked payload's digest.
         asked: Digest,
     },
-    /// The run ended with recorded effects it never asked for (a deletion), seen at
-    /// [`ShadowPort::finish`].
+    /// The run ended with recorded effects it never asked for, seen at [`ShadowPort::finish`].
     Unreached {
         /// The first position never asked for.
         position: u64,
@@ -175,8 +152,8 @@ impl fmt::Display for EffectDivergence {
 
 impl std::error::Error for EffectDivergence {}
 
-/// Shadow replay: compares each request with the next recorded one **before** handing back
-/// its recorded result; holds no live sink, so it cannot submit anything.
+/// Shadow replay: compares each request with the next recorded one **before** handing back its
+/// recorded result; holds no live sink, so it cannot submit anything.
 #[derive(Clone, Debug)]
 pub struct ShadowPort<'a> {
     recorded: &'a [EffectRecord],
@@ -316,8 +293,6 @@ impl<F: FnMut(&EffectRequest) -> Vec<u8>> RecordingPort<F> {
 
 impl<F: FnMut(&EffectRequest) -> Vec<u8>> EffectPort for RecordingPort<F> {
     fn submit(&mut self, req: EffectRequest) -> Result<Vec<u8>, EffectDivergence> {
-        // The sequence space is checked before the sink runs: an effect the recording could
-        // not hold is never submitted.
         let Some(after) = self.next_seq.checked_add(1) else {
             return Err(EffectDivergence::Inserted {
                 position: self.next_seq,

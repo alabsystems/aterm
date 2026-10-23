@@ -514,35 +514,31 @@ __aterm_win_cwd_to=
 # shells where a `$(...)` fork costs ~16 ms (bash 5.3+ uses `${ ...; }` in-process).
 #
 # No builtin puts a history entry in a variable, and bash 5.3 keeps a `${ ...; }`
-# substitution's output in a file it makes and unlinks at once (a memfd on Linux)
-# in `$TMPDIR`, else in the system folder it found first and remembers (`/tmp`).
-# Git Bash's `/tmp` is MSYS2's shared `usertemp` mount, the TEMP of the
-# session's first MSYS2 process, and where that folder is gone bash cannot make
-# the file: the read fails (`function_substitute: cannot open anonymous file`)
-# and the line runs with no block. So the read names a folder it saw just now,
-# `$TMPDIR` or else `/tmp`, and forks `$(...)`, which needs none, only where
-# neither is there. On Linux bash asks for a memfd before any folder
-# (`anonopen`), so the read there checks none: a check would fork every line
-# where `/tmp` is read-only and `$TMPDIR` unset (a read-only container), and a
-# read that still fails does so inside PS0's `${| ...; }` or the DEBUG trap,
-# where the line runs on.
+# substitution's output in a file it makes and unlinks at once: a memfd where
+# the kernel takes the `MFD_NOEXEC_SEAL` bash asks for (Linux 6.3+; a bash built
+# on glibc before 2.38 asks with no flag, which any Linux takes), else a file in
+# `$TMPDIR`, else in the system folder it found first and remembers (`/tmp`).
+# Where no such folder is writable bash cannot make the file: a Git Bash whose
+# `/tmp` (MSYS2's shared `usertemp` mount, the TEMP of the session's first
+# MSYS2 process) went away, a read-only container on an older Linux with
+# `$TMPDIR` unset. The read fails (`function_substitute: cannot open anonymous
+# file`) and the line runs with no block. So the read names a folder it saw
+# just now, `$TMPDIR` or else `/tmp`, and forks `$(...)`, which needs none,
+# only where neither is there, whatever `$OSTYPE` says: whether bash gets a
+# memfd is its kernel's and its libc's to say.
 __aterm_hist_mark="${__aterm_hist_mark:-}"
 if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
     # Inside eval so older bash versions do not fail parsing `${ ...; }`.
-    if [[ $OSTYPE == linux* ]]; then
-        eval '__aterm_history_line() { REPLY=${ HISTTIMEFORMAT= builtin history 1; }; }'
-    else
-        eval '__aterm_history_line() {
-            if [[ -d ${TMPDIR-} && -w ${TMPDIR-} ]]; then
-                REPLY=${ HISTTIMEFORMAT= builtin history 1; }
-            elif [[ -d /tmp && -w /tmp ]]; then
-                local TMPDIR=/tmp
-                REPLY=${ HISTTIMEFORMAT= builtin history 1; }
-            else
-                REPLY=$(HISTTIMEFORMAT= builtin history 1)
-            fi
-        }'
-    fi
+    eval '__aterm_history_line() {
+        if [[ -d ${TMPDIR-} && -w ${TMPDIR-} ]]; then
+            REPLY=${ HISTTIMEFORMAT= builtin history 1; }
+        elif [[ -d /tmp && -w /tmp ]]; then
+            local TMPDIR=/tmp
+            REPLY=${ HISTTIMEFORMAT= builtin history 1; }
+        else
+            REPLY=$(HISTTIMEFORMAT= builtin history 1)
+        fi
+    }'
 elif [[ -n "$__aterm_win_posix" ]]; then
     __aterm_history_line() { return 1; }
 else

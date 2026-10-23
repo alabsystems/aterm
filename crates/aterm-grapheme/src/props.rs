@@ -2,19 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The Unicode `Script` and `General_Category` properties.
-//!
-//! The text shaper (`aterm_font::shape`) reads both: the first script that is
-//! not Common or Inherited picks a run's OpenType script and direction, and
-//! the general category tells marks, letters, decimal digits, spaces and
-//! format characters apart (grapheme continuations, automatic fractions,
-//! Arabic joining). They moved here from the `unicode-script` and
-//! `unicode-properties` crates at TF.6 of docs/AUDIT-third-party-2026-10-15.md.
-//!
-//! Both are generated from the same Unicode version as this crate's other
-//! tables ([`PROPS_UNICODE_VERSION`]; the `unicode_tables` Rust example). A code point no
-//! script names is [`Script::UNKNOWN`], and an unassigned one is
-//! [`GeneralCategory::Unassigned`].
+//! Unicode `Script` and `General_Category` character property lookups.
 
 use crate::tables::props::{GENERAL_CATEGORY_RUNS, SCRIPT_CODES, SCRIPT_RUNS};
 
@@ -197,11 +185,7 @@ pub fn script(c: char) -> Script {
         .map_or(Script::UNKNOWN, Script)
 }
 
-/// The `Script` property as the runs it is stored in: `(first, script)` for
-/// each run, ascending from U+0000, a run ending where the next begins and the
-/// last at U+10FFFF, so [`script`] of a code point is the script of the last
-/// run that starts at or below it. For a caller that counts which of many code
-/// points carry a script (a font's cmap) without a lookup per code point.
+/// Returns an iterator of `(first_codepoint, script)` runs in ascending order from `U+0000`.
 #[inline]
 pub fn script_runs() -> impl Iterator<Item = (u32, Script)> {
     SCRIPT_RUNS.iter().map(|&e| {

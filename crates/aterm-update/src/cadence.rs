@@ -85,7 +85,7 @@ pub(crate) struct Cadence {
 
 impl Cadence {
     /// Create a healthy schedule with `base` interval.
-    pub(crate) fn new(base: Duration) -> Self {
+    pub(crate) const fn new(base: Duration) -> Self {
         Self {
             base,
             failures: 0,
@@ -96,18 +96,18 @@ impl Cadence {
     }
 
     /// Hold the next check until `until` (the end of a sibling's fresh check window).
-    pub(crate) fn hold_until(&mut self, until: Instant) {
+    pub(crate) const fn hold_until(&mut self, until: Instant) {
         self.hold = Some(until);
     }
 
     /// Configured base check interval.
     #[cfg(target_os = "macos")]
-    pub(crate) fn base(&self) -> Duration {
+    pub(crate) const fn base(&self) -> Duration {
         self.base
     }
 
     /// Record a check failure and advance the exponential backoff.
-    pub(crate) fn failed(&mut self) {
+    pub(crate) const fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
         self.offline = 0;
         self.in_flight = 0;
@@ -134,7 +134,7 @@ impl Cadence {
     }
 
     /// Record a network-unreachable check failure ([`OFFLINE_RETRY`]).
-    pub(crate) fn failed_offline(&mut self) {
+    pub(crate) const fn failed_offline(&mut self) {
         self.offline = self.offline.saturating_add(1);
         if self.offline as usize > OFFLINE_RETRY.len() {
             self.failures = self.failures.saturating_add(1);
@@ -144,12 +144,12 @@ impl Cadence {
     }
 
     /// Whether the next wait uses a quick [`OFFLINE_RETRY`] rung.
-    pub(crate) fn retrying_offline(&self) -> bool {
+    pub(crate) const fn retrying_offline(&self) -> bool {
         self.offline > 0 && self.offline as usize <= OFFLINE_RETRY.len()
     }
 
     /// Record a successful check and reset backoff (or schedule an in-flight retry).
-    pub(crate) fn succeeded(&mut self, head_in_flight_checks: u32) {
+    pub(crate) const fn succeeded(&mut self, head_in_flight_checks: u32) {
         self.failures = 0;
         self.offline = 0;
         self.in_flight = head_in_flight_checks;
@@ -157,7 +157,7 @@ impl Cadence {
     }
 
     /// Reset failure backoff and holds after a system wake.
-    pub(crate) fn woke(&mut self) {
+    pub(crate) const fn woke(&mut self) {
         self.failures = 0;
         self.offline = 0;
         self.in_flight = 0;

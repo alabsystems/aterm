@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! **THE ROSTER TELLS THE TRUTH ABOUT HOW AN ATERM LEFT** (design
-//! `DESIGN-sessions-as-subagents-2026-10-15.md` §6).
-//!
-//! A quit and a seamless update's Commit both close the bridge's lanes, and
-//! they need opposite answers on the roster. So aterm tells its bridge which,
-//! first: `bye quit` withdraws every session it hosted — one `state=exited`
-//! row each — and a post to one is refused at its SENDER, `ERR unroutable`;
-//! `bye handoff` withdraws none, because the successor adopts the same sids.
-//! Either way the bridge's connection ends and the node's will fires, which
-//! reads `away`: a session left `live` under an away node still routes, and
-//! the post waits on the bus for the node.
-//!
-//! Two real nodes on one broker, each a headless `aterm` with its own
-//! `aterm link serve` child. The quit is the real one — `invoke Quit`, which a
-//! headless instance takes like Cmd-Q. The handoff is its bridge-visible half:
-//! a headless instance cannot hand off, so the QA seam
-//! `ATERM_DEBUG_QUIT_BYE=handoff` (a development build's only) makes that quit
-//! say `bye handoff` instead — the word, then the lanes closing, which is all
-//! the bridge ever sees of a Commit.
-//!
-//! Every wait is `until <observable state>`, a hang detector.
+//! Roster session withdrawal on `bye quit` vs preservation on `bye handoff` (design §6).
 
 use crate::harness;
 
@@ -84,8 +64,6 @@ fn a_quit_withdraws_its_sessions_and_a_post_to_one_is_refused() {
     until("the quit to withdraw B's session", || {
         (states(&fleet, &face).last().map(String::as_str) == Some("exited")).then_some(())
     });
-    // B's bridge has exited (`Node::quit`): the history is final, and its
-    // one hosted session was withdrawn once.
     let quits: Vec<String> = b
         .ev(&fleet)
         .into_iter()
@@ -142,8 +120,6 @@ fn a_handoff_withdraws_nothing_and_a_post_to_an_away_session_queues() {
     until("B's node to read away once its bridge is gone", || {
         fleet.row(&node).filter(|r| r.contains("state=away"))
     });
-    // B's bridge has exited (`Node::quit`) and its will has fired: nothing
-    // more can be published under B's node, so the history is final.
     let history = states(&fleet, &face);
     assert!(
         !history.iter().any(|s| s == "exited"),

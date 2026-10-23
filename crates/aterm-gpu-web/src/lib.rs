@@ -264,7 +264,7 @@ impl AtermGpuTerminal {
 
     /// Record the frame `build_frame` just produced as the one on glass.
     #[inline]
-    fn record_presented_frame(&mut self, key: FrameGateKey) {
+    const fn record_presented_frame(&mut self, key: FrameGateKey) {
         self.last_frame_key = Some(key);
         self.last_present_frac = self.frame_scratch.scroll_frac_px;
     }
@@ -303,7 +303,7 @@ impl AtermGpuTerminal {
 
     /// Record a visual change the engine's damage epoch cannot see (renderer-held or presentation state), reopening the frame gate for one frame.
     #[inline]
-    pub(crate) fn note_host_visual_change(&mut self) {
+    pub(crate) const fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
@@ -815,13 +815,13 @@ impl AtermGpuTerminal {
 
     /// The chrome interior padding from [`Self::set_chrome`] (px; 0 = exact fit), read from the CPU face.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn chrome_pad(&self) -> u16 {
+    pub const fn chrome_pad(&self) -> u16 {
         self.cpu.pad() as u16
     }
 
     /// The chrome top head band set via [`Self::set_chrome`] (px; 0 = none).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn chrome_head(&self) -> u16 {
+    pub const fn chrome_head(&self) -> u16 {
         self.cpu.head() as u16
     }
 
@@ -934,19 +934,19 @@ impl AtermGpuTerminal {
 
     /// Cell width in device pixels — the host computes cols = floor(canvasW / cellWidth).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cell_width(&self) -> usize {
+    pub const fn cell_width(&self) -> usize {
         self.cpu.cell_size().0
     }
 
     /// Cell height in device pixels — the host computes rows = floor(canvasH / cellHeight).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cell_height(&self) -> usize {
+    pub const fn cell_height(&self) -> usize {
         self.cpu.cell_size().1
     }
 
     /// True once [`AtermGpuTerminal::init`] has acquired a GPU + surface.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn gpu_ready(&self) -> bool {
+    pub const fn gpu_ready(&self) -> bool {
         self.gpu.is_some()
     }
 
@@ -974,13 +974,13 @@ pub struct SearchMeta {
 impl SearchMeta {
     /// True when the results may be truncated.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn incomplete(&self) -> bool {
+    pub const fn incomplete(&self) -> bool {
         self.incomplete
     }
 
     /// Number of matches the paired [`AtermGpuTerminal::search`] call returns (its flat triplet array length / 3), after any cap.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn match_count(&self) -> u32 {
+    pub const fn match_count(&self) -> u32 {
         self.match_count
     }
 }
@@ -1009,49 +1009,49 @@ impl BudgetedSearchResult {
 
     /// Whether every retained row has been scanned and every match delta has been delivered.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.complete
     }
 
     /// Token to resume with; `undefined` once complete.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cursor(&self) -> Option<u64> {
+    pub const fn cursor(&self) -> Option<u64> {
         self.cursor
     }
 
     /// Stable identity for the logical search, including its completing step; `undefined` only for an empty/invalid query result.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn search_id(&self) -> Option<u64> {
+    pub const fn search_id(&self) -> Option<u64> {
         self.search_id
     }
 
     /// Whether this step starts a new logical result stream.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn reset(&self) -> bool {
+    pub const fn reset(&self) -> bool {
         self.reset
     }
 
     /// True when the results may be truncated (eviction or the match cap).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn incomplete_index(&self) -> bool {
+    pub const fn incomplete_index(&self) -> bool {
         self.incomplete_index
     }
 
     /// Final oldest absolute line retained by the completed search index, stable from the first turn.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn lowest_retained_line(&self) -> u32 {
+    pub const fn lowest_retained_line(&self) -> u32 {
         self.lowest_retained_line
     }
 
     /// Rows scanned so far (progress numerator; restarts reset it).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn rows_fed(&self) -> u32 {
+    pub const fn rows_fed(&self) -> u32 {
         self.rows_fed
     }
 
     /// Total rows this search will scan (progress denominator).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn total_rows(&self) -> u32 {
+    pub const fn total_rows(&self) -> u32 {
         self.total_rows
     }
 }
@@ -1119,19 +1119,19 @@ impl LinkHit {
 
     /// Inclusive start column of the link span.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_col(&self) -> u16 {
+    pub const fn start_col(&self) -> u16 {
         self.start_col
     }
 
     /// Exclusive end column of the link span, a grid column as `start_col` is.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_col(&self) -> u16 {
+    pub const fn end_col(&self) -> u16 {
         self.end_col
     }
 
     /// Link kind: 0=osc8, 1=url, 2=file_path, 3=other.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn kind(&self) -> u8 {
+    pub const fn kind(&self) -> u8 {
         self.kind
     }
 }
@@ -1149,25 +1149,25 @@ pub struct SelectionRange {
 impl SelectionRange {
     /// Start column (display-relative).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_x(&self) -> u16 {
+    pub const fn start_x(&self) -> u16 {
         self.start_x
     }
 
     /// Start row (display-relative, 0 = top visible row).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_y(&self) -> u16 {
+    pub const fn start_y(&self) -> u16 {
         self.start_y
     }
 
     /// End column (display-relative, side-adjusted/inclusive).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_x(&self) -> u16 {
+    pub const fn end_x(&self) -> u16 {
         self.end_x
     }
 
     /// End row (display-relative).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_y(&self) -> u16 {
+    pub const fn end_y(&self) -> u16 {
         self.end_y
     }
 }

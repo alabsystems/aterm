@@ -391,8 +391,8 @@ fn fetch(
 }
 
 /// The screen stamp a `status` line carries: its `seq=` and `hash=` values
-/// (parse by key). `None` when it carries neither — a cut against it cannot be
-/// shown quiescent.
+/// (parse by key). `None` when it carries neither, or either is `-` (no whole
+/// frame to stamp) — a cut against it cannot be shown quiescent.
 fn stamp(status: &str) -> Option<(String, String)> {
     let key = |k: &str| {
         status
@@ -402,6 +402,7 @@ fn stamp(status: &str) -> Option<(String, String)> {
     };
     match (key("seq="), key("hash=")) {
         (None, None) => None,
+        (seq, hash) if seq.as_deref() == Some("-") || hash.as_deref() == Some("-") => None,
         (seq, hash) => Some((seq.unwrap_or_default(), hash.unwrap_or_default())),
     }
 }
@@ -673,6 +674,13 @@ mod tests {
             Some(("9".to_string(), "ab".to_string()))
         );
         assert_eq!(stamp("OK nothing"), None);
+        for unstamped in [
+            "OK schema=1 gen=4.9 seq=- hash=-",
+            "OK schema=1 gen=4.9 seq=9 hash=-",
+            "OK schema=1 gen=4.9 seq=- hash=ab",
+        ] {
+            assert_eq!(stamp(unstamped), None, "{unstamped}");
+        }
         assert_eq!(parse_cursor("OK 58 2 1 blinking_block"), Some((58, 2)));
         assert_eq!(screen_rows("one\r\ntwo\n"), strings(&["one", "two"]));
         assert_eq!(

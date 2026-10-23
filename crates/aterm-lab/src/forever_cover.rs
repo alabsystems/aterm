@@ -80,7 +80,7 @@ fn need_raised(seen: &Seen) -> Option<String> {
 
 /// A task record the run read where none was given (`OK task -` throughout
 /// is none).
-fn invented_record(seen: &Seen) -> Option<&str> {
+pub(super) fn invented_record(seen: &Seen) -> Option<&str> {
     seen.task
         .iter()
         .map(|(_, r)| r.trim())
@@ -1094,7 +1094,7 @@ fn ladder_badge(seen: &Seen, r: &Row) -> bool {
 /// reset, journaled after `t1` (the act that met it): each `WAITING …
 /// rule=limit-retry@v1 … on the back-off ladder` with its `until=` (unix
 /// ms) and its line, in order.
-fn ladder_waits(seen: &Seen, t1: i64) -> Vec<(i64, i64, &str)> {
+pub(super) fn ladder_waits(seen: &Seen, t1: i64) -> Vec<(i64, i64, &str)> {
     let rule = format!("rule={RULE_LIMIT_RETRY} ");
     seen.journal
         .iter()
@@ -1120,12 +1120,12 @@ fn ladder_due(seen: &Seen, t1: i64, lift: i64) -> Option<i64> {
 
 /// How far before the due its ladder wait named a `Keep trying` may come and
 /// still be at that due (the journal cuts `until=` to its second).
-const LADDER_DUE_SLACK_MS: i64 = 2_000;
+pub(super) const LADDER_DUE_SLACK_MS: i64 = 2_000;
 
 /// The due of the `Keep trying` pressed at `ts`: the `until=` of the last
 /// `WAITING … rule=limit-retry@v1` journaled after `t1` and before it (the
 /// dialog's wait on its named reset, or the ladder's), unix ms.
-fn press_due(seen: &Seen, t1: i64, ts: i64) -> Option<i64> {
+pub(super) fn press_due(seen: &Seen, t1: i64, ts: i64) -> Option<i64> {
     let rule = format!("rule={RULE_LIMIT_RETRY} ");
     seen.journal
         .iter()
@@ -1240,7 +1240,7 @@ fn ladder_climbed(
 /// NEEDS YOU TAKEN DOWN by the ladder's try that got through at `through`: a
 /// `CLEARED` line, or a status read without `needs=ask`, after it and by the
 /// landing `done`.
-fn ladder_cleared(seen: &Seen, through: i64, done: i64) -> Option<i64> {
+pub(super) fn ladder_cleared(seen: &Seen, through: i64, done: i64) -> Option<i64> {
     let cleared = seen
         .journal
         .iter()

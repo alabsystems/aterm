@@ -1,27 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The tooling cache's share of the reclaim (docs/DESIGN-init-system-2026-10-20.md §4.1,
-//! §4.4). `targo --unverified verify provision` places each pinned tool in
-//! `<tooling>/<package>-<version>/`, and that is cache: a row nothing ran for
-//! [`RECLAIM_IDLE`] goes, as a build directory nobody wrote for that long does (the idle
-//! rule), and the verb lays it again when a checkout next asks. Unfinished `.provision-*`
-//! scratches stay: neither their age nor a parent's exit proves that a copied program
-//! finished its first execution. This includes legacy scratches and scratches an earlier
-//! reclaim already staged.
-//!
-//! A row's use is the newest of its files' modification and access times, two levels down
-//! (`bin/fish`, `lib/libbinaryen.dylib`, pwsh's own files, the stamp a run that finds the
-//! row in place touches), and its folders' modification times. An exec sets a program's
-//! access time (measured on APFS, macOS 27: an exec of a Mach-O or a script moved it to
-//! now), so a run counts as use; a plain read does not (a `cat` or `dd` left it as it
-//! was), so a row only read, never run, is idle. A folder's access time is not read, since
-//! this pass's own listing sets it. Nothing here reads a file's bytes.
-//!
-//! Each goes by a rename aside to a `.provision-reclaim-<name>` stage, once `record` has
-//! put its intent on record, then removal; a removal cut short leaves the stage, which the
-//! next pass finishes ([`Unused::Unfinished`]), except a staged scratch. Never follows a
-//! link, never leaves the root.
+//! The tooling cache's share of the reclaim (docs/DESIGN-init-system-2026-10-20.md §4.1, §4.4).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -35,8 +15,8 @@ const DEPTH: usize = 2;
 /// reads it as a row.
 const STAGE: &str = ".provision-reclaim-";
 
-/// The tooling cache under `home`, on macOS's rule
-/// (`aterm_uds::host::user_cache`): `~/Library/Caches/aterm/tooling.noindex`.
+/// The tooling cache under `home`, on macOS's rule (`aterm_uds::host::user_cache`):
+/// `~/Library/Caches/aterm/tooling.noindex`.
 #[must_use]
 pub fn root(home: &Path) -> PathBuf {
     aterm_uds::host::user_cache("macos", Some(home), None, aterm_uds::host::TOOLING)
@@ -100,8 +80,7 @@ fn entries(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// What [`reclaim`] would take from the tooling cache `root` at `now`, read and never
-/// acted on.
+/// What [`reclaim`] would take from the tooling cache `root` at `now`, read and never acted on.
 #[must_use]
 pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
     entries(root)
@@ -117,8 +96,8 @@ pub fn plan(root: &Path, now: SystemTime) -> Vec<Planned> {
         .collect()
 }
 
-/// Remove what nobody uses from the tooling cache `root` at `now` ([`why`]), `record`
-/// asked first for each (`false` keeps it); each removed whole is returned with why.
+/// Remove what nobody uses from the tooling cache `root` at `now` ([`why`]), `record` asked first
+/// for each (`false` keeps it); each removed whole is returned with why.
 pub fn reclaim(
     root: &Path,
     now: SystemTime,
@@ -159,8 +138,6 @@ pub fn reclaim(
 mod tests {
     use super::*;
 
-    // The helpers below serve the unix-only test (it makes a symlink); built elsewhere they
-    // would be dead code.
     #[cfg(unix)]
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -207,7 +184,6 @@ mod tests {
             file(&root.join(row).join("stamp.json"));
             age_tree(&root.join(row), month);
         }
-        // fish's binary ran yesterday: its access time is use.
         let fish = root.join("fish-4.9.3/bin/tool");
         std::fs::File::open(&fish)
             .unwrap()
@@ -250,7 +226,6 @@ mod tests {
         let mut asked = Vec::new();
         let removed = reclaim(&root, now, &mut |p, why| {
             asked.push((p.to_path_buf(), why));
-            // A refused intent keeps binaryen.
             !p.ends_with("binaryen-133")
         });
         assert_eq!(asked.len(), 3, "{asked:#?}");

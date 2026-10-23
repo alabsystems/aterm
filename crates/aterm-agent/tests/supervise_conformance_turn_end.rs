@@ -166,6 +166,7 @@ fn reading(
         notice_elsewhere: false,
         reset_clock: None,
         program: aterm_phase::Program::Claude,
+        seat: Default::default(),
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,

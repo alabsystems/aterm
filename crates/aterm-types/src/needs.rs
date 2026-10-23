@@ -1,24 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEED WORDS (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2): what a
-//! session needs of its owner now, in the one vocabulary `status needs=`,
-//! `survey needs=`, `aterm ctl survey`'s classes, the window and the presence
-//! engine all speak. The classifier that picks a word lives with the facts it
-//! reads (`aterm-gui`'s `needs`); this module is only the words, so a reader on
-//! the far side of the wire (`aterm-ctl`, a fleet peer) parses exactly what the
-//! server prints.
-//!
-//! * [`NeedWord`] — the need, in precedence order (the first that applies
-//!   wins), each with its [`Severity`].
-//! * [`WaitWord`] — what aterm is waiting out: never a need.
-//! * [`HoldWord`] — whose hold stands on the session: never a need either.
-//! * [`AttentionKind`] — what a keyed attention entry is (`meta set attention
-//!   owner=<k> kind=<ask|wait>`): an ask for the owner, or a wait the writer
-//!   settles by itself.
+//! THE NEED WORDS (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.2): what a session needs of its
+//! owner now, in the one vocabulary `status needs=`, `survey needs=`, `aterm ctl survey`'s classes,
+//! the window and the presence engine all speak.
 
-/// How a need is shown: stuck (nothing moves until the owner acts) or decide
-/// (the owner's answer is awaited).
+/// How a need is shown: stuck (nothing moves until the owner acts) or decide (the owner's answer is
+/// awaited).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Nothing moves until the owner acts: the stop tone.
@@ -38,8 +26,7 @@ impl Severity {
     }
 }
 
-/// What a session needs of its owner now. The derived order IS the
-/// precedence: the first word that applies to a session is its need.
+/// What a session needs of its owner now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NeedWord {
     /// The program is not reading its input (the server's input stall).
@@ -92,8 +79,8 @@ impl NeedWord {
         }
     }
 
-    /// The word a wire field names, or `None` (`-`, an older or newer
-    /// build's word this one does not know).
+    /// The word a wire field names, or `None` (`-`, an older or newer build's word this one does
+    /// not know).
     #[must_use]
     pub fn parse(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|need| need.word() == word)
@@ -114,28 +101,24 @@ impl NeedWord {
     }
 }
 
-/// What aterm is waiting out for a session: a record shown in pull-only
-/// rows, never a need.
+/// What aterm is waiting out for a session: a record shown in pull-only rows, never a need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WaitWord {
-    /// A usage limit: the harness waits it out, or an unsupervised one has
-    /// not reached its reset yet.
+    /// A usage limit: the harness waits it out, or an unsupervised one has not reached its reset
+    /// yet.
     Limit,
     /// The API cannot be reached: the network coming back answers it.
     Api,
     /// The service is overloaded and the turn is retried.
     Overloaded,
-    /// Claude Code's critical-memory banner, and the host restarts the agent
-    /// at its next idle point.
+    /// Claude Code's critical-memory banner, and the host restarts the agent at its next idle
+    /// point.
     MemoryRestart,
-    /// Claude Code's lost login, which the harness carries (an account move,
-    /// or its own `/login`); the browser sign-in that only the owner can
-    /// finish is its notice's ask, not this wait.
+    /// Claude Code's lost login, which the harness carries (an account move, or its own `/login`).
     Login,
-    /// An attention entry its writer marked `kind=wait` (`meta set attention
-    /// owner=<k> kind=wait <text>`), with no wall on the screen: what it
-    /// waits on is the entry's own words (a script's CI run, a supervisor's
-    /// wait), never a usage limit by default.
+    /// An attention entry its writer marked `kind=wait` (`meta set attention owner=<k> kind=wait
+    /// <text>`), with no wall on the screen: what it waits on is the entry's own words (a script's
+    /// CI run, a supervisor's wait), never a usage limit by default.
     Entry,
 }
 
@@ -170,7 +153,7 @@ impl WaitWord {
     }
 }
 
-/// Whose hold stands on a session (`hold_by=`). A hold is never a need.
+/// Whose hold stands on a session (`hold_by=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HoldWord {
     /// The person at the window took the tab over.
@@ -184,8 +167,7 @@ pub enum HoldWord {
 }
 
 impl HoldWord {
-    /// Every word, the person's first: where several slots stand, the
-    /// first is the one shown.
+    /// Every word, the person's first: where several slots stand, the first is the one shown.
     pub const ALL: [Self; 4] = [Self::Person, Self::Remote, Self::Local, Self::Bridge];
 
     /// The wire word.
@@ -206,14 +188,13 @@ impl HoldWord {
     }
 }
 
-/// What a keyed attention entry is (`meta set attention owner=<k>
-/// kind=<ask|wait> <text>`).
+/// What a keyed attention entry is (`meta set attention owner=<k> kind=<ask|wait> <text>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionKind {
     /// The owner is asked for: a need.
     Ask,
-    /// The writer is waiting something out by itself (the harness at a
-    /// limit it continues after): a record.
+    /// The writer is waiting something out by itself (the harness at a limit it continues after): a
+    /// record.
     Wait,
 }
 

@@ -9,7 +9,7 @@ use crate::flow::now_unix;
 
 /// The dispatch roster, public so the manual (a sibling crate) can be pinned against the verbs that actually run.
 #[must_use]
-pub fn dispatch_roster() -> &'static [&'static str] {
+pub const fn dispatch_roster() -> &'static [&'static str] {
     &VERBS
 }
 
@@ -201,9 +201,10 @@ const TABLE: &[Verb] = &[
         usage: "aterm pkg machine                 — the [machine] settings, as the doctor reads \
                 them\n\
                 aterm pkg machine apply           — apply them now: Universal Control off for \
-                this host\n\
+                this host, Rosetta 2 on Apple silicon, and removes Rust build-cache folders \
+                nothing builds into any more and pinned tools nothing has run for a month\n\
                 aterm pkg machine cache           — what the apply would take from the Rust \
-                build cache, and why; removes nothing\n\
+                build cache and the tooling cache, and why; removes nothing\n\
                 aterm pkg machine cache clean     — reclaim unused Rust build cache entries \
                 without applying host settings",
         arity: Arity::Own,
@@ -1500,7 +1501,7 @@ fn spawner_from(said: Option<&str>, parent: impl FnOnce() -> Option<u32>) -> Opt
     }
 }
 
-fn is_orphaned(spawner: Option<u32>, now: Option<u32>) -> bool {
+const fn is_orphaned(spawner: Option<u32>, now: Option<u32>) -> bool {
     matches!((spawner, now), (Some(spawner), Some(now)) if now != spawner)
 }
 
@@ -2031,7 +2032,7 @@ enum WaitStep {
     Wait,
 }
 
-fn pending_wait_step(running: bool, installed: bool, failed: bool) -> WaitStep {
+const fn pending_wait_step(running: bool, installed: bool, failed: bool) -> WaitStep {
     if installed {
         WaitStep::Run
     } else if failed || !running {
@@ -3736,7 +3737,7 @@ fn repair_exit(rows: &[aterm_converge::ItemReport]) -> ExitCode {
     }
 }
 
-fn repair_left_undone(row: &aterm_converge::ItemReport) -> bool {
+const fn repair_left_undone(row: &aterm_converge::ItemReport) -> bool {
     use aterm_converge::Outcome;
     !matches!(
         row.outcome,
@@ -4462,7 +4463,7 @@ fn cmd_gc() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn gc_freed_nothing(report: &crate::gc::GcReport) -> bool {
+const fn gc_freed_nothing(report: &crate::gc::GcReport) -> bool {
     report.reclaimed.is_empty()
         && report.swept_partial.is_empty()
         && report.swept_scratch.is_empty()
@@ -4564,7 +4565,7 @@ fn cmd_tree_root(dir: Option<&String>) -> ExitCode {
 }
 
 /// The target triple of this build, for artifact selection.
-pub(crate) fn current_triple() -> &'static str {
+pub(crate) const fn current_triple() -> &'static str {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         "aarch64-apple-darwin"
@@ -5120,7 +5121,7 @@ fn advance_floors(layout: &crate::store::Layout, index_build: u64, roster_seq: u
     crate::flow::observe_roster_generation(layout, roster_seq);
 }
 
-fn manager_enabled() -> bool {
+const fn manager_enabled() -> bool {
     crate::manager_enabled()
 }
 
@@ -5163,7 +5164,7 @@ fn remove_marker(path: &std::path::Path) {
     }
 }
 
-fn default_set_adopts(
+const fn default_set_adopts(
     activated: usize,
     failures: u32,
     had_builds_before: bool,
@@ -6964,7 +6965,7 @@ fn answer_announcement(ok: bool) {
 const SEED_FOLLOW_ON: &str = "atpkg: these tools are on PATH in every aterm shell — \
                               aterm pkg list shows them; aterm <tool> runs one anywhere";
 
-fn should_complete_set(
+const fn should_complete_set(
     consent: bool,
     adopted: bool,
     asked: bool,
@@ -8157,7 +8158,7 @@ struct ProbePackagesConfig {
 }
 
 impl ProbePackagesConfig {
-    fn new(path: Option<std::path::PathBuf>, cfg: crate::config::PackagesConfig) -> Self {
+    const fn new(path: Option<std::path::PathBuf>, cfg: crate::config::PackagesConfig) -> Self {
         Self {
             path,
             seen: None,
@@ -8308,7 +8309,7 @@ impl PassSeams<'static> {
     }
 }
 
-fn no_read_ahead_note(_: &str) {}
+const fn no_read_ahead_note(_: &str) {}
 
 fn refresh_shell_hooks(layout: &crate::store::Layout) {
     relay_base(layout, &SHELL_RELAY);
@@ -8443,7 +8444,7 @@ fn update_pass_stopped(
     finish_update_pass(layout, (seams.now)(), false, offline, code)
 }
 
-fn pass_reached_nothing(index_answered: bool, vendor: &VendorPass) -> bool {
+const fn pass_reached_nothing(index_answered: bool, vendor: &VendorPass) -> bool {
     !index_answered && !vendor.reached
 }
 
@@ -8915,7 +8916,7 @@ enum Consent {
 }
 
 impl Consent {
-    fn announced(self) -> (&'static str, &'static str) {
+    const fn announced(self) -> (&'static str, &'static str) {
         match self {
             Consent::InstallingAterm => (
                 "installing aterm is the consent for this; ",
@@ -8926,7 +8927,7 @@ impl Consent {
     }
 }
 
-fn set_completion_consent(adopted: bool, adopted_by_seed: bool) -> Consent {
+const fn set_completion_consent(adopted: bool, adopted_by_seed: bool) -> Consent {
     if adopted && !adopted_by_seed {
         Consent::Explicit
     } else {
@@ -10754,7 +10755,7 @@ fn unserved_sentence(triple: &str, served: &[String]) -> String {
     )
 }
 
-fn says_not_installed_yet(store_empty: bool, window_pass: bool) -> bool {
+const fn says_not_installed_yet(store_empty: bool, window_pass: bool) -> bool {
     store_empty && !window_pass
 }
 

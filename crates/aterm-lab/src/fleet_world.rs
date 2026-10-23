@@ -283,13 +283,11 @@ impl World {
         let log = root.join("gui.log");
         let out = std::fs::File::create(&log).map_err(|e| format!("m{i:02}: its log: {e}"))?;
         let err = out.try_clone().map_err(|e| e.to_string())?;
-        let (lifeline, far) = aterm_uds::lifeline::Lifeline::open(&root)
-            .map_err(|e| format!("m{i:02}: the lifeline: {e}"))?;
         let home = root.join("home");
         let mut cmd = limited("fleet-sim-instance", &self.aterm);
         cmd.env_clear()
             .envs(world_env(&root, &self.bin))
-            .args(["--headless", aterm_uds::lifeline::FLAG, "0", "--no-reroute"])
+            .args(["--headless", "--no-reroute"])
             .arg("--control-sock")
             .arg(&sock)
             .arg("-d")
@@ -302,9 +300,10 @@ impl World {
             ])
             .current_dir(&home)
             .setsid(true)
-            .stdin(Stdio::from(far))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err));
+        let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, &root)
+            .map_err(|e| format!("m{i:02}: the lifeline: {e}"))?;
         let pid = procs::spawn_kept(&mut cmd).map_err(|e| format!("m{i:02}: cannot start: {e}"))?;
         let inst = Inst {
             i,

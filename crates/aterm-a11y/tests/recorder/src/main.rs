@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The semantics oracle's recorder (A11Y.5 of
-//! docs/AUDIT-third-party-2026-10-15.md, unit a11y), built outside the aterm
-//! workspace (see Cargo.toml): registry accesskit_atspi_common 0.19.0, over
-//! accesskit_consumer 0.37.0 and accesskit 0.24.1, plays the corpus of
-//! `../oracle/corpus.rs` and prints the transcript of `../oracle/transcript.rs`,
-//! the file aterm-a11y's own semantics are held to.
-//!
-//!   (no argument)   the recording: events as text, the other blocks digested
-//!   --full          every block's text
-//!   --blank-lines   the blank-line table: every text offset and granularity
-//!                   of the corpus's blank-line documents, `hang` where the
-//!                   registry crates never answered
+//! AT-SPI semantics oracle recorder that replays `../oracle/corpus.rs` through
+//! upstream `accesskit` crates and prints `../oracle/transcript.rs` output.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -71,8 +61,6 @@ fn blank_lines() {
                 keys.push(transcript::blank_line_key(&document, offset, g));
                 let tx = tx.clone();
                 let document = document.clone();
-                // A question that loops keeps its thread spinning until the
-                // process exits; every other one ends at once.
                 std::thread::spawn(move || {
                     let _ = tx.send((row, transcript::blank_line_answer(&document, offset, g)));
                 });
@@ -91,7 +79,7 @@ fn blank_lines() {
     for (key, answer) in keys.iter().zip(answers) {
         println!("{key} {}", answer.as_deref().unwrap_or("hang"));
     }
-    // The spinning threads never end; the process does.
+    // Exit the process directly since hung paragraph-search threads spin indefinitely.
     std::process::exit(0);
 }
 

@@ -111,6 +111,13 @@ impl Watchers {
         crate::term_lock(term).set_frame_watchers(self.clone());
     }
 
+    /// The list [`Self::bind_frame`] attached to `t`, which its session's PTY reader rings at every burst.
+    #[must_use]
+    pub(crate) fn of(t: &Terminal) -> Option<Arc<Watchers>> {
+        let bound: Arc<dyn std::any::Any + Send + Sync> = t.frame_watchers()?.clone();
+        bound.downcast().ok()
+    }
+
     /// Returns the number of active subscriptions watching this list.
     #[must_use]
     pub(crate) fn count(&self) -> usize {

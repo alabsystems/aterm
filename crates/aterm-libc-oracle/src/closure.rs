@@ -1,21 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A cell's DECLARATION SET: its `union.json` names plus every reference-crate
-//! name their signatures reach, transitively.
-//!
-//! A named type reachable from a declared item's signature must itself be
-//! declared or the shim does not compile, so the shim declares the closure, and
-//! the shape gate must expect exactly it. This one function is the set for all
-//! three: `regen` declares it in the shim and asserts it in the oracle
-//! ([`crate::regen::decls`]), and the shape gate expects it of the shim's
-//! rustdoc ([`crate::shape`]). Emitting the oracle from the union list alone
-//! once left closure-only types (`cmsghdr`, `vm_statistics64`, …) declared but
-//! never checked.
-//!
-//! Names are read off each signature RENDERED as Rust source, not off the type
-//! tree's paths alone: an array length is an expression (`[u8; __PTHREAD_SIZE__]`)
-//! and the constant it names is part of the closure.
+//! A cell's DECLARATION SET: its `union.json` names plus every reference-crate name their
+//! signatures reach, transitively.
 
 use std::collections::BTreeSet;
 
@@ -48,8 +35,7 @@ const BUILTIN: [&str; 16] = [
 
 const KEYWORDS: [&str; 7] = ["mut", "const", "fn", "extern", "unsafe", "dyn", "Option"];
 
-/// A rustdoc `Type` as unqualified Rust source. A shape this does not model
-/// renders as `/*?*/()`, which names nothing.
+/// A rustdoc `Type` as unqualified Rust source.
 #[must_use]
 pub fn render(ty: &Value) -> String {
     const UNMODELLED: &str = "/*?*/()";
@@ -226,7 +212,6 @@ fn signature_types<'d>(doc: &'d Doc, entry: &Entry<'d>) -> Result<Vec<&'d Value>
 }
 
 /// `names` plus every name in `public` their signatures reach, transitively.
-///
 /// # Errors
 /// When a reached item lacks its `inner` object.
 pub fn closure(doc: &Doc, public: &Public<'_>, names: &[String]) -> Result<BTreeSet<String>> {

@@ -668,7 +668,7 @@ pub fn pack_with(ctx: &Ctx, request: &PackRequest, tools: &dyn Tools) -> Result<
 
     let provenance = scan(&stage_root, &compiler)?;
     let asset = stage_dir.join(pkgdoc::asset_name(program, build_number, request.triple));
-    let packed = tarwrite::write(&stage_root, &asset)?;
+    let packed = tarwrite::write_with(&stage_root, &asset, tools.compressor())?;
     let header = Header {
         program: program.clone(),
         version: meta.version.clone(),

@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/input_method.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
-// declarations, where upstream used x11-dl's.)
-
 use std::ffi::{CStr, CString, IntoStringError};
 use std::os::raw::{c_char, c_ulong, c_ushort};
 use std::sync::{Arc, Mutex};
@@ -21,11 +18,6 @@ static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<ffi::XIM> {
     let _lock = GLOBAL_LOCK.lock();
 
-    // XSetLocaleModifiers returns...
-    // * The current locale modifiers if it's given a NULL pointer.
-    // * The new locale modifiers if we succeeded in setting them.
-    // * NULL if the locale modifiers string is malformed or if the current locale is not supported
-    //   by Xlib.
     unsafe { (xconn.xlib.XSetLocaleModifiers)(locale_modifiers.as_ptr()) };
 
     let im = unsafe {
@@ -51,7 +43,6 @@ impl InputMethod {
     fn new(xconn: &Arc<XConnection>, im: ffi::XIM, name: String) -> Option<Self> {
         let mut styles: *mut XIMStyles = std::ptr::null_mut();
 
-        // Query the styles supported by the XIM.
         unsafe {
             if !(xconn.xlib.XGetIMValues)(
                 im,
@@ -167,12 +158,6 @@ impl From<util::GetPropertyError> for GetXimServersError {
     }
 }
 
-// The root window has a property named XIM_SERVERS, which contains a list of atoms representing
-// the available XIM servers. For instance, if you're using ibus, it would contain an atom named
-// "@server=ibus". It's possible for this property to contain multiple atoms, though presumably
-// rare. Note that we replace "@server=" with "@im=" in order to match the format of locale
-// modifiers, since we don't want a user who's looking at logs to ask "am I supposed to set
-// XMODIFIERS to `@server=ibus`?!?"
 unsafe fn get_xim_servers(xconn: &Arc<XConnection>) -> Result<Vec<String>, GetXimServersError> {
     let atoms = xconn.atoms();
     let servers_atom = atoms[XIM_SERVERS];
@@ -262,21 +247,10 @@ impl PotentialInputMethod {
     }
 }
 
-// By logging this struct, you get a sequential listing of every locale modifier tried, where it
-// came from, and if it succeeded.
 #[derive(Debug, Clone)]
 pub(crate) struct PotentialInputMethods {
-    // On correctly configured systems, the XMODIFIERS environment variable tells us everything we
-    // need to know.
     xmodifiers: Option<PotentialInputMethod>,
-    // We have some standard options at our disposal that should ostensibly always work. For users
-    // who only need compose sequences, this ensures that the program launches without a hitch
-    // For users who need more sophisticated IME features, this is more or less a silent failure.
-    // Logging features should be added in the future to allow both audiences to be effectively
-    // served.
     fallbacks: [PotentialInputMethod; 2],
-    // For diagnostic purposes, we include the list of XIM servers that the server reports as
-    // being available.
     _xim_servers: Result<Vec<String>, GetXimServersError>,
 }
 
@@ -284,34 +258,15 @@ impl PotentialInputMethods {
     pub fn new(xconn: &Arc<XConnection>) -> Self {
         let xmodifiers = env::var("XMODIFIERS").ok().map(PotentialInputMethod::from_string);
         PotentialInputMethods {
-            // Since passing "" to XSetLocaleModifiers results in it defaulting to the value of
-            // XMODIFIERS, it's worth noting what happens if XMODIFIERS is also "". If simply
-            // running the program with `XMODIFIERS="" cargo run`, then assuming XMODIFIERS is
-            // defined in the profile (or parent environment) then that parent XMODIFIERS is used.
-            // If that XMODIFIERS value is also "" (i.e. if you ran `export XMODIFIERS=""`), then
-            // XSetLocaleModifiers uses the default local input method. Note that defining
-            // XMODIFIERS as "" is different from XMODIFIERS not being defined at all, since in
-            // that case, we get `None` and end up skipping ahead to the next method.
             xmodifiers,
             fallbacks: [
-                // This is a standard input method that supports compose sequences, which should
-                // always be available. `@im=none` appears to mean the same thing.
                 PotentialInputMethod::from_str("@im=local"),
-                // This explicitly specifies to use the implementation-dependent default, though
-                // that seems to be equivalent to just using the local input method.
                 PotentialInputMethod::from_str("@im="),
             ],
-            // The XIM_SERVERS property can have surprising values. For instance, when I exited
-            // ibus to run fcitx, it retained the value denoting ibus. Even more surprising is
-            // that the fcitx input method could only be successfully opened using "@im=ibus".
-            // Presumably due to this quirk, it's actually possible to alternate between ibus and
-            // fcitx in a running application.
             _xim_servers: unsafe { get_xim_servers(xconn) },
         }
     }
 
-    // This resets the `successful` field of every potential input method, ensuring we have
-    // accurate information when this struct is re-used by the destruction/instantiation callbacks.
     fn reset(&mut self) {
         if let Some(ref mut input_method) = self.xmodifiers {
             input_method.reset();

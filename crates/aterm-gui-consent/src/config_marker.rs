@@ -1,46 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Config-directory marker files: the small "the person already answered this" records beside
-//! `aterm.toml`, read and written here by the macOS access card (`consent_card::MARKER`) and
-//! the debugger-access change (`debugger_access::CHANGE_MARKER`, `OBSERVED_MARKER`). A planted
-//! link, a directory, or an oversized file at a marker path must be neither read through,
-//! written through, nor mistaken for a record:
-//!
-//! * **Reading** opens the path without following a final-component link and checks the handle
-//!   (not a separate stat something could swap under), the boundary the theme files use
-//!   (`aterm_effects::file_feed::read_bounded_regular_utf8`). Anything but a regular file of at
-//!   most `max_bytes` valid UTF-8 is `None`, so the surface errs toward disclosure and shows
-//!   again.
-//! * **Writing** never goes through anything already at the path: the text lands in a fresh
-//!   sibling created exclusively (`create_new`, owner-only on unix) and is renamed over the
-//!   marker (a rename replaces a planted link rather than following it). A non-regular occupant
-//!   fails closed (`AlreadyExists`) and is left as found. A text past `max_bytes` is refused
-//!   (`InvalidInput`), never truncated: a truncated record would read as a different answer.
+//! Bounded regular-file reading and atomic writing for config-directory consent markers.
 
 use crate::durable::Flush;
 use std::io::Write as _;
 use std::path::Path;
 
-/// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`;
-/// `None` for everything else.
+/// The marker's text, when a regular, non-symlink file of at most `max_bytes` sits at `path`.
 #[inline]
 pub fn read_marker(path: &Path, max_bytes: usize) -> Option<String> {
     aterm_effects::file_feed::read_bounded_regular_utf8(path, max_bytes).ok()
 }
 
-/// Record `text` at `path`, exclusively and atomically (see the module doc), its
-/// sibling finished with `flush` before the rename: [`Flush::Ordered`] where a lost or
-/// older marker only brings its question back, [`Flush::Durable`] where something
-/// beyond this device's write order depends on it. Each caller says which. On unix a
-/// durable marker's directory is flushed too, after the rename: the new entry is
-/// metadata the file's own flush does not cover, and a power loss could otherwise keep
-/// the old entry. That flush is best-effort: the marker is in place once the rename has
-/// happened, so a directory that cannot be opened or flushed leaves the write a success,
-/// and an `Err` always means the marker was not written. (Windows opens no directory
-/// as a plain `File`, and its rename is the only barrier there.)
-/// Creates the parent directory best-effort; an unwritable one surfaces as the
-/// `create_new` error, which callers treat as "the card comes back".
+/// Atomically writes `text` to `path` using `flush` ([`Flush::Ordered`], [`Flush::Durable`]).
 pub fn write_marker(
     path: &Path,
     text: &str,
@@ -77,8 +50,6 @@ pub fn write_marker(
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    // Only a successful exclusive create owns this sibling. In particular,
-    // AlreadyExists must not remove the entry another writer created.
     let mut file = options.open(&tmp)?;
     let written = file
         .write_all(text.as_bytes())
@@ -105,9 +76,7 @@ pub fn write_marker(
     Ok(())
 }
 
-/// Remove the marker at `path`, if a regular file is there. A link or a directory at the path
-/// is not a marker and is left as found (`AlreadyExists`, the refusal [`write_marker`] gives);
-/// an absent marker is not an error.
+/// Remove the marker at `path`, if a regular file is there ([`write_marker`]).
 pub fn remove_marker(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_file() => std::fs::remove_file(path),
@@ -127,8 +96,7 @@ pub const fn is_within_marker_cap(len: usize, max_bytes: usize) -> bool {
     len <= max_bytes
 }
 
-/// Encode the four FDA record fields (`asked_at`, `opened_at`, `verified_at`, `verified_build`)
-/// into 16 little-endian bytes (`u32` each).
+/// Encodes the four FDA record fields into 16 little-endian bytes.
 #[must_use]
 #[inline]
 pub const fn encode_fda_timestamps_le(
@@ -250,7 +218,6 @@ mod tests {
         );
         assert!(std::fs::symlink_metadata(&marker).unwrap().is_dir());
         std::fs::remove_dir(&marker).unwrap();
-        // Removal: a regular marker goes, an absent one is not an error.
         write_marker(&marker, "gone soon", 64, Flush::Durable).unwrap();
         remove_marker(&marker).unwrap();
         assert!(!marker.exists());
@@ -259,12 +226,6 @@ mod tests {
     }
 
     /// A durable marker makes two durable flushes, an ordered one a single ordered flush.
-    /// One of the two is the directory's: a directory this process may write and search
-    /// but not open (mode 0o300) drops it, and the write still succeeds with the new text
-    /// in place, so an error never reports a marker that was written. Which flush comes
-    /// first, and where each falls against the rename, is `write_marker`'s order: the
-    /// recording seam sees neither a path nor the rename. NEGATIVE CONTROL: the ordered
-    /// write's single flush.
     #[cfg(unix)]
     #[test]
     fn a_durable_marker_also_flushes_its_directory() {

@@ -305,6 +305,25 @@ fn ledger_scopes(ledger: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The reason of each wall end row of the ledger at `ledger`
+/// ([`RULE_WALL_WAIT_END`]), in order.
+fn end_reasons(ledger: &Path) -> Vec<String> {
+    std::fs::read_to_string(ledger)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| {
+            v.get("rule_id").and_then(aterm_json::Value::as_str) == Some(RULE_WALL_WAIT_END)
+        })
+        .map(|v| {
+            v.get("reason")
+                .and_then(aterm_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
 /// The program each wall row of the ledger at `ledger` names it met under
 /// ([`approvals::PROGRAM`]; `None`: the row names none).
 fn wall_programs(ledger: &Path) -> Vec<Option<String>> {
@@ -1125,6 +1144,8 @@ struct AgentThen {
     rows: Vec<String>,
     /// The program each wall row names ([`wall_programs`]).
     programs: Vec<Option<String>>,
+    /// Each wall end row's reason ([`end_reasons`]).
+    ends: Vec<String>,
     /// The open wall left for a loop that follows.
     open: Option<approvals::OpenWall>,
 }
@@ -1160,6 +1181,7 @@ fn agent_then(tag: &str, l: &AgentLimit, host: bool, after: &[String], later: &[
     let all = loop_points(&ledger, host, seed, &points);
     let rows = ledger_scopes(&ledger);
     let programs = wall_programs(&ledger);
+    let ends = end_reasons(&ledger);
     let open = approvals::open_wall(&ledger, Some("@s-1"));
     let _ = std::fs::remove_dir_all(dir);
     let after = all[usize::from(l.wall.is_some())..].to_vec();
@@ -1168,6 +1190,7 @@ fn agent_then(tag: &str, l: &AgentLimit, host: bool, after: &[String], later: &[
         after,
         rows,
         programs,
+        ends,
         open,
     }
 }
@@ -1175,7 +1198,9 @@ fn agent_then(tag: &str, l: &AgentLimit, host: bool, after: &[String], later: &[
 /// Whether `t`'s points after the wall are the next agent's own — never on
 /// the limit's account, the limit's track and memory gone, the last its
 /// continue — and the limit, never scoped, ended at the first of them
-/// (`name`'s wall rows all naming it).
+/// (`name`'s wall rows all naming it), its end row saying another program
+/// ended it ([`approvals::LIMIT_ENDED_ELSEWHERE`]), never the worker's work
+/// or another wall ([`approvals::LIMIT_ENDED`]).
 fn ended_at_the_next_agent(t: &AgentThen, name: &str) -> bool {
     t.after
         .iter()
@@ -1188,6 +1213,8 @@ fn ended_at_the_next_agent(t: &AgentThen, name: &str) -> bool {
             .iter()
             .all(|r| r.ends_with("conversation=None"))
         && wall_ended(&t.rows)
+        && t.ends.iter().any(|r| r == approvals::LIMIT_ENDED_ELSEWHERE)
+        && !t.ends.iter().any(|r| r == approvals::LIMIT_ENDED)
         && t.open.is_none()
         && t.programs.iter().all(|p| p.as_deref() == Some(name))
 }

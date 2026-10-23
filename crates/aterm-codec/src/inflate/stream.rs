@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming RFC 1951 (raw DEFLATE), RFC 1950 (zlib) and RFC 1952 (gzip)
-//! decompression over `std::io::Read`.
-//!
-//! atpkg's `tar-gz` and `zip` lanes extract an archive one entry at a time and
-//! `aterm-png` unfilters an image a scanline at a time, so neither can buffer the
-//! whole output for the one-shot [`inflate`](super::inflate).
-//!
-//! This drives the parent's `Huffman` construction, root tables, dynamic-table
-//! reader and bit reader incrementally:
-//!
-//! * input accumulates in a refilled buffer; output keeps a 32 KiB history
-//!   window plus undelivered bytes, so memory is bounded;
-//! * each unit of work (block header, table read, symbol, stored byte) runs
-//!   against a checkpoint of the bit reader. On [`InflateError::Truncated`] with
-//!   more source to read, the checkpoint is restored, input is refilled and the
-//!   unit retried; once the source is exhausted `Truncated` is a real error.
-//!   Work stays linear.
+//! Streaming RFC 1951 (raw DEFLATE), RFC 1950 (zlib) and RFC 1952 (gzip) decompression over `std::io::Read`.
 
 use std::io::{self, Read};
 
@@ -175,10 +159,6 @@ impl Inflater {
 
     /// Decode until [`PUMP_TARGET`] bytes are pending, the input runs dry, or
     /// the final block ends.
-    ///
-    /// Each arm checkpoints, attempts, and on [`InflateError::Truncated`]
-    /// restores the checkpoint and returns [`Pump::NeedInput`], leaving the
-    /// decoder exactly as before the attempt.
     fn pump(&mut self) -> Result<Pump, InflateError> {
         let Self {
             input,
@@ -225,8 +205,7 @@ impl Inflater {
                                     };
                                 }
                                 2 => {
-                                    // The table read is one unit: retried from
-                                    // the header's end, never resumed half-built.
+                                    // Read dynamic tables as one unit.
                                     match read_dynamic_tables(&mut br) {
                                         Err(InflateError::Truncated) => {
                                             *cursor = save;
@@ -306,8 +285,6 @@ impl Inflater {
                         if out.len().saturating_sub(*out_at) >= PUMP_TARGET {
                             break;
                         }
-                        // Two-phase decode: the walk for `ROOT_BUILD_AFTER`
-                        // symbols, then armed root tables for the rest.
                         if *warm == 0 {
                             lit.arm_root();
                             dist.arm_root();
@@ -340,10 +317,6 @@ impl Inflater {
 }
 
 /// Decode one literal or match into `out`. Returns `true` at end-of-block.
-///
-/// The parent's `block_loop` body, except: no `max_output` ceiling (the
-/// caller's cap bounds an expansion bomb), and a back-reference distance is
-/// checked against total bytes produced, since `out` is compacted to the window.
 fn decode_one(
     br: &mut BitReader<'_>,
     lit: &Huffman,
@@ -358,7 +331,6 @@ fn decode_one(
         lit.decode(br)?
     };
     if sym < 256 {
-        // `sym < 256`, so the narrowing cast is lossless.
         out.push(sym as u8);
         *produced = produced.saturating_add(1);
         return Ok(false);
@@ -366,14 +338,11 @@ fn decode_one(
     if sym == 256 {
         return Ok(true);
     }
-    // `sym >= 257` here, so the subtraction never actually saturates.
     let li = (sym as usize).saturating_sub(257);
     let (base, extra) = match (LENGTH_BASE.get(li), LENGTH_EXTRA.get(li)) {
         (Some(&b), Some(&e)) => (b, e),
         _ => return Err(InflateError::BadSymbol),
     };
-    // `extra <= 5` and RFC 1951 lengths top out at 258; the clamps are no-ops on
-    // every real path and bound `length` locally.
     let length = (base as usize + (br.read_bits(extra)?.min(31)) as usize).min(258);
     let dsym = if bitwise {
         dist.decode_bitwise(br)? as usize
@@ -385,8 +354,6 @@ fn decode_one(
         _ => return Err(InflateError::BadDistance),
     };
     let distance = dbase as usize + br.read_bits(dextra)? as usize;
-    // Legality is against everything ever produced; the retained window makes
-    // it reachable (`distance <= WINDOW`, and `compact` keeps `WINDOW` bytes).
     if distance == 0 || distance as u64 > *produced {
         return Err(InflateError::BadDistance);
     }
@@ -396,11 +363,8 @@ fn decode_one(
     };
     out.reserve(length);
     if distance >= length {
-        // Non-overlapping: the whole source range is already decoded, so it is
-        // one copy.
         out.extend_from_within(start..start.saturating_add(length));
     } else {
-        // True RLE overlap must stay byte-by-byte.
         for i in 0..length {
             let Some(&byte) = out.get(start.saturating_add(i)) else {
                 return Err(InflateError::BadDistance);
@@ -441,9 +405,6 @@ impl std::fmt::Display for InflateError {
 impl std::error::Error for InflateError {}
 
 /// A raw RFC 1951 DEFLATE stream, decompressed as it is read.
-///
-/// Reading stops at the final block and leaves later bytes in `source`
-/// unconsumed (a zip member's extent comes from the central directory).
 pub struct DeflateReader<R> {
     source: R,
     inflater: Inflater,
@@ -475,8 +436,6 @@ impl<R: Read> DeflateReader<R> {
                     return Ok(false);
                 }
                 Ok(n) => {
-                    // `n <= chunk.len()`, so the slice is in range; `get` keeps
-                    // the bound local and the `None` arm is unreachable.
                     if let Some(fresh) = chunk.get(..n) {
                         self.inflater.input.extend_from_slice(fresh);
                     }
@@ -548,14 +507,6 @@ enum ZlibState {
 }
 
 /// An RFC 1950 zlib stream, decompressed as it is read.
-///
-/// The header is checked as [`zlib_decompress`](super::zlib_decompress) checks
-/// it, and the Adler-32 that follows the DEFLATE data is verified when the
-/// final block ends: `read` returns `Ok(0)` only after it matched. Bytes after
-/// the checksum are not part of the stream and are never looked at, which is
-/// the prefix semantics of [`zlib_decompress_prefix`](super::zlib_decompress_prefix)
-/// (a PNG's padded final `IDAT`). Memory is the DEFLATE window plus one
-/// refill, whatever the stream decompresses to.
 pub struct ZlibReader<R> {
     inner: DeflateReader<R>,
     adler: Adler32,
@@ -589,8 +540,6 @@ impl<R: Read> Read for ZlibReader<R> {
                         return Err(io_err(InflateError::Truncated));
                     };
                     check_zlib_header(cmf, flg).map_err(io_err)?;
-                    // Nothing has been decoded yet, so the bit reader is empty
-                    // and starting it two bytes in skips exactly the header.
                     self.inner.inflater.cursor.pos = 2;
                     self.state = ZlibState::Body;
                 }
@@ -602,8 +551,6 @@ impl<R: Read> Read for ZlibReader<R> {
                         self.adler.update(produced);
                         return Ok(n);
                     }
-                    // The final block ended; the checksum starts at the next
-                    // whole byte.
                     let at = self.inner.inflater.cursor.byte_position();
                     self.inner.fill_to(at.saturating_add(4))?;
                     let Some(&trailer) = self
@@ -650,9 +597,6 @@ fn gz_err(msg: &'static str) -> io::Error {
 }
 
 /// Parse one RFC 1952 member header out of `buf`.
-///
-/// `Ok(None)` means "not enough bytes yet"; `Ok(Some(n))` means the header
-/// occupies the first `n` bytes and the deflate stream starts at `n`.
 fn parse_gzip_header(buf: &[u8]) -> io::Result<Option<usize>> {
     const FHCRC: u8 = 1 << 1;
     const FEXTRA: u8 = 1 << 2;
@@ -662,8 +606,6 @@ fn parse_gzip_header(buf: &[u8]) -> io::Result<Option<usize>> {
     let Some(fixed) = buf.get(..10) else {
         return Ok(None);
     };
-    // Indices 0..10 exist by the `get` above; `get`/`copied` keep each bound
-    // local and no `None` arm is reachable.
     if fixed.first().copied() != Some(0x1f) || fixed.get(1).copied() != Some(0x8b) {
         return Err(gz_err("not a gzip stream: bad magic"));
     }
@@ -716,8 +658,6 @@ fn parse_gzip_header(buf: &[u8]) -> io::Result<Option<usize>> {
             return Ok(None);
         };
         let stored = u16::from_le_bytes([lo, hi]);
-        // RFC 1952 §2.3.1: FHCRC is the low 16 bits of the CRC-32 of the header
-        // bytes up to (not including) the CRC16 itself.
         let want = (Crc32::of(head) & 0xFFFF) as u16;
         if stored != want {
             return Err(gz_err("gzip header checksum mismatch"));
@@ -743,10 +683,6 @@ enum GzState {
 }
 
 /// A multi-member RFC 1952 gzip stream, decompressed as it is read.
-///
-/// A concatenation of gzip files is a gzip file (as `gzip -d` treats it).
-/// Every member's CRC-32 and length trailer is checked, so a truncated or
-/// corrupted download fails instead of yielding a short tar.
 pub struct GzipReader<R> {
     source: R,
     /// Source bytes the framing layer owns (header and trailer). Handed to the
@@ -842,15 +778,12 @@ impl<R: Read> Read for GzipReader<R> {
                                 return if !self.frame.is_empty() {
                                     Err(gz_err("trailing bytes are not a gzip member"))
                                 } else if self.members == 0 {
-                                    // Nothing at all: a truncated file, not an
-                                    // empty archive.
+                                    // Empty input is a truncated file.
                                     Err(io::Error::new(
                                         io::ErrorKind::UnexpectedEof,
                                         "empty gzip stream",
                                     ))
                                 } else {
-                                    // A clean end after a whole number of
-                                    // members: exactly where `gzip -d` stops.
                                     Ok(0)
                                 };
                             }

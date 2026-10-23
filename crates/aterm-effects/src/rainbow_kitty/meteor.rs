@@ -21,7 +21,7 @@ use aterm_render::{
     premul_rgb, ribbon_beam, ribbon_beam_v,
 };
 
-use crate::cursor_glow::{BandPx, Geom, InkRole, band_row};
+use crate::cursor_glow::{BandPx, Geom, InkRole, band_row, night_rgb};
 use crate::effect_util::{lerp_rgb, push_fx_quad, push_fx_rect, push_twinkle_star};
 use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
@@ -166,7 +166,23 @@ pub fn landing_stop_ink(i: usize) -> u32 {
 /// Stations per train layer (, ).
 pub const STATIONS_MAX: usize = 96;
 
-/// Minimum station stride in px.
+/// How far each end of a train layer eases in from nothing, in cells: the
+/// head end under the nucleus, the tail end where the layer runs out
+/// ([`build_stations`]). Cut square, the white heat's head stood as a
+/// white block with hard vertical sides where a Return launched, and the
+/// colour train's tail as an olive block at the end of the line it left.
+pub const END_EASE_HEAD_CELLS: f32 = 0.9;
+/// See [`END_EASE_HEAD_CELLS`].
+pub const END_EASE_TAIL_CELLS: f32 = 1.0;
+/// The most of a short train (a hop's first frames) either end's ease may
+/// take, so the train still shows its run of colours.
+pub const END_EASE_SPAN_SHARE: f32 = 0.2;
+/// The stations each eased end adds, so the ease is laid in slabs a pixel
+/// or two wide rather than the stride's steps.
+pub const END_EASE_STATIONS: usize = 8;
+
+/// Minimum station stride in px: a whole sweep across an 8-cell hop's 20 px
+/// frame-0 span (`cw = 9`) needs more than three slabs.
 pub const STATION_STRIDE_MIN_PX: f32 = 2.0;
 
 /// Hard cap on one meteor's `under` share (, ).
@@ -1223,6 +1239,12 @@ pub struct Meteors {
     reduced: bool,
     /// The hand's floor, `(row, col)`.
     hand_floor: Option<(u16, u16)>,
+    /// Test-only: lay each train layer cut square, as it was: at both ends
+    /// (no `END_EASE_*`) and where a Return's white heat reaches the line it
+    /// printed (a hard switch to [`WHITE_PRINTED_SHARE`] half a row off it),
+    /// the negative control of the eased ends' and the printed line's tests.
+    #[cfg(test)]
+    pub(crate) ends_square: bool,
 }
 
 impl Default for Meteors {
@@ -1241,10 +1263,12 @@ impl Meteors {
             live: Vec::with_capacity(METEOR_POOL),
             landings: Vec::with_capacity(LANDING_POOL),
             sown: Vec::with_capacity(SOW_SCRATCH),
-            verts: Vec::with_capacity(STATIONS_MAX),
+            verts: Vec::with_capacity(STATIONS_MAX + 2 * END_EASE_STATIONS),
             ord: 0,
             reduced: false,
             hand_floor: None,
+            #[cfg(test)]
+            ends_square: false,
         }
     }
 
@@ -1294,11 +1318,15 @@ impl Meteors {
 
         let mut verts = mem::take(&mut self.verts);
         let hand_floor = self.hand_floor;
+        #[cfg(not(test))]
+        let square = false;
+        #[cfg(test)]
+        let square = self.ends_square;
         let (live, landings, sown) = (&mut self.live, &mut self.landings, &mut self.sown);
 
         for m in live.iter_mut() {
             if let Some(f) = Flight::of(m, ctx) {
-                draw_train(&mut verts, m, &f, ctx, frame);
+                draw_train(&mut verts, m, &f, ctx, frame, square);
                 draw_head(m, &f, ctx, frame);
                 if m.retired_at.is_none() && !m.chained {
                     shed(m, &f, ctx, sown);
@@ -1724,6 +1752,38 @@ impl Meteors {
 /// launched from ([`build_stations`]): that line is printed text now.
 const WHITE_PRINTED_SHARE: f32 = 0.25;
 
+/// Where the printed line's share ([`WHITE_PRINTED_SHARE`]) gives way to the
+/// full white heat, as distances from the launch line in rows: held to
+/// `NEAR`, eased back in by `FAR`. A hard switch at half a row stopped the
+/// glare in a vertical seam across the train (round-2 judges, item 10).
+const WHITE_PRINTED_NEAR: f32 = 0.25;
+const WHITE_PRINTED_FAR: f32 = 0.85;
+
+/// The share of the white heat a station at `dy` px from the launch line keeps
+/// on a flight off its row of `rows_off` px ([`WHITE_PRINTED_SHARE`]).
+fn white_printed_share(dy: f32, rows_off: f32, ch: f32) -> f32 {
+    if rows_off < 0.5 * ch {
+        return 1.0;
+    }
+    let ch = ch.max(1.0);
+    let u = (dy.abs() / ch - WHITE_PRINTED_NEAR) / (WHITE_PRINTED_FAR - WHITE_PRINTED_NEAR);
+    WHITE_PRINTED_SHARE + (1.0 - WHITE_PRINTED_SHARE) * smoothstep01(u.clamp(0.0, 1.0))
+}
+
+/// A coma petal's colour on a dark page: a stop whose hue sits where a dim
+/// additive glow reads olive or khaki (yellow, 40°–100°) is moved onto the
+/// night arc ([`night_rgb`]); the others keep their stop.
+fn dark_petal_rgb(stop: u32) -> u32 {
+    let (h, _, _) = crate::color_math::rgb2hsv(stop & 0x00FF_FFFF);
+    if (40.0..=100.0).contains(&h) {
+        night_rgb(stop)
+    } else {
+        stop
+    }
+}
+
+// The per-frame flight solution (§6.2, §6.3, §6.8, §6.11)
+
 /// Everything about one meteor on one frame, solved once so no two layers can
 /// read the flight at two different instants (§17.1).
 struct Flight {
@@ -1917,12 +1977,13 @@ fn draw_train(
     f: &Flight,
     ctx: &Ctx<'_>,
     frame: &mut Frame<'_>,
+    square: bool,
 ) {
     let clip = ctx.geom.beam_clip();
     let step = f.step();
     let light = !ctx.cfg.dark_theme;
 
-    build_stations(verts, m, f, ctx, Layer::Colour);
+    build_stations(verts, m, f, ctx, Layer::Colour, square);
     let cap = frame.under.len() + UNDER_QUAD_CAP;
     let blend = if light {
         GlowBlend::Over
@@ -1934,7 +1995,7 @@ fn draw_train(
     if light {
         return;
     }
-    build_stations(verts, m, f, ctx, Layer::White);
+    build_stations(verts, m, f, ctx, Layer::White, square);
     let cap = frame.out.len() + WHITE_QUAD_CAP;
     rasterize(frame.out, clip, verts, f.axis, step, cap, GlowBlend::Add);
 }
@@ -1964,6 +2025,7 @@ fn build_stations(
     f: &Flight,
     ctx: &Ctx<'_>,
     layer: Layer,
+    square: bool,
 ) {
     verts.clear();
     let light = !ctx.cfg.dark_theme;
@@ -1994,8 +2056,24 @@ fn build_stations(
         0.0
     };
 
-    for k in 0..n {
-        let s = span * (k as f32) / ((n - 1) as f32);
+    // Each end eases in from nothing (`END_EASE_*`), on stations of its own
+    // finer than the stride; the stride's stations inside an end are not
+    // laid.
+    let ease_head = (END_EASE_HEAD_CELLS * cw).min(END_EASE_SPAN_SHARE * span);
+    let ease_tail = (END_EASE_TAIL_CELLS * cw).min(END_EASE_SPAN_SHARE * span);
+    let ends = |s: f32| {
+        if square {
+            return 1.0;
+        }
+        smoothstep01(s / ease_head.max(1e-3)) * smoothstep01((span - s) / ease_tail.max(1e-3))
+    };
+    let fine = END_EASE_STATIONS as f32;
+    let head_zone = (0..END_EASE_STATIONS).map(|i| ease_head * i as f32 / fine);
+    let body = (0..n)
+        .map(|k| span * (k as f32) / ((n - 1) as f32))
+        .filter(|&s| s >= ease_head && s <= span - ease_tail);
+    let tail_zone = (1..=END_EASE_STATIONS).map(|i| span - ease_tail * (fine - i as f32) / fine);
+    for s in head_zone.chain(body).chain(tail_zone) {
         let px = f.head.0 - f.unit.0 * s;
         let py = f.head.1 - f.unit.1 * s + rail;
 
@@ -2029,10 +2107,18 @@ fn build_stations(
             }
             Layer::White => {
                 let tail = (s - f.white_shoulder).max(0.0);
-                let printed = if (m.y1 - m.y0).abs() >= 0.5 * ch && (py - m.y0).abs() < 0.5 * ch {
-                    WHITE_PRINTED_SHARE
+                // A flight off its row (a Return) launches from the line it
+                // just printed: over that line the white heat keeps only the
+                // printed line's share, so the line's last word is not
+                // whited out under the glare.
+                let printed = if square {
+                    if (m.y1 - m.y0).abs() >= 0.5 * ch && (py - m.y0).abs() < 0.5 * ch {
+                        WHITE_PRINTED_SHARE
+                    } else {
+                        1.0
+                    }
                 } else {
-                    1.0
+                    white_printed_share(py - m.y0, (m.y1 - m.y0).abs(), ch)
                 };
                 let c = f.head_cov * (-tail / f.white_fall).exp() * printed;
                 let blend = smoothstep01((s - f.white_shoulder) / f.white_shoulder.max(1.0));
@@ -2041,6 +2127,7 @@ fn build_stations(
                 (0x00FF_FFFF, c * alpha, f.width_at(s) * 0.5 * share)
             }
         };
+        let cov = cov * ends(s);
         if cov < 1.0 {
             continue;
         }
@@ -2145,7 +2232,7 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
                 py,
                 petal_x,
                 petal_y,
-                premul_rgb(spectrum_stop(i), coma_cov as u8),
+                premul_rgb(dark_petal_rgb(spectrum_stop(i)), coma_cov as u8),
             );
         }
     }
@@ -3488,6 +3575,163 @@ mod tests {
             "the white heat over the line it left: {off:.1} against {along:.1} along it"
         );
     }
+
+    /// A TRAIN EASES IN AT BOTH ENDS, NEVER A BLOCK (round 1: on the frame
+    /// after a Return the white heat's head stood as a white block with hard
+    /// vertical sides, and the colour train's tail as an olive block cut
+    /// square at the end of the line it left; on paper the stripe's ends were
+    /// cut square). Along a leap's row on its first frames, the brightest
+    /// light of each layer per pixel column (the white heat in `out`, the
+    /// colour in `under`) never steps by more than two fifths of the layer's
+    /// peak from one column to the next. Negative control: the same trains
+    /// cut square at both ends ([`Meteors::ends_square`]) step by more than
+    /// three fifths of it.
+    #[test]
+    fn a_train_eases_in_at_both_ends() {
+        let cfg = config();
+        let t0 = Instant::now();
+        // `(largest column step, peak)` of `quads` on `row`.
+        let steps = |quads: &[GlowQuad], row: u16| -> (f32, f32) {
+            let mut col = vec![0.0f32; 4096];
+            for q in quads.iter().filter(|q| q.row == row) {
+                for x in q.x..q.x + q.w {
+                    let v = lum(q.color).max(lum(q.color2));
+                    col[usize::from(x)] = col[usize::from(x)].max(v);
+                }
+            }
+            let peak = col.iter().copied().fold(0.0, f32::max);
+            let step = col
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0, f32::max);
+            (step, peak)
+        };
+        let worst = |square: bool| -> (f32, f32) {
+            let (mut white, mut colour) = (0.0f32, 0.0f32);
+            for (from, to) in [((5u16, 40u16), (5u16, 2u16)), ((5, 2), (5, 40))] {
+                let mut m = Meteors::new();
+                m.ends_square = square;
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv(from, to), t0, &ctx).expect("a leap flies");
+                for at in [16u64, 40] {
+                    let mut sc = Scratch::default();
+                    sc.emit(&mut m, &ctx_at(t0 + ms(at), &cfg, to, 0.25));
+                    let (ws, wp) = steps(&sc.out, 5);
+                    let (cs, cp) = steps(&sc.under, 5);
+                    assert!(wp > 0.0 && cp > 0.0, "fixture: both layers fly at {at} ms");
+                    white = white.max(ws / wp);
+                    colour = colour.max(cs / cp);
+                }
+            }
+            (white, colour)
+        };
+        let (white, colour) = worst(false);
+        assert!(
+            white <= 0.4 && colour <= 0.4,
+            "a train steps by {white:.2} (white) and {colour:.2} (colour) of its peak in a column"
+        );
+        let (white_sq, colour_sq) = worst(true);
+        assert!(
+            white_sq.max(colour_sq) >= 0.6,
+            "control: cut square, the trains step by only {white_sq:.2} and {colour_sq:.2}"
+        );
+    }
+
+    /// A RETURN'S WHITE HEAT EASES OFF THE LINE IT PRINTED, NEVER A SEAM
+    /// (round-2 judges, item 10: on every ribbon kitty's dark Return the
+    /// pink-white heat stopped in a vertical seam where the train came within
+    /// half a row of the launch line). Through a Return's flight two rows down,
+    /// the white heat's brightest light per pixel column, wherever it is at
+    /// least a tenth of its peak, never steps by more than a quarter of itself
+    /// from one column to the next (the train's own ends are
+    /// `a_train_eases_in_at_both_ends`'s). Negative control: the hard switch
+    /// ([`Meteors::ends_square`]) steps by more than nine twentieths.
+    #[test]
+    fn a_returns_white_heat_eases_off_the_line_it_printed() {
+        let cfg = config();
+        let t0 = Instant::now();
+        let worst = |square: bool| -> f32 {
+            let mut worst = 0.0f32;
+            for at in [16u64, 35, 60, 90] {
+                let (from, to) = ((5u16, 40u16), (7u16, 2u16));
+                let mut m = Meteors::new();
+                m.ends_square = square;
+                let ctx = ctx_at(t0, &cfg, to, 0.25);
+                m.on_event(&mv_as(from, to, Licence::Return), t0, &ctx)
+                    .expect("a Return flies");
+                let mut sc = Scratch::default();
+                sc.emit(&mut m, &ctx_at(t0 + ms(at), &cfg, to, 0.25));
+                let mut col = vec![0.0f32; 4096];
+                for q in &sc.out {
+                    for x in q.x..q.x + q.w {
+                        let v = lum(q.color).max(lum(q.color2));
+                        col[usize::from(x)] = col[usize::from(x)].max(v);
+                    }
+                }
+                let peak = col.iter().copied().fold(0.0, f32::max);
+                assert!(peak > 0.0, "fixture: the white heat flies at {at} ms");
+                // The train's own ends ease on their own law
+                // (`a_train_eases_in_at_both_ends`); judge its body.
+                let lit: Vec<usize> = (0..col.len()).filter(|&x| col[x] > 0.0).collect();
+                let (lo, hi) = (lit[0] + 24, lit[lit.len() - 1].saturating_sub(24));
+                for x in lo..hi.max(lo) {
+                    let big = col[x].max(col[x + 1]);
+                    if big < 0.1 * peak {
+                        continue;
+                    }
+                    worst = worst.max((col[x + 1] - col[x]).abs() / big);
+                }
+            }
+            worst
+        };
+        let eased = worst(false);
+        assert!(
+            eased <= 0.25,
+            "the white heat steps by {eased:.2} of its light in a column"
+        );
+        let hard = worst(true);
+        assert!(
+            hard >= 0.45,
+            "control: switched hard, the white heat steps by only {hard:.2}"
+        );
+    }
+
+    /// A DARK COMA IS NEVER OLIVE (round-2 judges, item 10: on a dark Return
+    /// the corona's yellow petal, dim and additive, sat on the printed line
+    /// as an olive smudge, #404218-#4a4519). On a dark page no coma petal's
+    /// colour sits in the olive band (hue 40°-100°). Negative control: the
+    /// spectrum's own stops do.
+    #[test]
+    fn a_dark_coma_is_never_olive() {
+        let olive = |rgb: u32| {
+            let (h, s, _) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
+            s > 0.2 && (40.0..=100.0).contains(&h)
+        };
+        assert!(
+            (0..COMA_PETALS).any(|i| olive(spectrum_stop(i))),
+            "control: the spectrum carries a yellow stop"
+        );
+        let cfg = config();
+        assert!(cfg.dark_theme, "fixture: the page is dark");
+        let t0 = Instant::now();
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (8, 2), 0.25);
+        m.on_event(&mv((5, 60), (8, 2)), t0, &ctx)
+            .expect("a Return flies");
+        let mut sc = Scratch::default();
+        sc.emit(&mut m, &ctx_at(t0 + ms(40), &cfg, (8, 2), 0.25));
+        let petals: Vec<u32> = sc.halos.iter().map(|h| h.color).collect();
+        assert!(
+            petals.len() >= COMA_PETALS,
+            "fixture: the coma is drawn ({})",
+            petals.len()
+        );
+        for c in petals {
+            assert!(!olive(c), "a dark coma petal is olive: #{c:06x}");
+        }
+    }
+
+    // -- §6.9, retire-previous ----------------------------------------------
 
     /// §6.9: a crossing meteor retires the first from the alpha it had, reaching the
     /// chroma cull at `R`; a mash keeps at most two heads on a fixed pool (§18).

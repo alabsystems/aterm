@@ -4,28 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A composition the input method ends without saying so does not stay open. While a window's
-//! preedit is open its keys go to the input method's lookup (`Xutf8LookupString`), which gives
-//! arrows, Home, End and the function keys no text, and only the input method's preedit-done
-//! closed it. IBus ends a composition on a focus loss, and with its own restart, without one, so
-//! those keys went dead in that window until its next preedit (the desk audit, GNOME 46 on Xorg
-//! with IBus through XIM, 2026-10-22). The backend now ends it where it ends unannounced: the
-//! window's focus loss, which tells the application an empty preedit; a new input context for
-//! the window; and the input method's replacement, which remakes every context. A new context is
-//! told as `Ime::Enabled` or `Ime::Disabled`, which aterm-gui takes as the composition's end.
-//!
-//! A composition is opened as the input method's preedit-start callback opens one, by its event
-//! on the backend's IME channel. The focus events are the XI2 focus events the server would
-//! send, and the key is a core press of the Left arrow, each handed to the event processor's
-//! handlers for a window of the backend, as `focus_tests` does. The input method is the one
-//! `XMODIFIERS` names on `$DISPLAY`, else Xlib's local one.
-//!
-//! The negative controls: without the end in `xinput2_unfocused`, the focus loss tells no empty
-//! preedit and the Left arrow, the focus back, reports no key. Without the end on
-//! `ImeEvent::Enabled`, the remade context leaves the arrow dead; without `announce_contexts` in
-//! `replace_im`, the replaced input method does.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! A composition the input method ends without saying so does not stay open.
 
 use std::cell::RefCell;
 
@@ -92,7 +71,6 @@ impl Bed {
                 .expect("an X11 window")
         };
         let mut bed = Bed { event_loop, window, seen: RefCell::new(Vec::new()) };
-        // The new window's context says so (`Ime::Disabled`); the tests start from there.
         bed.process_ime();
         bed.take();
         bed
@@ -197,7 +175,6 @@ fn a_focus_loss_ends_the_composition_the_input_method_left_open() {
     bed.press_left();
     assert_eq!(bed.take(), [], "in a composition the arrow goes to the input method");
 
-    // The focus leaves, and the input method says nothing of the composition it ended.
     bed.focus(false);
     assert_eq!(bed.take(), [Told::Preedit(String::new())], "the focus loss ends the preedit");
     assert_eq!(bed.processor().composing, None);
@@ -216,7 +193,6 @@ fn a_new_input_context_ends_the_composition_its_window_had_open() {
     let mut bed = Bed::new();
     bed.focus(true);
 
-    // The window's context remade, to take compositions.
     bed.open_composition();
     bed.window.set_ime_allowed(true);
     bed.process_ime();
@@ -225,7 +201,6 @@ fn a_new_input_context_ends_the_composition_its_window_had_open() {
     bed.press_left();
     assert_eq!(bed.take(), [Told::Left], "the arrow is a key");
 
-    // The input method replaced, as its callbacks replace it when IBus restarts.
     bed.open_composition();
     assert!(bed.ime(|ime| ime.replace_for_test()), "an input method opens again");
     bed.process_ime();

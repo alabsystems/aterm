@@ -1,38 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Thread-scoped I/O policy (macOS): the walker thread's (design §10.5 rule 6)
-//! and the dataless-file setter every other aterm thread uses (moved here from
-//! `aterm-gui`'s `dataless_files`, design §3.1's crate table).
-//!
-//! An evicted iCloud Drive item or other File Provider placeholder is "dataless":
-//! `lstat`, `open(2)`, `fstat` and `realpath` succeed at once, and the first
-//! `read(2)` blocks until the whole download finishes (`O_NONBLOCK` does not apply).
-//! An unreachable SMB/NFS volume behaves the same until its network timeout.
-//! `setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, …)`
-//! controls this per thread: with the policy off, only `read(2)` of a dataless file
-//! fails immediately with `EDEADLK`; with it on, the thread may wait.
-//!
-//! * The GUI's main thread never materializes: [`main_thread_never_materializes`]
-//!   runs once at startup, and a dataless read there fails fast instead of
-//!   stalling the event loop.
-//! * A document admission worker sets [`MaterializePolicy::On`] for itself,
-//!   since the person asked for the file and a short-lived worker may wait.
-//! * The walker thread ([`set_walker_thread_policy`]), before its first
-//!   listing: never materialize (the walker reads no file, and this makes
-//!   sure nothing it calls does), no access-time updates (a walk must not
-//!   dirty every directory it lists), and throttled disk I/O
-//!   (`IOPOL_THROTTLE`: a walk yields the disk to everything else).
-//!
-//! Each returns 0 unprivileged (measured, design §10.5). `setiopolicy_np` is
-//! declared here because the generated `libc` shim must match the pinned
-//! reference libc, which does not export it.
+//! Thread-scoped macOS I/O policy helpers ([`MaterializePolicy::On`]).
+//! Provides [`main_thread_never_materializes`] and [`set_walker_thread_policy`].
 
 /// Whether reads on the CALLING thread may block to download a dataless file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializePolicy {
-    /// Inherit the process policy (the kernel default is to materialize): what
-    /// a thread that never set one reads back.
+    /// Inherit the process policy (the kernel default is to materialize).
     Default,
     /// Never wait: a dataless read fails immediately with `EDEADLK`.
     Off,
@@ -41,11 +16,6 @@ pub enum MaterializePolicy {
 }
 
 /// Set the calling thread's dataless-file policy.
-///
-/// # Errors
-///
-/// The kernel's errno when it refused the call; off macOS this is a no-op
-/// that succeeds.
 pub fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i32> {
     #[cfg(target_vendor = "apple")]
     {
@@ -61,25 +31,18 @@ pub fn set_thread_materialize_policy(policy: MaterializePolicy) -> Result<(), i3
     }
 }
 
-/// Run once on the GUI's main thread at startup so the event loop never waits
-/// on a download.
-///
-/// # Errors
-///
-/// The errno, for the caller to log; startup proceeds either way.
+/// Run once on the GUI's main thread at startup so the event loop never waits on a download.
 #[inline]
 pub fn main_thread_never_materializes() -> Result<(), i32> {
     set_thread_materialize_policy(MaterializePolicy::Off)
 }
 
-/// Read back the calling thread's dataless-file policy: `None` when the kernel
-/// refuses the query or answers a value this build does not name, and off
-/// macOS. Lets the tests check the SDK constants against the kernel.
+/// Read back the calling thread's dataless-file policy.
 #[must_use]
 pub fn thread_materialize_policy() -> Option<MaterializePolicy> {
     #[cfg(target_vendor = "apple")]
     {
-        // SAFETY: plain FFI query with two integer arguments; see the declaration.
+        // SAFETY: Plain FFI query with two integer arguments; see the declaration.
         let raw = unsafe {
             sys::getiopolicy_np(
                 sys::IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
@@ -106,9 +69,7 @@ pub struct PolicyOutcome {
     pub failed: Vec<(&'static str, i32)>,
 }
 
-/// Set the calling thread's walker I/O policy. Off macOS this does nothing and
-/// reports nothing failed: Linux has no dataless files, and `statx` with
-/// `AT_STATX_DONT_SYNC` reads cached attributes without dirtying access times.
+/// Set the calling thread's walker I/O policy.
 #[must_use]
 pub fn set_walker_thread_policy() -> PolicyOutcome {
     #[cfg(target_vendor = "apple")]
@@ -142,8 +103,7 @@ pub fn set_walker_thread_policy() -> PolicyOutcome {
 /// One `setiopolicy_np` at thread scope.
 #[cfg(target_vendor = "apple")]
 fn set_thread_policy_raw(iotype: libc::c_int, policy: libc::c_int) -> Result<(), i32> {
-    // SAFETY: integer-only FFI call that changes only the calling thread's
-    // policy; signature per the declaration below.
+    // SAFETY: Integer-only FFI call that changes only the calling thread's policy.
     if unsafe { sys::setiopolicy_np(iotype, sys::IOPOL_SCOPE_THREAD, policy) } == 0 {
         Ok(())
     } else {
@@ -155,8 +115,6 @@ fn set_thread_policy_raw(iotype: libc::c_int, policy: libc::c_int) -> Result<(),
 pub(crate) mod sys {
     use libc::c_int;
 
-    // `<sys/resource.h>` ABI values (stable since 10.15), checked by the
-    // round-trip test through `getiopolicy_np`.
     pub(crate) const IOPOL_TYPE_DISK: c_int = 0;
     pub(crate) const IOPOL_TYPE_VFS_ATIME_UPDATES: c_int = 2;
     pub(crate) const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: c_int = 3;
@@ -167,8 +125,7 @@ pub(crate) mod sys {
     pub(crate) const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: c_int = 1;
     pub(crate) const IOPOL_MATERIALIZE_DATALESS_FILES_ON: c_int = 2;
 
-    // SAFETY (declaration): libSystem exports both on every supported macOS
-    // with these C signatures (`int` arguments, `int` return, errno on failure).
+    // SAFETY: `libSystem` exports both symbols with these C signatures on macOS.
     unsafe extern "C" {
         pub(crate) fn setiopolicy_np(iotype: c_int, scope: c_int, policy: c_int) -> c_int;
         pub(crate) fn getiopolicy_np(iotype: c_int, scope: c_int) -> c_int;

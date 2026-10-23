@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT A SPAWN COSTS A PROCESS SHAPED LIKE THE WINDOW — a benchmark, not a
-//! gate: it maps 800 MB and prints its numbers.
-//!
-//! This process is shaped like the window (about 6 400 VM regions, 400 MB
-//! resident), then times the `spawn()` call and the parent's bill after it
-//! (rewriting its resident memory once: the copy-on-write faults a fork
-//! leaves) for a plain `std` spawn (the `posix_spawn` baseline), a forked
-//! `std` + strip ([`InheritNothing`]), and [`command`]. Run it by hand:
-//!
-//! ```text
-//! targo --unverified bench -p aterm-uds --bench spawn_cost
-//! ```
-//!
-//! macOS only (the region walk is `PROC_PIDREGIONINFO`); elsewhere it says so.
-//! A bench binary is its own fresh process, so the shape is this process's.
+//! WHAT A SPAWN COSTS A PROCESS SHAPED LIKE THE WINDOW.
 
 #[cfg(target_vendor = "apple")]
 mod bench {
@@ -45,7 +31,6 @@ mod bench {
             fn getpid() -> i32;
         }
         const PROC_PIDREGIONINFO: i32 = 7;
-        // `struct proc_regioninfo`: 96 bytes, `pri_address` at 80, `pri_size` at 88.
         let mut info = [0u8; 96];
         let (mut at, mut count) = (0u64, 0usize);
         loop {
@@ -86,8 +71,8 @@ mod bench {
         const PROT_READ_WRITE: i32 = 1 | 2;
         const MAP_PRIVATE_ANON: i32 = 0x0002 | 0x1000;
         let len = CHUNK * CHUNKS;
-        // SAFETY: an anonymous private mapping this function alone uses and
-        // never unmaps (the process exits with it).
+        // SAFETY: an anonymous private mapping this function alone uses and never unmaps (the
+        // process exits with it).
         let base = unsafe {
             mmap(
                 std::ptr::null_mut(),

@@ -1,43 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Claude Code lights' permission-mode return (`aterm-gui`'s `claude_lights`): a click on
-//! the mode chip, from a mode the owner does not expect, presses Claude's own shift+tab forward
-//! to the nearest one they do (bypass or auto), reading each press back before the next.
+//! The Claude Code lights' permission-mode return (`aterm-gui`'s `claude_lights`).
 
 use aterm_spec::derive::*;
 
-/// One mode return. `mode` is Claude's pill in the forward ring the return walks: `0` an
-/// expected mode (bypass or auto), `1` manual, `2` accept edits, `3` plan, `4` don't ask (which
-/// leads on to manual); one shift+tab moves it one step, and from plan it lands on bypass, or on
-/// manual in a session whose cycle holds neither (`ring == 0`, `Narrow`). `start` is the mode
-/// the click found. `phase` is the host's: `0` at rest, `1` returning (the click's press goes at
-/// once; there is no armed state), `2` ended (a notice or refusal on show). `sent` is a press
-/// Claude has not answered, `auto` whether it is aterm's own rather than the click's; `busy` a
-/// turn in flight; `covered` a box over the composer. `late` says the press's deadline passed
-/// before the loop handled Claude's answer: the loop may read the answer but not press from it.
-///
-/// Host actions: `Click` (sends the first shift+tab), `Press` (each next one, once Claude has
-/// answered the last and is not mid-turn), `Arrive` (an expected mode shows), `Lap` (the cycle
-/// came back round or the presses ran out), `Reject` (the input seam took no press), `Expire`
-/// (a press unanswered, a box up or a turn running past that press's deadline), and `Timeout`
-/// (a late loop turn). Claude's: `Answer`, `TurnStarts`/`TurnEnds`, `Cover`/`Uncover`; the
-/// person's: `Leave`, `DontAsk`, and a narrower cycle (`Narrow`).
-///
-/// A box opens only mid-turn, on a tool call: a turn that starts after a press went (`fresh`)
-/// cannot draw one before Claude reads the key (milliseconds against a tool call's seconds).
-/// So the host presses only while Claude is idle: a read that shows no box cannot see one
-/// opening mid-turn, and a shift+tab into a box answers it (Claude Code 2.1.283's edit prompt
-/// takes it as "yes, allow edits for this session"). The click's own press is the person's.
-///
-/// `MaxPresses` bounds a return's presses as the host's lap check and `lights::MAX_MODE_PRESSES`
-/// do; from don't ask the nearest expected mode is four presses away.
-///
-/// Laws: no press from an expected mode (`NeverPressesPastExpected`); none of aterm's presses
-/// into a box (`NoPressIntoABox`); a return that ends off an expected mode names where it
-/// stopped (`AStopIsNamed`); no press after its deadline from a delayed wake (`NoLatePress`).
-/// `Buggy = 1` replays each: a press decided without reading the mode, a press into a box or
-/// mid-turn or late, and a stop that drops the mode's name.
+/// One mode return.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_mode_return_model() -> Model {

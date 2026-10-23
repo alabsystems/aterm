@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE QUAD ORACLE: the card as it was drawn before fx layers, a stream of
-//! [`GlowQuad`]s each inside one cell-row band, kept for the tests
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §4.9, migration exactness). The
-//! layers are held to it pixel for pixel
-//! (`the_card_layers_equal_the_legacy_quads`), so every law its tests prove
-//! of the quads holds of the layers. Its one change from the shipped
-//! emitter is the trail held still from a rim's width short of the kitty
-//! (`TrailLay::held`), which both draw. Its budget is gone: it lays every
-//! mark of a frame, whole.
+//! THE QUAD ORACLE.
 
 use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
@@ -21,18 +13,16 @@ use super::{
 use crate::effect_util::{STAR_CORE_ADD, STAR_GLINT_COV, StarPart, star_pieces};
 use crate::genome::mix;
 
-/// The one way a quad leaves the oracle: clipped, split at every row band
-/// and tagged with its row.
+/// The one way a quad leaves the oracle: clipped, split at every row band and tagged with its row.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Sink {
     pub(super) geo: Geo,
 }
 
 impl Sink {
-    /// Push `r` (clipped to `clip` and the box) as a horizontal ramp from `l`
-    /// at its left edge to `rt` at its right; split at every row band.
+    /// Push `r` (clipped to `clip` and the box) as a horizontal ramp from `l` at its left edge to
+    /// `rt` at its right; split at every row band.
     pub(super) fn push(&self, out: &mut Vec<GlowQuad>, clip: Rect, r: Rect, l: Paint, rt: Paint) {
-        // Additive zero light adds nothing; a source-over quad still darkens.
         if l.alpha == 0 && l.color == 0 && rt.color == 0 {
             return;
         }
@@ -47,7 +37,6 @@ impl Sink {
             let band = (y - g.oy).div_euclid(g.ch);
             let end = g.band(band + 1).min(c.y1);
             if let Ok(row) = u16::try_from(g.row_base + band) {
-                // In range: `c` lies inside the u16 pixel space.
                 out.push(GlowQuad::gradient(
                     row,
                     c.x0 as u16,
@@ -86,10 +75,9 @@ impl Ramps for QuadSink<'_> {
     }
 }
 
-/// Lay the flat piece `r`, clipped to `clip`, in `paint`, but where it lies
-/// on `on_trail` (a light frame's trail ink, segment by segment) in `glint`:
-/// on the trail one quad a run of segments that share the piece's rows, off
-/// it the piece less every segment ([`lay_cut`]).
+/// Lay the flat piece `r`, clipped to `clip`, in `paint`, but where it lies on `on_trail` (a light
+/// frame's trail ink, segment by segment) in `glint`: on the trail one quad a run of segments that
+/// share the piece's rows, off it the piece less every segment ([`lay_cut`]).
 pub(super) fn lay_toned(
     out: &mut Vec<GlowQuad>,
     sink: &Sink,
@@ -133,12 +121,7 @@ pub(super) fn lay_toned(
     });
 }
 
-/// One four-point star of [`star_pieces`], clipped to `clip`: additive light
-/// on dark; on light `color` is the print ink it is laid in, every piece
-/// source-over, opaque from a settled star's coverage up
-/// ([`STAR_PRINT_FULL`]) and the nucleus with the body, and the paper's
-/// white where a piece lies on the trail's ink (`on_trail`, [`lay_toned`];
-/// empty on dark).
+/// One four-point star of [`star_pieces`], clipped to `clip`.
 #[allow(
     clippy::too_many_arguments,
     reason = "output + sink + clip + centre + arm + coverage + glint + colour + the \
@@ -159,8 +142,6 @@ pub(super) fn lay_star(
     if cov < 1.0 || arm < 1 {
         return;
     }
-    // One piece of the star at coverage `c` (0..255): in its colour, and in
-    // the paper's white where it lies on the trail's ink.
     let tone = |rgb: u32, c: f32| {
         if dark {
             light(rgb, c)
@@ -175,8 +156,6 @@ pub(super) fn lay_star(
     for piece in star_pieces(arm32, gold).iter() {
         let p = match piece.part {
             StarPart::Body => full,
-            // Additive, the crossing supplies part of the nucleus; ink lays
-            // it whole.
             StarPart::Core if dark => paint((cov * STAR_CORE_ADD).floor()),
             StarPart::Core => full,
             StarPart::Tip { taper, .. } => {
@@ -187,8 +166,6 @@ pub(super) fn lay_star(
                 }
                 paint(tip_cov)
             }
-            // Dim light on dark. On paper the star's own ink at the body's
-            // strength: a third of it let the paper through, a pale halo.
             StarPart::Glint if dark => paint((cov * STAR_GLINT_COV).floor()),
             StarPart::Glint => full,
         };
@@ -202,11 +179,7 @@ pub(super) fn lay_star(
     }
 }
 
-/// The kitty: its frame's art as opaque source-over rectangles — each run of
-/// one colour along a pixel row, carried down the rows under it that repeat
-/// it exactly (the same columns and colour, neither neighbour that colour) —
-/// split at the row bands they cross. The authored art's runs are compared
-/// with the production sprite; this quad count is not a production budget.
+/// The kitty: its frame's art as opaque source-over rectangles.
 pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -220,7 +193,6 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
         while c < px.len() {
             let ch = px[c];
             let run = px[c..].iter().take_while(|&&b| b == ch).count();
-            // Row `other` holds this very run.
             let repeats = |other: &str| {
                 let o = other.as_bytes();
                 o[c..c + run].iter().all(|&b| b == ch)
@@ -251,9 +223,7 @@ pub(super) fn kitty_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     debug_assert!(KITTY_PALETTE[0] == b'.');
 }
 
-/// The rim as quads: each strip ([`rim_strips`]) in its paint
-/// ([`Emit::rim_paint`]), clipped to the box inside the border's stroke and
-/// cut, segment by segment, where it would lie on the trail.
+/// The rim as quads.
 pub(super) fn rim_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     let Some((at, pose)) = cx.kitty else {
         return;
@@ -275,7 +245,6 @@ pub(super) fn rim_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
             sink.flat(out, clip, piece, paint);
             true
         };
-        // The trail's segments under the strip, if any.
         match trail {
             Some(t) if q.x0 < t.drawn && q.x1 > t.tx0 => {
                 let first = (q.x0 - t.tx0).max(0) / t.seg;
@@ -289,8 +258,7 @@ pub(super) fn rim_quads(cx: &Emit<'_>, sink: &Sink, out: &mut Vec<GlowQuad>) {
     });
 }
 
-/// Every quad of `cx`'s frame: the border and (but in serious mode) the
-/// trail into `under`, the kitty, its rim and the stars into `over`.
+/// Every quad of `cx`'s frame.
 pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<GlowQuad>) {
     let sink = Sink { geo: cx.geo };
     cx.border(&mut QuadSink { sink, out: under });
@@ -319,11 +287,7 @@ pub(super) fn quads(cx: &Emit<'_>, under: &mut Vec<GlowQuad>, over: &mut Vec<Glo
 }
 
 impl HarnessCard {
-    /// The oracle's frame: [`Self::draw`]'s step, its quads appended to
-    /// `under` and `over`, and the frame's fingerprint returned — `0` when
-    /// nothing was drawn; otherwise a hash of every quad appended, folded
-    /// with the frame index while an intro animates and with the step in
-    /// the flow.
+    /// The oracle's frame.
     pub(super) fn tick(
         &mut self,
         now: Instant,
@@ -345,10 +309,7 @@ impl HarnessCard {
     }
 }
 
-/// A frame's fingerprint ([`HarnessCard::tick`]): `0` when it holds no
-/// quad; otherwise a hash of every quad, `under`'s then `over`'s, folded
-/// with the frame index while an intro animates and with the step in the
-/// flow (`clock`).
+/// A frame's fingerprint ([`HarnessCard::tick`]).
 pub(super) fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u64 {
     if under.is_empty() && over.is_empty() {
         return 0;

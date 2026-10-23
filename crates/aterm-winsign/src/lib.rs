@@ -359,7 +359,7 @@ pub fn resolve_config(sources: &[&Values]) -> Result<Config, String> {
 
 /// The timestamp server a lane uses when none is configured.
 #[must_use]
-pub fn default_timestamp(lane: &Lane) -> &'static str {
+pub const fn default_timestamp(lane: &Lane) -> &'static str {
     match lane {
         Lane::TrustedSigning { .. } => "http://timestamp.acs.microsoft.com",
         Lane::Thumbprint(_) => "http://timestamp.digicert.com",

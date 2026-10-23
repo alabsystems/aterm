@@ -1169,7 +1169,7 @@ impl Gated<'_> {
         let _lock = pack::pack_lock(b.ctx, program, pack::LOCK_WAIT)?;
         let asset_name = pkgdoc::asset_name(program, b.build, b.triple);
         let asset = b.req.out.join(&asset_name);
-        let packed = tarwrite::write(&root_of(&stage), &asset)?;
+        let packed = tarwrite::write_with(&root_of(&stage), &asset, b.tools.compressor())?;
         drop(stage);
         let header = Header {
             program: program.clone(),

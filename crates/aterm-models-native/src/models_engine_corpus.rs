@@ -1,26 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //
-//! The aterm-models-native models aterm-spec's own unit tests run the engine on (`config_catalog_snapshot_model`),
-//! re-exported from this crate's root like every other. aterm-spec `#[path]`-mounts this file
-//! (`src/test_models.rs`), so it holds only these and names only `aterm_spec::…` paths: an edit
-//! to the rest of this crate's models then rebuilds no aterm-spec test and does not seed
-//! aterm-spec, and with it every crate that depends on aterm-spec, into `verify`'s change cone.
+//! The aterm-models-native models aterm-spec's own unit tests run the engine on
+//! (`config_catalog_snapshot_model`), re-exported from this crate's root like every other.
 
 use aterm_spec::derive::*;
 
-/// Every admitted config revision publishes text, its resolved trail-style
-/// cache (`TrailStyleCache`), resolved kitty sprite, parsed custom-theme
-/// catalog, and exact inline + Toy Pack consumer projection as one immutable
-/// snapshot. Settings, the live host, and capture may observe a generation only
-/// after every payload reaches it. Explicit mutant actions
-/// independently retain each stale asset generation, proving no member is
-/// accidentally protected only by another. One more, `PublishLiveUnadmitted`,
-/// installs a worker-prepared generation on the live host before the service
-/// admits it — `finish_native_config_write` scheduling its runtime observation
-/// ahead of `synchronize_prepared_observation` instead of on its `Ok` arm — so
-/// when admission fails the host runs a config the service never published
-/// (`ViewsNeverAhead`).
+/// Every admitted config revision publishes text, its resolved trail-style cache
+/// (`TrailStyleCache`), resolved kitty sprite, parsed custom-theme catalog, and exact inline + Toy
+/// Pack consumer projection as one immutable snapshot.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn config_catalog_snapshot_model() -> Model {
@@ -34,9 +22,6 @@ pub fn config_catalog_snapshot_model() -> Model {
             var kitty_generation = 0;
             var theme_generation = 0;
             var sparkle_generation = 0;
-            // Distinguishes a byte-identical path-asset refresh from an
-            // ordinary text patch in Tier-1 traces without weakening the
-            // shared atomic-generation invariant.
             var asset_refresh = 0;
             var view_one_generation = 0;
             var view_two_generation = 0;
@@ -60,10 +45,6 @@ pub fn config_catalog_snapshot_model() -> Model {
                 sparkle_generation = revision + 1;
                 asset_refresh = 0;
             }
-            // A byte-identical external observation may still resolve a new
-            // path-backed asset generation. The text is re-admitted as part of
-            // the same immutable snapshot identity; consumers never combine
-            // the retained text Arc with an independently refreshed catalog.
             action RefreshAssets when (revision == 0) {
                 revision = revision + 1;
                 text_generation = revision + 1;
@@ -73,8 +54,6 @@ pub fn config_catalog_snapshot_model() -> Model {
                 sparkle_generation = revision + 1;
                 asset_refresh = 1;
             }
-            // The theme-directory watcher parses off-thread and republishes a
-            // complete outer snapshot even when config text is byte-identical.
             action RefreshThemes when (revision == 0) {
                 revision = revision + 1;
                 text_generation = revision + 1;
@@ -160,9 +139,6 @@ pub fn config_catalog_snapshot_model() -> Model {
             invariant ViewsNeverAhead:
                 view_one_generation <= revision && view_two_generation <= revision &&
                 live_generation <= revision && capture_generation <= revision;
-            // Consumers receive the one immutable snapshot `Arc` — text and every
-            // asset together — so a consumer's generation is complete whenever the
-            // snapshot is (`SnapshotAtomic`) and not ahead of it (`ViewsNeverAhead`).
             bound RevisionBounded: revision <= MaxRevision && asset_refresh <= 2;
         }
     }

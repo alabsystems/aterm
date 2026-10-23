@@ -1,23 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Whether this machine consents to the UNATTENDED adoption of the ALab toolset: the one
-//! predicate the first-launch seed (`cli::cmd_seed`) asks before it writes anything, and
-//! that the window asks before it acts on that seed's behalf, so the two cannot drift.
-//!
-//! The order is the seed's, and each refusal names why:
-//!
-//! 1. a recorded decline (`uninstall --all`, [`crate::store::Layout::declined`]) — the
-//!    lane adopts the toolset, so without this it would undo that on the next launch;
-//! 2. a `[packages] prefix` this build ignores ([`crate::config::PackagesConfig::ignored_prefix`])
-//!    — the toolset lives where it points, and the lane would lay a second one down;
-//! 3. `[packages].auto_install = false` (or an unreadable table,
-//!    [`crate::config::PackagesConfig::auto_install`]) — the ONE install consent;
-//! 4. a build that pins no root key ([`crate::manager_enabled`]) — stubs laid now would
-//!    promise a pass that answers "disabled".
-//!
-//! Only [`Adoption::Consented`] lets an unattended lane adopt, lay a stub or a shell hook,
-//! or re-assert the rustup seam.
+//! Unattended adoption consent for the ALab toolset, checked in priority order:
+//! recorded decline, ignored prefix, `auto_install = false` (or unreadable config),
+//! and disabled manager.
 
 use crate::config::PackagesConfig;
 use crate::store::Layout;
@@ -37,36 +23,27 @@ pub enum Adoption {
     ManagerDisabled,
 }
 
-/// Whether the unattended lanes may adopt the ALab toolset on `layout` under `cfg`, and if
-/// not, the first reason (module doc).
+/// Whether the unattended lanes may adopt the ALab toolset on `layout` under `cfg`, or the first refusal reason.
 #[must_use]
 pub fn adoption(layout: &Layout, cfg: &PackagesConfig) -> Adoption {
     adoption_with(layout.declined().is_file(), cfg, crate::manager_enabled())
 }
 
-/// [`adoption`] answering yes or no.
+/// Returns true when [`adoption`] consents.
 #[must_use]
 pub fn adoption_consented(layout: &Layout, cfg: &PackagesConfig) -> bool {
     adoption(layout, cfg) == Adoption::Consented
 }
 
-/// Whether `layout`'s first install of the ALab toolset is still ahead of it: no ALab program
-/// is active (an agent program lands on its own lane and does not count) and no pass has
-/// recorded a success — a store a pass already served that still holds no ALab program (an
-/// architecture no build covers, programs removed on purpose) has nothing coming. With
-/// [`adoption_consented`], the window's update is owed at once: the first-run row it holds
-/// ahead of that update (`aterm-gui`'s `first_run_ahead`, which asks this) and the promise its
-/// seed makes the pending stubs ([`crate::progress::promise_pass`]) both rest on it.
+/// Whether `layout`'s first install of the ALab toolset is still ahead: no non-vendor ALab
+/// program is active and no pass has recorded a success.
 #[must_use]
 pub fn first_install_ahead(layout: &Layout) -> bool {
     holds_no_alab_program(layout)
         && crate::status::read(layout).is_none_or(|status| status.last_success_at.is_empty())
 }
 
-/// Whether `layout` holds no ALab program: none is active but the agent programs, which land
-/// on their own lane ([`crate::vendor_direct::is_vendor`]) — [`first_install_ahead`]'s first
-/// half, and the window's whole first-run test for the toolchain bar it shows (`aterm-gui`'s
-/// `pass_is_first_run`).
+/// Whether `layout` has no active non-vendor ALab program.
 #[must_use]
 pub fn holds_no_alab_program(layout: &Layout) -> bool {
     !crate::active_builds(layout)
@@ -74,20 +51,10 @@ pub fn holds_no_alab_program(layout: &Layout) -> bool {
         .any(|program| !crate::vendor_direct::is_vendor(program))
 }
 
-/// The managed `bin/` a session's PATH carries from its first byte, APPENDED (the hook's own
-/// placement, [`crate::hooks`]: a managed tool never shadows a system one), or `None`.
+/// Returns the managed `bin/` directory to append to a session's PATH, or `None`.
 ///
-/// A launch builds its sessions' PATH before its first-launch seed writes the shell hook, and
-/// a process started before that hook (an agent, a script, a shell without aterm's
-/// integration) never sources it; with `bin/` already on its PATH it runs a pending stub at
-/// once and the real shim the moment it lands. It is handed only where nothing new is
-/// surfaced by it: `home` already holds the hook ([`crate::hooks::written`]), which appends
-/// the same entry in every interactive shell, or the automatic lanes are on
-/// ([`PackagesConfig::enabled`]) on a machine that consents to the adoption
-/// ([`adoption_consented`]), whose launch seed writes that hook a moment later. A PATH entry
-/// installs nothing, but on a declined or `auto_install = false` machine with no hook it
-/// would put tools in front of a person who never asked to see them. The directory need not
-/// exist: a PATH entry naming nothing is inert.
+/// Provided only when `home` already holds the shell hook or automatic lanes are
+/// enabled on a consenting machine.
 #[must_use]
 pub fn session_bin_dir(
     layout: &Layout,
@@ -226,7 +193,6 @@ mod tests {
             None,
             "declined"
         );
-        // The hook already appends `bin/` in every shell that sources it.
         let shell_d = home.join(".aterm").join("shell.d");
         std::fs::create_dir_all(&shell_d).unwrap();
         std::fs::write(shell_d.join("00-atpkg.zsh"), "# hook\n").unwrap();

@@ -337,7 +337,10 @@ impl Verb {
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Ai => "aterm ai [<cmd>]",
             Verb::Machines => "aterm machines <cmd>",
-            Verb::Init => "aterm init [--plan|--check] [--json]",
+            // Longer than the synopsis column: it prints on a line of its own.
+            Verb::Init => {
+                "aterm init [--plan|--check] [--json] [--develop|--no-develop] [--only <items>]"
+            }
             Verb::Secrets => "aterm secrets [<cmd>]",
             Verb::Harness => "aterm harness <cmd>",
             Verb::Keeper => "aterm keeper <cmd>",
@@ -414,6 +417,7 @@ impl Verb {
                 "Restore aterm's commands and shell integration (over SSH too), then set",
                 "this Mac's keyboard, scrolling, widgets, Dock and accounts (at its console).",
                 "Optional init.toml GitHub authentication and clones. Current macOS user.",
+                "`--develop`: a checkout fast-forwarded and its test tools, no settings.",
             ],
             Verb::Secrets => &[
                 "One credentials file for every machine: the vault, its server",
@@ -475,12 +479,15 @@ const VERB_BLURB_COLUMN: usize = 30;
 fn verb_help_block(verb: Verb) -> String {
     let mut out = String::new();
     let mut lines = verb.blurb().iter();
-    let first = lines.next().unwrap_or(&"");
-    out.push_str(&format!(
-        "    {:<width$}{first}\n",
-        verb.usage(),
-        width = VERB_BLURB_COLUMN - 4
-    ));
+    let width = VERB_BLURB_COLUMN - 4;
+    if verb.usage().len() >= width {
+        // A synopsis wider than its column gets a line of its own, rather than running
+        // into its blurb.
+        out.push_str(&format!("    {}\n", verb.usage()));
+    } else {
+        let first = lines.next().unwrap_or(&"");
+        out.push_str(&format!("    {:<width$}{first}\n", verb.usage()));
+    }
     for line in lines {
         out.push_str(&format!("{:width$}{line}\n", "", width = VERB_BLURB_COLUMN));
     }
@@ -3777,6 +3784,27 @@ mod tests {
             "`aterm agents` is not advertised in --help"
         );
         assert!(!is_tool_candidate(Some("agents")));
+    }
+
+    /// A synopsis wider than its column (init's flags) is printed on a line of its own, so
+    /// no synopsis runs into its blurb; the rest keep the blurb on their line.
+    #[test]
+    fn no_synopsis_runs_into_its_blurb() {
+        assert!(Verb::Init.usage().len() >= crate::VERB_BLURB_COLUMN - 4);
+        for verb in Verb::ALL {
+            let block = crate::verb_help_block(*verb);
+            let first = block.lines().next().unwrap_or_default();
+            let rest = first
+                .trim_start()
+                .strip_prefix(verb.usage())
+                .unwrap_or_else(|| panic!("{first:?}"));
+            assert!(rest.is_empty() || rest.starts_with(' '), "{first:?}");
+            assert_eq!(
+                block.lines().count(),
+                verb.blurb().len() + usize::from(rest.is_empty()),
+                "{block}"
+            );
+        }
     }
 
     /// The front-door roster gate: every verb is advertised, well-formed and

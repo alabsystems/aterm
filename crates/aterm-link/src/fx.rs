@@ -169,7 +169,7 @@ impl Fx {
     }
 
     /// Whether the presence view may be opened: always live; never simulated, where the view's own dial and reader thread are outside the doors and the bridge routes by its walk instead (the module doc's "Where the claim ends").
-    pub(crate) fn presence_view(&self) -> bool {
+    pub(crate) const fn presence_view(&self) -> bool {
         match &self.world {
             World::Os => true,
             #[cfg(test)]

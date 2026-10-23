@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The CoreGraphics display services aterm calls: which displays are active,
-//! and each one's bounds, size, model number and current mode; and the reads
-//! of a `CGImage`'s byte layout that the GUI's `window` capture copies an
-//! AppKit bitmap by.
-//!
-//! Declarations under Apple's names, plus [`CGDisplay`], whose methods keep
-//! the names the `core-graphics` crate gave them so the winit fork's call
-//! sites read as before. A display ID is a plain integer that CoreGraphics
-//! validates, so those methods are safe.
-//!
-//! **The SDK is the authority**, as for [`aterm_objc::cf`]: `tests/cg_sdk.rs`
-//! holds every declaration here to the headers with clang, both arches.
-//!
-//! Its own crate, not a feature of `aterm-objc`: CoreGraphics is a GUI
-//! framework, and only the windowing backend (crates/aterm-window) and the
-//! GUI (crates/aterm-gui, the `window` capture's `CGImage` reads) should make
-//! a binary load it. A feature would have been unified into every binary of a
-//! build that also compiled winit, and forked aterm-objc between `-p` and
-//! `--workspace` selections.
-//!
-//! It replaces the `core-graphics`, `core-graphics-types` and `foreign-types`
-//! crates in the vendored winit fork (`docs/AUDIT-third-party-2026-10-15.md`,
-//! winit-core step 3).
+//! CoreGraphics display and image FFI bindings for macOS.
 
 #![cfg(target_os = "macos")]
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
@@ -42,8 +20,7 @@ pub type CGColorSpaceRef = *mut CGColorSpace;
 pub type CGDataProviderRef = *mut CGDataProvider;
 pub type CGBitmapInfo = u32;
 pub type CGColorSpaceModel = i32;
-/// `aterm_objc::cf`'s, which `CGDataProviderCopyData` returns; named here so
-/// `tests/cg_sdk.rs` spells it as the SDK typedef.
+/// Re-export of [`aterm_objc::cf::CFDataRef`] returned by [`CGDataProviderCopyData`].
 pub type CFDataRef = aterm_objc::cf::CFDataRef;
 
 pub const kCGErrorSuccess: CGError = 0;
@@ -85,8 +62,7 @@ const fn check(error: CGError) -> Result<(), CGError> {
     }
 }
 
-/// One display, by ID. Any ID is a valid argument: CoreGraphics answers an
-/// unknown one with zeros, an empty rect or NULL, never by reading through it.
+/// Wrapper around a `CGDirectDisplayID`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CGDisplay {
     pub id: CGDirectDisplayID,
@@ -107,8 +83,7 @@ impl CGDisplay {
         Self::new(unsafe { CGMainDisplayID() })
     }
 
-    /// The active displays' IDs. A display that leaves between the sizing
-    /// call and the fill is dropped from the list, not left as a zero ID.
+    /// Returns the IDs of all active displays.
     pub fn active_displays() -> Result<Vec<CGDirectDisplayID>, CGError> {
         let mut count = 0_u32;
         // SAFETY: the sizing call — a NULL list of capacity 0 is written to

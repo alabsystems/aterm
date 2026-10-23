@@ -379,7 +379,11 @@ mark() { ev=$((ev + 1)); : > "$events/$ev.$1"; }
 # the loop could read its suggestion before the final cursor-home sequence and
 # take the text under a displaced cursor for a person's draft. One builtin
 # writes the clear, screen and final cursor together. Composer redraws likewise
-# use only builtins after loading their metadata.
+# use only builtins after loading their metadata. Every frame is drawn inside a
+# DEC 2026 synchronized-output window, as Claude Code draws its own: one
+# builtin's bytes can still reach the terminal in more than one read, and the
+# loop's reads of the screen are made on whole frames, so it never reads part
+# of one.
 draw() {
   screen=$(cat "$dir/$1.scr"; printf .); screen="${screen%.}"
   # The box is answered by a key, never composed into: it has no composer.
@@ -388,7 +392,7 @@ draw() {
     below=$(cat "$dir/$1.below"; printf .); below="${below%.}"
   fi
   mark "draw-$1"; cur="$1"
-  printf '\033[H\033[2J%s' "$screen"
+  printf '\033[?2026h\033[H\033[2J%s\033[?2026l' "$screen"
 }
 # A busy spell of $1 s. While a loop watches (its connection made "$seen"
 # before this spell began, `Tap`), the seconds run from when the loop has READ
@@ -408,7 +412,7 @@ compose() {
   shown="$buf"
   if [ "$mangle" = mangle ] && [ ${#buf} -gt 40 ]; then shown="[Pasted text #1]"; fi
   n=$(( (2 + ${#shown} + cols - 1) / cols )); [ "$n" -lt 1 ] && n=1
-  printf '\033[%s;1H\033[J\033[%s;1H%s\033[%s;1H❯ %s' \
+  printf '\033[?2026h\033[%s;1H\033[J\033[%s;1H%s\033[%s;1H❯ %s\033[?2026l' \
     "$row" "$((row + n))" "$below" "$row" "$shown"
 }
 # Every read that brought bytes is an event too, `key`, stamped as soon as it

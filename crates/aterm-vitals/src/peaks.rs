@@ -1,19 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Peaks: the capacities of the rows that have no fixed maximum
-//! (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §6.5, §8.2).
-//!
-//! Network (each direction) and Tokens are drawn against the largest of the
-//! last 7 days' daily maxima, today included. A day's maximum is its
-//! sustained-30 s value: the largest smallest-of-three over consecutive
-//! closed 10 s buckets ([`crate::ring::BucketRing::sustained`]), so one spike
-//! cannot set it. A peak rises at once.
-//!
-//! Each [`DailyMax`] also counts the seconds it has read, so a row knows when
-//! it has learned its peak: 24 hours for the network, 10 minutes for tokens.
-//! The host persists the peaks (`vitals-peaks.json`, through `aterm_json`)
-//! from [`Peaks::to_pairs`] and restores them with [`Peaks::from_pairs`].
+//! Rolling 7-day [`DailyMax`] capacities ([`crate::ring::BucketRing::sustained`],
+//! [`Peaks::to_pairs`], [`Peaks::from_pairs`]).
 
 use crate::ring::BUCKET_S;
 
@@ -27,18 +16,14 @@ pub const TOKENS_LEARN_S: u32 = 600;
 /// The last [`PEAK_DAYS`] days' maxima of one quantity.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DailyMax {
-    /// `(day, maximum)`, oldest first, one row per day; the day is unix days
-    /// (UTC). At most [`PEAK_DAYS`] rows.
+    /// `(day, maximum)`, oldest first, one row per day; the day is unix days (UTC) ([`PEAK_DAYS`]).
     pub days: Vec<(u32, f64)>,
     /// Seconds of sustained readings noted, ever (saturating).
     pub read_s: u32,
 }
 
 impl DailyMax {
-    /// Note `v`, the sustained-30 s value ending at a bucket that closed on
-    /// `today`: it raises today's maximum, adds a bucket's seconds to what
-    /// was read, and drops days that left the window. A non-finite or
-    /// negative `v` is ignored.
+    /// Note `v`, the sustained-30 s value ending at a bucket that closed on `today`.
     pub fn note_bucket(&mut self, today: u32, v: f64) {
         if !v.is_finite() || v < 0.0 {
             return;
@@ -54,8 +39,7 @@ impl DailyMax {
         self.days.drain(..extra);
     }
 
-    /// The largest maximum of the [`PEAK_DAYS`] days ending `today`; `None`
-    /// when none was noted in them.
+    /// The largest maximum of the [`PEAK_DAYS`] days ending `today`.
     #[must_use]
     pub fn peak(&self, today: u32) -> Option<f64> {
         self.days
@@ -65,8 +49,7 @@ impl DailyMax {
             .reduce(f64::max)
     }
 
-    /// Whether at least `min_s` seconds have been read
-    /// ([`NET_LEARN_S`], [`TOKENS_LEARN_S`]).
+    /// Whether at least `min_s` seconds have been read ([`NET_LEARN_S`], [`TOKENS_LEARN_S`]).
     #[inline]
     #[must_use]
     pub const fn learned(&self, min_s: u32) -> bool {
@@ -79,10 +62,7 @@ impl DailyMax {
         (self.read_s, self.days.clone())
     }
 
-    /// A daily max from what [`Self::to_pairs`] gave. Rows that are not
-    /// finite or are negative are dropped, a day written twice keeps its
-    /// larger value, and only the newest [`PEAK_DAYS`] days are kept, so a
-    /// hand-edited or damaged file cannot inflate a peak's window.
+    /// A daily max from what [`Self::to_pairs`] gave ([`PEAK_DAYS`]).
     #[must_use]
     pub fn from_pairs(read_s: u32, days: &[(u32, f64)]) -> Self {
         let mut rows: Vec<(u32, f64)> = days
@@ -104,8 +84,7 @@ impl DailyMax {
     }
 }
 
-/// One persisted peak: its name ([`Peaks::NAMES`]), the seconds it has read
-/// and its day rows.
+/// One persisted peak: its name ([`Peaks::NAMES`]), the seconds it has read and its day rows.
 pub type PeakRow = (&'static str, u32, Vec<(u32, f64)>);
 
 /// Every peak the model keeps.
@@ -134,8 +113,7 @@ impl Peaks {
         ]
     }
 
-    /// Peaks from `(name, read_s, days)` rows; an unknown name is ignored and
-    /// a missing one starts empty.
+    /// Peaks from `(name, read_s, days)` rows.
     #[must_use]
     pub fn from_pairs<'a>(
         rows: impl IntoIterator<Item = (&'a str, u32, &'a [(u32, f64)])>,
@@ -161,7 +139,6 @@ mod tests {
 
     #[test]
     fn peaks() {
-        // The 7-day window: day 10's maximum counts through day 16.
         let mut d = DailyMax::default();
         d.note_bucket(10, 9.0);
         d.note_bucket(10, 4.0);
@@ -173,8 +150,6 @@ mod tests {
         assert_eq!(d.days, [(12, 3.0), (17, 1.0)]);
         assert_eq!(d.peak(30), None);
 
-        // The sustained-30 s day maximum ignores one spike bucket: the ring
-        // hands the peak the smallest of each three closed buckets.
         let mut ring = BucketRing::default();
         let mut day = DailyMax::default();
         let t0 = 1_792_000_800_000i64;
@@ -187,7 +162,6 @@ mod tests {
         }
         assert_eq!(day.peak(20_740), Some(3.1), "{day:?}");
 
-        // Learning: tokens after 600 s of readings, the network after 24 h.
         let mut t = DailyMax::default();
         for _ in 0..59 {
             t.note_bucket(1, 1.0);
@@ -205,7 +179,6 @@ mod tests {
         n2.note_bucket(1, 1.0);
         assert!(n2.learned(NET_LEARN_S));
 
-        // Round trip.
         let p = Peaks {
             net_rx: d.clone(),
             net_tx: n2,
@@ -214,7 +187,6 @@ mod tests {
         let pairs = p.to_pairs();
         let back = Peaks::from_pairs(pairs.iter().map(|(n, r, days)| (*n, *r, days.as_slice())));
         assert_eq!(back, p);
-        // A damaged file cannot widen the window or inflate a day.
         let damaged = DailyMax::from_pairs(
             5,
             &[
@@ -246,13 +218,11 @@ mod tests {
         );
         assert_eq!(damaged.read_s, 5);
 
-        // The window ends today; a restored future day cannot set today's peak.
         let mut future = DailyMax::from_pairs(0, &[(10, 2.0), (11, 20.0), (u32::MAX, 99.0)]);
         assert_eq!(future.peak(10), Some(2.0));
         future.note_bucket(10, 1.0);
         assert_eq!(future.days, [(10, 2.0)]);
 
-        // Every admitted day is valid at its own edge, without adding past u32::MAX.
         let mut edge = DailyMax::default();
         edge.note_bucket(u32::MAX, 4.0);
         assert_eq!(edge.peak(u32::MAX), Some(4.0));

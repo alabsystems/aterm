@@ -5441,15 +5441,28 @@ fn paint_compiled_node(
             }
             if spec.audit_id == RAINBOW_BANNER_AUDIT {
                 let (sky, rim) = rainbow_banner_sky(&roles);
-                crate::settings::paint_rainbow_banner(
-                    prims,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    sky,
-                    rim,
-                );
+                if let Some(village) = spec.value.as_deref() {
+                    crate::settings::paint_rainbow_kitty_village(
+                        prims,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        sky,
+                        rim,
+                        village,
+                    );
+                } else {
+                    crate::settings::paint_rainbow_banner(
+                        prims,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        sky,
+                        rim,
+                    );
+                }
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {

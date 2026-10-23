@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The three pages that name a download — `/`, `/aterm`, `/terminal` — rewritten
-//! for the elected downloads, and the live site compared with the checkout.
-//!
-//! Every rule matches EXACTLY once or the page is refused: a page edit must never
-//! silently orphan a rule. The one exception is the platform attributes on the
-//! `/aterm` and `/terminal` anchors (`data-href-linux-<arch>`,
-//! `data-install-linux-<arch>`, `data-intel-proof`, `data-toolchain-<arch>`):
-//! inserted when known, removed when not, never duplicated; the site's
-//! `platform.js` renders from them. The homepage is one button, the DMG, and
-//! carries no platform attribute.
-//!
-//! Linux installs through `install.sh`, which `ship site` serves at
-//! [`INSTALL_URL`] (the public commit's `tools/install.sh`): a Linux pick shows
-//! the command [`linux_install_command`] writes, offered only for an
-//! architecture whose signed executable the election proved.
+//! The three pages that name a download.
 
 use std::fmt;
 
@@ -26,12 +12,7 @@ use super::toolchain::{Levels, MAC_ARCHES};
 /// Where alab.systems serves the installer (`public/install.sh`).
 pub const INSTALL_URL: &str = "https://alab.systems/install.sh";
 
-/// The one command a Linux visitor runs, when `arch` has a signed executable:
-/// the installer piped to bash, which picks the architecture itself and
-/// installs the latest release — pinned with `--version` only when the newest
-/// signed executable for `arch` is older than that release (the installer
-/// verifies it under the latest release's policy). `None` for a legacy tarball
-/// or no build: the installer installs neither.
+/// The one command a Linux visitor runs, when `arch` has a signed executable.
 #[must_use]
 pub fn linux_install_command(facts: &Facts, arch: &str) -> Option<String> {
     let d = facts.linux(arch)?;
@@ -183,7 +164,6 @@ fn notes(text: &str) -> Vec<Hit> {
             let name_end = text.len() - rest.len();
             let close = name_end + text[name_end..].find('<')?;
             let mut end = close + text[close..].strip_prefix("</code>").map(|_| 7)?;
-            // (?: &middot; <code>\d+\.\d+\.\d+</code>)?
             if let Some(v) = text[end..].strip_prefix(" &middot; <code>") {
                 let vs = text.len() - v.len();
                 if let Some(ve) = triple(text, vs)
@@ -192,7 +172,6 @@ fn notes(text: &str) -> Vec<Hit> {
                     end = ve + 7;
                 }
             }
-            // (?: &middot; <code>~?\d+(?:\.\d+)?&nbsp;[MG]B</code>)?
             if let Some(s) = text[end..].strip_prefix(" &middot; <code>") {
                 let mut at = text.len() - s.len();
                 at += usize::from(text[at..].starts_with('~'));
@@ -296,8 +275,8 @@ fn exactly_once(
     ))
 }
 
-/// The platform attributes the `/aterm` and `/terminal` anchors carry, in the order
-/// they are written, each with its value — `None` removes it.
+/// The platform attributes the `/aterm` and `/terminal` anchors carry, in the order they are
+/// written, each with its value — `None` removes it.
 #[must_use]
 pub fn platform_attributes(
     facts: &Facts,
@@ -380,7 +359,6 @@ fn with_platform_attributes(
 }
 
 /// `page` (one of [`PAGES`]) rewritten for `facts` and the toolchain levels.
-///
 /// # Errors
 /// A rule that does not match exactly once, or a duplicated platform attribute.
 pub fn rewrite(
@@ -520,14 +498,12 @@ impl fmt::Display for Difference {
     }
 }
 
-/// What the live site and the checkout hold, by file: `engine.js`, the three pages,
-/// `releases.html` and `install.sh` (`None` = not fetched, or not in the checkout).
+/// What the live site and the checkout hold, by file.
 pub struct Copies<'a> {
     pub get: &'a dyn Fn(&str) -> Option<String>,
 }
 
-/// How the live site differs from the checkout: the engine pair, every download
-/// href, every platform attribute (including absence), `/releases`, `/install.sh`.
+/// How the live site differs from the checkout.
 #[must_use]
 pub fn compare(facts: &Facts, local: &Copies<'_>, live: &Copies<'_>) -> Vec<Difference> {
     let mut out = Vec::new();
@@ -643,7 +619,6 @@ mod tests {
         let out = rewrite("terminal.html", &page("terminal.html"), &f, None).unwrap();
         assert_eq!(hrefs("terminal.html", &out), [DMG63]);
         assert_eq!(title_versions(&out), ["0.63.0"]);
-        // the Register button is left alone
         assert_eq!(
             quoted(&out, "<a class=\"get register\" href=\"", "\"").len(),
             1
@@ -684,13 +659,11 @@ mod tests {
             );
             assert_eq!(one("data-toolchain-x86_64"), ["partial"]);
             assert_eq!(one("data-toolchain-aarch64"), ["full"]);
-            // a second pass changes nothing
             assert_eq!(
                 rewrite(name, &out, &f, Some(&levels)).unwrap(),
                 out,
                 "{name}"
             );
-            // facts nobody has any more are removed, not left stale
             let bare = rewrite(name, &out, &facts(Some(1)), None).unwrap();
             for (attr, _) in platform_attributes(&f, Some(&levels)) {
                 assert!(attribute_values(&bare, attr).is_empty(), "{name} {attr}");
@@ -738,7 +711,6 @@ mod tests {
                 attribute_values(&out, "data-install-linux-x86_64").is_empty(),
                 "{name}"
             );
-            // the raw link stays a literal the site can check; the command is beside it
             assert_eq!(
                 attribute_values(&out, "data-href-linux-aarch64"),
                 [signed("0.63.0", "aarch64").url],
@@ -823,7 +795,6 @@ mod tests {
         };
         let (l, v) = (lookup(&local), lookup(&live));
         assert_eq!(compare(&f, &Copies { get: &l }, &Copies { get: &v }), []);
-        // the installer: compared once the checkout serves one
         local.insert("install.sh", "#!/usr/bin/env bash\n".into());
         let l = lookup(&local);
         assert_eq!(

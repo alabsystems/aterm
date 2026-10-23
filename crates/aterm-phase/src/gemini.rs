@@ -972,6 +972,51 @@ pub fn zone_offset_s(zone: &str) -> Option<i32> {
     (h <= 14 && m < 60).then_some(sign * (h * 3600 + m * 60))
 }
 
+/// THE MODEL THE FOOTER NAMES: the value under its `/model` column head,
+/// the footer's last (`Auto`, measured on 0.46.0 —
+/// [`fixtures::IDLE`]; the bundle's `getDisplayString` of the model the
+/// person chose with `/model` otherwise, UNMEASURED), its last cell right
+/// under the head's row (the row naming `workspace (/directory)`), the
+/// newest such footer on the rows. A usage limit is a model's (`Usage limit
+/// reached for <model>.`): a later read naming another model says the
+/// session left the model the limit was read under. `None` with no footer
+/// drawn, its `/model` column hidden, or its value row blank.
+#[must_use]
+pub fn footer_model(rows: &[String]) -> Option<String> {
+    let head = rows.iter().rposition(|r| {
+        crate::text::contains(r, const { anchor_text("gemini.footer.workspace") })
+    })?;
+    if !rows[head]
+        .trim_end()
+        .ends_with(const { anchor_text("gemini.footer.model") })
+    {
+        return None;
+    }
+    let value = rows.get(head + 1)?.trim_end();
+    let cell = crate::text::trim(value.rsplit("  ").next()?);
+    (!cell.is_empty()).then(|| cell.to_string())
+}
+
+/// THE LOGIN THE BANNER NAMES (the bundle's `UserIdentity`, beside the
+/// logo): `Authenticated with gemini-api-key` (measured on 0.46.0,
+/// [`fixtures::IDLE`]) or `Signed in with Google: <email>` (READ in the
+/// bundle), its ` /auth` hint cut. Drawn once at the session's start: a
+/// relaunch draws the login it runs on. `None` where the banner has
+/// scrolled off, or names neither.
+#[must_use]
+pub fn banner_login(rows: &[String]) -> Option<String> {
+    rows.iter().find_map(|r| {
+        let t = crate::text::trim(
+            r.trim_end()
+                .strip_suffix(const { anchor_text("gemini.banner.auth.tail") })?,
+        );
+        let at = t
+            .find(const { anchor_text("gemini.banner.auth") })
+            .or_else(|| t.find(const { anchor_text("gemini.banner.google") }))?;
+        Some(t[at..].to_string())
+    })
+}
+
 /// THE RESET THE USAGE-LIMIT DIALOG NAMES (module header): what its `Access resets at <time>.` row says, under the title of the dialog [`prompt`] reads whole and over its options — `5:06 AM` in `PDT` of `Access resets at 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]).
 #[must_use]
 pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
@@ -1313,7 +1358,19 @@ pub mod fixtures {
     /// A Google account's spent quota (`QUOTA_EXHAUSTED`, its reset in `RetryInfo`): the same dialog with `Access resets at <time>.` under its title, before any key.
     pub const LIMIT_DIALOG_ACCOUNT: &str =
         include_str!("fixtures/gemini-0.46.0-wall-429-account.txt");
-    /// The same dialog answered `2.`
+    /// THE PER-MODEL BUCKET'S DIALOG (HAND-BUILT from
+    /// [`LIMIT_DIALOG_ACCOUNT`] by the bundle's `ProQuotaDialog`): a terminal
+    /// quota on a Pro model whose fallback is another model, under the API
+    /// key — `Usage limit reached for all Pro models.`, its reset, and `1.
+    /// Switch to gemini-3.5-flash` over `2. Stop`: no `Keep trying`.
+    pub const LIMIT_DIALOG_BUCKET: &str =
+        include_str!("fixtures/gemini-0.46.0-wall-429-bucket-hand-built.txt");
+    /// The same under the Google login (HAND-BUILT): `/auth to switch to API
+    /// key.` in the message and `2. Upgrade for higher limits` (it opens a
+    /// browser) between the switch and `3. Stop`.
+    pub const LIMIT_DIALOG_BUCKET_UPGRADE: &str =
+        include_str!("fixtures/gemini-0.46.0-wall-429-bucket-upgrade-hand-built.txt");
+    /// The same dialog answered `2. Stop`.
     pub const LIMIT_STOPPED: &str = include_str!("fixtures/gemini-0.46.0-wall-429-stopped.txt");
     /// The same in a pane of 72 columns, a `GEMINI.md` loaded: the `ℹ` notice under the error wrapped onto a second row.
     pub const NARROW_LIMIT_STOPPED: &str =

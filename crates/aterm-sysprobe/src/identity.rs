@@ -94,7 +94,7 @@ pub struct Identity {
 impl Identity {
     /// What its signature vouches for ([`voucher`]).
     #[must_use]
-    pub fn voucher(&self) -> Voucher {
+    pub const fn voucher(&self) -> Voucher {
         voucher(self.cs_status, self.category)
     }
 }

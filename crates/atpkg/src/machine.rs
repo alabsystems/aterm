@@ -143,7 +143,7 @@ impl UniversalControlState {
     }
 
     /// The parenthetical naming which key a half state sets.
-    fn partial_note(&self) -> &'static str {
+    const fn partial_note(&self) -> &'static str {
         match (self.disable, self.magic_edges) {
             (Some(true), _) => " (Disable is set, DisableMagicEdges is not)",
             (_, Some(true)) => " (DisableMagicEdges is set, Disable is not)",
@@ -440,7 +440,7 @@ impl UcPosture {
 impl UniversalControlState {
     /// The coarse posture: `Unknown` when either read measured nothing; otherwise both keys true is `Disabled`, one is `Partial`, and neither is the OS default (an absent key is the ordinary state of a machine that never turned the feature off).
     #[must_use]
-    pub fn posture(&self) -> UcPosture {
+    pub const fn posture(&self) -> UcPosture {
         // told the user the cursor roams, on no evidence.
         if !self.measured {
             return UcPosture::Unknown;

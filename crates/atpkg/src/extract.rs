@@ -355,7 +355,7 @@ impl std::error::Error for TooLargeReason {}
 
 /// Map a tar entry type to our [`EntryKind`]; anything that is not a plain file,
 /// directory or link is treated as a disallowed kind (refused by [`vet_entry`]).
-fn classify(ty: TarEntryType) -> EntryKind {
+const fn classify(ty: TarEntryType) -> EntryKind {
     match ty {
         TarEntryType::Regular | TarEntryType::Continuous => EntryKind::Regular,
         TarEntryType::Directory => EntryKind::Directory,
@@ -366,7 +366,7 @@ fn classify(ty: TarEntryType) -> EntryKind {
 }
 
 /// Sanitize an archive mode (`0o755` for dirs/executables, `0o644` for regular files).
-pub fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
+pub const fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     if is_dir || entry_mode & 0o111 != 0 {
         0o755
     } else {
@@ -699,7 +699,7 @@ impl<'a> Layer<'a> {
     }
 
     /// Count one more entry against the entry cap.
-    fn next_entry(&mut self) -> Result<(), ExtractError> {
+    const fn next_entry(&mut self) -> Result<(), ExtractError> {
         self.count = self.count.saturating_add(1);
         if self.count > self.max_entries {
             return Err(ExtractError::TooLarge(TooLargeReason::EntryCap));
@@ -709,7 +709,7 @@ impl<'a> Layer<'a> {
 
     /// Charge `n` decompressed structural bytes (a tar header, padding, a GNU/PAX extension
     /// header and body) against the structure allowance.
-    fn charge_structure(&mut self, n: u64) -> Result<(), ExtractError> {
+    const fn charge_structure(&mut self, n: u64) -> Result<(), ExtractError> {
         if n > self.structure_remaining {
             return Err(ExtractError::TooLarge(TooLargeReason::StructureCap));
         }
@@ -717,7 +717,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    fn strip(&self) -> u32 {
+    const fn strip(&self) -> u32 {
         self.opts.strip_components
     }
 

@@ -207,7 +207,7 @@ impl CFUUID {
 
     /// The `CFUUIDRef`, borrowed for as long as `self` lives.
     #[must_use]
-    pub fn as_ptr(&self) -> CFUUIDRef {
+    pub const fn as_ptr(&self) -> CFUUIDRef {
         self.0.as_ptr()
     }
 
@@ -260,7 +260,7 @@ impl CFString {
 
     /// The `CFStringRef`, borrowed for as long as `self` lives.
     #[must_use]
-    pub fn as_ptr(&self) -> CFStringRef {
+    pub const fn as_ptr(&self) -> CFStringRef {
         self.0.as_ptr()
     }
 

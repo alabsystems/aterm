@@ -471,7 +471,7 @@ pub(crate) struct ConditionalLink<'a> {
 }
 
 impl ConditionalLink<'_> {
-    pub(crate) fn guard(&mut self) -> &mut crate::lock::StoreLock {
+    pub(crate) const fn guard(&mut self) -> &mut crate::lock::StoreLock {
         self.guard
     }
 

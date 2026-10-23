@@ -30,7 +30,18 @@ pub const RIBBON_QUAD_BUDGET: usize = 10_240;
 /// Cells the hot edge reaches back from the head (§4.1).
 pub const HOT_EDGE_CELLS: f32 = 3.0;
 
-/// The furthest back, in cells, the crisp edge may reach when a key is born on a change of speed or under an open theme ([`edge_cells`]).
+/// How far back from its head end a run the hand has left feathers in, in
+/// cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin
+/// to nothing at the end the caret jumped off instead of standing square-cut
+/// there, at the end and along the top edge beside it. Wide enough that its
+/// pixel-fine boundaries step by no more than a fifth of the body a column
+/// (0.9 stepped by 0.23), narrow enough that the band an Enter leaves goes
+/// dark with a submit's (1.5 dimmed its newest end a frame early).
+pub const HEAD_FEATHER_CELLS: f32 = 1.2;
+
+/// The furthest back, in cells, the crisp edge may reach when a key is born on a change of
+/// speed or under an open theme ([`edge_cells`]): the same alpha law over a longer `d`, so a
+/// longer streak, never a brighter one.
 pub const HOT_EDGE_CELLS_MAX: f32 = 5.0;
 
 /// The hot edge's falloff shape, normalised at the head cell.
@@ -1384,6 +1395,113 @@ struct Run {
     stream_dir: i8,
 }
 
+/// The feather a run the hand has left wears at its head end
+/// ([`Ribbon::head_feather`]): `1` everywhere for a run at the caret.
+#[derive(Clone, Copy, Debug)]
+struct HeadFeather {
+    /// The head boundary's window x.
+    head_x: f32,
+    /// The feather's reach back from it, px; `0` for none.
+    width: f32,
+}
+
+impl HeadFeather {
+    /// The share of its light a boundary at window x `x` keeps: nothing at
+    /// the head end, easing to all of it [`HEAD_FEATHER_CELLS`] back.
+    #[inline]
+    fn at(self, x: f32) -> f32 {
+        if self.width <= 0.0 {
+            return 1.0;
+        }
+        smoothstep01((x - self.head_x).abs() / self.width)
+    }
+}
+
+/// A boundary as the emit lays it: a planned [`Segment`]'s fields with its
+/// coverage in `f32`, or one laid between two of them.
+#[derive(Clone, Copy, Debug)]
+struct LaidSegment {
+    x: f32,
+    spine: f32,
+    up: f32,
+    dn: f32,
+    t: f32,
+    cov: f32,
+}
+
+/// How far apart, px, the boundaries inside a head feather's reach are laid
+/// ([`for_each_feathered`]).
+const FEATHER_FINE_PX: f32 = 1.0;
+
+/// The rows, in cells, a planned boundary's body and rail are reckoned to
+/// spend quads on when the emit weighs whether the frame has room for a
+/// smooth feather ([`Ribbon::emit`]).
+const FEATHER_ROOM_ROWS: f32 = 1.6;
+/// The share of [`RIBBON_QUAD_BUDGET`] the reckoned plan must stay under for
+/// a smooth feather.
+const FEATHER_ROOM_SHARE: f32 = 0.6;
+
+/// Hand `each` the boundaries of `segs` last first (the emit's head-first
+/// order), each with its index in `segs`; between two boundaries either of
+/// which lies inside `feather`'s reach, boundaries [`FEATHER_FINE_PX`] apart
+/// interpolated from them (index `None`), so the slabs `ribbon_beam` tiles
+/// there are narrow and the feather thins smoothly, not in the stride's
+/// steps (a 3 px stair read at the end the caret left).
+fn for_each_feathered(
+    segs: &[Segment],
+    feather: HeadFeather,
+    mut each: impl FnMut(Option<usize>, LaidSegment),
+) {
+    let laid = |s: &Segment| LaidSegment {
+        x: s.x,
+        spine: s.spine,
+        up: s.up,
+        dn: s.dn,
+        t: s.t,
+        cov: f32::from(s.cov),
+    };
+    let mut prev: Option<LaidSegment> = None;
+    for (i, seg) in segs.iter().enumerate().rev() {
+        let here = laid(seg);
+        if let Some(p) = prev
+            && feather.width > 0.0
+            && (p.x - feather.head_x)
+                .abs()
+                .min((here.x - feather.head_x).abs())
+                < feather.width
+        {
+            let n = ((here.x - p.x).abs() / FEATHER_FINE_PX).floor() as usize;
+            for k in 1..n {
+                let u = k as f32 / n as f32;
+                let l = |a: f32, b: f32| a + (b - a) * u;
+                each(
+                    None,
+                    LaidSegment {
+                        x: l(p.x, here.x),
+                        spine: l(p.spine, here.spine),
+                        up: l(p.up, here.up),
+                        dn: l(p.dn, here.dn),
+                        t: l(p.t, here.t),
+                        cov: l(p.cov, here.cov),
+                    },
+                );
+            }
+        }
+        each(Some(i), here);
+        prev = Some(here);
+    }
+}
+
+/// The attach's level this frame, set by [`Ribbon::plan_run`] at the head
+/// boundary of the run under the caret: the head boundary's coverage (`base`),
+/// the head cell's uniform attack (`uniform`, [`BIRTH_EDGE_FLOOR`] to 1 over
+/// the edge-in) and the wipe's probe ([`Ribbon::wipe_of`]).
+/// [`AttachFloor::level`] at `dist` across the caret cell is the light the
+/// attach puts there: the caret cell's own segments when nothing is laid
+/// under the caret, and the floor under a leaving cell's light when one is (a
+/// Backspaced cell draining, or a neighbour retiring by content), so the
+/// block stands on the band while the cell spends and its retirement changes
+/// no byte.
 #[derive(Clone, Copy, Debug)]
 struct AttachFloor {
     row: u16,
@@ -1419,6 +1537,21 @@ struct RewrapStart {
 /// The ribbon producer.
 #[derive(Clone, Debug, Default)]
 pub struct Ribbon {
+    /// Test-only: leave a run the hand has left square-cut at its head end
+    /// (no [`Ribbon::head_feather`]), the negative control of the feather's
+    /// test.
+    #[cfg(test)]
+    head_square: bool,
+    /// Test-only: keep the hot edge on a run the hand has left, as it was,
+    /// the negative control of the hot edge's hand test.
+    #[cfg(test)]
+    hot_edge_left_lit: bool,
+    /// Test-only: lay the boundaries inside a head feather's reach at the
+    /// stride, as they were ([`for_each_feathered`]), the negative control of
+    /// the smooth feather's test.
+    #[cfg(test)]
+    feather_coarse: bool,
+    /// The live cells, resident and reused (§18: no allocation per frame).
     cells: Vec<Cell>,
     cohorts: Vec<Cohort>,
     plan: Vec<Segment>,
@@ -4774,16 +4907,51 @@ impl Ribbon {
         let rail_reach_max = RAIL_REACH_MAX_CH * chf;
         let plan = &self.plan;
         let ink = &self.ink;
+        let head_feather = |run: &Run| self.head_feather(ctx, run);
+        #[cfg(test)]
+        let coarse = self.feather_coarse;
+        // The fine boundaries cost quads: laid only while the whole plan's
+        // light (a row of a device pixel per slab and pixel row, body and
+        // rail, [`FEATHER_ROOM_ROWS`] cells tall) fits in
+        // [`FEATHER_ROOM_SHARE`] of the budget, so a saturated frame keeps
+        // every run's body before any feather's finish, and every run lays
+        // the same light whatever runs it shares the frame with.
+        let roomy = (self.plan.len() as f32) * FEATHER_ROOM_ROWS * chf
+            < RIBBON_QUAD_BUDGET as f32 * FEATHER_ROOM_SHARE;
         {
             let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
                 if rail_layer && (!rail || row_bottom >= pane_bot) {
                     return true;
                 }
+                let head_feather_of = head_feather(run);
+                let feather = |x: f32| head_feather_of.at(x);
+                #[cfg(test)]
+                let roomy = roomy && !coarse;
+                let fine_feather = if roomy {
+                    head_feather_of
+                } else {
+                    HeadFeather {
+                        width: 0.0,
+                        ..head_feather_of
+                    }
+                };
                 verts.clear();
                 verts.reserve(run.hi - run.lo);
+                // The head boundary's place in `verts` once they are put back
+                // in plan order, for a capped repaint.
+                let mut head_rev = 0usize;
+                // Laid head-first, so a capped run is repainted outward from its head and never
+                // drops the light beside the hand. Inside the head feather's reach the boundaries
+                // are laid a pixel or so apart ([`for_each_feathered`]), so the feather thins
+                // smoothly instead of in the stride's steps.
                 if rail_layer {
-                    for seg in plan[run.lo..run.hi].iter().rev() {
+                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, |i, seg| {
+                        if i == Some(run.head - run.lo) {
+                            head_rev = verts.len();
+                        }
+                        // The vivid rail lies below the row's bottom and uses
+                        // the body's own lower reach, capped at the leading.
                         let top = row_bottom.max(seg.spine);
                         let dn = (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max);
                         verts.push(RibbonVertex {
@@ -4794,14 +4962,18 @@ impl Ribbon {
                             core_up: 0.0,
                             core_dn: dn * RAIL_CORE_SHARE,
                             color: ink.rail_at(seg.t),
-                            cov: f32::from(seg.cov) * RAIL_GAIN,
+                            cov: seg.cov * RAIL_GAIN * feather(seg.x),
                             lift: 0.0,
                             lift_span: 0.0,
                         });
-                    }
+                    });
                 } else {
-                    for seg in plan[run.lo..run.hi].iter().rev() {
-                        let cov = f32::from(seg.cov);
+                    for_each_feathered(&plan[run.lo..run.hi], fine_feather, |i, seg| {
+                        if i == Some(run.head - run.lo) {
+                            head_rev = verts.len();
+                        }
+                        // The spine's strip is inside the body's one ceiling.
+                        let cov = seg.cov * feather(seg.x);
                         let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
                         verts.push(RibbonVertex {
                             x: seg.x,
@@ -4815,13 +4987,13 @@ impl Ribbon {
                             lift: strip,
                             lift_span,
                         });
-                    }
+                    });
                 }
                 let start = out.len();
                 let shoulder = if rail_layer { 1.0 } else { shoulder };
                 let mut complete =
                     ribbon_beam(out, clip, &verts, shoulder, stride, budget, GlowBlend::Over);
-                let head = run.head - run.lo;
+                let head = verts.len().saturating_sub(1 + head_rev);
                 if !complete && head + 1 < verts.len() {
                     out.truncate(start);
                     verts.reverse();
@@ -4879,6 +5051,39 @@ impl Ribbon {
             .count();
     }
 
+    /// The feather `run` wears at its head end: a run the hand has left (the
+    /// caret jumped off it, or moved to another row) whose head boundary is
+    /// one of its ends thins to nothing over [`HEAD_FEATHER_CELLS`] there, so
+    /// its body, rail and hot edge never stand square-cut where the caret
+    /// was. The run under the caret keeps its head whole (the caret stands on
+    /// it), and so does a run whose head lies inside it or meets other light
+    /// in the cell past it (two runs sharing a boundary carry one light
+    /// across it), and every run under a falling curtain.
+    fn head_feather(&self, ctx: &Ctx<'_>, run: &Run) -> HeadFeather {
+        let head_x = self.plan.get(run.head).map_or(0.0, |seg| seg.x);
+        let past = if run.stream_dir < 0 {
+            run.head_col.checked_add(1)
+        } else {
+            run.head_col.checked_sub(1)
+        };
+        let meets = past.is_some_and(|col| self.index.at(run.row, col).is_some());
+        let at_end = (run.head == run.lo || run.head + 1 == run.hi) && !meets;
+        // A falling curtain spends the band by its own law (its cliff bound).
+        let at_end = at_end && self.curtain.is_none();
+        #[cfg(test)]
+        if self.head_square {
+            return HeadFeather { head_x, width: 0.0 };
+        }
+        let width = if !run.at_caret && at_end {
+            HEAD_FEATHER_CELLS * ctx.geom.cw as f32
+        } else {
+            0.0
+        };
+        HeadFeather { head_x, width }
+    }
+
+    /// Retry only a run that the quad budget actually cut, starting at its
+    /// head and walking both sides without a synthetic segment between them.
     fn repaint_capped_run_from_head(
         out: &mut Vec<GlowQuad>,
         clip: BeamClip,
@@ -4935,7 +5140,17 @@ impl Ribbon {
         let Some(run) = self.runs.first() else {
             return;
         };
-        if !run.wet {
+        // Still wet at the hand: the head cell itself, only while it is live
+        // light, and only while the hand is on it: a run the caret jumped off
+        // (a clear, a Return) sheds its hairline with the hand, or it stood
+        // detached a gap above the band's feathered end. The gain is priced
+        // from that cell's birth, not the run's newest-born cell (after a
+        // backspace, the erased one).
+        #[cfg(not(test))]
+        let left_lit = false;
+        #[cfg(test)]
+        let left_lit = self.hot_edge_left_lit;
+        if !run.wet || !(run.at_caret || left_lit) {
             return;
         }
         let Some(head_cell) = self
@@ -4972,6 +5187,7 @@ impl Ribbon {
         let reach = cells * cw;
         let seam_lvl = seam.map_or(0.0, |(_, l)| l);
         let intensity = clamp01(ctx.cfg.intensity);
+        let feather = self.head_feather(ctx, run);
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -4985,7 +5201,8 @@ impl Ribbon {
             let d = behind / cw;
             let a = HOT_EDGE_ALPHA * (1.0 - d / cells).max(0.0).powi(2);
             let a_rel = (a / HOT_EDGE_ALPHA).max(if in_seam { seam_lvl } else { 0.0 });
-            let cov = (HOT_EDGE_COV_MAX * a_rel * gain * intensity).clamp(0.0, HOT_EDGE_COV_MAX);
+            let cov = (HOT_EDGE_COV_MAX * a_rel * gain * intensity * feather.at(seg.x))
+                .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
                 x: seg.x,
                 y: seg.spine - seg.up,
@@ -6842,6 +7059,163 @@ mod tests {
         );
     }
 
+    /// A RUN THE HAND LEAVES IS FEATHERED AT ITS HEAD END: on the frame a
+    /// program's jump takes the caret off a typed run to another row, the
+    /// run's body, its rail and its hot edge thin to nothing at the end the
+    /// caret left, so neither the end nor the top edge beside it stands
+    /// square-cut, in every ribbon spelling on both grounds. Negative control:
+    /// the same frame with the feather off keeps that end at the body's
+    /// level and the hot edge at its peak there.
+    #[test]
+    fn a_run_the_hand_leaves_is_feathered_at_its_head_end() {
+        // The quad's level: its coverage, or an additive quad's brightest
+        // channel.
+        let level = |q: &GlowQuad| {
+            if q.alpha > 0 {
+                f32::from(q.alpha)
+            } else {
+                [16u32, 8, 0]
+                    .iter()
+                    .map(|&sh| ((q.color >> sh) & 0xff) as f32)
+                    .fold(0.0, f32::max)
+            }
+        };
+        let peak = |qs: &[GlowQuad], x0: f32, x1: f32| {
+            qs.iter()
+                .filter(|q| f32::from(q.x) < x1 && f32::from(q.x + q.w) > x0)
+                .map(level)
+                .fold(0.0f32, f32::max)
+        };
+        let cw = geom().cw as f32;
+        let head_x = 22.0 * cw;
+        for (name, c) in [
+            ("tall dark", cfg(true, true)),
+            ("underline dark", cfg(true, false)),
+            ("flat dark", flat(true, true)),
+            ("tall light", cfg(false, true)),
+        ] {
+            let jump = |square: bool| {
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                rib.head_square = square;
+                type_run(&mut rib, t0, 2, 20, &c, 0.9);
+                let now = at(t0, 19 * 60 + 16);
+                let cx = ctx(now, &c, (10, 2), 0.9);
+                rib.on_event(&pty((2, 22), (10, 2)), now, &cx);
+                rib.plan(&cx);
+                let mut sink = Sink::default();
+                {
+                    let mut f = sink.frame();
+                    rib.emit(&cx, &mut f);
+                }
+                let end = (head_x - 0.25 * cw, head_x);
+                (
+                    peak(&sink.under, end.0, end.1),
+                    peak(&sink.under, head_x - 4.0 * cw, head_x - 3.0 * cw),
+                    peak(&sink.out, end.0, end.1),
+                )
+            };
+            let (end, body, edge) = jump(false);
+            let (square_end, square_body, square_edge) = jump(true);
+            assert!(
+                body > 0.0 && square_body > 0.0,
+                "{name}: fixture: the band is on glass on the jump frame"
+            );
+            assert!(
+                end <= 0.4 * body,
+                "{name}: the end the caret left stands at {end} against the body's {body}"
+            );
+            assert!(
+                square_end >= 0.75 * square_body,
+                "{name}: control: square-cut, the end stands at {square_end} against {square_body}"
+            );
+            if square_edge > 0.0 {
+                assert!(
+                    edge <= 0.4 * square_edge,
+                    "{name}: the hot edge stands at {edge} at the end the caret left \
+                     (square-cut {square_edge})"
+                );
+            }
+        }
+    }
+
+    /// THE FEATHER THINS SMOOTHLY AND THE HAIRLINE GOES WITH THE HAND (round
+    /// 1: the end the caret jumped off thinned in steps a slab wide, 154,
+    /// 147, 117, 67, 18, 0 three pixels apart, and the hot edge's hairline
+    /// stood detached over it). Twenty keys on row 2, then a jump to row 10:
+    /// on the jump frame the band's light per pixel column across its
+    /// feathered end never steps by more than a fifth of the body's level,
+    /// and no hot edge lies over the run the hand left. Negative controls:
+    /// the feather laid at the stride ([`Ribbon::feather_coarse`]) steps by
+    /// more than that; the hairline kept on the left run
+    /// ([`Ribbon::hot_edge_left_lit`]) lights it.
+    #[test]
+    fn the_left_run_s_feather_is_smooth_and_sheds_the_hot_edge() {
+        let c = cfg(true, true);
+        let g = geom();
+        let cw = g.cw as f32;
+        let head_x = 22.0 * cw;
+        let jump = |coarse: bool, left_lit: bool| -> (f32, f32, usize) {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.feather_coarse = coarse;
+            rib.hot_edge_left_lit = left_lit;
+            type_run(&mut rib, t0, 2, 20, &c, 0.9);
+            let now = at(t0, 19 * 60 + 16);
+            let cx = ctx(now, &c, (10, 2), 0.9);
+            rib.on_event(&pty((2, 22), (10, 2)), now, &cx);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            // The body's coverage per pixel column on row 2 (source-over).
+            let mut col = vec![0.0f32; usize::from(g.win_w)];
+            for q in sink.under.iter().filter(|q| q.row == 2 && q.alpha > 0) {
+                for x in q.x..q.x + q.w {
+                    let a = f32::from(q.alpha.max(q.alpha2));
+                    col[usize::from(x)] = col[usize::from(x)].max(a);
+                }
+            }
+            let body = col[(head_x - 4.0 * cw) as usize];
+            let lo = (head_x - 1.5 * cw) as usize;
+            let hi = (head_x + 0.5 * cw) as usize;
+            let step = col[lo..hi]
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0, f32::max);
+            let edge = sink.out.iter().filter(|q| q.row <= 2).count();
+            (step, body, edge)
+        };
+        let (step, body, edge) = jump(false, false);
+        assert!(
+            body > 0.0,
+            "fixture: the band is on glass on the jump frame"
+        );
+        assert!(
+            step <= 0.2 * body,
+            "the feather steps by {step} in a column against the body's {body}"
+        );
+        assert_eq!(
+            edge, 0,
+            "{edge} hot-edge quads stand over the run the hand left"
+        );
+        let (coarse, coarse_body, _) = jump(true, false);
+        assert!(
+            coarse > 0.2 * coarse_body,
+            "control: laid at the stride the feather steps by only {coarse} against {coarse_body}"
+        );
+        let (_, _, kept) = jump(false, true);
+        assert!(
+            kept > 0,
+            "control: kept on the left run, the hairline lays nothing"
+        );
+    }
+
+    // -- R5: the wake ------------------------------------------------------
+
+    /// Cells on `row` as `(col, typing, life_s, born)`, column-sorted.
     fn row_cells(rib: &Ribbon, row: u16) -> Vec<(u16, bool, f32, Instant)> {
         let mut v: Vec<_> = rib
             .cells()

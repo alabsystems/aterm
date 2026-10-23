@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `edit` and `await edit` control verbs' lane handlers (amacs design
-//! §6.2-§6.4; slice N1).
-//!
-//! `@s-<sid> edit <file-uri> …` asks the window hosting `<sid>` for a fresh
-//! Editor view of the file beside `<sid>`'s tab; `await edit ticket=<t>` waits
-//! until that view is gone. Both run on a wait lane and post their request as
-//! a counted main-thread hop ([`MainPost::ask`]), so one the main thread has
-//! not taken is seen by the next verb's stall refusal. They park on its
-//! one-shot channel, which the main thread answers (`App::begin_edit`,
-//! `App::await_edit` in `app_edit`), in [`crate::control::hangup_park`] slices
-//! so a killed client frees the lane within [`crate::control::HANGUP_POLL`], as
-//! `askpass` does (`control_askpass`). Every exit of `await edit` withdraws its
-//! waiter, and an `edit` that stops waiting cancels its ticket, so a late
-//! admission is dropped rather than opening a view nobody asked for any more.
-//!
-//! The lane also resolves the file's realpath spelling (`/tmp` is
-//! `/private/tmp` on macOS), as an admission's grant names it: that reads the
-//! file system, which may wait on a network volume, so it happens here and not
-//! on the main thread.
-//!
-//! The lane logic is written against an injected [`MainPost`] and `hung_up`
-//! closure: no event-loop proxy can be built in a unit test.
+//! Lane handlers for the `edit` and `await edit` control verbs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -37,54 +16,43 @@ use crate::control::control_media::MainPost;
 
 pub(crate) mod hold;
 
-/// How long `edit` waits for its view to be installed: the main-thread RPC
-/// deadline (`control_media::call_main`), after which the ticket is cancelled.
+/// Maximum wait for an `edit` view to be installed before cancelling its ticket.
 pub(crate) const EDIT_ADMISSION_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One `await edit`'s name on the main thread, so its withdraw finds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WaiterId(pub(crate) u64);
 
-/// An `edit` request, posted to the main thread with the channel its one
-/// reply line goes back on.
+/// An `edit` request posted to the main thread with its reply channel.
 #[derive(Debug)]
 pub(crate) struct EditCall {
     pub(crate) ticket: Ticket,
     /// The session the view opens beside (`@<sid>`, resolved).
     pub(crate) session: u64,
     pub(crate) request: EditRequest,
-    /// The request's file in its realpath spelling, when it resolves
-    /// ([`real_file_uri`]).
+    /// The request's file in its realpath spelling, when it resolves.
     pub(crate) real_uri: Option<String>,
     pub(crate) reply: Sender<String>,
 }
 
-/// An `await edit`, posted to the main thread with the channel its outcome
-/// line goes back on.
+/// An `await edit` request posted to the main thread with its outcome channel.
 #[derive(Debug)]
 pub(crate) struct AwaitCall {
     pub(crate) waiter: WaiterId,
     pub(crate) key: AwaitKey,
-    /// A `uri=` key's file in its realpath spelling, when it resolves
-    /// ([`real_file_uri`]).
+    /// A `uri=` key's file in its realpath spelling, when it resolves.
     pub(crate) real_uri: Option<String>,
     pub(crate) reply: Sender<String>,
 }
 
-/// The realpath spelling of `uri`'s file (`file:///tmp/x` is
-/// `file:///private/tmp/x` on macOS), as the document store keys it; `None`
-/// when `uri` names no local file that resolves. Reads the file system: call it
-/// on a lane, never on the main thread.
+/// Resolves the canonical `file://` URI for `uri` on the filesystem.
 pub(crate) fn real_file_uri(uri: &str) -> Option<String> {
     let path = amacs::protocol::uri::file_uri_to_path(uri).ok()?;
     let real = std::fs::canonicalize(path).ok()?;
     amacs::protocol::uri::path_to_file_uri(&real).ok()
 }
 
-/// The next edit ticket. The high half is this process's id, so a ticket a
-/// client kept across a seamless update never names one its successor minted
-/// (the successor answers it `ERR unknown ticket`; the client re-arms by
-/// `uri=`).
+/// Mints the next edit ticket scoped to this process ID.
 pub(crate) fn mint_ticket() -> Ticket {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let low = NEXT.fetch_add(1, Ordering::Relaxed) & 0xffff_ffff;
@@ -96,9 +64,7 @@ fn mint_waiter() -> WaiterId {
     WaiterId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// `@<sid> edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`.
-/// `session` is the resolved `@<sid>`; `None` on the bare App lane, which has
-/// no tab to open beside.
+/// Handles `@<sid> edit <file-uri> [line=<L>[:<C>]] [create=1] [for=<word>] [wait=0]`.
 pub(crate) fn cmd_edit(
     proxy: &EventLoopProxy<Wake>,
     scope: Scope,
@@ -119,8 +85,7 @@ pub(crate) fn cmd_edit(
     )
 }
 
-/// [`cmd_edit`]'s lane logic, past the main-thread refusal [`cmd_edit`] asks
-/// first. `post` reaches the main thread; `park` bounds one wait slice.
+/// Runs [`cmd_edit`]'s lane logic past the initial main-thread stall check.
 pub(crate) fn serve_edit(
     scope: Scope,
     session: Option<u64>,
@@ -130,8 +95,6 @@ pub(crate) fn serve_edit(
     deadline: Duration,
     park: fn(Duration) -> Duration,
 ) -> String {
-    // Owner exactly: every in-session client holds the Owner token, and the
-    // client falls back to editing in its own terminal on any other answer.
     if scope != Scope::Owner {
         return "ERR scope\n".to_string();
     }
@@ -149,13 +112,8 @@ pub(crate) fn serve_edit(
         return format!("ERR refused bad-uri ({error})\n");
     }
     let ticket = mint_ticket();
-    // `wait=0`: nobody will wait on the ticket, so its view opens holding
-    // nothing. The mark stands until this lane has its answer, which the main
-    // thread sends after the view has opened.
     let _unwaited = (!request.wait).then(|| hold::Unwaited::mark(ticket));
     let real_uri = real_file_uri(&request.uri);
-    // Counted from the post until the main thread takes the request or this
-    // lane returns, whichever is first.
     let (answer, _hop) = match post.ask(|reply| {
         Wake::EditRequest(Box::new(EditCall {
             ticket,
@@ -184,11 +142,7 @@ pub(crate) fn serve_edit(
     }
 }
 
-/// `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]` (`rest` starts at
-/// `edit`). No main-thread refusal: its client ends the wait on any `ERR` but
-/// the few that say the server is going or busy (`aterm-ctl`'s
-/// `edit::await_reply`), and a standing dialog or a stall leaves the view it
-/// waits on open.
+/// Handles `await edit ticket=<t>|uri=<file-uri> [timeout=<ms>]`.
 pub(crate) fn await_edit(proxy: &EventLoopProxy<Wake>, scope: Scope, rest: &str) -> String {
     serve_await_edit(
         scope,
@@ -199,7 +153,7 @@ pub(crate) fn await_edit(proxy: &EventLoopProxy<Wake>, scope: Scope, rest: &str)
     )
 }
 
-/// [`await_edit`]'s lane logic; see [`serve_edit`] for the closures.
+/// Runs [`await_edit`]'s lane logic.
 pub(crate) fn serve_await_edit(
     scope: Scope,
     rest: &str,
@@ -207,9 +161,6 @@ pub(crate) fn serve_await_edit(
     hung_up: &mut dyn FnMut() -> bool,
     park: fn(Duration) -> Duration,
 ) -> String {
-    // Owner exactly, as for `edit`: a waiter reads any ticket's outcome and
-    // adopts it (its hold stands again), which is the asking program's power,
-    // not an observer's.
     if scope != Scope::Owner {
         return "ERR scope\n".to_string();
     }
@@ -237,8 +188,6 @@ pub(crate) fn serve_await_edit(
         Err(error) => return format!("ERR {error}\n"),
     };
     let waited = park_for_answer(&answer, Instant::now() + timeout, hung_up, park);
-    // Every exit withdraws: an answered waiter is already gone, and a timed-out
-    // or hung-up one starts its ticket's orphan clock.
     post.tell(Wake::EditAwaitWithdraw { waiter });
     match waited {
         Waited::Answer(line) => line,
@@ -371,7 +320,6 @@ mod tests {
         let mut cancelled = None;
         let mut post = |wake: Wake| {
             match wake {
-                // Keep the channel open and never answer.
                 Wake::EditRequest(call) => held = Some(*call),
                 Wake::EditCancel { ticket } => cancelled = Some(ticket),
                 other => panic!("unexpected {other:?}"),
@@ -413,7 +361,6 @@ mod tests {
         assert!(MainPost::injected(|_| true, hops).tell(raw));
         assert_eq!(hops.since_ns(), None, "a raw post is not counted");
 
-        // Never taken: counted for the whole wait, out once the lane returns.
         let mut posted = Vec::new();
         let mut counted = Vec::new();
         let line = serve_edit(
@@ -476,8 +423,6 @@ mod tests {
             other => panic!("the wait counted, its withdrawal not: {other:?}"),
         }
 
-        // Taken at once, as `user_event` takes every wake: out of the count
-        // while the lane still parks for the answer.
         let mut taken = Vec::new();
         let mut counted = Vec::new();
         let line = serve_await_edit(
@@ -542,7 +487,6 @@ mod tests {
 
     #[test]
     fn await_edit_withdraws_on_every_exit() {
-        // Answered.
         let mut withdrawn = Vec::new();
         let mut post = |wake: Wake| {
             match wake {
@@ -565,7 +509,6 @@ mod tests {
             short,
         );
         assert_eq!(line, "OK edit done result=closed saved=1 seq=2\n");
-        // Timed out (the channel stays open, unanswered).
         let mut parked = Vec::new();
         let mut post_timeout = |wake: Wake| {
             match wake {
@@ -583,7 +526,6 @@ mod tests {
             short,
         );
         assert_eq!(line, "OK timeout\n");
-        // Hung up.
         let mut post_hung = |wake: Wake| {
             match wake {
                 Wake::EditAwait(call) => parked.push(*call),
@@ -606,7 +548,6 @@ mod tests {
             withdrawn[1..].to_vec(),
             "each waiter withdraws itself"
         );
-        // A malformed wait, or one from a scope short of Owner, posts nothing.
         let mut nothing = |wake: Wake| panic!("posted {wake:?}");
         assert!(
             serve_await_edit(
@@ -633,7 +574,6 @@ mod tests {
 
     /// The lane hands the main thread both spellings of a file it can resolve:
     /// a symlinked directory's and the realpath the store keys documents by.
-    /// Unix: a directory symlink on Windows needs a privilege a test lacks.
     #[cfg(unix)]
     #[test]
     fn edit_lanes_resolve_the_realpath_spelling() {

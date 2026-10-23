@@ -8435,6 +8435,9 @@ pub enum HostTurn {
     Notice,
     CarryOn,
     Check,
+    /// The occupancy door's line at a break ([`TurnEndState::fact_typed`]): its answer is never a done
+    /// report, never a short turn, and moves no streak.
+    Fact,
 }
 
 /// Why the session's host restarts the agent in its tab ([`TurnEndAction::Restart`]).
@@ -9523,6 +9526,88 @@ pub(crate) fn met_under_another(met: Option<Program>, here: Program) -> bool {
     met.is_some_and(|met| met != here && decided(met) && decided(here))
 }
 
+/// THE SEAT A SCREEN NAMES: the model and the login a screen-alone agent
+/// draws ([`screen_alone`]; X2 of the walls-3 stage) — agy's footer model and
+/// its launch card's login row (`Gemini API key`, or the signed-in account),
+/// Gemini CLI's footer `/model` value and its banner's login
+/// (`Authenticated with gemini-api-key`). A limit met under one seat binds
+/// another no longer ([`TurnEndState::observe`]: the account's limit is that
+/// account's, a model's limit that model's). Muse Code's limit is its
+/// account's and its screen names no account; Claude Code's are read from
+/// its conversation. `None` where the screen does not draw it (the launch
+/// card and the banner scroll off; the footer may be hidden).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Seat {
+    pub model: Option<String>,
+    pub login: Option<String>,
+}
+
+impl Seat {
+    /// The seat `program`'s screen `rows` name.
+    #[must_use]
+    pub fn of(program: Program, rows: &[String]) -> Self {
+        match program {
+            Program::Agy => Self {
+                model: aterm_phase::agy::launch_card(rows).map(|c| c.model),
+                login: aterm_phase::agy::launch_card_login(rows).map(str::to_owned),
+            },
+            Program::Gemini => Self {
+                model: aterm_phase::gemini::footer_model(rows),
+                login: aterm_phase::gemini::banner_login(rows),
+            },
+            Program::Claude | Program::Codex | Program::Muse | Program::Generic => Self::default(),
+        }
+    }
+
+    /// The fields `later` names, each over this one's.
+    fn update(&mut self, later: &Self) {
+        if later.model.is_some() {
+            self.model.clone_from(&later.model);
+        }
+        if later.login.is_some() {
+            self.login.clone_from(&later.login);
+        }
+    }
+
+    /// This seat with the fields `later` names over it.
+    fn merged(&self, later: &Self) -> Self {
+        let mut seat = self.clone();
+        seat.update(later);
+        seat
+    }
+
+    /// WHETHER `now` IS THIS SEAT'S ACCOUNT BY THE SCREEN'S OWN WORD: both
+    /// name the login, alike, and it names an account — an address
+    /// (`user@example.com (Google AI Pro)`, `Signed in with Google:
+    /// user@example.com`) — never a key's label (`Gemini API key`,
+    /// `Authenticated with gemini-api-key`), which every key draws alike: a
+    /// relaunch under another key draws the same words (F1 of the review of
+    /// walls-3).
+    fn same_account(&self, now: &Self) -> bool {
+        matches!((&self.login, &now.login), (Some(a), Some(b)) if a == b && a.contains('@'))
+    }
+
+    /// Whether `now` names another login than this seat, or — where the
+    /// limit is a model's (`per_model`) — another model: both named, and
+    /// different.
+    fn moved(&self, now: &Self, per_model: bool) -> bool {
+        let differs =
+            |a: &Option<String>, b: &Option<String>| matches!((a, b), (Some(a), Some(b)) if a != b);
+        differs(&self.login, &now.login) || (per_model && differs(&self.model, &now.model))
+    }
+}
+
+/// WHETHER A LIMIT ON `program`'s SCREEN IS A MODEL'S: Gemini CLI's (`Usage
+/// limit reached for <model>.`, its quota per model) and agy's (`You have
+/// exhausted your quota on this model.`, its 429's `QuotaFailure` per
+/// model). Muse Code's is its account's.
+fn limit_per_model(program: Program) -> bool {
+    match program {
+        Program::Gemini | Program::Agy => true,
+        Program::Claude | Program::Codex | Program::Muse | Program::Generic => false,
+    }
+}
+
 /// What one screen says, as the turn-end policy reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEndReading {
@@ -9570,6 +9655,9 @@ pub struct TurnEndReading {
     pub reach: Reach,
     pub person: Option<Duration>,
     pub program: Program,
+    /// The model and the login the screen names, where it is all the
+    /// evidence ([`Seat::of`]): what a limit met under one of them binds.
+    pub seat: Seat,
     pub account: Option<AccountAdvice>,
     pub autopilot: Autopilot,
     pub login_label: Option<String>,
@@ -9870,6 +9958,7 @@ impl TurnEndReading {
             wall_remembered: false,
             reach: Reach::Unknown,
             program: reading.program,
+            seat: Seat::of(reading.program, rows),
             account: None,
             autopilot: Autopilot::Cruise,
             login_label: None,
@@ -10071,6 +10160,38 @@ struct WallTrack {
     login: LoginBooks,
     conversation: Conversation,
     program: Option<Program>,
+    /// THE AGENT RELAUNCHED UNDER THE LIMIT ([`TurnEndState::relaunch_startup`]).
+    relaunch: RelaunchBooks,
+    /// The seat the limit was met under ([`Seat`]: the model and login its
+    /// screen named where the wall was read).
+    seat: Seat,
+    /// A later screen named another seat ([`Seat::moved`]), or the agent
+    /// was relaunched on a seat nothing vouches for
+    /// ([`TurnEndState::relaunch_startup`]): the limit binds the session no
+    /// longer — its reset dropped, the point going at once — and it holds no
+    /// host's step ([`TurnEndState::limit_holds_host`]). Only until the wall
+    /// is met again: that wall is the new seat's own, its seat taken and
+    /// this cleared (C1 of the review of walls-3), so it holds the host's
+    /// steps again and a further move is a move from it.
+    seat_moved: bool,
+}
+
+/// WHAT A LIMIT'S TRACK KEEPS OF ITS AGENT'S RELAUNCH ([`WallTrack::relaunch`],
+/// [`TurnEndState::relaunch_startup`]): a limit met under an agent whose
+/// screen is all its evidence ([`screen_alone`]: Muse Code, agy, Gemini CLI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RelaunchBooks {
+    /// The last point of the limit's own program read while the track
+    /// stood; `None`: none since the track opened ([`WallTrack::since`]).
+    read: Option<Instant>,
+    /// A point of no agent's was read since (a shell's prompt: the agent
+    /// left the tab, crashed or upgraded), as no host's start says.
+    away: bool,
+    /// THE RELAUNCH'S START-UP STANDS: the agent's process came back since
+    /// the limit was last read and no turn has run since — the limit is the
+    /// account's still, whatever the new process drew (a fresh banner with no
+    /// task included: [`TurnEndReading::taskless`] ends no such track).
+    startup: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -10243,6 +10364,13 @@ pub const PERSON_TURN_SLACK: Duration = Duration::from_secs(30);
 /// The longest answer that is still a person's own exchange ([`TurnEndState::left_to_person`]).
 pub const EXCHANGE_WORK: Duration = Duration::from_secs(10 * 60);
 
+/// A line the occupancy door typed at a break ([`TurnEndState::fact_typed`]): whether a read has
+/// seen the agent take it ([`TurnEndState::took`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FactAwaited {
+    taken: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Awaited {
     rule: &'static str,
@@ -10383,6 +10511,8 @@ pub struct TurnEndState {
     acts: VecDeque<Instant>,
     wall_acts: VecDeque<(Instant, &'static str)>,
     awaiting: Option<Awaited>,
+    /// The occupancy door's line at a break ([`Self::fact_typed`]), beside the act awaited.
+    fact: Option<FactAwaited>,
     followed: Option<&'static str>,
     point_worked: Duration,
     short: u32,
@@ -10410,6 +10540,16 @@ pub struct TurnEndState {
     account_resumed: Option<i64>,
     limit_try: Option<LimitTry>,
     limit_ended: bool,
+    /// That end was ANOTHER PROGRAM'S SCREEN read ([`met_under_another`],
+    /// [`Self::limit_ended_elsewhere`]).
+    limit_ended_elsewhere: bool,
+    /// THE SEAT THE TAB'S SCREEN-ALONE AGENT LAST NAMED ([`Seat`], each field
+    /// kept from the last read that drew it; [`Self::seat_seen`]): the login
+    /// its launch card or banner drew at the session's start, which scroll
+    /// off long before a limit is met, is the one a limit met later binds.
+    /// Replaced at another agent's screen, and at a relaunch by what the new
+    /// process draws ([`Self::relaunch_startup`]).
+    seat_seen: Option<(Program, Seat)>,
     reset_resume: Option<ResetResume>,
     account_unmade: Option<Unmade>,
     account_unmade_seed: Option<Unmade>,
@@ -10517,6 +10657,7 @@ impl TurnEndState {
             acts: VecDeque::new(),
             wall_acts: VecDeque::new(),
             awaiting: None,
+            fact: None,
             followed: None,
             point_worked: Duration::ZERO,
             short: 0,
@@ -10544,6 +10685,8 @@ impl TurnEndState {
             account_resumed: None,
             limit_try: None,
             limit_ended: false,
+            limit_ended_elsewhere: false,
+            seat_seen: None,
             reset_resume: None,
             account_unmade: None,
             account_unmade_seed: None,
@@ -10737,6 +10880,9 @@ impl TurnEndState {
             return;
         }
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class: if limit.bucket {
                 WallClass::Model
             } else {
@@ -10783,6 +10929,9 @@ impl TurnEndState {
             return;
         }
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class: WallClass::Retry,
             since: now.checked_sub(ago).unwrap_or(now),
             attempts,
@@ -10827,6 +10976,9 @@ impl TurnEndState {
         let typed_at = self.login_seed.take();
         let cancelled = interrupted || at_wall.left_before;
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class: WallClass::Auth,
             since: now,
             attempts: usize::from(typed_at.is_some()),
@@ -10884,6 +11036,9 @@ impl TurnEndState {
             _ => (since, 0, named, None),
         };
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class,
             since,
             attempts,
@@ -10910,6 +11065,9 @@ impl TurnEndState {
             return;
         }
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class,
             since,
             attempts: 0,
@@ -11226,6 +11384,9 @@ impl TurnEndState {
         let read = later(u.at, answered);
         let program = self.wall.as_ref().and_then(|t| t.program);
         self.wall = Some(WallTrack {
+            relaunch: RelaunchBooks::default(),
+            seat: Seat::default(),
+            seat_moved: false,
             class,
             since: later(read, self.timing.take_within),
             attempts: u.limit.attempts.max(1),
@@ -11281,6 +11442,74 @@ impl TurnEndState {
 
     pub(crate) fn has_limit_track(&self) -> bool {
         self.wall.as_ref().is_some_and(|t| named_class(t.class))
+    }
+
+    /// THE SEAT `program`'s SCREEN NAMES NOW ([`WallTrack::seat`]): the
+    /// fields `here` (this screen's [`Seat::of`]) names, over those the tab's
+    /// earlier screens of the same agent named ([`TurnEndState::seat_seen`]:
+    /// the launch card's or banner's login, read at the session's start and
+    /// scrolled off since).
+    #[must_use]
+    pub(crate) fn seat_now(&self, program: Program, here: &Seat) -> Seat {
+        match &self.seat_seen {
+            Some((seen_by, seen)) if *seen_by == program => seen.merged(here),
+            _ => here.clone(),
+        }
+    }
+
+    /// WHETHER THE SCREEN `here` OF `program`'s RELAUNCHED PROCESS NAMES THE
+    /// ACCOUNT THE TAB'S EARLIER SCREENS NAMED ([`Seat::same_account`]): the
+    /// seat vouched for across a relaunch nobody here made.
+    #[must_use]
+    pub(crate) fn seat_vouched(&self, program: Program, here: &Seat) -> bool {
+        self.seat_seen
+            .as_ref()
+            .is_some_and(|(seen_by, seen)| *seen_by == program && seen.same_account(here))
+    }
+
+    /// The seat `reading`'s screen names, kept ([`TurnEndState::seat_seen`]):
+    /// a screen-alone agent's fields over what the tab's earlier screens of
+    /// it named; another agent's screen replaces it (its seat is none of
+    /// this one's); a screen no reader names (a shell, a frame before the
+    /// agent draws) keeps it.
+    fn note_seat(&mut self, reading: &TurnEndReading) {
+        let program = reading.program;
+        if program == Program::Generic {
+            return;
+        }
+        if !screen_alone(program) {
+            self.seat_seen = None;
+            return;
+        }
+        match &mut self.seat_seen {
+            Some((seen_by, seen)) if *seen_by == program => seen.update(&reading.seat),
+            _ => self.seat_seen = Some((program, reading.seat.clone())),
+        }
+    }
+
+    /// WHETHER A LIMIT THIS POLICY WAITS ON HOLDS THE HOST'S STEPS at `now`
+    /// (`Session::host_steps_here`, `host_steps_in_background`: a relaunch's
+    /// carry-on, an upgrade's notice): a usage limit, spend limit or model
+    /// bucket ([`named_class`]) met under an agent whose screen is all its
+    /// evidence ([`screen_alone`]), its track standing — through the
+    /// agent's relaunch ([`Self::relaunch_startup`]), where the loop's own
+    /// limit episode closed on the relaunched screen — until `grace` past the
+    /// reset it named, and for good where it names none (a reset is never
+    /// guessed: the policy's own tries, or a person's turn, end it). Past
+    /// that the host steps as at any idle point. Measured before (the
+    /// walls-3 probe of 2026-10-21): Muse Code relaunched under its limit had
+    /// no episode open at its first idle point, and the host's carry-on was
+    /// offered it. Claude Code's are the episode's and its transcript's
+    /// (`Session::standing_holds`).
+    #[must_use]
+    pub fn limit_holds_host(&self, now: Instant, grace: Duration) -> bool {
+        let Some(t) = self.wall.as_ref().filter(|t| named_class(t.class)) else {
+            return false;
+        };
+        if !t.program.is_some_and(screen_alone) || t.seat_moved {
+            return false;
+        }
+        t.named.is_none_or(|n| now < later(n.at, grace))
     }
 
     /// Whether a usage limit or a model bucket whose notice named its reset is waited on ([`named_class`]).
@@ -11843,12 +12072,38 @@ impl TurnEndState {
         self.awaiting
             .is_some_and(|a| a.rule != RULE_HOST_TURN && !a.taken)
             || self.after.is_some()
+            || self.fact_untaken()
     }
 
     /// A TURN THE HARNESS TYPED THAT THE AGENT HAS NOT TAKEN YET.
     #[must_use]
     pub fn typed_untaken(&self) -> bool {
-        self.awaiting.is_some_and(|a| !a.taken)
+        self.awaiting.is_some_and(|a| !a.taken) || self.fact_untaken()
+    }
+
+    /// THE OCCUPANCY DOOR TYPED ITS LINE AT A BREAK ([`HostTurn::Fact`], the red-team's
+    /// F12): kept in a record of its own, so an act awaited before it keeps its own (a taken
+    /// continuation's point judges that act's answer), and untaken until a read sees the agent
+    /// take it ([`Self::took`]), which holds the next break ([`Self::act_untaken`]) and reads
+    /// that turn as the harness's ([`Self::typed_untaken`]). The land, check, compact, open,
+    /// repo and account state that [`Self::host_typed`] resets are the task's, and stand.
+    pub fn fact_typed(&mut self) {
+        self.keyed_by_harness();
+        self.fact = Some(FactAwaited { taken: false });
+    }
+
+    /// The occupancy door's line stands untaken ([`Self::fact_typed`]).
+    #[must_use]
+    pub fn fact_untaken(&self) -> bool {
+        self.fact.is_some_and(|f| !f.taken)
+    }
+
+    /// A BREAK OF THE AGENT'S OWN BACKGROUND WORK READ AFTER THE DOOR'S LINE WAS TAKEN: its
+    /// answer ended there (`OccupancyDoor`'s `Break`), so the point after it is the agent's own.
+    pub fn fact_answered(&mut self) {
+        if self.fact.is_some_and(|f| f.taken) {
+            self.fact = None;
+        }
     }
 
     fn compact_owed_text(&self, rule: &str, rules: Option<&str>) -> Option<String> {
@@ -11940,6 +12195,7 @@ impl TurnEndState {
             && self.after.is_none()
             && !self.other_turn
             && !self.quiet_wake
+            && self.fact.is_none()
     }
 
     /// [`Self::took`] for A LANDED TASK'S OWN WAKE.
@@ -11963,7 +12219,12 @@ impl TurnEndState {
 
     /// A read saw the agent's live turn (its spinner or busy footer, never a break of its own background work).
     pub fn took(&mut self) {
-        if self.awaiting.is_none() && self.after.is_none() && !self.quiet_wake {
+        // The door's line's answer is the harness's turn, no one else's.
+        if self.awaiting.is_none()
+            && self.after.is_none()
+            && !self.quiet_wake
+            && self.fact.is_none()
+        {
             self.other_turn = true;
             self.land.legs = None;
         }
@@ -11983,6 +12244,9 @@ impl TurnEndState {
         if let Some(a) = &mut self.awaiting {
             a.taken = true;
             a.met = false;
+        }
+        if let Some(f) = &mut self.fact {
+            f.taken = true;
         }
         if std::mem::take(&mut self.seed_answered) {
             self.checking = false;
@@ -12125,6 +12389,18 @@ impl TurnEndState {
     #[must_use]
     pub fn limit_ended(&self) -> bool {
         self.limit_ended
+    }
+
+    /// The limit's track ended at the last fold ([`Self::limit_ended`])
+    /// because ANOTHER PROGRAM'S SCREEN was read: a limit met under one
+    /// agent the loop decides on, ended where another such agent runs in
+    /// the tab now ([`met_under_another`]), not by the worker's work or
+    /// another wall. The loop's end row says so
+    /// ([`crate::supervise::approvals::LIMIT_ENDED_ELSEWHERE`]) — the work-or-wall
+    /// words it shared before named neither.
+    #[must_use]
+    pub fn limit_ended_elsewhere(&self) -> bool {
+        self.limit_ended && self.limit_ended_elsewhere
     }
 
     /// The acts made at the wall being worked, if it is of `kind`'s class ([`exception_for`]'s and the conformance walks' projection).
@@ -12671,6 +12947,9 @@ impl TurnEndState {
         let arrived = self.points > 0 || reading.worked.is_some();
         let ran_turn = self.ran_turn_reading(reading, now);
         let reading = ran_turn.as_ref().unwrap_or(reading);
+        // The seat this screen names, kept for a limit met later
+        // ([`Self::note_seat`]).
+        self.note_seat(reading);
         if reading.phase != Phase::Busy {
             if super::login::carried(reading.program) {
                 self.take_up_login(
@@ -12688,6 +12967,7 @@ impl TurnEndState {
             self.login_confirmed = false;
         }
         self.limit_ended = false;
+        self.limit_ended_elsewhere = false;
         self.point_moved = false;
         self.left_judged = false;
         if !reading.wall_remembered
@@ -12698,6 +12978,7 @@ impl TurnEndState {
             self.wall = None;
             self.fallback_unmade = false;
             self.limit_ended = true;
+            self.limit_ended_elsewhere = true;
         }
         self.looked = Some((
             now,
@@ -12721,10 +13002,9 @@ impl TurnEndState {
         self.fold_credits(reading, now);
         if reading.taskless
             && reading.wall.is_none()
-            && self
-                .wall
-                .as_ref()
-                .is_some_and(|t| matches!(t.class, WallClass::Usage | WallClass::Model))
+            && self.wall.as_ref().is_some_and(|t| {
+                matches!(t.class, WallClass::Usage | WallClass::Model) && !t.relaunch.startup
+            })
         {
             self.wall = None;
             self.fallback_unmade = false;
@@ -12861,7 +13141,13 @@ impl TurnEndState {
         let landing_act = self.landing_act.take();
         self.seed_answered = false;
         let met = self.awaiting.is_some_and(|a| a.met);
-        let host = self.awaiting.and_then(|a| a.host);
+        // The door's line, where no act was awaited before it: its answer is judged as the line's
+        // ([`HostTurn::Fact`]); with one, as that act's (the red-team's F12).
+        let fact = self.fact.take();
+        let host = self
+            .awaiting
+            .and_then(|a| a.host)
+            .or(fact.map(|_| HostTurn::Fact));
         let unseen_after_off =
             self.awaiting.is_some_and(|a| a.off_stood) && reading.worked.is_none();
         let wall_retry = self.awaiting.is_some_and(|a| a.wall_retry);
@@ -12979,6 +13265,13 @@ impl TurnEndState {
         let mut wake_kept = false;
         let mut land_judged = false;
         match (awaited, reading.worked) {
+            // THE OCCUPANCY DOOR'S LINE'S ANSWER: never a done report, never a short turn, and no
+            // streak moved; the land, check and carry state stand. The point is a new one, so
+            // the policy judges the agent at it as at any point.
+            (Some(RULE_HOST_TURN) | None, worked) if host == Some(HostTurn::Fact) => {
+                self.point_worked = worked.unwrap_or_default();
+                self.new_point(now);
+            }
             (Some(RULE_HOST_TURN), worked) if host == Some(HostTurn::Check) => {
                 let d = worked.unwrap_or_default();
                 if d >= min {
@@ -13295,6 +13588,34 @@ impl TurnEndState {
                     },
                     now,
                 );
+                // THE SEAT THE LIMIT WAS MET UNDER ([`Seat`]): what its
+                // screen names where it was first read, or met again at a
+                // turn's end — over what the tab's earlier screens of the
+                // agent named ([`Self::seat_now`]: the launch card's login,
+                // scrolled off by now; F1 of the review of walls-3, where a
+                // limit met past the first screen bound no login and no
+                // relaunch under another account moved it). Not a remembered
+                // wall's: the memory supplies the notice, and this screen's
+                // seat is the session's now. AND THE WALL MET AGAIN AFTER A
+                // SEAT MOVE ([`WallTrack::seat_moved`], no work read before
+                // it: a fast 429 on the new model or login) is the NEW SEAT'S
+                // OWN: its seat taken, the move done with — so it holds the
+                // host's steps again ([`Self::limit_holds_host`]) and a
+                // further move is told (C1 of the review: the move stuck, a
+                // relaunch then had the host's carry-on typed into the new
+                // seat's standing wall, and a third seat was held to it).
+                let seat_now = self.seat_now(reading.program, &reading.seat);
+                if !reading.wall_remembered
+                    && let Some(t) = self.wall.as_mut().filter(|t| {
+                        named_class(t.class)
+                            && t.program == Some(reading.program)
+                            && screen_alone(reading.program)
+                    })
+                    && (t.seat == Seat::default() || reading.worked.is_some() || t.seat_moved)
+                {
+                    t.seat.update(&seat_now);
+                    t.seat_moved = false;
+                }
             }
             None => {
                 let login_back = reading.login_back
@@ -13359,6 +13680,35 @@ impl TurnEndState {
                 }) {
                     // once ([`decide_turn_end`]).
                     t.named = None;
+                } else if let Some((t, seat_now)) = {
+                    let seat_now = self.seat_now(reading.program, &reading.seat);
+                    self.wall
+                        .as_mut()
+                        .filter(|t| {
+                            named_class(t.class)
+                                && !t.seat_moved
+                                && t.program == Some(reading.program)
+                                && screen_alone(reading.program)
+                                && t.seat.moved(&seat_now, limit_per_model(reading.program))
+                        })
+                        .map(|t| (t, seat_now))
+                } {
+                    // ANOTHER SEAT THAN THE LIMIT'S (X2 of the walls-3
+                    // stage): a screen-alone agent's screen names another
+                    // login than the one the limit was met under (agy's
+                    // launch card, Gemini CLI's banner: a relaunch on
+                    // another account or key), or another model where the
+                    // limit is a model's (their footers: a person's
+                    // `/model`). The limit is that account's, or that
+                    // model's: its reset binds the session no longer, and
+                    // the point goes at once — the turn resumed under the
+                    // new seat, which the track takes (a limit that holds it
+                    // too is met again: the new seat's own wall, above).
+                    // Measured before (the walls-3 probe): the old account's
+                    // reset held the new one.
+                    t.named = None;
+                    t.seat_moved = true;
+                    t.seat.update(&seat_now);
                 } else if (dropped
                     || reading.auto_continue == Some(aterm_phase::AutoContinue::Unkept))
                     && let Some(n) = self.wall.as_mut().and_then(|t| t.named.as_mut())
@@ -13665,6 +14015,9 @@ impl TurnEndState {
             _ => {
                 self.limit_ended |= self.wall.as_ref().is_some_and(|t| named_class(t.class));
                 self.wall = Some(WallTrack {
+                    relaunch: RelaunchBooks::default(),
+                    seat: Seat::default(),
+                    seat_moved: false,
                     class,
                     since: now,
                     attempts: 0,
@@ -13952,6 +14305,95 @@ impl TurnEndState {
         }
         self.drop_gone_countdown();
         self.drop_gone_launch_latch();
+    }
+
+    /// THE RELAUNCH'S START-UP UNDER A LIMIT (X2 of the walls-3 stage): a
+    /// usage limit, spend limit or model bucket ([`named_class`]) met under
+    /// an agent whose screen is all its evidence ([`screen_alone`]: Muse
+    /// Code, agy, Gemini CLI), whose process came back since the limit was
+    /// last read — the host names a start later than that read
+    /// ([`Self::agent_started`]), or, with no host's word, a point of no
+    /// agent's (a shell's prompt: it crashed, exited or upgraded) was read
+    /// in between. The FIRST point of the relaunched agent is its start-up:
+    /// what it drew (its conversation replayed, read busy; a resumed-after-
+    /// crash card) is no turn anyone asked and lifts no limit, so it is
+    /// folded and decided as no work (`reading.worked` taken), and the limit
+    /// is decided by the reset it named ([`still_shown`]) — never by the
+    /// continue policy's back-off into the standing limit. Until a turn runs
+    /// the start-up stands ([`RelaunchBooks::startup`]): a fresh banner with
+    /// no task does not end the limit ([`Self::observe`]'s `/clear` rule) —
+    /// the account's limit holds the next process as it held the last. A
+    /// turn that runs past it ends the limit as any work does. Measured
+    /// before (the walls-3 probe of 2026-10-21): Muse Code's resume after a
+    /// crash, read with four seconds of start-up work, dropped the limit and
+    /// typed `continue@v1` (Cruise) or `land@v1` (Land) into it at the two-
+    /// minute back-off; agy relaunched on a fresh banner dropped it as a
+    /// conversation with no task. Claude Code's relaunches are its own rules'
+    /// (its transcript names its limit). Call before the point is folded
+    /// ([`Self::observe`]) and decided.
+    ///
+    /// THE SEAT AT THE RELAUNCH (F1 of the review of walls-3): the limit
+    /// holds the relaunched process only where its seat is vouched for — the
+    /// relaunch is the host's own (`ours`: a crash's relaunch on exit, the
+    /// live upgrade's, the restart in place, which type the line with the
+    /// env and login the agent ran under, `IdleHost::relaunch_owed`), or
+    /// the new process's screen names the account the limit was met under
+    /// ([`Seat::same_account`], its login an address read now and before).
+    /// A relaunch nobody here made, on a seat nothing vouches for — another
+    /// key (every key draws the same label), a login the limit's screens
+    /// never drew, Muse Code (its screen names no account) — is another seat
+    /// for all the loop can tell: the limit binds it no longer, and the turn
+    /// is resumed at once (`usage-resume@v1`), ONE TRY, which a limit that
+    /// holds the new process too answers with its wall: met again, a wall of
+    /// its own, held to the reset it names ([`Self::observe`]). Measured
+    /// before (the review's probe `zz_f`): agy's card scrolled off by the
+    /// 429, its relaunch under another login was held to the old account's
+    /// reset and the host's carry-on withheld past it; a key switch never
+    /// moved the seat at all. `ours` is asked only at such a relaunch.
+    pub fn relaunch_startup(
+        &mut self,
+        reading: &mut TurnEndReading,
+        now: Instant,
+        ours: impl FnOnce() -> bool,
+    ) {
+        if matches!(reading.phase, Phase::Busy | Phase::Prompt) {
+            return;
+        }
+        let start = self.agent_start;
+        let Some(t) = self.wall.as_mut().filter(|t| named_class(t.class)) else {
+            return;
+        };
+        let Some(met) = t.program.filter(|p| screen_alone(*p)) else {
+            return;
+        };
+        if reading.program != met {
+            // No agent's screen: the agent left the tab. Another agent's
+            // ends the limit ([`met_under_another`]).
+            if !reads_conversation(reading.program) && !screen_alone(reading.program) {
+                t.relaunch.away = true;
+            }
+            return;
+        }
+        let last = t.relaunch.read.unwrap_or(t.since);
+        let relaunched = t.relaunch.away || start.is_some_and(|start| start > last);
+        t.relaunch.away = false;
+        t.relaunch.read = Some(now);
+        if relaunched {
+            t.relaunch.startup = true;
+            reading.worked = None;
+            if !t.seat_moved && !t.seat.same_account(&reading.seat) && !ours() {
+                t.named = None;
+                t.seat_moved = true;
+                t.seat = reading.seat.clone();
+            }
+        } else if reading.worked.is_some() {
+            t.relaunch.startup = false;
+        }
+        // The new process names its own seat: the old one's login is gone
+        // with it ([`TurnEndState::seat_seen`]).
+        if relaunched {
+            self.seat_seen = Some((met, reading.seat.clone()));
+        }
     }
 
     fn drop_gone_countdown(&mut self) {

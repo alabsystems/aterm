@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify soak [--ledger PATH]`: the crash restore's soak, keeper P4's precondition
-//! (`docs/DESIGN-crash-restore-2026-10-20.md` §7, `docs/DESIGN-pty-keeper-2026-09-26.md` §7).
-//!
-//! NOT A CHECK OF THE TREE. It reads this machine's recovery ledger — the installed app's,
-//! one row per windowed launch, in the log directory, or the file `--ledger` names — and
-//! prints what `aterm_update::restore_soak` judges of it against the bar P4 waits on
-//! (`restore_soak::P4`): the days the keeper link has been on, the real kills the keeper
-//! brought back, how many sessions came back exactly, none blank, none missed. The judge is
-//! the updater crate's own, over the same reader `aterm doctor` uses, so the rows are read
-//! by one parser.
-//!
-//! Exit: `0` the bar is met, `1` it is not (yet), `2` usage, `3` could not run (no ledger
-//! at the path: the installed app writes it, a dev build or a test never does).
+//! `verify soak [--ledger PATH]` runner for `aterm_update::restore_soak`.
 
 use std::path::PathBuf;
 

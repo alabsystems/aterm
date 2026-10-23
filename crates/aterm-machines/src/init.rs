@@ -16,7 +16,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The local setup's command-line help.
-pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--only <item,...>]\n\
+pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--develop | --no-develop]\n\
+                  [--only <item,...>]\n\
     First restore what aterm lays for this account (the installed commands and\n\
     their ~/.local/bin links, the shell integration, the reroute stubs, the\n\
     rustup link, exec roots), as bare `aterm doctor` does, and install Apple's\n\
@@ -27,22 +28,35 @@ pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--only <item,..
     no widgets, only aterm, System Settings and Safari pinned in the Dock,\n\
     sign out of Messages and FaceTime, and keep rustup's offline docs (rust-docs,\n\
     tens of thousands of pages Spotlight indexes) off this login: the minimal\n\
-    profile, and rust-docs removed from the toolchains rustup installed. Applies\n\
-    and reads back each setting; safe to run again.\n\
+    profile, and rust-docs removed from the toolchains rustup installed. On a\n\
+    develop machine (one `aterm init --develop` recorded) it then runs the develop\n\
+    items too. Applies and reads back each setting; safe to run again.\n\
     Joins the secrets vault (aterm help secrets): the ALab vault when it answers\n\
     on this network (asking only for its join password), else the one you name.\n\
     Optional ~/.config/aterm/init.toml [github] config keeps its GitHub token in\n\
-    the login keychain and clones all accessible owned repositories into your\n\
-    home; see aterm help init.\n\
+    the login keychain, clones all accessible owned repositories into your home\n\
+    and fast-forwards each clean checkout that is behind; see aterm help init.\n\
     Run as the logged-in user, without sudo. Account sign-out may need\n\
     Accessibility and Automation permission for aterm in System Settings.\n\
 \n\
     --plan    Report the changes without applying them.\n\
     --check   Read only; exit nonzero if anything still needs attention.\n\
     --json    Print the per-setting report as JSON.\n\
-    --only    Run only the base items named (an id such as base.clt or\n\
-              base.shell.rc, a family such as shell or pkg, or base), and no\n\
-              setting of this login.\n\
+    --develop Record this Mac as a develop machine ([develop] in init.toml)\n\
+              and converge base and develop only, no setting of this login: each\n\
+              recorded aterm checkout fetched and fast-forwarded when it is clean,\n\
+              on its default branch and has no commit of its own (else left as it\n\
+              is, saying why; never a reset, stash, push or hook), its\n\
+              vendor/astream submodule where that loses nothing, and, in a\n\
+              checkout it aligns, the test tools its tree pins (its own `targo\n\
+              --unverified --locked verify provision`). Run inside a checkout\n\
+              to record it; a linked worktree is not recorded.\n\
+    --no-develop  Remove the [develop] table; the tools stay as cache.\n\
+    --only    Run only the items named: a base id such as base.clt or\n\
+              base.shell.rc, a family such as shell or pkg, or base; workstation\n\
+              (this login's settings); a develop id such as develop.checkout or\n\
+              develop.checkout@~/aterm, a family (profile, checkout, tooling), or\n\
+              develop.\n\
     --help    Show this help without inspecting or changing the Mac.\n\
 \n\
     Exit: 0 done; 75 only what an install pass's store lock held back is left;\n\
@@ -62,8 +76,19 @@ struct Options {
     action: Action,
     json: bool,
     help: bool,
-    /// `--only` words: the base items kept ([`aterm_converge::select`]); empty runs all.
+    /// `--only` words: the items kept ([`aterm_converge::select`]); empty runs all.
     only: Vec<String>,
+    /// `--develop` (`Some(true)`) or `--no-develop` (`Some(false)`).
+    develop: Option<bool>,
+}
+
+impl Options {
+    /// Whether this run converges the workstation layer: a bare `aterm init` or `--only
+    /// workstation`, never under `--develop` or `--no-develop`.
+    fn workstation(&self) -> bool {
+        (self.only.is_empty() && self.develop.is_none())
+            || self.only.iter().any(|word| word == "workstation")
+    }
 }
 
 fn options(args: &[OsString]) -> Result<Options, String> {
@@ -74,7 +99,7 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             Some("--only") => Some(
                 args.next()
                     .and_then(|words| words.to_str())
-                    .ok_or("--only takes a comma-separated list of base items")?,
+                    .ok_or("--only takes a comma-separated list of items")?,
             ),
             Some(arg) => arg.strip_prefix("--only="),
             None => None,
@@ -87,7 +112,7 @@ fn options(args: &[OsString]) -> Result<Options, String> {
                 .map(str::to_owned)
                 .collect();
             if words.is_empty() {
-                return Err("--only takes a comma-separated list of base items".into());
+                return Err("--only takes a comma-separated list of items".into());
             }
             options.only.extend(words);
             continue;
@@ -95,6 +120,13 @@ fn options(args: &[OsString]) -> Result<Options, String> {
         match arg.to_str() {
             Some("--help" | "-h") => options.help = true,
             Some("--json") => options.json = true,
+            Some(flag @ ("--develop" | "--no-develop")) => {
+                let develop = flag == "--develop";
+                if options.develop.is_some_and(|asked| asked != develop) {
+                    return Err("choose either --develop or --no-develop".into());
+                }
+                options.develop = Some(develop);
+            }
             Some("--plan" | "--check") => {
                 let action = if arg == "--plan" {
                     Action::Plan
@@ -109,6 +141,9 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             _ => return Err(format!("unknown argument {arg:?}")),
         }
     }
+    if options.develop.is_some() && options.only.iter().any(|word| word == "workstation") {
+        return Err("--develop and --no-develop cannot be combined with --only workstation".into());
+    }
     Ok(options)
 }
 
@@ -120,6 +155,9 @@ pub struct Base {
     pub held: Option<Box<dyn std::any::Any>>,
     /// `base.clt` ([`crate::init_clt`]), run once the lock is released.
     pub clt: Option<crate::init_clt::CommandLineTools>,
+    /// The toolset's `targo`, which `develop.workspace-tools@<path>` runs the checkout's
+    /// `verify provision` with ([`crate::init_develop::Targo`]).
+    pub targo: Option<crate::init_develop::Targo>,
 }
 
 impl Base {
@@ -130,6 +168,7 @@ impl Base {
             items: Vec::new(),
             held: None,
             clt: None,
+            targo: None,
         }
     }
 
@@ -155,11 +194,17 @@ impl Base {
         if only.is_empty() {
             return self;
         }
-        let Self { items, held, clt } = self;
+        let Self {
+            items,
+            held,
+            clt,
+            targo,
+        } = self;
         Self {
             items: aterm_converge::select(items, only).0,
             held,
             clt: clt.filter(|_| only.iter().any(|word| crate::init_clt::selected(word))),
+            targo,
         }
     }
 }
@@ -181,11 +226,12 @@ pub fn main_entry(
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    let unnamed = base(false).unnamed(&options.only);
+    // A develop word is checked against the checkouts once they are read.
+    let composed = base(false);
+    let unnamed = unnamed(&composed, &options.only);
     if !unnamed.is_empty() {
         eprintln!(
-            "aterm init: --only {} names no base item (an id such as base.clt or base.shell.rc, \
-             a family such as shell or pkg, or base)\n{USAGE}",
+            "aterm init: --only {} names no item ({ONLY_WORDS})\n{USAGE}",
             unnamed.join(",")
         );
         return ExitCode::from(2);
@@ -194,36 +240,35 @@ pub fn main_entry(
         eprintln!("aterm init: run in your own macOS login and home directory");
         return ExitCode::FAILURE;
     }
-    let sys = Live::new().with_full_disk_access(if options.only.is_empty() {
+    let sys = Live::new().with_full_disk_access(if options.workstation() {
         full_disk_access()
     } else {
         None
     });
-    let result = sys.journal().and_then(|mut journal| {
-        let mode = if options.action == Action::Apply {
-            Mode::Apply
-        } else {
-            Mode::Plan
-        };
-        let (ctx, groups) = if options.only.is_empty() {
-            let ctx = local_context(&sys)?;
-            let groups = prepare_groups(&sys, &ctx, mode)?;
-            (ctx, groups)
-        } else {
-            (context_for(&sys, WorkstationGroup::Accounts)?, Vec::new())
-        };
-        run(
-            &sys,
-            &ctx,
-            base(mode == Mode::Apply).narrowed(&options.only),
-            &groups,
-            mode,
-            journal.as_mut(),
-        )
-    });
+    let cwd = std::env::current_dir().ok();
+    let result = sys
+        .journal()
+        .map_err(Refused::Failed)
+        .and_then(|mut journal| {
+            converge(
+                &sys,
+                &options,
+                &Front {
+                    base: &|applies| base(applies),
+                    groups: &prepare_groups,
+                    targo: composed.targo.clone(),
+                    cwd: cwd.as_deref(),
+                },
+                journal.as_mut(),
+            )
+        });
     let rows = match result {
         Ok(rows) => rows,
-        Err(why) => {
+        Err(Refused::Usage(why)) => {
+            eprintln!("aterm init: {why}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+        Err(Refused::Failed(why)) => {
             eprintln!("aterm init: {why}");
             return ExitCode::FAILURE;
         }
@@ -248,6 +293,11 @@ pub fn main_entry(
             println!("{}: {}", word(row.outcome), row.title);
             if let (Some(from), Some(to)) = (&row.from, &row.to) {
                 println!("    {from} → {to}");
+            } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) =
+                (row.outcome, row.layer, &row.to)
+            {
+                // A checkout left as it is says why (dirty, ahead, diverged, …).
+                println!("    {now}");
             }
             if let Some(why) = &row.why {
                 println!("    {why}");
@@ -261,6 +311,139 @@ pub fn main_entry(
         println!("aterm init: {summary}");
     }
     ExitCode::from(code)
+}
+
+/// What `--only` takes, for its refusal.
+const ONLY_WORDS: &str = "a base id such as base.clt or base.shell.rc, a family such as shell \
+                          or pkg, or base; workstation; a develop id such as \
+                          develop.checkout@~/aterm, a family such as checkout, or develop";
+
+/// The `--only` words that name nothing a run could compose: no base item, not
+/// `workstation`, and no develop word ([`crate::init_develop::names`]).
+fn unnamed(base: &Base, only: &[String]) -> Vec<String> {
+    base.unnamed(only)
+        .into_iter()
+        .filter(|word| word != "workstation" && !crate::init_develop::names(word))
+        .collect()
+}
+
+/// Why a run did not start.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// A usage error: exit 2.
+    Usage(String),
+    /// Anything else: exit 1.
+    Failed(String),
+}
+
+impl From<String> for Refused {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+/// What the front door hands a run: the base layer (`true`: for a run that applies, which
+/// takes the store lock), the workstation's preparation ([`prepare_groups`]), the toolset's
+/// targo, and where `aterm init` was started.
+struct Front<'a> {
+    base: &'a dyn Fn(bool) -> Base,
+    groups: &'a Prepare<'a>,
+    targo: Option<crate::init_develop::Targo>,
+    cwd: Option<&'a Path>,
+}
+
+/// The layers a run converges (design §4.1): base always; the workstation on a bare `aterm
+/// init` or `--only workstation`, never under `--develop` or `--no-develop`; develop when
+/// this Mac records it, `--develop` or `--no-develop` asks, or an `--only` word names it.
+/// The context refuses root (a fleet-style job) before any develop item is composed: the
+/// fleet never fetches, builds or runs checkout code as a user (§4.4). The develop layer
+/// never stops the base layer: a run whose `--only` names no develop word reads no profile
+/// (`--only base`, ship provision's audit), and a profile that cannot be read is one
+/// `develop.record` row saying why, with the base layer run as ever.
+fn converge(
+    sys: &dyn System,
+    options: &Options,
+    front: &Front<'_>,
+    journal: &mut dyn Journal,
+) -> Result<Vec<ItemReport>, Refused> {
+    let mode = if options.action == Action::Apply {
+        Mode::Apply
+    } else {
+        Mode::Plan
+    };
+    let only = &options.only;
+    let workstation = options.workstation();
+    let ctx = if workstation {
+        local_context(sys)?
+    } else {
+        context_for_selected(sys, WorkstationGroup::All, Selection::none())?
+    };
+    let asked = only.iter().any(|word| crate::init_develop::names(word));
+    let develop = if options.develop.is_some() || only.is_empty() || asked {
+        crate::init_develop::layer(
+            sys,
+            &ctx,
+            &crate::init_develop::Inputs {
+                want: options.develop,
+                asked,
+                cwd: front.cwd,
+                targo: front.targo.clone(),
+            },
+        )
+    } else {
+        crate::init_develop::Composed::default()
+    };
+    // A develop word must name one of this run's develop items, or nothing is changed
+    // (when the layer could not be read, its one row says why instead).
+    let nothing: Vec<&str> = only
+        .iter()
+        .filter(|word| crate::init_develop::names(word))
+        .filter(|word| {
+            !develop.items.iter().any(|(item, place)| {
+                aterm_converge::selects(word, &item.id(), item.family(), Some(place.layer))
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    if !nothing.is_empty() && !develop.unreadable {
+        let checkouts: Vec<String> = develop
+            .items
+            .iter()
+            .map(|(item, _)| item.id())
+            .filter(|id| id.starts_with("develop.checkout@"))
+            .collect();
+        return Err(Refused::Usage(format!(
+            "--only {} names no develop item of this run ({})",
+            nothing.join(","),
+            if checkouts.is_empty() {
+                "init.toml's [develop] records no checkout; `aterm init --develop` records one"
+                    .to_owned()
+            } else {
+                format!("its checkouts: {}", checkouts.join(", "))
+            }
+        )));
+    }
+    // A run that leaves the workstation out reads and asks nothing of this login's settings
+    // (no keyboard list, no vault question).
+    let groups = if workstation {
+        (front.groups)(sys, &ctx, mode)?
+    } else {
+        Vec::new()
+    };
+    // The store lock last: no question waits while it is held.
+    Ok(run_layers(
+        sys,
+        &ctx,
+        (front.base)(mode == Mode::Apply).narrowed(only),
+        &groups,
+        &develop.items,
+        &Narrowing {
+            only,
+            record: options.develop.is_some() || develop.unreadable,
+        },
+        mode,
+        journal,
+    )?)
 }
 
 /// The exit status (design §3.3): 0 when complete; when the only incomplete rows stood
@@ -663,6 +846,9 @@ impl Item for Guard {
     fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
         self.inner.stood_aside()
     }
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.inner.read_aside()
+    }
     fn withheld(&self) -> Option<String> {
         self.inner.withheld()
     }
@@ -876,6 +1062,9 @@ fn workstation_items_selected(
 /// Items that share one place in the desired state.
 type Group = (Vec<Box<dyn Item>>, Place);
 
+/// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in).
+type Prepare<'a> = dyn Fn(&dyn System, &Ctx, Mode) -> Result<Vec<Group>, String> + 'a;
+
 /// Preparation can read optional profiles and ask vault questions before an item is
 /// probed.
 fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>, String> {
@@ -943,13 +1132,56 @@ fn workstation_place(class: Class) -> Place {
     }
 }
 
-/// Run the `base` items, then `groups` against `sys`, each change journaled in `journal`
-/// before it is made.
-fn run<'a>(
-    sys: &'a dyn System,
-    ctx: &'a Ctx,
+/// [`run_layers`] with no develop item and no `--only`: the base and workstation passes.
+#[cfg(test)]
+fn run(
+    sys: &dyn System,
+    ctx: &Ctx,
     base: Base,
-    groups: &'a [Group],
+    groups: &[Group],
+    mode: Mode,
+    journal: &mut dyn Journal,
+) -> Result<Vec<ItemReport>, String> {
+    run_layers(
+        sys,
+        ctx,
+        base,
+        groups,
+        &[],
+        &Narrowing {
+            only: &[],
+            record: false,
+        },
+        mode,
+        journal,
+    )
+}
+
+/// How a run's second pass is narrowed: the `--only` words, and whether `develop.record`
+/// stays whatever they say (`--develop` and `--no-develop` ask for the record itself, and a
+/// profile that cannot be read is said by that row).
+struct Narrowing<'a> {
+    only: &'a [String],
+    record: bool,
+}
+
+/// Run the `base` items, then `base.clt`, `groups` and `develop` in one pass (a
+/// `develop.workspace-tools@` waits for `base.clt`) narrowed by `narrowing`, against `sys`,
+/// each change journaled in `journal` before it is made. Every class applies; an item that
+/// needs the console runs only when this login holds it (`ctx.console`). What the base
+/// layer holds (the store lock) is released once its items have run: a later item can wait
+/// on a person.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run's whole composition, each part its own input"
+)]
+fn run_layers(
+    sys: &dyn System,
+    ctx: &Ctx,
+    base: Base,
+    groups: &[Group],
+    develop: &[(Box<dyn Item>, Place)],
+    narrowing: &Narrowing<'_>,
     mode: Mode,
     journal: &mut dyn Journal,
 ) -> Result<Vec<ItemReport>, String> {
@@ -957,24 +1189,39 @@ fn run<'a>(
         at_console: ctx.console.is_some(),
         ..aterm_converge::Scope::EVERY
     };
-    let Base { items, held, clt } = base;
+    let Base {
+        items, held, clt, ..
+    } = base;
     let mut rows = aterm_converge::run_scoped(&items, mode, scope, journal, &mut |_| {})
         .map_err(|refused| refused.to_string())?;
     drop(held);
-    if let Some(clt) = &clt {
-        let bound = crate::engine::bind([(clt as &dyn Item, crate::init_clt::place())], sys, ctx);
-        rows.extend(
-            aterm_converge::run_scoped(&bound, mode, scope, journal, &mut |_| {})
-                .map_err(|refused| refused.to_string())?,
-        );
-    }
+    // `base.clt` once the lock is gone (its apply waits on a person's password), then the
+    // workstation items, then the develop items.
+    let clt = clt
+        .as_ref()
+        .map(|clt| (clt as &dyn Item, crate::init_clt::place()));
     let bound = crate::engine::bind(
-        groups.iter().flat_map(|(items, place)| {
-            items.iter().map(move |item| (item.as_ref(), place.clone()))
-        }),
+        clt.into_iter()
+            .chain(groups.iter().flat_map(|(items, place)| {
+                items.iter().map(move |item| (item.as_ref(), place.clone()))
+            }))
+            .chain(
+                develop
+                    .iter()
+                    .map(|(item, place)| (item.as_ref(), place.clone())),
+            ),
         sys,
         ctx,
     );
+    let bound = if narrowing.only.is_empty() {
+        bound
+    } else {
+        let mut words = narrowing.only.to_vec();
+        if narrowing.record {
+            words.push(crate::init_develop::RECORD.to_owned());
+        }
+        aterm_converge::select(bound, &words).0
+    };
     rows.extend(
         aterm_converge::run_scoped(&bound, mode, scope, journal, &mut |_| {})
             .map_err(|refused| refused.to_string())?,
@@ -993,8 +1240,8 @@ fn context_for(sys: &dyn System, group: WorkstationGroup) -> Result<Ctx, String>
 
 fn context_for_selected(
     sys: &dyn System,
-    _group: WorkstationGroup,
-    _selected: Selection,
+    group: WorkstationGroup,
+    selected: Selection,
 ) -> Result<Ctx, String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
@@ -1034,6 +1281,24 @@ fn context_for_selected(
             disrupt: true,
         });
     }
+    let keyboards = if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock)
+    {
+        Vec::new()
+    } else {
+        let command = crate::facts::hidutil_keyboards();
+        let keyboard_list = sys
+            .run_complete_stdout(&command)
+            .map_err(|e| format!("{}: {e}", command.display()))?;
+        if !keyboard_list.success() {
+            return Err(format!(
+                "{}: {}",
+                command.display(),
+                keyboard_list.describe()
+            ));
+        }
+        crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())?
+    };
+    let facts = HostFacts { keyboards, ..facts };
     Ok(Ctx {
         facts,
         users: vec![user.clone()],
@@ -1530,8 +1795,9 @@ mod tests {
         assert_eq!(ids, ["init.test.changes"]);
     }
 
-    /// An item whose probes answer from a list (the last one repeats), counting its applies
-    /// and its runtime refreshes; with `aside`, each apply stands aside on it.
+    /// An item whose probes and preference plans answer from lists (the last one repeats),
+    /// counting its applies and its runtime refreshes; with `aside`, each apply stands aside
+    /// on it.
     struct Counted {
         id: &'static str,
         probes: Mutex<Vec<Probe>>,
@@ -1539,8 +1805,8 @@ mod tests {
         refreshes: Arc<std::sync::atomic::AtomicU32>,
         aside: Option<aterm_converge::StoodAside>,
         /// The preference keys it would change, or why it cannot say
-        /// ([`Item::preference_changes`]).
-        keys: Result<Vec<(Target, Read<PValue>)>, String>,
+        /// ([`Item::preference_changes`]), one answer per call.
+        keys: Mutex<Vec<Result<PreferenceSnapshot, String>>>,
     }
 
     impl Counted {
@@ -1563,7 +1829,7 @@ mod tests {
                 applies: Arc::clone(&counts[0]),
                 refreshes: Arc::clone(&counts[1]),
                 aside,
-                keys: Ok(Vec::new()),
+                keys: Mutex::new(vec![Ok(Vec::new())]),
             });
             (item, counts)
         }
@@ -1605,7 +1871,12 @@ mod tests {
             _: &dyn System,
             _: &Ctx,
         ) -> Result<Vec<(Target, Read<PValue>)>, String> {
-            self.keys.clone()
+            let mut keys = self.keys.lock().unwrap();
+            if keys.len() > 1 {
+                keys.remove(0)
+            } else {
+                keys[0].clone()
+            }
         }
     }
 
@@ -1622,7 +1893,10 @@ mod tests {
                 applies: Arc::default(),
                 refreshes: Arc::default(),
                 aside: None,
-                keys: Ok(vec![(Target::user(domain, "k", &alice), Read::Absent)]),
+                keys: Mutex::new(vec![Ok(vec![(
+                    Target::user(domain, "k", &alice),
+                    Read::Absent,
+                )])]),
             }) as Box<dyn Item>
         };
         let mut pass = Workstation {
@@ -1647,13 +1921,15 @@ mod tests {
 
     /// An item whose before-images cannot be taken (its plan fails, or a value it would
     /// replace reads unusable) changes nothing and the other items still apply: one such
-    /// item once failed the whole pass. Its write stays refused when its probe passes
+    /// item once failed the whole pass. Its write stays refused when its plan reads cleanly
     /// after the snapshot failed (what it read cleared in between), since no recovery
     /// record holds what it would replace; the Dock's own case, whose probe fails as its
     /// snapshot did, is `init_preferences`'
     /// `a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply`. Negative
     /// controls: `?` on the item's snapshot in `Workstation::preference_changes` fails the
-    /// pass; dropping the refused snapshot's error in `Guard::validate` applies both.
+    /// pass; dropping the refused snapshot's error in `Guard::validate` applies both;
+    /// planning again there instead, and going ahead on a clean read, applies the cleared
+    /// one.
     #[test]
     fn an_item_without_before_images_changes_nothing_and_the_others_run() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1666,25 +1942,29 @@ mod tests {
                 applies: Arc::clone(&applies),
                 refreshes: Arc::default(),
                 aside: None,
-                keys,
+                keys: Mutex::new(keys),
             }) as Box<dyn Item>;
             (item, applies)
         };
         let target = |domain: &str| Target::user(domain, "k", &alice);
+        // Its snapshot's plan fails; every later plan reads the key cleanly.
         let (cleared, cleared_applies) = item(
             "init.test.cleared",
-            Err("plutil timed out; left untouched".into()),
+            vec![
+                Err("plutil timed out; left untouched".into()),
+                Ok(vec![(target("com.apple.dock"), Read::Absent)]),
+            ],
         );
         let (unusable, unusable_applies) = item(
             "init.test.unusable",
-            Ok(vec![(
+            vec![Ok(vec![(
                 target("com.apple.finder"),
                 Read::Unusable("cfprefsd timed out".into()),
-            )]),
+            )])],
         );
         let (widgets, widgets_applies) = item(
             "init.test.widgets",
-            Ok(vec![(target("com.apple.WindowManager"), Read::Absent)]),
+            vec![Ok(vec![(target("com.apple.WindowManager"), Read::Absent)])],
         );
         let mut pass = Workstation {
             items: vec![cleared, unusable, widgets],
@@ -1954,6 +2234,7 @@ mod tests {
             })],
             held: Some(Box::new(Held(Arc::clone(&released)))),
             clt: None,
+            targo: None,
         };
         let groups = vec![(
             vec![Box::new(Sees {
@@ -2071,7 +2352,8 @@ mod tests {
             asked,
             [
                 "init.spotlight.rustup-profile@alice",
-                "init.spotlight.rust-docs@alice"
+                "init.spotlight.rust-docs@alice",
+                "init.spotlight.build-noindex@alice"
             ]
         );
         for b in &bound {
@@ -2214,6 +2496,7 @@ mod tests {
                 json: true,
                 help: false,
                 only: Vec::new(),
+                develop: None,
             }
         );
         assert_eq!(
@@ -2244,6 +2527,7 @@ mod tests {
                 Box::new(|_: &dyn System| crate::init_clt::Found::Present("cc".into())),
                 PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
             )),
+            targo: None,
         };
         assert_eq!(
             base().unnamed(&["base.clt".into(), "pkg".into(), "base".into()]),
@@ -2290,6 +2574,7 @@ mod tests {
                 },
                 PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
             )),
+            targo: None,
         };
         let alice = user("alice", 501);
         let ctx = Ctx {
@@ -2375,6 +2660,7 @@ mod tests {
                 })],
                 held: None,
                 clt: None,
+                targo: None,
             };
             let groups = if at_console {
                 vec![(
@@ -2493,35 +2779,53 @@ mod tests {
     }
 
     #[test]
-    fn local_context_never_inventories_live_keyboards() {
-        let mut sys = Fake::root();
-        sys.euid = 501;
-        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-        sys.on(
-            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-            Ran::ok("GroupMembership: alice\n"),
-        );
-        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
-        sys.stat_of(
-            "/dev/console",
-            Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: 0,
-            },
-        );
-        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
-        let ctx = local_context(&sys).unwrap();
-        assert!(ctx.facts.keyboards.is_empty());
-        assert!(
-            !sys.calls().iter().any(|call| call.contains("hidutil")),
-            "calls: {:?}",
-            sys.calls()
-        );
+    fn an_unreadable_keyboard_list_at_the_console_is_refused_before_preferences_or_accounts_are_read()
+     {
+        let current_user = || {
+            let mut sys = Fake::root();
+            sys.euid = 501;
+            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+            sys.on(
+                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+                Ran::ok("GroupMembership: alice\n"),
+            );
+            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+            sys.stat_of(
+                "/dev/console",
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o600,
+                    dir: false,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+            sys
+        };
+        let command = crate::facts::hidutil_keyboards();
+        for invalid in [
+            "Services:\nUnknownHeader\nnonempty unparsed row\n",
+            "Devices:\n",
+        ] {
+            let sys = current_user();
+            sys.on(&command.display(), Ran::ok(invalid));
+            assert!(local_context(&sys).is_err());
+            assert!(
+                !sys.calls()
+                    .iter()
+                    .any(|call| call.contains("defaults") || call.contains("accounts.data"))
+            );
+        }
+        let sys = current_user();
+        sys.on(&command.display(), Ran::ok("Services:\n\nDevices:\n"));
+        assert!(local_context(&sys).unwrap().facts.keyboards.is_empty());
+        let sys = current_user();
+        sys.on(&command.display(), Ran::ok("Services:\n"));
+        sys.refuse_complete_stdout(&command.display(), "incomplete captured service list");
+        assert!(local_context(&sys).is_err());
     }
 
     #[test]
@@ -2560,5 +2864,526 @@ mod tests {
         assert!(complete(&[row.clone()], Action::Plan));
         assert!(!complete(&[row.clone()], Action::Apply));
         assert!(!complete(&[row], Action::Check));
+    }
+
+    /// alice (uid 501) in her own shell, with the console's owner `console_uid`, and an
+    /// aterm checkout at `~/aterm` whose manifest is hers; `profile` is her init.toml.
+    fn alice_with_checkout(console_uid: u32, profile: Option<&str>) -> Fake {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+        sys.on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok("GroupMembership: alice\n"),
+        );
+        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        let owned = |uid: u32, dir: bool| Stat {
+            uid,
+            gid: 20,
+            mode: if dir { 0o755 } else { 0o600 },
+            dir,
+            symlink: false,
+            len: 0,
+        };
+        sys.stat_of("/dev/console", owned(console_uid, false));
+        sys.stat_of("/Users//alice", owned(501, true));
+        sys.stat_of("/Users//alice/aterm", owned(501, true));
+        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+        sys.on(
+            &crate::facts::hidutil_keyboards().display(),
+            Ran::ok("Services:\n\nDevices:\n"),
+        );
+        let alice = user("alice", 501);
+        sys.write_user_file(
+            &alice,
+            Path::new("/Users//alice/aterm/Cargo.toml"),
+            crate::checkout::tests::manifest(Path::new("/srv/origin.git")).as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        if let Some(profile) = profile {
+            sys.write_user_file(
+                &alice,
+                Path::new("/Users//alice/.config/aterm/init.toml"),
+                profile.as_bytes(),
+                0o600,
+            )
+            .unwrap();
+        }
+        sys
+    }
+
+    /// A run's front with an empty base layer (one `base.pkg.shims` item, already as
+    /// wanted, when `base_item`) and a workstation of one preference item, counting how
+    /// often each was composed.
+    struct Composed {
+        bases: std::sync::atomic::AtomicU32,
+        workstations: std::sync::atomic::AtomicU32,
+        base_item: bool,
+    }
+
+    impl Composed {
+        fn new() -> Self {
+            Self {
+                bases: std::sync::atomic::AtomicU32::new(0),
+                workstations: std::sync::atomic::AtomicU32::new(0),
+                base_item: false,
+            }
+        }
+
+        fn with_base() -> Self {
+            Self {
+                base_item: true,
+                ..Self::new()
+            }
+        }
+
+        fn converge(
+            &self,
+            sys: &dyn System,
+            options: &Options,
+        ) -> Result<Vec<ItemReport>, Refused> {
+            use std::sync::atomic::Ordering;
+            let base = |_: bool| {
+                self.bases.fetch_add(1, Ordering::SeqCst);
+                let mut base = Base::none();
+                if self.base_item {
+                    base.items.push(Box::new(BaseItem {
+                        probes: Mutex::new(vec![ok()]),
+                        applied: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    }));
+                }
+                base
+            };
+            let groups = |_: &dyn System, _: &Ctx, _: Mode| {
+                self.workstations.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![(
+                    vec![Listed::boxed("init.test.dock", vec![change(), ok()])],
+                    place(Class::Preference),
+                )])
+            };
+            converge(
+                sys,
+                options,
+                &Front {
+                    base: &base,
+                    groups: &groups,
+                    targo: None,
+                    cwd: Some(Path::new("/Users//alice/aterm")),
+                },
+                &mut NoJournal,
+            )
+        }
+
+        fn counts(&self) -> (u32, u32) {
+            use std::sync::atomic::Ordering;
+            (
+                self.bases.load(Ordering::SeqCst),
+                self.workstations.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// DEVELOP TOUCHES NO PREFERENCE (design §4.1): `--develop` at this Mac's console runs
+    /// base and develop only: the workstation is never composed, no row is a preference,
+    /// and nothing of this login's settings is read. Negative control: a bare `aterm init`
+    /// on the same fake composes the workstation and applies its preference item.
+    #[test]
+    fn develop_on_a_fake_system_applies_no_preference_item() {
+        let develop = Options {
+            develop: Some(true),
+            ..Options::default()
+        };
+        let sys = alice_with_checkout(501, None);
+        let front = Composed::new();
+        let rows = front.converge(&sys, &develop).unwrap();
+        assert_eq!(front.counts(), (1, 0), "the workstation is never composed");
+        assert!(
+            rows.iter()
+                .all(|row| row.class != Some(Class::Preference)
+                    && row.layer != Some(Layer::Workstation)),
+            "{rows:?}"
+        );
+        assert_eq!(rows[0].id, crate::init_develop::RECORD);
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        assert!(rows.iter().all(|row| row.layer == Some(Layer::Develop)));
+        assert!(!sys.calls().iter().any(|call| call.contains("defaults")
+            || call.contains("hidutil")
+            || call.contains("accounts")));
+
+        let sys = alice_with_checkout(501, None);
+        let front = Composed::new();
+        let rows = front.converge(&sys, &Options::default()).unwrap();
+        assert_eq!(front.counts(), (1, 1));
+        let dock = rows.iter().find(|row| row.id == "init.test.dock").unwrap();
+        assert_eq!(dock.class, Some(Class::Preference));
+        assert_eq!(dock.outcome, Outcome::Changed, "{rows:?}");
+        assert!(
+            sys.calls().iter().any(|call| call.contains("hidutil")),
+            "the workstation inventories its keyboard obligations: {:?}",
+            sys.calls()
+        );
+        assert!(
+            !rows.iter().any(|row| row.layer == Some(Layer::Develop)),
+            "{rows:?}"
+        );
+    }
+
+    /// THE FLEET NEVER RUNS DEVELOP ITEMS (§4.4): a root run (what a fleet job is) of
+    /// `aterm init --develop` is refused before anything is composed, read or run: no base
+    /// layer, no profile write, no git. Negative control: the same run as alice composes and
+    /// runs the develop items, writing her profile and reading her checkout with git.
+    #[test]
+    fn a_fleet_style_run_as_root_is_refused_before_any_develop_item() {
+        let develop = Options {
+            develop: Some(true),
+            ..Options::default()
+        };
+        let mut root = alice_with_checkout(501, None);
+        root.euid = 0;
+        let before = root.calls();
+        let front = Composed::new();
+        let refused = front.converge(&root, &develop).unwrap_err();
+        assert_eq!(
+            refused,
+            Refused::Failed("run as the logged-in user, without sudo".into())
+        );
+        assert_eq!(front.counts(), (0, 0));
+        assert_eq!(root.calls(), before, "nothing ran");
+
+        let sys = alice_with_checkout(501, None);
+        let front = Composed::new();
+        let rows = front.converge(&sys, &develop).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "develop.record",
+                "develop.checkout@~/aterm",
+                "develop.submodules@~/aterm",
+                "develop.workspace-tools@~/aterm"
+            ]
+        );
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "alice$ write /Users//alice/.config/aterm/init.toml 600"),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("git -C /Users//alice/aterm")),
+            "{calls:?}"
+        );
+    }
+
+    /// `--develop` and `--no-develop` exclude each other; `--only` takes base, workstation
+    /// and develop words before anything is read, and a develop word that names no checkout
+    /// this Mac records is refused (exit 2) once the record is read, before anything runs.
+    /// `--only workstation` composes the workstation alone.
+    #[test]
+    fn only_takes_workstation_and_develop_words_and_refuses_a_checkout_nobody_records() {
+        assert!(options(&["--develop".into(), "--no-develop".into()]).is_err());
+        for flag in ["--develop", "--no-develop"] {
+            for args in [
+                vec![flag, "--only", "workstation"],
+                vec!["--only=workstation", flag],
+                vec![flag, "--only=base,workstation"],
+                vec!["--only", "base", flag, "--only", "workstation"],
+            ] {
+                let sys = alice_with_checkout(501, None);
+                let before = sys.calls();
+                let front = Composed::new();
+                let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+                let result = options(&args)
+                    .map_err(Refused::Usage)
+                    .and_then(|options| front.converge(&sys, &options));
+                assert!(
+                    matches!(&result, Err(Refused::Usage(_))),
+                    "{args:?}: {result:?}"
+                );
+                assert_eq!(front.counts(), (0, 0), "{args:?}");
+                assert_eq!(sys.calls(), before, "{args:?}");
+            }
+        }
+        assert_eq!(
+            options(&["--no-develop".into(), "--no-develop".into()])
+                .unwrap()
+                .develop,
+            Some(false)
+        );
+        assert_eq!(
+            unnamed(
+                &Base::none(),
+                &[
+                    "workstation".into(),
+                    "develop".into(),
+                    "develop.checkout@~/aterm".into(),
+                    "tooling".into(),
+                    "keyboard".into(),
+                ]
+            ),
+            ["keyboard"]
+        );
+        let recorded = "[develop]\ncheckouts = [\"~/aterm\"]\n";
+        let only = |word: &str| Options {
+            only: vec![word.to_owned()],
+            ..Options::default()
+        };
+        let sys = alice_with_checkout(501, Some(recorded));
+        let front = Composed::new();
+        let refused = front
+            .converge(&sys, &only("develop.checkout@~/elsewhere"))
+            .unwrap_err();
+        assert!(
+            matches!(&refused, Refused::Usage(why) if why.contains("its checkouts: develop.checkout@~/aterm")),
+            "{refused:?}"
+        );
+        assert!(
+            !sys.calls().iter().any(|call| call.contains("git")),
+            "{:?}",
+            sys.calls()
+        );
+        let rows = front
+            .converge(&sys, &only("develop.checkout@~/aterm"))
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["develop.checkout@~/aterm"]);
+        let workstation = options(&["--only".into(), "workstation".into()]).unwrap();
+        let rows = front.converge(&sys, &workstation).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["init.test.dock"]);
+        assert_eq!(rows[0].class, Some(Class::Preference));
+        assert_eq!(rows[0].outcome, Outcome::Changed);
+        // Unrecorded, `--only develop` reads the record and says what makes one.
+        let sys = alice_with_checkout(501, None);
+        let rows = Composed::new().converge(&sys, &only("develop")).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].outcome, Outcome::Ok);
+        assert!(
+            rows[0]
+                .to
+                .as_deref()
+                .is_some_and(|now| now.contains("`aterm init --develop` records one")),
+            "{rows:?}"
+        );
+    }
+
+    /// THE DEVELOP LAYER NEVER STOPS THE BASE LAYER: an init.toml that does not parse,
+    /// holds a table init does not know, records a relative checkout, or is group-writable
+    /// is one `develop.record` row (`Unknown`, saying why) on a bare run, at the console or
+    /// away from it, and the base layer runs as ever; `--only base` and `--only
+    /// base.pkg.shims` (what ship provision's audit and a repair name) read no profile at
+    /// all and compose no develop row. Negative control: the develop layer's own `compose`
+    /// refuses each of these profiles.
+    #[test]
+    fn a_profile_that_cannot_be_read_never_stops_the_base_layer() {
+        for (profile, mode, why) in [
+            ("[develop\n", 0o600, "invalid ~/.config/aterm/init.toml"),
+            (
+                "[unknown]\nx = 1\n",
+                0o600,
+                "invalid ~/.config/aterm/init.toml",
+            ),
+            (
+                "[develop]\ncheckouts = [\"aterm\"]\n",
+                0o600,
+                "must be ~/<path> or absolute",
+            ),
+            (
+                "[develop]\ncheckouts = [\"~/aterm\"]\n",
+                0o664,
+                "cannot safely read ~/.config/aterm/init.toml",
+            ),
+        ] {
+            for (only, console) in [
+                (Vec::new(), 501),
+                (Vec::new(), 0),
+                (vec!["base".to_owned()], 0),
+                (vec!["base.pkg.shims".to_owned()], 501),
+            ] {
+                let sys = alice_with_checkout(console, None);
+                let alice = user("alice", 501);
+                sys.write_user_file(
+                    &alice,
+                    Path::new("/Users//alice/.config/aterm/init.toml"),
+                    profile.as_bytes(),
+                    mode,
+                )
+                .unwrap();
+                let front = Composed::with_base();
+                let options = Options {
+                    only: only.clone(),
+                    ..Options::default()
+                };
+                let rows = front.converge(&sys, &options).unwrap_or_else(|refused| {
+                    panic!("{profile:?} {only:?} at {console}: {refused:?}")
+                });
+                assert_eq!(front.counts().0, 1);
+                let base = rows.iter().find(|row| row.id == "base.pkg.shims");
+                assert_eq!(base.map(|row| row.outcome), Some(Outcome::Ok), "{rows:?}");
+                let record: Vec<&ItemReport> = rows
+                    .iter()
+                    .filter(|row| row.layer == Some(Layer::Develop))
+                    .collect();
+                if only.is_empty() {
+                    assert_eq!(record.len(), 1, "{profile:?}: {rows:?}");
+                    assert_eq!(record[0].id, crate::init_develop::RECORD);
+                    assert_eq!(record[0].outcome, Outcome::Unknown);
+                    assert!(
+                        record[0]
+                            .why
+                            .as_deref()
+                            .is_some_and(|said| said.contains(why)),
+                        "{profile:?}: {:?}",
+                        record[0].why
+                    );
+                    assert_eq!(status(&rows, Action::Apply), 1);
+                } else {
+                    assert!(record.is_empty(), "{only:?}: {rows:?}");
+                    assert_eq!(status(&rows, Action::Apply), 0);
+                }
+                // Negative control: the layer itself cannot be composed from this profile.
+                let ctx = local_context(&sys).unwrap();
+                let composed = crate::init_develop::compose(
+                    &sys,
+                    &ctx,
+                    &crate::init_develop::Inputs {
+                        want: None,
+                        asked: true,
+                        cwd: None,
+                        targo: None,
+                    },
+                );
+                assert!(
+                    composed.is_err_and(|said| said.contains(why)),
+                    "{profile:?}"
+                );
+            }
+        }
+    }
+
+    /// AN OFFLINE DEVELOP MACHINE EXITS 69: a recorded checkout whose origin's host cannot
+    /// be reached (no name resolution) stands aside offline, in an apply and in a check, so
+    /// the run exits 69 and its remedy is the next pass once online. Negative control: an
+    /// origin that refuses (no key) is `Unknown`, and the run exits 1.
+    #[test]
+    fn an_offline_develop_machine_exits_69_not_1() {
+        use aterm_converge::StoodAside;
+        for (stderr, code) in [
+            (
+                "fatal: unable to access 'https://github.com/alabsystems/aterm/': Could not \
+                 resolve host: github.com\n",
+                69,
+            ),
+            (
+                "git@github.com: Permission denied (publickey).\nfatal: Could not read from \
+                 remote repository.\n",
+                1,
+            ),
+        ] {
+            for action in [Action::Apply, Action::Check] {
+                let sys = alice_with_checkout(501, Some("[develop]\ncheckouts = [\"~/aterm\"]\n"));
+                let alice = user("alice", 501);
+                crate::init_develop::tests::script_local(
+                    &sys,
+                    &alice,
+                    crate::init_develop::tests::ORIGIN,
+                    true,
+                    "",
+                );
+                sys.on(
+                    &crate::checkout::git(&alice, Some(Path::new("/Users//alice/aterm")))
+                        .args(["ls-remote", "--symref", "origin", "HEAD"])
+                        .display(),
+                    Ran::exit(128, stderr),
+                );
+                let options = Options {
+                    action,
+                    only: vec!["develop.checkout@~/aterm".into()],
+                    ..Options::default()
+                };
+                let rows = Composed::new().converge(&sys, &options).unwrap();
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert_eq!(status(&rows, action), code, "{action:?}: {rows:?}");
+                if code == 69 {
+                    assert_eq!(rows[0].outcome, Outcome::Blocked);
+                    assert!(matches!(rows[0].stood_aside, Some(StoodAside::Offline(_))));
+                    assert_eq!(
+                        rows[0].explain.as_ref().map(|explain| &explain.remedy),
+                        Some(&Remedy::Network)
+                    );
+                } else {
+                    assert_eq!(rows[0].outcome, Outcome::Unknown, "{rows:?}");
+                    assert_eq!(rows[0].stood_aside, None);
+                }
+                assert!(
+                    sys.calls().iter().all(|call| !call.contains(" fetch ")),
+                    "{:?}",
+                    sys.calls()
+                );
+            }
+        }
+    }
+
+    /// `--only` A CHECKOUT NAMES THAT CHECKOUT ALONE: with `~/aterm` and `~/aterm.old`
+    /// recorded, `--only develop.checkout@~/aterm` runs `~/aterm`'s item and never the other
+    /// one's. Control: the id without its path names both.
+    #[test]
+    fn an_only_word_with_its_path_names_that_checkout_alone() {
+        let profile = "[develop]\ncheckouts = [\"~/aterm\", \"~/aterm.old\"]\n";
+        let ids = |word: &str| -> Vec<String> {
+            let sys = alice_with_checkout(501, Some(profile));
+            let options = Options {
+                only: vec![word.to_owned()],
+                ..Options::default()
+            };
+            Composed::new()
+                .converge(&sys, &options)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect()
+        };
+        assert_eq!(
+            ids("develop.checkout@~/aterm"),
+            ["develop.checkout@~/aterm"]
+        );
+        assert_eq!(
+            ids("develop.checkout"),
+            ["develop.checkout@~/aterm", "develop.checkout@~/aterm.old"]
+        );
+    }
+
+    /// `--develop` RECORDS WHATEVER `--only` SAYS: `--develop --only tooling` runs the
+    /// record and the tools item. Negative control: `--only tooling` on the same recorded
+    /// Mac without `--develop` runs the tools item alone.
+    #[test]
+    fn develop_records_whatever_only_says() {
+        let ids = |develop: Option<bool>, profile: Option<&str>| -> Vec<String> {
+            let sys = alice_with_checkout(501, profile);
+            let options = Options {
+                develop,
+                only: vec!["tooling".into()],
+                ..Options::default()
+            };
+            Composed::new()
+                .converge(&sys, &options)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(Some(true), None),
+            ["develop.record", "develop.workspace-tools@~/aterm"]
+        );
+        assert_eq!(
+            ids(None, Some("[develop]\ncheckouts = [\"~/aterm\"]\n")),
+            ["develop.workspace-tools@~/aterm"]
+        );
     }
 }

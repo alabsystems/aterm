@@ -5,13 +5,7 @@
 // project in 2026.
 // See ../../../LICENSE-MIT and ../../../LICENSE-APACHE for the upstream licenses.
 
-//! A [Compact Font Format Table](
-//! https://docs.microsoft.com/en-us/typography/opentype/spec/cff) implementation.
-
-// Useful links:
-// http://wwwimages.adobe.com/content/dam/Adobe/en/devnet/font/pdfs/5176.CFF.pdf
-// http://wwwimages.adobe.com/content/dam/Adobe/en/devnet/font/pdfs/5177.Type2.pdf
-// https://github.com/opentypejs/opentype.js/blob/master/src/tables/cff.js
+//! Compact Font Format (CFF) table implementation.
 
 use core::convert::TryFrom;
 use core::num::NonZeroU16;
@@ -28,10 +22,8 @@ use crate::parser::{LazyArray16, NumFrom, Stream, TryNumFrom};
 use crate::sink::NullSink;
 use crate::{GlyphId, OutlineSink, Rect, RectF};
 
-// Limits according to the Adobe Technical Note #5176, chapter 4 DICT Data.
 const MAX_OPERANDS_LEN: usize = 48;
 
-// Limits according to the Adobe Technical Note #5177 Appendix B.
 const STACK_LIMIT: u8 = 10;
 const MAX_ARGUMENTS_STACK_LEN: usize = 48;
 
@@ -70,8 +62,7 @@ mod operator {
     pub const FIXED_16_16: u8 = 255;
 }
 
-/// Enumerates some operators defined in the Adobe Technical Note #5176,
-/// Table 9 Top DICT Operator Entries
+/// Top DICT operators from Adobe Technical Note #5176, Table 9.
 mod top_dict_operator {
     pub const CHARSET_OFFSET: u16 = 15;
     pub const ENCODING_OFFSET: u16 = 16;
@@ -83,22 +74,21 @@ mod top_dict_operator {
     pub const FD_SELECT: u16 = 1237;
 }
 
-/// Enumerates some operators defined in the Adobe Technical Note #5176,
-/// Table 23 Private DICT Operators
+/// Private DICT operators from Adobe Technical Note #5176, Table 23.
 mod private_dict_operator {
     pub const LOCAL_SUBROUTINES_OFFSET: u16 = 19;
     pub const DEFAULT_WIDTH: u16 = 20;
     pub const NOMINAL_WIDTH: u16 = 21;
 }
 
-/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 22
+/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 22.
 mod charset_id {
     pub const ISO_ADOBE: usize = 0;
     pub const EXPERT: usize = 1;
     pub const EXPERT_SUBSET: usize = 2;
 }
 
-/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 16
+/// Enumerates Charset IDs defined in the Adobe Technical Note #5176, Table 16.
 mod encoding_id {
     pub const STANDARD: usize = 0;
     pub const EXPERT: usize = 1;
@@ -168,7 +158,6 @@ fn parse_top_dict(s: &mut Stream) -> Option<TopDict> {
 
     let index = parse_index::<u16>(s)?;
 
-    // The Top DICT INDEX should have only one dictionary.
     let data = index.get(0)?;
 
     let mut operands_buffer = [0.0; MAX_OPERANDS_LEN];
@@ -217,7 +206,6 @@ fn parse_top_dict(s: &mut Stream) -> Option<TopDict> {
     Some(top_dict)
 }
 
-// TODO: move to integration
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,7 +233,6 @@ mod tests {
             0x01, // offset size: 1
             0x01, // index [0]: 1
             0x03, // index [1]: 3
-            // Item 0
             0x8A, // offset: -1
             0x11, // operator: 17 (char_string)
         ];
@@ -260,8 +247,6 @@ mod tests {
             0x01, // offset size: 1
             0x01, // index [0]: 1
             0x02, // index [1]: 2
-            // Item 0
-            // <-- No number here.
             0x11, // operator: 17 (char_string)
         ];
 
@@ -275,7 +260,6 @@ mod tests {
             0x01, // offset size: 1
             0x01, // index [0]: 1
             0x04, // index [1]: 4
-            // Item 0
             0x8A, // length: -1
             0x8A, // offset: -1
             0x12, // operator: 18 (private)
@@ -322,12 +306,7 @@ fn parse_font_dict(data: &[u8]) -> Option<Range<usize>> {
     None
 }
 
-/// In CID fonts, to get local subroutines we have to:
-///   1. Find Font DICT index via FDSelect by GID.
-///   2. Get Font DICT data from FDArray using this index.
-///   3. Get a Private DICT offset from a Font DICT.
-///   4. Get a local subroutine offset from Private DICT.
-///   5. Parse a local subroutine at offset.
+/// Resolves local subroutines for a glyph in a CID font.
 fn parse_cid_local_subrs<'a>(
     data: &'a [u8],
     glyph_id: GlyphId,
@@ -340,8 +319,6 @@ fn parse_cid_local_subrs<'a>(
     let private_dict = parse_private_dict(private_dict_data);
     let subroutines_offset = private_dict.local_subroutines_offset?;
 
-    // 'The local subroutines offset is relative to the beginning
-    // of the Private DICT data.'
     let start = private_dict_range.start.checked_add(subroutines_offset)?;
     let subrs_data = data.get(start..)?;
     let mut s = Stream::new(subrs_data);
@@ -413,7 +390,6 @@ fn parse_char_string(
 
     let bbox = parser.builder.bbox;
 
-    // Check that bbox was changed.
     if bbox.is_default() {
         return Err(CFFError::ZeroBBox);
     }
@@ -434,19 +410,12 @@ fn _parse_char_string(
         let op = s.read::<u8>().ok_or(CFFError::ReadOutOfBounds)?;
         match op {
             0 | 2 | 9 | 13 | 15 | 16 | 17 => {
-                // Reserved.
                 return Err(CFFError::InvalidOperator);
             }
             operator::HORIZONTAL_STEM
             | operator::VERTICAL_STEM
             | operator::HORIZONTAL_STEM_HINT_MASK
             | operator::VERTICAL_STEM_HINT_MASK => {
-                // y dy {dya dyb}* hstem
-                // x dx {dxa dxb}* vstem
-                // y dy {dya dyb}* hstemhm
-                // x dx {dxa dxb}* vstemhm
-
-                // If the stack length is uneven, than the first value is a `width`.
                 let len = if p.stack.len().is_odd() && ctx.width.is_none() {
                     ctx.width = Some(p.stack.at(0));
                     p.stack.len() - 1
@@ -456,7 +425,6 @@ fn _parse_char_string(
 
                 ctx.stems_len = ctx.stems_len.saturating_add(len as u32 >> 1);
 
-                // We are ignoring the hint operators.
                 p.stack.clear();
             }
             operator::VERTICAL_MOVE_TO => {
@@ -491,9 +459,6 @@ fn _parse_char_string(
                     return Err(CFFError::NestingLimitReached);
                 }
 
-                // Parse and remember the local subroutine for the current glyph.
-                // Since it's a pretty complex task, we're doing it only when
-                // a local subroutine is actually requested by the glyphs charstring.
                 if ctx.local_subrs.is_none() {
                     if let FontKind::CID(ref cid) = ctx.metadata.kind {
                         ctx.local_subrs =
@@ -524,7 +489,6 @@ fn _parse_char_string(
                 break;
             }
             TWO_BYTE_OPERATOR_MARK => {
-                // flex
                 let op2 = s.read::<u8>().ok_or(CFFError::ReadOutOfBounds)?;
                 match op2 {
                     operator::HFLEX => p.parse_hflex()?,
@@ -536,7 +500,6 @@ fn _parse_char_string(
             }
             operator::ENDCHAR => {
                 if p.stack.len() == 4 || (ctx.width.is_none() && p.stack.len() == 5) {
-                    // Process 'seac'.
                     let accent_char = seac_code_to_glyph_id(&ctx.metadata.charset, p.stack.pop())
                         .ok_or(CFFError::InvalidSeacCode)?;
                     let base_char = seac_code_to_glyph_id(&ctx.metadata.charset, p.stack.pop())
@@ -589,10 +552,8 @@ fn _parse_char_string(
             operator::HINT_MASK | operator::COUNTER_MASK => {
                 let mut len = p.stack.len();
 
-                // We are ignoring the hint operators.
                 p.stack.clear();
 
-                // If the stack length is uneven, than the first value is a `width`.
                 if len.is_odd() {
                     len -= 1;
                     if ctx.width.is_none() {
@@ -693,8 +654,6 @@ fn _parse_char_string(
         }
     }
 
-    // TODO: 'A charstring subroutine must end with either an endchar or a return operator.'
-
     Ok(())
 }
 
@@ -706,7 +665,6 @@ fn seac_code_to_glyph_id(charset: &Charset, n: f32) -> Option<GlyphId> {
 
     match charset {
         Charset::ISOAdobe => {
-            // ISO Adobe charset only defines string ids up to 228 (zcaron)
             if code <= 228 {
                 Some(GlyphId(sid.0))
             } else {
@@ -741,12 +699,8 @@ impl FDSelect<'_> {
                     return None;
                 }
 
-                // 'A sentinel GID follows the last range element and serves
-                // to delimit the last range in the array.'
-                // So we can simply increase the number of ranges by one.
                 let number_of_ranges = number_of_ranges.checked_add(1)?;
 
-                // Range is: GlyphId + u8
                 let mut prev_first_glyph = s.read::<GlyphId>()?;
                 let mut prev_index = s.read::<u8>()?;
                 for _ in 1..number_of_ranges {
@@ -796,8 +750,6 @@ fn parse_sid_metadata<'a>(
         top_dict.private_dict_range,
         private_dict.local_subroutines_offset,
     ) {
-        // 'The local subroutines offset is relative to the beginning
-        // of the Private DICT data.'
         if let Some(start) = private_dict_range.start.checked_add(subroutines_offset) {
             let data = data.get(start..data.len())?;
             let mut s = Stream::new(data);
@@ -823,8 +775,6 @@ fn parse_cid_metadata(
     };
 
     if charset_offset <= charset_id::EXPERT_SUBSET {
-        // 'There are no predefined charsets for CID fonts.'
-        // Adobe Technical Note #5176, chapter 18 CID-keyed Fonts
         return None;
     }
 
@@ -843,12 +793,9 @@ fn parse_cid_metadata(
     Some(FontKind::CID(metadata))
 }
 
-/// A [Compact Font Format Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/cff).
+/// A [Compact Font Format Table]( https://docs.microsoft.com/en-us/typography/opentype/spec/cff).
 #[derive(Clone, Copy)]
 pub struct Table<'a> {
-    // The whole CFF table.
-    // Used to resolve a local subroutine in a CID font.
     table_data: &'a [u8],
 
     #[allow(dead_code)]
@@ -866,7 +813,6 @@ impl<'a> Table<'a> {
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
 
-        // Parse Header.
         let major = s.read::<u8>()?;
         s.skip::<u8>(); // minor
         let header_size = s.read::<u8>()?;
@@ -876,25 +822,20 @@ impl<'a> Table<'a> {
             return None;
         }
 
-        // Jump to Name INDEX. It's not necessarily right after the header.
         if header_size > 4 {
             s.advance(usize::from(header_size) - 4);
         }
 
-        // Skip Name INDEX.
         skip_index::<u16>(&mut s)?;
 
         let top_dict = parse_top_dict(&mut s)?;
 
-        // Must be set, otherwise there are nothing to parse.
         if top_dict.char_strings_offset == 0 {
             return None;
         }
 
-        // String INDEX.
         let strings = parse_index::<u16>(&mut s)?;
 
-        // Parse Global Subroutines INDEX.
         let global_subrs = parse_index::<u16>(&mut s)?;
 
         let char_strings = {
@@ -902,7 +843,6 @@ impl<'a> Table<'a> {
             parse_index::<u16>(&mut s)?
         };
 
-        // 'The number of glyphs is the value of the count field in the CharStrings INDEX.'
         let number_of_glyphs = u16::try_from(char_strings.len())
             .ok()
             .and_then(NonZeroU16::new)?;
@@ -923,7 +863,6 @@ impl<'a> Table<'a> {
         let kind = if top_dict.has_ros {
             parse_cid_metadata(data, top_dict, number_of_glyphs.get())?
         } else {
-            // Only SID fonts are allowed to have an Encoding.
             let encoding = match top_dict.encoding_offset {
                 Some(encoding_id::STANDARD) => Encoding::new_standard(),
                 Some(encoding_id::EXPERT) => Encoding::new_expert(),
@@ -947,8 +886,6 @@ impl<'a> Table<'a> {
     }
 
     /// Returns a total number of glyphs in the font.
-    ///
-    /// Never zero.
     #[inline]
     pub fn number_of_glyphs(&self) -> u16 {
         self.number_of_glyphs.get()
@@ -973,18 +910,14 @@ impl<'a> Table<'a> {
         parse_char_string(data, self, glyph_id, false, builder).map(|v| v.0)
     }
 
-    /// Resolves a Glyph ID for a code point.
-    ///
-    /// Similar to [`Face::glyph_index`](crate::Face::glyph_index) but 8bit
-    /// and uses CFF encoding and charset tables instead of TrueType `cmap`.
+    /// Resolves a Glyph ID for a code point ([`Face::glyph_index`](crate::Face::glyph_index)).
     pub fn glyph_index(&self, code_point: u8) -> Option<GlyphId> {
         match self.kind {
             FontKind::SID(ref sid_meta) => {
                 match sid_meta.encoding.code_to_gid(&self.charset, code_point) {
                     Some(id) => Some(id),
                     None => {
-                        // Try using the Standard encoding otherwise.
-                        // Custom Encodings does not guarantee to include all glyphs.
+                        // Fall back to Standard encoding.
                         Encoding::new_standard().code_to_gid(&self.charset, code_point)
                     }
                 }
@@ -993,11 +926,7 @@ impl<'a> Table<'a> {
         }
     }
 
-    /// Returns a glyph width.
-    ///
-    /// This value is different from outline bbox width and is stored separately.
-    ///
-    /// Technically similar to [`Face::glyph_hor_advance`](crate::Face::glyph_hor_advance).
+    /// Returns a glyph width ([`Face::glyph_hor_advance`](crate::Face::glyph_hor_advance)).
     pub fn glyph_width(&self, glyph_id: GlyphId) -> Option<u16> {
         match self.kind {
             FontKind::SID(ref sid) => {

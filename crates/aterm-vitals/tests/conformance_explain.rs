@@ -1,21 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `ExplainHonesty` (`aterm_models_misc::explain_honesty_model`):
-//! each scene of the cause engine's tests (`aterm_vitals::explain::fixtures`)
-//! is read through the real `Vitals::absorb` (the split, `detect`, the
-//! episodes and the clause) and `explain::account`, and projected onto the
-//! model. The scene's facts, written down here from the scene and never from
-//! the engine, are the state its window leaves (`fresh = 0`); the engine's
-//! answers are the states `Detect` and then `Attach` must reach, every law
-//! holding in each. The Deck's clause is replayed tick by tick through
-//! `Hold` and `Fail`: over the real split ticks of Spotlight's moment, and
-//! over a scripted run of the real `ClauseHold` that fails for 30 s.
-//!
-//! NEGATIVE CONTROLS (§17's table): the real engine with one injected defect
-//! (`explain::Fault`, a `cfg(any(test, debug_assertions))` seam). Each is
-//! refused at Buggy 0, admitted by its own mutant, and that mutant's state
-//! breaks its own law — so a projection that accepts everything fails here.
+//! Tier-1 for `ExplainHonesty` (`aterm_models_misc::explain_honesty_model`): each scene of the
+//! cause engine's tests (`aterm_vitals::explain::fixtures`) is read through the real
+//! `Vitals::absorb` (the split, `detect`, the episodes and the clause) and `explain::account`, and
+//! projected onto the model.
 
 use std::collections::BTreeMap;
 
@@ -137,7 +126,6 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             Truth { terms: 0, ..T1032 },
         ),
         (
-            // Its terms hold and it covers 600 mc, but under a tenth.
             "Spotlight under a tenth of a build",
             window(tab2_build_mds_1048()),
             2,
@@ -150,7 +138,6 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             },
         ),
         (
-            // Two of its three coalitions are start-up's, 1420 of its 3420 mc.
             "Spotlight with corespotlightd restarted",
             window(spotlight_late_1032()),
             1,
@@ -191,7 +178,6 @@ fn cases() -> Vec<(&'static str, Vec<Sample>, u64, Truth)> {
             Truth { swept: 0, ..T1032 },
         ),
         (
-            // No coalition is read, so no lead's claim is.
             "the lane off",
             window(lane_off_1032()),
             1,

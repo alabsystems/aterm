@@ -3,17 +3,6 @@
 
 //! The status item's AppKit: the mug button, its two template images, the menu (built once,
 //! retitled in place) and the pop-up that shows it.
-//!
-//! Every send here talks to WindowServer, so no test reaches the functions that send (the
-//! aterm-census guard `test-appkit-door` holds `+[NSMenuItem separatorItem]` and
-//! `-setToolTip:` to that); the tests below cover the pure helpers and the prototypes.
-//!
-//! The menu is never set on the item: a click reaches the target ([`super::app`]), which
-//! shows it with `-popUpMenuPositioningItem:atLocation:inView:`, and the image and tooltip
-//! are sent only when they change (aterm-gui's status item, 2026-09-28: a whole-app stall
-//! inside the status item's scene setup, under a `-setMenu:` on every change). So that
-//! accessibility can open it too (an item with no menu offers no `AXShowMenu`), the button
-//! carries a custom action, [`SHOW_MENU`], which sends the target its own selector.
 
 use aterm_objc::send::{
     alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_id_sel,
@@ -44,15 +33,15 @@ const POINTS: u32 = 18;
 const SCALES: [u32; 2] = [1, 2];
 /// How far below the button the menu's top edge sits, in points.
 const POPUP_GAP: f64 = 3.0;
-/// The button's custom accessibility action, which opens the menu: VoiceOver lists it
-/// among the item's actions (VO-Command-Space).
+/// The button's custom accessibility action, which opens the menu: VoiceOver lists it among the
+/// item's actions (VO-Command-Space).
 pub(super) const SHOW_MENU: &str = "Show Menu";
 
 /// `-[NSMenu popUpMenuPositioningItem:atLocation:inView:]`, `B48@0:8@16{CGPoint=dd}24@40`:
 /// no helper has this shape.
 type PopUpFn = unsafe extern "C-unwind" fn(Id, Sel, Id, CGPoint, Id) -> Bool;
 
-/// The mug in the menu bar. Dropping it takes the item off the bar.
+/// The mug in the menu bar.
 pub(super) struct StatusUi {
     /// The bar item; releasing it would also take it off the bar.
     item: Obj,
@@ -78,11 +67,9 @@ pub(super) struct Popup {
     button: Obj,
 }
 
-/// Put the mug in the menu bar: a variable-length item whose button sends `click` to
-/// `target` on a left or right release and `show` (`- (BOOL)x:(id)action`) for its
-/// [`SHOW_MENU`] accessibility action, and the menu of `rows` whose items send `choose` to
-/// `target` with their action's tag. `None` when AppKit refuses any of it (nothing is
-/// left on the bar then). Main thread only.
+/// Put the mug in the menu bar: a variable-length item whose button sends `click` to `target` on a
+/// left or right release and `show` (`- (BOOL)x:(id)action`) for its [`SHOW_MENU`] accessibility
+/// action, and the menu of `rows` whose items send `choose` to `target` with their action's tag.
 pub(super) fn install(
     target: Id,
     click: Sel,
@@ -94,13 +81,7 @@ pub(super) fn install(
         let images = [template_image(false)?, template_image(true)?];
         let menu = new_menu()?;
         let items = add_rows(menu.id(), target, choose, &rows);
-        // SAFETY: main-thread AppKit sends on live receivers. `+systemStatusBar` is
-        // `@16@0:8`; `-statusItemWithLength:` is `@24@0:8d16` and answers the item at +0,
-        // retained here (the bar does not keep it); `-button` is `@16@0:8`, the item's own
-        // button, retained for the pop-ups. `-setImagePosition:` is `v24@0:8Q16`,
-        // `-setTarget:` `v24@0:8@16` (held weakly: the caller keeps `target` alive),
-        // `-setAction:` `v24@0:8:16`, `-sendActionOn:` `q24@0:8Q16` (its answer, the old
-        // mask, is not needed) and `-setAccessibilityLabel:` `v24@0:8@16`.
+        // SAFETY: main-thread AppKit sends on live receivers.
         unsafe {
             let bar = send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
             if bar.is_null() {
@@ -135,17 +116,14 @@ pub(super) fn install(
 }
 
 impl StatusUi {
-    /// Show the full mug when `lit`, else the empty one, with `tip` as the hover; each is
-    /// sent only when it differs from what the button shows. The accessibility label says
-    /// which ([`state_text`]): a label set on the button hides its image's description, so
-    /// without it a VoiceOver user would hear the same thing on and off.
+    /// Show the full mug when `lit`, else the empty one, with `tip` as the hover.
     pub(super) fn show(&mut self, lit: bool, tip: &str) {
         autoreleasepool(|_| {
             if self.shown_lit != Some(lit) {
                 let image = &self.images[usize::from(lit)];
-                // SAFETY: `-setImage:` and `-setAccessibilityLabel:` are `v24@0:8@16` on the
-                // live button, handed a live image this holds (the button retains it too) and
-                // a live string it copies.
+                // SAFETY: `-setImage:` and `-setAccessibilityLabel:` are `v24@0:8@16` on the live
+                // button, handed a live image this holds (the button retains it too) and a live
+                // string it copies.
                 unsafe {
                     send_v_id(self.button.id(), sel!(setImage:), image.id());
                     if let Some(label) = aterm_objc::ns_string(state_text(lit)) {
@@ -157,17 +135,16 @@ impl StatusUi {
             if self.shown_tip.as_deref() != Some(tip)
                 && let Some(text) = aterm_objc::ns_string(tip)
             {
-                // SAFETY: `-setToolTip:` is `v24@0:8@16` on the live button, handed a live
-                // string it copies.
+                // SAFETY: `-setToolTip:` is `v24@0:8@16` on the live button, handed a live string
+                // it copies.
                 unsafe { send_v_id(self.button.id(), sel!(setToolTip:), text.id()) };
                 self.shown_tip = Some(tip.to_string());
             }
         });
     }
 
-    /// Make the menu show `rows`: the rows that changed are retitled (and their checkmark
-    /// and tag set) in place; a menu of another shape is built again, items sending
-    /// `choose` to `target`.
+    /// Make the menu show `rows`: the rows that changed are retitled (and their checkmark and tag
+    /// set) in place; a menu of another shape is built again, items sending `choose` to `target`.
     pub(super) fn refresh_menu(&mut self, target: Id, choose: Sel, rows: Vec<Row>) {
         autoreleasepool(|_| match changed_rows(&self.rows, &rows) {
             Some(changed) => {
@@ -186,8 +163,8 @@ impl StatusUi {
         self.rows = rows;
     }
 
-    /// The menu and its button, retained for [`pop_up`], which runs while no borrow of the
-    /// app's state is held (a choice in the menu changes that state).
+    /// The menu and its button, retained for [`pop_up`], which runs while no borrow of the app's
+    /// state is held (a choice in the menu changes that state).
     pub(super) fn popup(&self) -> Popup {
         Popup {
             menu: self.menu.clone_retained(),
@@ -199,8 +176,8 @@ impl StatusUi {
 impl Drop for StatusUi {
     fn drop(&mut self) {
         autoreleasepool(|_| {
-            // SAFETY: `+systemStatusBar` is `@16@0:8` and `-removeStatusItem:` `v24@0:8@16`,
-            // handed the item it made; the item is released after, with the rest.
+            // SAFETY: `+systemStatusBar` is `@16@0:8` and `-removeStatusItem:` `v24@0:8@16`, handed
+            // the item it made; the item is released after, with the rest.
             unsafe {
                 let bar = send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
                 if !bar.is_null() {
@@ -211,16 +188,11 @@ impl Drop for StatusUi {
     }
 }
 
-/// Show the menu just below its button, the button highlighted while it is open, and
-/// return when it closes (a choice has been sent to its target by then or will be from
-/// the run loop). Main thread only.
+/// Show the menu just below its button, the button highlighted while it is open, and return when it
+/// closes (a choice has been sent to its target by then or will be from the run loop).
 pub(super) fn pop_up(popup: &Popup) {
     autoreleasepool(|_| {
         // SAFETY: main-thread AppKit sends on the live menu and button `popup` retains.
-        // `-highlight:` is `v20@0:8B16`, `-bounds` `{CGRect=…}16@0:8`, `-isFlipped`
-        // `B16@0:8`, and the pop-up `PopUpFn`'s prototype: a nil positioning item puts the
-        // menu's top-left corner at the point, in the button's coordinates. It runs the
-        // menu's tracking loop and answers whether an item was chosen.
         unsafe {
             let button = popup.button.id();
             send_v_bool(button, sel!(highlight:), true);
@@ -241,9 +213,8 @@ pub(super) fn pop_up(popup: &Popup) {
     });
 }
 
-/// Where the menu's top-left corner goes for a button with `bounds`: its left edge, a gap
-/// below its bottom edge, which is the larger y in a flipped view and the smaller in an
-/// unflipped one.
+/// Where the menu's top-left corner goes for a button with `bounds`: its left edge, a gap below its
+/// bottom edge, which is the larger y in a flipped view and the smaller in an unflipped one.
 pub(super) fn popup_point(bounds: CGRect, flipped: bool) -> CGPoint {
     let y = if flipped {
         bounds.origin.y + bounds.size.height + POPUP_GAP
@@ -256,8 +227,7 @@ pub(super) fn popup_point(bounds: CGRect, flipped: bool) -> CGPoint {
     }
 }
 
-/// The rows of `now` that differ from `shown`, by index; `None` when the two are not the
-/// same shape (count, and kind at each index), so the menu has to be built again.
+/// The rows of `now` that differ from `shown`, by index.
 pub(super) fn changed_rows(shown: &[Row], now: &[Row]) -> Option<Vec<usize>> {
     let same_kind = |a: &Row, b: &Row| std::mem::discriminant(a) == std::mem::discriminant(b);
     if shown.len() != now.len() || !shown.iter().zip(now).all(|(a, b)| same_kind(a, b)) {
@@ -274,8 +244,8 @@ pub(super) fn changed_rows(shown: &[Row], now: &[Row]) -> Option<Vec<usize>> {
     )
 }
 
-/// What the mug says it is, lit or not: its image's description and the button's
-/// accessibility label once it shows one ([`StatusUi::show`]).
+/// What the mug says it is, lit or not: its image's description and the button's accessibility
+/// label once it shows one ([`StatusUi::show`]).
 pub(super) const fn state_text(lit: bool) -> &'static str {
     if lit { "Caffeine on" } else { "Caffeine off" }
 }
@@ -289,8 +259,7 @@ fn template_image(lit: bool) -> Option<Obj> {
         width: side,
         height: side,
     };
-    // SAFETY: main-thread sends, inside the caller's pool. `-initWithSize:` is
-    // `@32@0:8{CGSize=dd}16`, consuming the `+alloc` and answering +1.
+    // SAFETY: main-thread sends, inside the caller's pool.
     let image = unsafe {
         Obj::from_owned(send_id_size(
             alloc(class(c"NSImage")),
@@ -300,15 +269,15 @@ fn template_image(lit: bool) -> Option<Obj> {
     }?;
     for scale in SCALES {
         let rep = bitmap(&icon::png(lit, POINTS * scale))?;
-        // SAFETY: `-setSize:` (`v32@0:8{CGSize=dd}16`) makes the bitmap's pixels that many
-        // points; `-addRepresentation:` (`v24@0:8@16`) retains it into the live image.
+        // SAFETY: `-setSize:` (`v32@0:8{CGSize=dd}16`) makes the bitmap's pixels that many points;
+        // `-addRepresentation:` (`v24@0:8@16`) retains it into the live image.
         unsafe {
             send_v_size(rep.id(), sel!(setSize:), size);
             send_v_id(image.id(), sel!(addRepresentation:), rep.id());
         }
     }
-    // SAFETY: `-setTemplate:` is `v20@0:8B16` and `-setAccessibilityDescription:`
-    // `v24@0:8@16`, on the live image.
+    // SAFETY: `-setTemplate:` is `v20@0:8B16` and `-setAccessibilityDescription:` `v24@0:8@16`, on
+    // the live image.
     unsafe {
         send_v_bool(image.id(), sel!(setTemplate:), true);
         if let Some(text) = aterm_objc::ns_string(state_text(lit)) {
@@ -325,9 +294,8 @@ fn bitmap(png: &[u8]) -> Option<Obj> {
         return None;
     }
     autoreleasepool(|_| {
-        // SAFETY: `-initWithBytes:length:` is `@32@0:8r^v16Q24`, copying the `png.len()`
-        // bytes for the call and answering +1. `+imageRepWithData:` is `@24@0:8@16` and
-        // answers the decoded bitmap at +0, retained before this pool pops.
+        // SAFETY: `-initWithBytes:length:` is `@32@0:8r^v16Q24`, copying the `png.len()` bytes for
+        // the call and answering +1.
         unsafe {
             let data = Obj::from_owned(send_id_cptr_usize(
                 alloc(class(c"NSData")),
@@ -351,9 +319,6 @@ fn set_show_menu_action(button: Id, target: Id, show: Sel) {
         return;
     };
     // SAFETY: main-thread AppKit sends on live receivers.
-    // `-initWithName:target:selector:` is `@40@0:8@16@24:32` and consumes the +alloc (the
-    // target held weakly: the caller keeps it alive); `+arrayWithObject:` is `@24@0:8@16`
-    // and answers +0; `-setAccessibilityCustomActions:` is `v24@0:8@16` and copies the array.
     unsafe {
         let Some(action) = Obj::from_owned(send_id_id_id_sel(
             alloc(class(c"NSAccessibilityCustomAction")),
@@ -425,10 +390,8 @@ fn new_item(row: &Row, target: Id, choose: Sel) -> Option<Obj> {
     let title = aterm_objc::ns_string(title)?;
     let empty = aterm_objc::ns_string("")?;
     let action = if tagged.is_some() { choose } else { Sel::NULL };
-    // SAFETY: `-initWithTitle:action:keyEquivalent:` is `@40@0:8@16:24@32`, consuming the
-    // `+alloc` and answering +1; a nil action is its "no action". Both strings are live
-    // and copied. `-setTarget:` is `v24@0:8@16` (held weakly: the caller keeps `target`
-    // alive), `-setEnabled:` `v20@0:8B16`, `-setTag:` and `-setState:` `v24@0:8q16`.
+    // SAFETY: `-initWithTitle:action:keyEquivalent:` is `@40@0:8@16:24@32`, consuming the `+alloc`
+    // and answering +1; a nil action is its "no action".
     unsafe {
         let item = Obj::from_owned(send_id_id_sel_id(
             alloc(class(c"NSMenuItem")),
@@ -472,8 +435,8 @@ const fn state(checked: bool) -> isize {
 
 /// Append a separator line.
 fn add_separator(menu: Id) {
-    // SAFETY: `+separatorItem` is `@16@0:8` and answers a fresh item at +0, inside the
-    // caller's pool; `-addItem:` retains it into the live menu.
+    // SAFETY: `+separatorItem` is `@16@0:8` and answers a fresh item at +0, inside the caller's
+    // pool; `-addItem:` retains it into the live menu.
     unsafe {
         let separator = send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
         if !separator.is_null() {
@@ -537,7 +500,6 @@ mod tests {
         assert_eq!((flipped.x, flipped.y), (0.0, 22.0 + POPUP_GAP));
         let unflipped = popup_point(rect(0.0, 0.0, 24.0, 22.0), false);
         assert_eq!((unflipped.x, unflipped.y), (0.0, -POPUP_GAP));
-        // An origin off zero moves with it.
         let moved = popup_point(rect(5.0, 2.0, 24.0, 22.0), true);
         assert_eq!((moved.x, moved.y), (5.0, 24.0 + POPUP_GAP));
         let moved = popup_point(rect(5.0, 2.0, 24.0, 22.0), false);
@@ -549,7 +511,6 @@ mod tests {
         const NOW: u64 = 1_790_000_000;
         let off = menu::compose(Mode::Off, NOW, Startup::Off, "1");
         assert_eq!(changed_rows(&off, &off), Some(vec![]));
-        // Turning on forever moves the checkmark: only that row changes.
         let forever = menu::compose(Mode::Forever, NOW, Startup::Off, "1");
         let forever_row = off
             .iter()
@@ -564,12 +525,10 @@ mod tests {
             })
             .expect("forever row");
         assert_eq!(changed_rows(&off, &forever), Some(vec![forever_row]));
-        // A timed mode's time left retitles its row a minute later.
         let timed = Mode::chosen(Choice::Hours1, NOW);
         let a = menu::compose(timed, NOW, Startup::On, "1");
         let b = menu::compose(timed, NOW + 60, Startup::On, "1");
         assert_eq!(changed_rows(&a, &b).map(|c| c.len()), Some(1));
-        // Another shape is built again.
         assert_eq!(changed_rows(&off, &off[1..]), None);
         let mut kinds = off.clone();
         kinds[1] = Row::Info("x".into());
@@ -586,8 +545,8 @@ mod tests {
     fn runtime(cls: &'static std::ffi::CStr, sel: Sel, class_method: bool) -> Option<String> {
         let cls = class(cls);
         assert!(!cls.is_null(), "{cls:?}");
-        // SAFETY: `cls` is a live, registered class, and so is its metaclass; reading a
-        // method's encoding has no side effects and opens no WindowServer connection.
+        // SAFETY: `cls` is a live, registered class, and so is its metaclass; reading a method's
+        // encoding has no side effects and opens no WindowServer connection.
         unsafe {
             let cls = if class_method {
                 aterm_objc::class_of(cls.as_id())
@@ -600,8 +559,6 @@ mod tests {
 
     /// Every prototype this file sends with, against what the runtime says the selector
     /// takes: a wrong width or sign here would corrupt registers in an app no test runs.
-    /// (`+separatorItem` and `-setToolTip:` are `send_id` and `send_v_id` shapes like
-    /// others here, and are not named in a test: the `test-appkit-door` guard.)
     #[test]
     fn every_send_here_has_the_prototype_the_runtime_reports() {
         let (v, id, b, sel_, q, uq, d) = (

@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The bundle pack end to end on the real tools: a sysroot of `cc`-built Mach-Os whose
-//! `trustc` is a fixture Trust compiler, packed by [`PackBundle`] with the host's `strip`,
-//! `codesign`, `otool` (relocation) and the client's lineage checker. The published shape
-//! — `bin/rustc` and `bin/trustc` the same program under two ad-hoc signatures — must ship
-//! as one inode, one signature, a compiler that runs.
+//! `trustc` is a fixture Trust compiler, packed by [`pack_bundle_with`] over the host's
+//! tools ([`HostTools`]: `strip`, `codesign`, `otool` for relocation, the client's lineage
+//! checker), compressed by aterm-zstd's raw-block writer in place of the zstd CLI. The
+//! published shape — `bin/rustc` and `bin/trustc` the same program under two ad-hoc
+//! signatures — must ship as one inode, one signature, a compiler that runs.
 //!
 //! macOS only: it needs `cc`, `codesign`, `otool` and Mach-O.
 
@@ -14,8 +15,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use atpkg_publish::api::{BundlePacker, BundleRequest, HelloGate, Signing};
-use atpkg_publish::artifact::bundle::PackBundle;
+use atpkg_publish::api::{BundleRequest, HelloGate, Signing};
+use atpkg_publish::artifact::bundle::pack_bundle_with;
+use atpkg_publish::artifact::relocate::Report;
+use atpkg_publish::artifact::tarwrite::{Compressor, RawFrames};
+use atpkg_publish::artifact::tools::{HostTools, Ran, Run, RunError, Tools};
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 
@@ -56,9 +60,36 @@ fn ino(p: &Path) -> u64 {
     std::fs::metadata(p).expect("stat").ino()
 }
 
+/// [`HostTools`] in every call but the compressor, which is aterm-zstd's raw-block writer:
+/// the pack's shape is under test, not the zstd CLI's compression.
+struct HostButRaw;
+
+impl Tools for HostButRaw {
+    fn run(&self, run: &Run) -> Result<Ran, RunError> {
+        HostTools.run(run)
+    }
+    fn strip(&self, file: &Path, locals_and_debug: bool) -> Result<(), String> {
+        HostTools.strip(file, locals_and_debug)
+    }
+    fn resign(&self, file: &Path) -> Result<(), String> {
+        HostTools.resign(file)
+    }
+    fn same_unsigned(&self, a: &Path, b: &Path) -> Result<bool, String> {
+        HostTools.same_unsigned(a, b)
+    }
+    fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String> {
+        HostTools.thin(file, arch, out)
+    }
+    fn relocate(&self, stage: &Path, donors: &[PathBuf]) -> Result<Report, String> {
+        HostTools.relocate(stage, donors)
+    }
+    fn compressor(&self) -> &dyn Compressor {
+        &RawFrames::WHOLE
+    }
+}
+
 #[test]
 fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
-    crate::shared::need_compressor();
     let tmp = scratch("e2e-bundle");
     let root = std::fs::canonicalize(tmp.path()).expect("root");
     let host = if std::env::consts::ARCH == "aarch64" {
@@ -186,9 +217,7 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
         signing: Signing::Unsigned,
         upload: false,
     };
-    let outcome = PackBundle
-        .pack_bundle(&ctx, &request)
-        .expect("the real pack");
+    let outcome = pack_bundle_with(&ctx, &request, &HostButRaw).expect("the real pack");
     assert_eq!(
         outcome.triple.as_str(),
         host,

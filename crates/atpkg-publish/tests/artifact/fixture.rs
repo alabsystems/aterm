@@ -429,6 +429,11 @@ impl Tools for FakeTools {
             None => Ok(atpkg_publish::artifact::relocate::Report::default()),
         }
     }
+
+    /// aterm-zstd's raw-block writer: the fake packs with no zstd CLI on the box.
+    fn compressor(&self) -> &dyn atpkg_publish::artifact::tarwrite::Compressor {
+        &atpkg_publish::artifact::tarwrite::RawFrames::WHOLE
+    }
 }
 
 /// Copy `src` to `dst` (made), symlinks copied as symlinks and every file copied on its

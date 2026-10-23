@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the `amacs` client's `edit` and `await edit` exchanges: the
-//! re-armed wait and its re-dial against a scripted wire and a scripted
-//! clock, the meaning of each `edit` answer, and both exchanges over a real
-//! socket to a mock window.
+//! Tests for `edit` and `await edit` exchanges over scripted and real sockets.
 
 use std::collections::VecDeque;
 
@@ -215,8 +212,6 @@ fn redial_by_uri_after_replaced() {
     assert_eq!(wire.requests(), [ticket_leg(), uri_leg()]);
     assert_eq!(wire.paused, Duration::ZERO, "the same server, at once");
 
-    // A seamless update's old process may say it is going away before it
-    // closes the connection; behind a forward, the relay says its host went.
     for going in [
         "ERR event loop gone",
         "ERR edit waiter was dropped",
@@ -232,7 +227,6 @@ fn redial_by_uri_after_replaced() {
         assert_eq!(wire.requests(), [ticket_leg(), uri_leg()], "{going}");
     }
 
-    // Nothing answers again: the wait ends at the bound, as a replacement.
     let mut wire = Script::new(vec![Err(io::ErrorKind::UnexpectedEof.into())]);
     let outcome = await_over(&mut wire, SID, AwaitKey::Ticket(Ticket(7)), URI);
     assert!(
@@ -243,7 +237,6 @@ fn redial_by_uri_after_replaced() {
     assert!(wire.paused <= crate::redial::SUCCESSOR_BOUND + REDIAL_POLL);
     assert!(wire.requests()[1..].iter().all(|line| *line == uri_leg()));
 
-    // A refusal from the server the wait was armed on is the answer.
     let mut wire = Script::new(vec![ok("ERR scope")]);
     let outcome = await_over(&mut wire, SID, AwaitKey::Ticket(Ticket(7)), URI);
     assert_eq!(outcome, Err(AwaitErr::Refused("ERR scope".to_string())));
@@ -326,7 +319,6 @@ fn err_reply_selects_terminal_face() {
         for_word: Some("git".to_string()),
         wait: true,
     };
-    // No window to ask: the request never left.
     let mut wire = Script::new(Vec::new()).resolving(vec![Err(io::ErrorKind::NotFound.into())]);
     let err = edit_over(&mut wire, SID, &request).expect_err("nothing to ask");
     assert!(matches!(err, EditErr::Unreachable(_)) && err.falls_back_to_terminal());
@@ -334,8 +326,6 @@ fn err_reply_selects_terminal_face() {
     let mut wire = Script::new(vec![Err(io::ErrorKind::ConnectionRefused.into())]);
     let err = edit_over(&mut wire, SID, &request).expect_err("a dead socket");
     assert!(matches!(err, EditErr::Unreachable(_)) && err.falls_back_to_terminal());
-    // A timeout, EOF/reset after the send, or an uncertain write/flush:
-    // delivery may have happened, so none can start a second editor.
     for kind in [
         io::ErrorKind::WouldBlock,
         io::ErrorKind::UnexpectedEof,
@@ -350,7 +340,6 @@ fn err_reply_selects_terminal_face() {
         assert!(matches!(err, EditErr::NoAnswer(_)), "{err:?}");
         assert!(!err.falls_back_to_terminal());
     }
-    // A request that cannot be one wire line is never sent.
     let spaced = EditRequest {
         uri: "file:///tmp/a b".to_string(),
         ..request.clone()
@@ -359,7 +348,6 @@ fn err_reply_selects_terminal_face() {
     let err = edit_over(&mut wire, SID, &spaced).expect_err("unsendable");
     assert!(matches!(err, EditErr::Unsendable(_)) && err.falls_back_to_terminal());
     assert!(wire.sent.is_empty());
-    // Short captured IDs and real minted IDs retain the same wire spelling.
     for sid in [SID, "s-0123456789abcdef0123"] {
         let mut wire = Script::new(vec![ok(&format!(
             "OK edit ticket=9 view=4 doc=2 uri={URI}"

@@ -50,7 +50,7 @@ pub enum Format<'a> {
     HighByteMappingThroughTable(Subtable2<'a>),
     SegmentMappingToDeltaValues(Subtable4<'a>),
     TrimmedTableMapping(Subtable6<'a>),
-    MixedCoverage, // unsupported
+    MixedCoverage,
     TrimmedArray(Subtable10<'a>),
     SegmentedCoverage(Subtable12<'a>),
     ManyToOneRangeMappings(Subtable13<'a>),
@@ -72,7 +72,6 @@ impl<'a> Subtable<'a> {
     /// Checks that the current encoding is Unicode compatible.
     #[inline]
     pub const fn is_unicode(&self) -> bool {
-        // https://docs.microsoft.com/en-us/typography/opentype/spec/name#windows-encoding-ids
         const WINDOWS_UNICODE_BMP_ENCODING_ID: u16 = 1;
         const WINDOWS_UNICODE_FULL_REPERTOIRE_ENCODING_ID: u16 = 10;
 
@@ -81,15 +80,11 @@ impl<'a> Subtable<'a> {
             PlatformId::Windows if self.encoding_id == WINDOWS_UNICODE_BMP_ENCODING_ID => true,
             PlatformId::Windows => {
                 // "Note: Subtable format 13 has the same structure as format 12; it differs only
-                // in the interpretation of the startGlyphID/glyphID fields".
                 let is_format_12_compatible = matches!(
                     self.format,
                     Format::SegmentedCoverage(..) | Format::ManyToOneRangeMappings(..)
                 );
 
-                // "Fonts that support Unicode supplementary-plane characters (U+10000 to U+10FFFF)
-                // on the Windows platform must have a format 12 subtable for platform ID 3,
-                // encoding ID 10."
                 self.encoding_id == WINDOWS_UNICODE_FULL_REPERTOIRE_ENCODING_ID
                     && is_format_12_compatible
             }
@@ -98,15 +93,6 @@ impl<'a> Subtable<'a> {
     }
 
     /// Maps a character to a glyph ID.
-    ///
-    /// This is a low-level method and unlike `Face::glyph_index` it doesn't
-    /// check that the current encoding is Unicode.
-    /// It simply maps a `u32` codepoint number to a glyph ID.
-    ///
-    /// Returns `None`:
-    /// - when glyph ID is `0`.
-    /// - when format is `MixedCoverage`, since it's not supported.
-    /// - when format is `UnicodeVariationSequences`. Use `glyph_variation_index` instead.
     #[inline]
     pub fn glyph_index(&self, code_point: u32) -> Option<GlyphId> {
         match self.format {
@@ -118,16 +104,11 @@ impl<'a> Subtable<'a> {
             Format::TrimmedArray(ref subtable) => subtable.glyph_index(code_point),
             Format::SegmentedCoverage(ref subtable) => subtable.glyph_index(code_point),
             Format::ManyToOneRangeMappings(ref subtable) => subtable.glyph_index(code_point),
-            // This subtable should be accessed via glyph_variation_index().
             Format::UnicodeVariationSequences(_) => None,
         }
     }
 
     /// Resolves a variation of a glyph ID from two code points.
-    ///
-    /// Returns `None`:
-    /// - when glyph ID is `0`.
-    /// - when format is not `UnicodeVariationSequences`.
     #[inline]
     pub fn glyph_variation_index(
         &self,
@@ -143,29 +124,17 @@ impl<'a> Subtable<'a> {
     }
 
     /// Calls `f` for all codepoints contained in this subtable.
-    ///
-    /// This is a low-level method and it doesn't check that the current
-    /// encoding is Unicode. It simply calls the function `f` for all `u32`
-    /// codepoints that are present in this subtable.
-    ///
-    /// Note that this may list codepoints for which `glyph_index` still returns
-    /// `None` because this method finds all codepoints which were _defined_ in
-    /// this subtable. The subtable may still map them to glyph ID `0`.
-    ///
-    /// Returns without doing anything:
-    /// - when format is `MixedCoverage`, since it's not supported.
-    /// - when format is `UnicodeVariationSequences`, since it's not supported.
     pub fn codepoints<F: FnMut(u32)>(&self, f: F) {
         match self.format {
             Format::ByteEncodingTable(ref subtable) => subtable.codepoints(f),
             Format::HighByteMappingThroughTable(ref subtable) => subtable.codepoints(f),
             Format::SegmentMappingToDeltaValues(ref subtable) => subtable.codepoints(f),
             Format::TrimmedTableMapping(ref subtable) => subtable.codepoints(f),
-            Format::MixedCoverage => {} // unsupported
+            Format::MixedCoverage => {}
             Format::TrimmedArray(ref subtable) => subtable.codepoints(f),
             Format::SegmentedCoverage(ref subtable) => subtable.codepoints(f),
             Format::ManyToOneRangeMappings(ref subtable) => subtable.codepoints(f),
-            Format::UnicodeVariationSequences(_) => {} // unsupported
+            Format::UnicodeVariationSequences(_) => {}
         };
     }
 }
@@ -215,7 +184,7 @@ impl<'a> Subtables<'a> {
             2 => Format::HighByteMappingThroughTable(Subtable2::parse(data)?),
             4 => Format::SegmentMappingToDeltaValues(Subtable4::parse(data)?),
             6 => Format::TrimmedTableMapping(Subtable6::parse(data)?),
-            8 => Format::MixedCoverage, // unsupported
+            8 => Format::MixedCoverage,
             10 => Format::TrimmedArray(Subtable10::parse(data)?),
             12 => Format::SegmentedCoverage(Subtable12::parse(data)?),
             13 => Format::ManyToOneRangeMappings(Subtable13::parse(data)?),
@@ -277,8 +246,7 @@ impl<'a> Iterator for SubtablesIter<'a> {
     }
 }
 
-/// A [Character to Glyph Index Mapping Table](
-/// https://docs.microsoft.com/en-us/typography/opentype/spec/cmap).
+/// A [Character to Glyph Index Mapping Table].
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'a> {
     /// A list of subtables.
@@ -290,7 +258,7 @@ impl<'a> Table<'a> {
     #[inline]
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut s = Stream::new(data);
-        s.skip::<u16>(); // version
+        s.skip::<u16>();
         let count = s.read::<u16>()?;
         let records = s.read_array16::<EncodingRecord>(count)?;
         Some(Table {

@@ -1,29 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An exception whose reporter has stopped naming it ends, by its own clock,
-//! without a second look, and never before that clock has run.
+//! An exception whose reporter has stopped naming it ends, by its own clock, without a second look,
+//! and never before that clock has run.
 
 use aterm_spec::derive::{Expr, Liveness, Model, eq, int, or_, var};
 
-/// One digest entry of a level family (`MessageCenter::sync_digest`). `cause` is a ghost: whether
-/// the fact still holds (only the reporter's pass reads it). `missed` is "the reporter's last pass
-/// did not name the entry", which arms its clock (`missed_at`; `digest_deadline` names the instant
-/// it ends); `age` counts the clock in `Ticks` of `RESOLVE_AFTER`. `Miss` and `Name` are looks
-/// that skip or name it (a flicker neither ends nor re-posts a fact), `Tick` is time passing,
-/// `Settle` the loop's wake at the deadline (`settle_digest`).
-///
-/// The claim is liveness because the upgrade reporter sends a look only when its rows change: a
-/// row that leaves produces one empty look and no second one, so every state stays legal while
-/// the entry stands for ever. `AnUnnamedEntryEnds`: once a look has missed an entry, it is named
-/// again or ended under nothing but time and the loop's wake; `Miss` and `Name` are not fair.
-///
-/// `Buggy=1` adds four mutants, each its own action. Two break the liveness: `TwoLooksToEnd` (the
-/// first missed look arms no clock; only a second look ends it) and `NobodyCallsSettle` (the clock
-/// names its instant and nothing calls the settle). Two break the safety: `EndsBeforeTheClockRan`
-/// (two looks milliseconds apart end a flickered fact) and `ClockOutlivesTheEntry` (an ended entry
-/// keeps a past deadline, so an idle loop wakes for ever).
-/// Tier-1: `aterm-messages/tests/conformance_digest_ends.rs`.
+/// One digest entry of a level family (`MessageCenter::sync_digest`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn exceptions_digest_ends_model() -> Model {
@@ -79,17 +62,13 @@ pub fn exceptions_digest_ends_model() -> Model {
 
             invariant NoEarlyEnd: open == 1 || ended_age == Ticks;
             invariant ClockDiesWithTheEntry: missed == 0 || open == 1;
-            // Each liveness mutant also trips an invariant: the `--strict-vacuity` audit
-            // credits a mutant as a negative control only when an invariant alone falsifies it.
             invariant TheClockNeverFreezes: frozen == 0;
             invariant TheSettleIsWired: unwired == 0;
         }
     }
 }
 
-/// `[]<>(missed = 0 \/ open = 0)`: the entry is not stuck missed-and-open for
-/// good. Weak fairness of `Tick` (time passes) and `Settle` (the loop takes the
-/// wake `digest_deadline` arms); each is load-bearing, which the audit checks.
+/// `[]<>(missed = 0 \/ open = 0)`: the entry is not stuck missed-and-open for good.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(exceptions_digest_ends_model)]

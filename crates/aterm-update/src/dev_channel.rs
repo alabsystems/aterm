@@ -67,7 +67,7 @@ impl DevLag {
 
     /// Whether the dev build is older than the newest release.
     #[must_use]
-    pub fn is_behind(&self) -> bool {
+    pub const fn is_behind(&self) -> bool {
         matches!(self, Self::Behind { .. })
     }
 
@@ -188,7 +188,7 @@ impl WatchGate {
 /// Whether the watch runs at all. `[update] enabled = false` turns off everything aterm
 /// checks by itself, and a copy that is not dev-marked has the updater's own check.
 #[must_use]
-pub fn should_watch(gate: WatchGate) -> bool {
+pub const fn should_watch(gate: WatchGate) -> bool {
     gate.automatic && gate.dev_marked
 }
 

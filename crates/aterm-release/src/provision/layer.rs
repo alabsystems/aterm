@@ -2,24 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! What `ship provision` audits past its own Apple, notary and credential checks
-//! (docs/DESIGN-init-system-2026-10-20.md §4.6): a release host is a develop machine
-//! plus the `release` layer. Each is an aterm-converge item, probed through one port
-//! ([`ReleaseHost`]) and run in the engine's plan mode, so nothing here changes the
-//! machine; a full `ship provision` runs `verify provision` first, and this reads what
-//! that left.
-//!
-//! - `base`: the installed aterm's `aterm init --check --json --only base`, complete.
-//! - `develop`: every row a bare `targo --unverified verify provision` provides, in
-//!   place (read in process with that verb's own check: `aterm init --only develop`
-//!   is S8's).
-//! - `release.openssl`: `/usr/bin/openssl` is macOS's LibreSSL (KEEP-OS, probe only).
-//! - `release.publication`: the publication engine checkout and `bin/pub`, with
-//!   gitleaks where `pub stage` finds it.
-//! - `release.site`: the site checkout with its executable `deploy.sh`.
-//! - `release.firebase`: node and firebase-tools, which `deploy.sh` runs, until S17.
-//!
-//! `release.rustup-x86_64`, `.identity`, `.notary`, `.credentials` and `.gh` are the
-//! `x86 slice`, Apple certificate, `notary`, `profile` and `github` checks beside these.
+//! (docs/DESIGN-init-system-2026-10-20.md §4.6): a release host is a develop machine plus the
+//! `release` layer.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,15 +15,12 @@ use super::Check;
 
 /// What the layer's items read: this machine ([`System`]), or a test's.
 pub(crate) trait ReleaseHost: Send + Sync {
-    /// The installed aterm's `aterm init --check --json --only base` report; `Ok(None)`
-    /// where no installed aterm is found.
-    ///
+    /// The installed aterm's `aterm init --check --json --only base` report.
     /// # Errors
     /// It ran and printed no report: why.
     fn base(&self) -> Result<Option<aterm_converge::Report>, String>;
 
     /// Each row a bare `verify provision` provides, as its read-only check finds it.
-    ///
     /// # Errors
     /// No `$HOME` names the caches.
     fn develop(&self) -> Result<Vec<(&'static str, State)>, String>;
@@ -50,9 +31,7 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// The publication engine's checkout (`$PUBLICATION_ENGINE`, else `~/publication`).
     fn publication(&self) -> PathBuf;
 
-    /// The site checkout `ship site` syncs (`$SITE_DIR`, else `publish/site.toml`'s
-    /// `dir`), where one is named.
-    ///
+    /// The site checkout `ship site` syncs, where one is named.
     /// # Errors
     /// `publish/site.toml` exists and does not parse.
     fn site(&self) -> Result<Option<PathBuf>, String>;
@@ -326,8 +305,6 @@ impl Item for LayerItem {
     }
 
     fn apply(&self) -> Result<(), String> {
-        // The audit runs in plan mode only: what acquires these is `verify provision`
-        // (develop), `aterm init` (base) or a person (the release layer).
         Err(format!("{} is audited here, never applied", self.id))
     }
 
@@ -409,8 +386,7 @@ fn check_of(row: &ItemReport) -> Check {
     }
 }
 
-/// Every item over `host`, probed and planned (nothing applied), as `(id, line)` in
-/// [`ITEMS`] order.
+/// Every item over `host`, probed and planned, as `` in [`ITEMS`] order.
 pub(crate) fn audit(host: &Arc<dyn ReleaseHost>) -> Vec<(&'static str, Check)> {
     let items = items(host);
     match aterm_converge::run(&items, Mode::Plan, &mut aterm_converge::ReadOnly) {
@@ -475,7 +451,6 @@ impl ReleaseHost for System {
         let Some(aterm) = self.installed_aterm() else {
             return Ok(None);
         };
-        // Read only (`--check`), and base items alone: nothing of this login is read.
         let out = aterm_uds::spawnfd::command(&aterm)
             .args(["init", "--check", "--json", "--only", "base"])
             .output_owned()

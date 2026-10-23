@@ -4,19 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! Recorded answers for the leaf types this crate absorbs in winit-core step 5
-//! (docs/AUDIT-third-party-2026-10-15.md, WC.5): `aterm_window::dpi` (from `dpi` 0.1.2),
-//! `aterm_window::window::CursorIcon` (from `cursor-icon` 1.2.0, the six icons aterm
-//! sets, and the eight edge-resize icons LW.5 added) and the `bitflags!` types
-//! (`bitflags` 2).
-//!
-//! Every expected value below was recorded from the third-party crates while
-//! they were still what these paths named. The absorb then keeps this file
-//! unchanged: what the packages answered is what the first-party code must
-//! answer. The rows that convert to an integer are the ones a re-implementation
-//! gets wrong, so `the_rounding_rows_reject_every_plausible_wrong_rounding`
-//! holds the table to telling round-half-away-from-zero apart from the
-//! alternatives, and the table cannot pass vacuously.
+//! Recorded reference answers for `dpi`, `CursorIcon`, and `ModifiersState` conversions.
 
 use std::panic::catch_unwind;
 
@@ -164,7 +152,6 @@ fn scale_factors_are_validated_as_recorded() {
     ] {
         assert_eq!(validate_scale_factor(sf), valid, "{sf}");
     }
-    // Every scaling conversion asserts the factor; a bad one panics, never clamps.
     assert!(catch_unwind(|| LogicalSize::new(1.0f64, 1.0).to_physical::<u32>(0.0)).is_err());
     assert!(catch_unwind(|| PhysicalSize::new(1u32, 1).to_logical::<f64>(f64::NAN)).is_err());
     assert!(catch_unwind(|| LogicalPosition::new(1.0f64, 1.0).to_physical::<i32>(-2.0)).is_err());
@@ -213,8 +200,6 @@ fn the_rounding_rows_reject_every_plausible_wrong_rounding() {
             });
         assert!(refuted, "the recorded rows cannot tell {what} from the recorded rounding");
     }
-    // And the recorded rounding itself reproduces them through the same arithmetic,
-    // so the control is measuring the rounding and nothing else.
     assert!(LOGICAL_TO_PHYSICAL_U32
         .iter()
         .all(|&((w, h), sf, want)| ((w * sf).round() as u32, (h * sf).round() as u32) == want));
@@ -263,8 +248,6 @@ fn cursor_icons_answer_as_recorded() {
         assert_eq!(format!("{icon:?}"), debug);
     }
     assert_eq!(CursorIcon::default(), CursorIcon::Default);
-    // Distinct icons: a carve that collapsed two of them onto one row would
-    // still match every name above if the table repeated itself.
     for (i, a) in CURSOR_ICONS.iter().enumerate() {
         for b in &CURSOR_ICONS[i + 1..] {
             assert_ne!(a.0, b.0);

@@ -14,6 +14,12 @@ pub(crate) enum ParseError {
 pub(crate) struct BrokerArgs<'a, S> {
     pub secret_file: Option<&'a S>,
     pub durability: Option<&'a S>,
+    /// `--lifeline-fd <n>` ([`aterm_uds::lifeline::FLAG`]): the descriptor a launcher that
+    /// opts in hands the broker, which ends itself once it reads end-of-file.
+    pub lifeline_fd: Option<&'a S>,
+    /// Where that flag stands among the words read, so a line that shows the invocation for
+    /// a person to run again can leave it out: only the launcher could hand the descriptor.
+    pub lifeline_at: Option<usize>,
     pub repair: bool,
     pub words: Vec<&'a S>,
 }
@@ -42,6 +48,8 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
         let mut out = Self {
             secret_file: None,
             durability: None,
+            lifeline_fd: None,
+            lifeline_at: None,
             repair: false,
             words: Vec::new(),
         };
@@ -52,6 +60,10 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
                 Some("-h" | "--help") => return Err(ParseError::Help),
                 Some("--secret-file") => Some((&mut out.secret_file, "--secret-file")),
                 Some("--durability") => Some((&mut out.durability, "--durability")),
+                Some(aterm_uds::lifeline::FLAG) => {
+                    out.lifeline_at = Some(i);
+                    Some((&mut out.lifeline_fd, aterm_uds::lifeline::FLAG))
+                }
                 Some("--repair") => {
                     out.repair = true;
                     None
@@ -186,6 +198,51 @@ mod tests {
             BrokerArgs::parse(&["sock", "--help"]),
             Err(ParseError::Help)
         ));
+    }
+
+    /// **A LIFELINE IS ONE MORE VALUED FLAG**, so a broker a test or tool armed
+    /// (`--lifeline-fd 0` appended after its words) reads off the process table as
+    /// the same serving invocation: its endpoint, its tier and its log. Its value is
+    /// opaque like the others', and it is kept once. NEGATIVE CONTROL: the same argv
+    /// with the flag's value missing is refused, never a serving argv.
+    #[test]
+    fn a_lifeline_is_a_valued_flag_and_the_serving_reads_hold() {
+        let argv = [
+            "aterm",
+            "link",
+            "broker",
+            "/r/bus.sock",
+            "/r/bus.log",
+            "--secret-file",
+            "/r/mint.secret",
+            aterm_uds::lifeline::FLAG,
+            "0",
+        ];
+        let parsed = BrokerArgs::from_invocation(&argv).expect("a serving invocation");
+        assert_eq!(parsed.lifeline_fd.copied(), Some("0"));
+        assert_eq!(parsed.lifeline_at, Some(4), "its place among the words");
+        assert_eq!(parsed.words, vec![&"/r/bus.sock", &"/r/bus.log"]);
+        assert!(parsed.serves_endpoint("/r/bus.sock"));
+        assert_eq!(
+            parsed.serving_durability(),
+            Some(crate::durability::default_for(true))
+        );
+        assert_eq!(
+            parsed.log_path(),
+            Some(std::path::PathBuf::from("/r/bus.log"))
+        );
+        let words = ["sock", "--lifeline-fd", "--durability"];
+        let opaque = BrokerArgs::parse(&words)
+            .ok()
+            .expect("its value is an opaque word");
+        assert_eq!(opaque.lifeline_fd.copied(), Some("--durability"));
+        assert!(opaque.durability.is_none());
+        assert!(matches!(
+            BrokerArgs::parse(&["sock", "--lifeline-fd", "0", "--lifeline-fd", "3"]),
+            Err(ParseError::Usage(_))
+        ));
+        let cut = &argv[..argv.len() - 1];
+        assert!(BrokerArgs::from_invocation(cut).is_none(), "no value");
     }
 
     /// **THE LOG IS READ AS THE BROKER VERB READS IT** — where astream's

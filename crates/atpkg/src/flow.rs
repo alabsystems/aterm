@@ -2091,7 +2091,7 @@ fn digest_refusal_note(
     Some(crate::state::held_failed(&memo.why, &how))
 }
 
-fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
+const fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
     match available {
         Some(avail) if !crate::cost::disk_ok(required, avail, crate::cost::FREE_FLOOR) => {
             Err(FlowError::InsufficientDisk {
@@ -2134,7 +2134,7 @@ pub(crate) struct LandingBytes {
 
 impl LandingBytes {
     /// One artifact's bytes.
-    pub(crate) fn of(artifact: &crate::manifest::Artifact) -> Self {
+    pub(crate) const fn of(artifact: &crate::manifest::Artifact) -> Self {
         Self {
             asset: artifact.size,
             tree: artifact.cost.disk_installed,
@@ -2143,7 +2143,7 @@ impl LandingBytes {
 
     /// `self` and `other` landing together, as a tuple's members.
     #[must_use]
-    pub(crate) fn and(self, other: Self) -> Self {
+    pub(crate) const fn and(self, other: Self) -> Self {
         Self {
             asset: self.asset.saturating_add(other.asset),
             tree: self.tree.saturating_add(other.tree),
@@ -2151,7 +2151,7 @@ impl LandingBytes {
     }
 
     /// What a disk gate requires free for this unit, before the reserve.
-    pub(crate) fn need(self) -> u64 {
+    pub(crate) const fn need(self) -> u64 {
         self.asset.saturating_add(self.tree)
     }
 }

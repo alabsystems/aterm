@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lane-bus xgrab <window> <out>`: the X window `<window>`'s pixels as the
-//! server holds them, read with GetImage (ZPixmap, every plane) on the
-//! display `DISPLAY` names and written to `<out>` as a binary PPM (P6, RGB).
-//! It is the server's side of a CPU present, which the lab holds equal to the
-//! frame aterm says it presented (`image`): an independent second X client,
-//! speaking the core protocol directly as [`crate::xdnd`] does, never through
-//! the aterm-x11 the presenter draws with (docs/AUDIT-third-party-2026-10-15.md
-//! LW.6).
-//!
-//! This oracle assumes the lane's 24- or 32-bit depth windows use little-endian
-//! 32-bit pixels with red, green and blue in bits 16-23, 8-15 and 0-7.
-//! It checks depth and reply length, but does not independently validate the
-//! image byte order, bits per pixel or visual channel masks.
+//! `lane-bus xgrab <window> <out>` X11 `GetImage` PPM reader via [`crate::xdnd`].
 
 use std::io::Write as _;
 use std::path::Path;
@@ -30,7 +18,6 @@ fn get_image(drawable: u32, width: u16, height: u16) -> Vec<u8> {
         body.extend_from_slice(&v.to_le_bytes());
     }
     body.extend_from_slice(&u32::MAX.to_le_bytes());
-    // Format ZPixmap (2).
     request(73, 2, &body)
 }
 

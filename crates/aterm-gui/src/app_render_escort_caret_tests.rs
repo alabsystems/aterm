@@ -1,35 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The flying head escorts the caret the pet escorts, in a single pane, in a
-//! split pane, and in a capture.
-//!
-//! A TUI like Claude Code hides the cursor once and repaints inside DEC-2026
-//! brackets. Past the 150 ms hold a present shows a bracket still open, the
-//! hidden cursor wherever the repaint stopped writing. The pet reads the last
-//! finished present's caret there (`CompanionOwner::prepare`); the single-pane
-//! host handed the flying head the raw cursor, so the head flew up the
-//! transcript to the write position. Both bodies now read
-//! `PetTick::escort_caret`, which also waits out a hidden cursor's move in a
-//! program that brackets nothing until the cursor has rested.
-//!
-//! The split arm handed the companions the painted caret only, so under a
-//! program that hides its cursor a split pane had no flying head at all, and
-//! a capture (`image`) read the painted caret only too: a lab still showed
-//! no head where the glass had one. Every arm now takes the escort caret.
+//! Tests that single-pane, split-pane, and capture renders use the escort caret.
 
 use super::*;
 use std::time::Duration;
 
 const WID: WindowId = WindowId(0);
-/// The composer's caret and the repaint's write position (0-based, in the
-/// focused pane's cells).
+/// The composer's caret and the repaint's write position (0-based, in the focused pane's cells).
 const CARET: (u16, u16) = (20, 10);
 const WRITE: (u16, u16) = (3, 30);
 const FRAME: Duration = Duration::from_millis(16);
 
-/// Which host arm draws the head: the single grid, or the focused pane of a
-/// split (the composed path).
+/// Which host arm draws the head.
 #[derive(Clone, Copy, Debug)]
 enum Arm {
     Single,
@@ -82,10 +65,7 @@ fn unfinished(app: &App) -> bool {
     crate::term_lock(&term).sync_frame_unfinished()
 }
 
-/// The flying kitty over a Claude-shaped screen in `arm`: a transcript, the
-/// composer's caret at [`CARET`], the cursor hidden, the head summoned (the
-/// collection hello) and flown to the caret. Returns the app, the clock, and
-/// the window-pixel-to-pane-row map's cell height.
+/// The flying kitty over a Claude-shaped screen in `arm` ([`CARET`]).
 fn summoned(arm: Arm) -> (App, Instant, i32) {
     let mut app = App::headless_for_test();
     app.config.serious_mode = Some(false);
@@ -95,13 +75,11 @@ fn summoned(arm: Arm) -> (App, Instant, i32) {
     app.config.trail_sounds = Some(false);
     app.kitty_cursor_enabled_cache = None;
     if let Arm::Split = arm {
-        // Side by side: the panes share the window's rows.
         app.split_active_stub_tab(WID);
     }
     app.recompute_sparkle();
     let _ = app.sparkle.take();
     {
-        // The real redraw path end to end, through a scripted CPU surface.
         let ws = app.windows.get_mut(&WID).expect("window");
         ws.present = Some(crate::PresentTarget::Cpu {
             surface: crate::present::CpuSurface::Scripted(Default::default()),
@@ -131,8 +109,7 @@ fn row_of(y: i32, ch: i32) -> i32 {
     (y + ch / 2).div_euclid(ch)
 }
 
-/// The head's row, asserted beside the hidden caret: the fixture every test
-/// below starts from (in the split arm the painted caret alone drew no head).
+/// The head's row, asserted beside the hidden caret.
 fn home_row(app: &App, ch: i32, arm: Arm) -> i32 {
     let (_, home_y) = head(app).unwrap_or_else(|| {
         panic!("{arm:?}: the summoned head is on glass beside the hidden caret")
@@ -161,7 +138,6 @@ fn a_torn_repaint_keeps_the_flying_head_at_the_caret() {
             format!("\x1b[?2026h\x1b[{};{}Hrepaint", WRITE.0 + 1, WRITE.1 + 1).as_bytes(),
             t,
         );
-        // Past the hold every present is torn: the bracket is open and written.
         let opened = t;
         let mut torn = Vec::new();
         let end = t + Duration::from_millis(600);

@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE OCCUPANCY FACTS BOARD (`docs/DESIGN-harness-occupancy-2026-10-20.md`,).
+//! Under the same lock it keeps the pace and reservation table (design §4.2, [`Pace`]),
+//! which a loop under `occupancy = "prompt"` takes before it books its intent ([`pace_for`]).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +13,7 @@ use std::time::Duration;
 use aterm_agent::harness::disk::Level;
 use aterm_agent::supervise::memory::Pressure as MemoryPressure;
 use aterm_agent::supervise::occupancy::rules::{HOLD_ROOM_MACHINE, HOLD_ROOM_SLOTS};
-use aterm_agent::supervise::occupancy::{OccupancyReading, SlotsSeen};
+use aterm_agent::supervise::occupancy::{OccupancyReading, PaceGrant, RuleId, SlotsSeen};
 use aterm_sysprobe::slots::{SlotsRead, Unread};
 use aterm_uds::process::ProcessStart;
 use aterm_vitals::model::{Pressure, ProcSample, SlotsUnread, SlotsView, Snapshot, TabRoot};
@@ -186,6 +188,8 @@ pub(crate) struct Judged {
     /// Each supervised session's last look at which a build slot's holder
     /// lay in its tab (the snapshot's unix ms), kept [`HELD_KEEP`].
     held: BTreeMap<String, i64>,
+    /// The machine's pace and the slots reserved ([`Pace`]).
+    pace: Pace,
 }
 
 impl Judged {
@@ -225,6 +229,12 @@ impl Judged {
         let taken = board.taken_unix_ms;
         self.held
             .retain(|_, at| taken.saturating_sub(*at) <= whole_ms(HELD_KEEP));
+        // A reservation ends where its session's tab was seen holding a slot
+        // since: the build it was for took one.
+        let held = &self.held;
+        self.pace
+            .reserved
+            .retain(|r| held.get(&r.sid).is_none_or(|at| *at < r.since_ms));
         self.board = Some(board);
     }
 
@@ -256,6 +266,135 @@ impl Judged {
             held_slot_last_ms: self.held.get(sid).copied(),
         }
         .aged_at(Some(now_unix_ms))
+    }
+
+    /// THE PACE FOR A LINE of `rule` in session `sid`'s hold begun at
+    /// `hold_since_ms`, asked at `now_unix_ms` ([`Pace::ask`]): a slot rule
+    /// counts the slots the board proves usable now, none on a board that no
+    /// longer speaks for now.
+    pub(crate) fn pace(
+        &mut self,
+        sid: &str,
+        rule: RuleId,
+        hold_since_ms: i64,
+        now_unix_ms: i64,
+    ) -> PaceGrant {
+        let slot = match rule {
+            RuleId::HoldRoom => true,
+            RuleId::WaitNudge => false,
+        };
+        let reading = self.reading(sid, now_unix_ms);
+        let usable = reading
+            .slots
+            .filter(|_| reading.fresh())
+            .map_or(0, |s| s.usable);
+        let ask = Ask {
+            sid,
+            slot,
+            hold_since_ms,
+            usable,
+        };
+        self.pace.ask(&ask, now_unix_ms)
+    }
+}
+
+/// THE MACHINE'S PACE: at most this many fact lines across the machine in
+/// any hour (design §4.2).
+pub(crate) const MACHINE_LINES_PER_HOUR: usize = 6;
+
+/// The machine pace's window, ms.
+const HOUR_MS: i64 = 60 * 60_000;
+
+/// A slot rule's line reserves one free build slot this long (design §4.2).
+pub(crate) const RESERVE_MS: i64 = 10 * 60_000;
+
+/// A hold refused for want of a slot stands first in line this long after
+/// its last ask: a hold that stopped asking (its own guard holds it) no
+/// longer keeps a younger one waiting.
+pub(crate) const ASK_KEEP_MS: i64 = aterm_agent::supervise::occupancy::reading::STALE_AFTER_MS;
+
+/// One ask of the table.
+struct Ask<'a> {
+    sid: &'a str,
+    /// The rule's line needs a free build slot.
+    slot: bool,
+    /// When the asking session's hold began, unix ms: the oldest first.
+    hold_since_ms: i64,
+    /// The build slots the board proves usable now.
+    usable: u16,
+}
+
+/// A build slot reserved for a session's line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reservation {
+    sid: String,
+    /// When it was taken, unix ms.
+    since_ms: i64,
+}
+
+/// A hold refused for want of a slot, waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Waiting {
+    sid: String,
+    hold_since_ms: i64,
+    /// Its last ask, unix ms.
+    asked_ms: i64,
+}
+
+/// THE PACE AND RESERVATION TABLE ([module docs](self)).
+#[derive(Debug, Default)]
+pub(crate) struct Pace {
+    /// When each line of the last hour was granted, unix ms.
+    lines: Vec<i64>,
+    /// The slots reserved, each for [`RESERVE_MS`] from its taking.
+    reserved: Vec<Reservation>,
+    /// The holds that asked for a slot and found none, by their age.
+    waiting: Vec<Waiting>,
+}
+
+impl Pace {
+    /// THE ASK at `now_ms`, answered with the machine's pace and the slot's
+    /// reservation taken together, or neither: [`PaceGrant::Machine`] where
+    /// the hour's lines are spent; for a slot rule [`PaceGrant::Reserved`]
+    /// where no usable slot is left past those other sessions reserved and
+    /// those older holds wait for (the asker then waits in line); else
+    /// [`PaceGrant::Granted`], the line counted and, for a slot rule, its
+    /// slot reserved.
+    fn ask(&mut self, ask: &Ask<'_>, now_ms: i64) -> PaceGrant {
+        self.lines.retain(|at| now_ms.saturating_sub(*at) < HOUR_MS);
+        self.reserved
+            .retain(|r| now_ms.saturating_sub(r.since_ms) < RESERVE_MS);
+        self.waiting
+            .retain(|w| now_ms.saturating_sub(w.asked_ms) <= ASK_KEEP_MS);
+        if self.lines.len() >= MACHINE_LINES_PER_HOUR {
+            return PaceGrant::Machine;
+        }
+        if ask.slot {
+            let mine = (ask.hold_since_ms, ask.sid);
+            let others = self.reserved.iter().filter(|r| r.sid != ask.sid).count();
+            let older = self
+                .waiting
+                .iter()
+                .filter(|w| w.sid != ask.sid && (w.hold_since_ms, w.sid.as_str()) < mine)
+                .count();
+            if usize::from(ask.usable) <= others + older {
+                self.waiting.retain(|w| w.sid != ask.sid);
+                self.waiting.push(Waiting {
+                    sid: ask.sid.to_string(),
+                    hold_since_ms: ask.hold_since_ms,
+                    asked_ms: now_ms,
+                });
+                return PaceGrant::Reserved;
+            }
+            self.waiting.retain(|w| w.sid != ask.sid);
+            self.reserved.retain(|r| r.sid != ask.sid);
+            self.reserved.push(Reservation {
+                sid: ask.sid.to_string(),
+                since_ms: now_ms,
+            });
+        }
+        self.lines.push(now_ms);
+        PaceGrant::Granted
     }
 }
 
@@ -292,10 +431,14 @@ fn change_words(b: &FactsBoard) -> String {
     format!("{slots} disk={disk}")
 }
 
-/// How many waits name the build slots now ([`Arming::arm`]).
+/// How many waits name a reader now ([`Arming::arm`]): the build slots'
+/// ([`SLOTS_ARMED`]), or the split's (`crate::vitals_host::SPLIT_ARMED`).
 #[derive(Debug, Default)]
 pub(crate) struct Arming {
     armed: AtomicUsize,
+    /// The lines logged when the first is armed and when the last is gone,
+    /// where the reader's cadence changes then; `None` logs nothing.
+    lines: Option<(&'static str, &'static str)>,
 }
 
 /// One armed wait; dropped, it is no longer counted.
@@ -303,17 +446,29 @@ pub(crate) struct Arming {
 pub(crate) struct Armed<'a>(&'a Arming);
 
 impl Arming {
-    /// None armed.
+    /// None armed, and nothing logged.
     pub(crate) const fn new() -> Self {
         Self {
             armed: AtomicUsize::new(0),
+            lines: None,
+        }
+    }
+
+    /// None armed; `armed` is logged when the first is, `at_rest` when the
+    /// last is gone.
+    pub(crate) const fn logged(armed: &'static str, at_rest: &'static str) -> Self {
+        Self {
+            armed: AtomicUsize::new(0),
+            lines: Some((armed, at_rest)),
         }
     }
 
     /// Count one wait as armed until the guard drops.
     pub(crate) fn arm(&self) -> Armed<'_> {
-        if self.armed.fetch_add(1, Ordering::AcqRel) == 0 {
-            aterm_log::info!("{}", aterm_sysprobe::slots::ARMED_LINE);
+        if self.armed.fetch_add(1, Ordering::AcqRel) == 0
+            && let Some((armed, _)) = self.lines
+        {
+            aterm_log::info!("{armed}");
         }
         Armed(self)
     }
@@ -326,14 +481,20 @@ impl Arming {
 
 impl Drop for Armed<'_> {
     fn drop(&mut self) {
-        if self.0.armed.fetch_sub(1, Ordering::AcqRel) == 1 {
-            aterm_log::info!("{}", aterm_sysprobe::slots::AT_REST_LINE);
+        if self.0.armed.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some((_, at_rest)) = self.0.lines
+        {
+            aterm_log::info!("{at_rest}");
         }
     }
 }
 
-/// THE WAITS ON THE BUILD SLOTS.
-pub(crate) static SLOTS_ARMED: Arming = Arming::new();
+/// THE WAITS ON THE BUILD SLOTS. The two edges are logged: `lab slot-lane`
+/// counts them.
+pub(crate) static SLOTS_ARMED: Arming = Arming::logged(
+    aterm_sysprobe::slots::ARMED_LINE,
+    aterm_sysprobe::slots::AT_REST_LINE,
+);
 
 /// The board and what it judged, as last taken ([`look`]); `None` before
 /// the first look.
@@ -382,6 +543,25 @@ pub(crate) fn reading_for(sid: &str) -> OccupancyReading {
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .map_or_else(OccupancyReading::default, |j| j.reading(sid, now_unix_ms))
+}
+
+/// THE PACE FOR SESSION `sid`'S LINE of `rule`, its hold begun at
+/// `hold_since_ms` (`IdleHost::occupancy_pace`, [`Judged::pace`]): taken with
+/// the board, under its one lock. A wall clock that cannot be read holds the
+/// line at the machine's pace.
+pub(crate) fn pace_for(sid: &str, rule: RuleId, hold_since_ms: i64) -> PaceGrant {
+    let Some(now_unix_ms) = aterm_time::unix_millis().and_then(|ms| i64::try_from(ms).ok()) else {
+        return PaceGrant::Machine;
+    };
+    let grant = BOARD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(Judged::default)
+        .pace(sid, rule, hold_since_ms, now_unix_ms);
+    if grant == PaceGrant::Granted {
+        aterm_log::info!("occupancy pace @{sid}: {} granted", rule.name());
+    }
+    grant
 }
 
 #[cfg(test)]

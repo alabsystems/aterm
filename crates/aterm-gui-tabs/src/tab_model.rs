@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Content-agnostic tab, view and split-tree foundations: stable tab, view and native
-//! app-instance identities and the logical-pixel split geometry. PTY ownership stays in
-//! `aterm_gui::SessionPool`; [`View::Terminal`] is only the typed link to it.
+//! Content-agnostic tab, view, and split-tree identities and logical-pixel split geometry.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,8 +27,7 @@ macro_rules! stable_id {
         pub struct $name(u64);
 
         impl $name {
-            /// The stable integer representation used by restore and control
-            /// serialization. It is never a vector index.
+            /// The stable integer representation used by restore and control serialization.
             #[must_use]
             #[inline]
             pub const fn get(self) -> u64 {
@@ -50,11 +47,7 @@ stable_id!(TabId);
 stable_id!(ViewId);
 stable_id!(AppInstanceId);
 
-/// Reconstitute an identity at a validated restore boundary. Live allocation
-/// goes through [`IdAllocator`] or [`ViewStore`]. Only the macOS tab strip
-/// reconstitutes a [`TabId`], and no shipping code an [`AppInstanceId`]; the
-/// tests mint both directly — aterm-gui's on every platform, so both are in
-/// every debug build too.
+/// Reconstitute an identity at a validated restore boundary.
 macro_rules! from_stored {
     ($name:ident) => {
         impl $name {
@@ -73,13 +66,11 @@ from_stored!(TabId);
 #[cfg(any(test, debug_assertions))]
 from_stored!(AppInstanceId);
 
-/// The stable-id space has been exhausted. This is explicit even though a
-/// process cannot realistically create `u64::MAX` tabs or views.
+/// The stable-id space has been exhausted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IdExhausted;
 
-/// Monotonic, never-reusing identity source. Removing an object never rewinds
-/// this counter, so a delayed event cannot address a later object by accident.
+/// Monotonic, never-reusing identity source.
 #[derive(Clone, Debug)]
 pub struct IdAllocator<I> {
     next: u64,
@@ -89,7 +80,6 @@ pub struct IdAllocator<I> {
 impl<I> Default for IdAllocator<I> {
     fn default() -> Self {
         Self {
-            // Zero is never allocated, so it can stand for "no object".
             next: 1,
             _id: PhantomData,
         }
@@ -116,7 +106,7 @@ stable_id_impl!(ViewId);
 stable_id_impl!(AppInstanceId);
 
 impl<I: StableId> IdAllocator<I> {
-    /// Mint the next identity. An exhausted allocator stays exhausted.
+    /// Mint the next identity.
     #[inline]
     pub fn allocate(&mut self) -> Result<I, IdExhausted> {
         let raw = self.next;
@@ -131,15 +121,13 @@ pub struct TerminalView {
     pub session: u64,
 }
 
-/// The core-owned link for a native view. Its reducer/view-local state lives in
-/// the native app runtime and is keyed by the enclosing [`ViewId`].
+/// The core-owned link for a native view.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NativeViewRef {
     pub instance: AppInstanceId,
 }
 
-/// Content of one split leaf. The closed enum makes PTY-only operations
-/// explicit and gives later native apps a first-class, non-PTY representation.
+/// Content of one split leaf.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Terminal(TerminalView),
@@ -197,7 +185,7 @@ impl ViewStore {
         self.views.contains_key(&id)
     }
 
-    /// Remove a view. Its identity remains burned and is never allocated again.
+    /// Remove a view.
     #[inline]
     pub fn remove(&mut self, id: ViewId) -> Option<View> {
         self.views.remove(&id)
@@ -275,10 +263,7 @@ impl<T> SplitTree<T> {
         }
     }
 
-    /// Allocation-free, short-circuiting `leaves.into_iter.any(..)`, in
-    /// [`Self::visit`]'s leaf order. The wake and present predicates
-    /// (`active_tab_displays_session`, `active_tab_contains_native`) run at the PTY
-    /// reader's batch rate, thousands of times a second under a flood, so they use this.
+    /// Allocation-free, short-circuiting predicate over leaves in [`Self::visit`] order.
     pub fn any_leaf(&self, pred: &mut impl FnMut(&T) -> bool) -> bool {
         match self {
             Self::Leaf(value) => pred(value),
@@ -286,8 +271,7 @@ impl<T> SplitTree<T> {
         }
     }
 
-    /// Preserve split structure/ratios while projecting leaf payloads into a
-    /// different identity domain (terminal compatibility mirror ↔ stable view).
+    /// Project leaf payloads while preserving split structure and ratios.
     #[must_use]
     pub fn map<U>(&self, map: &mut impl FnMut(&T) -> U) -> SplitTree<U> {
         match self {
@@ -323,8 +307,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         leaves
     }
 
-    /// Replace `target` with a split whose first leaf is the original and whose
-    /// second leaf is `new`. Returns false without mutation if `target` is stale.
+    /// Replace `target` with a split of the original and `new`, or return false if stale.
     pub fn split_leaf(&mut self, target: T, axis: SplitAxis, new: T) -> bool {
         match self {
             Self::Leaf(value) if *value == target => {
@@ -344,9 +327,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
-    /// Describe the parent split that collapses when `target` is removed. The
-    /// returned path names that parent; after collapse the same path names the
-    /// promoted sibling, which is the stable insertion point for reopen.
+    /// Describe the parent split that collapses when `target` is removed.
     #[must_use]
     pub fn leaf_placement(&self, target: T) -> Option<(SplitPath, SplitBranch, SplitAxis, f32)> {
         fn find<T: Copy + Eq>(
@@ -375,8 +356,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         find(self, target, &SplitPath::root())
     }
 
-    /// Recreate a split whose removed leaf was collapsed onto its sibling. A stale
-    /// path or already-present identity fails without mutation.
+    /// Recreate a split whose removed leaf was collapsed onto its sibling.
     pub fn restore_collapsed_leaf(
         &mut self,
         parent: &SplitPath,
@@ -407,8 +387,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         true
     }
 
-    /// Remove `target` and collapse its parent. The only leaf is reported but
-    /// left in place so the tab owner can atomically remove the whole tab.
+    /// Remove `target` and collapse its parent, leaving the sole leaf in place.
     pub fn remove_leaf(&mut self, target: T) -> RemoveLeaf {
         if !self.contains(target) {
             return RemoveLeaf::NotFound;
@@ -453,8 +432,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
-    /// The last leaf in tree order (bottom/right-most), the mirror of
-    /// [`Self::first_leaf`]: the leaf touching a divider from above/left of it.
+    /// The last leaf in tree order (bottom/right-most).
     #[must_use]
     #[inline]
     pub fn last_leaf(&self) -> T {
@@ -464,12 +442,7 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
-    /// The leaf that inherits `target`'s space when [`Self::remove_leaf`] collapses
-    /// its parent: of the sibling sub-tree, the leaf against the divider `target`
-    /// shared with it (`first_leaf` when `target` is the first child, `last_leaf`
-    /// when it is the second). Focus re-seats there, on the pane that visibly grows
-    /// into the hole, never on the tree's global first leaf. `None` when `target` is
-    /// not a leaf of this tree or is the whole tree.
+    /// The sibling leaf that inherits `target`'s space when its parent collapses.
     #[must_use]
     pub fn absorbing_neighbor(&self, target: T) -> Option<T> {
         let Self::Split { first, second, .. } = self else {
@@ -551,12 +524,6 @@ pub struct LayoutLeaf<T> {
 }
 
 /// One leaf's sizing contract in the tab's logical coordinate space.
-///
-/// `minimum` is a hard ergonomic request when the host has enough room. If the
-/// whole tree cannot fit, every leaf remains present and the shortage is shared
-/// deterministically instead of dropping a sibling. `preferred` is used to
-/// distribute that shortage and is otherwise advisory; the user's divider ratio
-/// remains the primary placement choice.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct LeafSizing {
     pub minimum: LogicalSize,
@@ -594,9 +561,7 @@ impl LeafSizing {
     }
 }
 
-/// A stable root-to-node branch. Paths remain valid across focus, resize and
-/// divider-ratio changes; a structural split/close intentionally invalidates
-/// paths below the changed node, where mutation then fails closed.
+/// A stable root-to-node branch.
 #[derive(
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
 )]
@@ -675,9 +640,7 @@ impl VisibleLeaf {
     }
 }
 
-/// A split pane reserves one cell row for its title, provided one content row
-/// remains. Shared with the terminal compatibility layout so its blits and the
-/// canonical plan's sizing, input and accessibility agree on the same inset.
+/// Reserve one cell row for a split pane's title when at least one content row remains.
 #[must_use]
 #[inline]
 pub fn pane_header_rect(rect: LogicalRect) -> Option<LogicalRect> {
@@ -685,8 +648,7 @@ pub fn pane_header_rect(rect: LogicalRect) -> Option<LogicalRect> {
         .then(|| LogicalRect::new(rect.origin.x, rect.origin.y, rect.size.width, 1.0))
 }
 
-/// One visible divider, including the bounds needed to turn a pointer back into
-/// a ratio without re-resolving an index or content kind.
+/// One visible divider and the span bounds needed to map pointer position to ratio.
 #[derive(Clone, PartialEq, Debug)]
 pub struct VisibleDivider {
     pub path: SplitPath,
@@ -696,8 +658,7 @@ pub struct VisibleDivider {
     span_extent: f32,
 }
 
-/// A frame-stable, content-agnostic plan. Paint, pointer hit testing, terminal
-/// sizing and accessibility all consume this same artifact.
+/// A frame-stable, content-agnostic layout plan.
 #[derive(Clone, PartialEq, Debug)]
 pub struct VisibleLeafPlan {
     pub tab: TabId,
@@ -710,8 +671,7 @@ pub struct VisibleLeafPlan {
 }
 
 impl VisibleLeafPlan {
-    /// Reserve host chrome only when siblings are visible. Single panes and
-    /// zoomed panes keep their full content area. Reapplying is harmless.
+    /// Reserve host chrome only when siblings are visible.
     pub fn reserve_pane_headers(&mut self) {
         if self.leaves.len() <= 1 {
             return;
@@ -754,7 +714,6 @@ impl VisibleLeafPlan {
     pub fn divider_at(&self, point: LogicalPoint) -> Option<&VisibleDivider> {
         self.dividers
             .iter()
-            // A nested divider is visually above its ancestor at intersections.
             .rev()
             .find(|divider| divider.rect.contains(point))
     }
@@ -772,8 +731,7 @@ impl VisibleLeafPlan {
     }
 }
 
-/// Root-to-split path used as a stable divider-drag handle while the tree shape
-/// remains unchanged.
+/// Root-to-split path used as a stable divider-drag handle.
 #[derive(Clone, PartialEq, Debug)]
 pub struct LogicalDividerHit {
     path: SplitPath,
@@ -792,8 +750,7 @@ pub enum FocusDirection {
 }
 
 impl<T: Copy + Eq> SplitTree<T> {
-    /// Resolve every leaf in logical pixels. `divider` is a pixel-width gap;
-    /// `min_leaf` is the nonzero ergonomic floor along the divided axis.
+    /// Resolve every leaf in logical pixels.
     #[must_use]
     pub fn layout(&self, bounds: LogicalRect, divider: f32, min_leaf: f32) -> Vec<LayoutLeaf<T>> {
         let mut out = Vec::with_capacity(self.len());
@@ -1153,9 +1110,6 @@ fn constrained_extent(
         return (first, available - first);
     }
 
-    // Impossible fit: keep both subtrees represented. Preferred extents are a
-    // deterministic tie-breaker when minimums are zero; otherwise shortage is
-    // shared in proportion to the requested minimums.
     let first_weight = if first_minimum + second_minimum > f32::EPSILON {
         first_minimum
     } else {
@@ -1329,28 +1283,18 @@ fn node_at_path_mut<'a, T>(
 }
 
 /// Independent tab-state flags; no state hides another state.
-///
-/// Each attention bit has one owner. The status classifier recomputes
-/// `status_attention` from the tab's leaves on every publication; `attention` is
-/// written out of band and cannot be derived from anything the classifier sees. A
-/// shared bool could not be recomputed without latching the recomputer's own past
-/// value. Ask [`Self::wants_attention`] at every render seam; never read one field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TabIndicators {
     pub dirty: bool,
     pub busy: bool,
-    /// Raised out of band by a native leaf's owner (a failed document shutdown, an
-    /// update announcement). Never written by the status path.
+    /// Raised out of band by a native leaf's owner.
     pub attention: bool,
-    /// Raised by the session status classifier (a failed last outcome). Recomputed
-    /// from the tab's terminal leaves on every pass, so it clears itself when the
-    /// failure is superseded.
+    /// Raised by the session status classifier and recomputed on every pass.
     pub status_attention: bool,
 }
 
 impl TabIndicators {
-    /// Whether anything at all wants the user's eye. The chrome shows one mark, so
-    /// every renderer and the introspection serializer fold here.
+    /// Whether any indicator wants the user's attention.
     #[must_use]
     #[inline]
     pub const fn wants_attention(self) -> bool {
@@ -1358,9 +1302,7 @@ impl TabIndicators {
     }
 }
 
-/// Closed icon identity for first-party, non-terminal tab applications. A terminal
-/// has no variant (its presentation is title-only, `TabPresentation::icon == None`),
-/// so unknown app metadata can never get a terminal's chrome policy.
+/// Closed icon identity for first-party, non-terminal tab applications.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabIconKind {
     Settings,
@@ -1395,13 +1337,7 @@ impl TabIconKind {
     }
 }
 
-/// Which side(s) of a live session connection (design §4) a tab's sessions sit
-/// on: `Outbound` = a session here holds authority into a peer, `Inbound` = a peer
-/// holds authority over a session here, `Both` = both.
-///
-/// Not a [`TabIndicators`] field: several seams assign whole `TabIndicators` values
-/// over a presentation, which would erase a third owner's bit. The role is stamped
-/// per tab by `App::stamp_tab_connection_roles` inside the one strip-refresh funnel.
+/// Which side(s) of a live session connection a tab's sessions sit on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TabConnRole {
     Outbound,
@@ -1422,8 +1358,7 @@ impl TabConnRole {
         }
     }
 
-    /// This role's directional flags, `(outbound, inbound)` — the inverse of
-    /// [`Self::from_flags`], so folds can union in flag space.
+    /// Directional `(outbound, inbound)` flags for this role.
     #[must_use]
     #[inline]
     pub const fn flags(self) -> (bool, bool) {
@@ -1434,8 +1369,7 @@ impl TabConnRole {
         }
     }
 
-    /// OR-fold two optional roles (the [`aggregate_presentations`] discipline:
-    /// one pane's role never hides another's — outbound + inbound = both).
+    /// OR-fold two optional roles.
     #[must_use]
     #[inline]
     pub const fn union(a: Option<Self>, b: Option<Self>) -> Option<Self> {
@@ -1450,9 +1384,7 @@ impl TabConnRole {
         Self::from_flags(ao || bo, ai || bi)
     }
 
-    /// Stable state tokens for the `chrome` introspection line
-    /// (`toolbar::format_tab_chrome`). `Both` reports both directional tokens, so a
-    /// script greps `conn-out`/`conn-in` and never misses a direction.
+    /// Stable state tokens for the `chrome` introspection line.
     #[must_use]
     #[inline]
     pub const fn chrome_states(self) -> &'static [&'static str] {
@@ -1470,9 +1402,7 @@ pub struct TabPresentation {
     pub title: String,
     pub icon: Option<TabIconKind>,
     pub indicators: TabIndicators,
-    /// The tab's connection-mark role (design §4), stamped by the strip-refresh funnel
-    /// ([`TabConnRole`] says why it is not an indicator bit). `None` = no live
-    /// connection touches this tab's sessions, or `tab_connection_badge` is off.
+    /// The tab's connection-mark role, or `None` when no live connection applies.
     pub conn: Option<TabConnRole>,
     pub closable: bool,
     pub tooltip: Option<String>,
@@ -1492,10 +1422,7 @@ impl TabPresentation {
     }
 }
 
-/// Aggregate split-leaf presentation without letting one state hide another.
-/// The focused leaf supplies the human title/icon; independent dirty/busy/
-/// attention bits are ORed across every visible sibling, and the tab is closable
-/// only when every leaf is ready to close.
+/// Aggregate split-leaf presentations without letting one state hide another.
 #[must_use]
 pub fn aggregate_presentations(
     focused: ViewId,
@@ -1511,13 +1438,8 @@ pub fn aggregate_presentations(
         count += 1;
         indicators.dirty |= presentation.indicators.dirty;
         indicators.busy |= presentation.indicators.busy;
-        // Both attention owners fold independently, so a native leaf's
-        // out-of-band mark and a terminal leaf's failure can neither hide nor
-        // erase one another.
         indicators.attention |= presentation.indicators.attention;
         indicators.status_attention |= presentation.indicators.status_attention;
-        // Directional union: a background pane's outbound role and the focused
-        // pane's inbound role read as `Both`, never as whichever pane won.
         conn = TabConnRole::union(conn, presentation.conn);
         closable &= presentation.closable;
         if fallback.is_none() {
@@ -1580,9 +1502,6 @@ impl Tab {
     }
 
     /// Resolve the canonical visible topology once for every frame consumer.
-    /// Zoom is a presentation transform over the unchanged tree: only the
-    /// focused leaf is planned, at the root path, and unzoom restores the exact
-    /// prior topology and ratios.
     #[must_use]
     pub fn visible_plan(
         &self,
@@ -1633,8 +1552,7 @@ impl Tab {
         }
     }
 
-    /// Deterministically insert `new_view` as the second (right/bottom) sibling
-    /// of the focused leaf and move focus to it.
+    /// Insert `new_view` as the second sibling of the focused leaf and focus it.
     pub fn split_focused(&mut self, axis: SplitAxis, new_view: ViewId) -> bool {
         if self.root.contains(new_view) || !self.root.split_leaf(self.focus, axis, new_view) {
             return false;
@@ -1653,10 +1571,7 @@ impl Tab {
         true
     }
 
-    /// Remove one leaf and re-seat focus on [`SplitTree::absorbing_neighbor`], read
-    /// before the removal because the collapse erases the parent that names the
-    /// sibling; `first_leaf` only when there is no such neighbour. The final leaf is
-    /// left in place so the tab owner can run its close transaction first.
+    /// Remove one leaf and re-seat focus on [`SplitTree::absorbing_neighbor`].
     pub fn remove_view(&mut self, view: ViewId) -> RemoveLeaf {
         let heir = self.root.absorbing_neighbor(view);
         let removed = self.root.remove_leaf(view);
@@ -1675,17 +1590,11 @@ impl Tab {
         self.zoomed
     }
 
-    /// The leaf a geometric focus move from the focused one lands on, independent
-    /// of leaf content kind; `None` for a zoomed or single-leaf plan and at an
-    /// edge. Read without moving focus ([`Self::set_focus`] moves it), because the
-    /// keyboard's pane-focus chords ask before they claim a key: a press with no
-    /// pane that way reaches the program instead (`App::pane_focus_neighbor`).
+    /// The leaf a geometric focus move from the focused leaf lands on.
     pub fn neighbor(&self, direction: FocusDirection, plan: &VisibleLeafPlan) -> Option<ViewId> {
         if plan.zoomed || plan.leaves.len() <= 1 {
             return None;
         }
-        // Focus navigation follows the pane allocation, including its header;
-        // shrinking a content area must not change which sibling is adjacent.
         let current = plan.leaf(self.focus).map(VisibleLeaf::outer_rect)?;
         let cur_right = current.origin.x + current.size.width;
         let cur_bottom = current.origin.y + current.size.height;
@@ -1739,9 +1648,7 @@ impl Tab {
         best.map(|(view, _, _, _)| view)
     }
 
-    /// Apply a divider ratio only while its stable path still names the same
-    /// split. A structural mutation invalidates the path and leaves the tree
-    /// unchanged.
+    /// Apply a divider ratio while its stable path still names the same split.
     pub fn set_divider_ratio(&mut self, path: &SplitPath, ratio: f32) -> bool {
         let Some(SplitTree::Split { ratio: current, .. }) = node_at_path_mut(&mut self.root, path)
         else {
@@ -1763,8 +1670,7 @@ impl Tab {
     }
 }
 
-/// Ordered stable tabs with active identity. Vector positions remain a chrome
-/// concern and never escape as durable identity.
+/// Ordered stable tabs with active identity.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct TabSet {
     active: Option<TabId>,
@@ -1887,9 +1793,7 @@ impl TabSet {
         Some(id)
     }
 
-    /// Remove a tab and keep the same logical active tab when possible. When
-    /// removing the active tab, select the tab now at that position, else the
-    /// preceding final tab.
+    /// Remove a tab and update the active tab selection.
     pub fn remove(&mut self, id: TabId) -> Option<Tab> {
         let index = self.tabs.iter().position(|tab| tab.id == id)?;
         let was_active = self.active == Some(id);
@@ -2243,7 +2147,6 @@ mod tests {
             }
         }
 
-        // Reversible: the tree was only ever read.
         let regrown = tab.visible_plan(LogicalRect::new(0.0, 0.0, 200.0, 48.0), 1.0, sizing);
         assert_eq!(
             regrown.leaves, roomy.leaves,
@@ -2304,7 +2207,6 @@ mod tests {
                             attention: true,
                             status_attention: true,
                         },
-                        // Unions with the focused pane's Inbound to Both below.
                         conn: Some(TabConnRole::Outbound),
                         closable: false,
                         tooltip: None,
@@ -2337,7 +2239,6 @@ mod tests {
             views[0],
             TabPresentation::terminal("one"),
         );
-        // 0 | (1 / 2), focused on 2 — the bottom-right leaf.
         assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
         assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
         assert_eq!(tab.focus, views[2]);
@@ -2347,7 +2248,6 @@ mod tests {
             "focus follows the space to view 1, not back to the first leaf 0"
         );
 
-        // 0 | (1 / 2) again: closing a leaf that is not focused leaves focus alone.
         let (_, views) = view_store_with(3);
         let mut tab = Tab::new(
             TabId::from_stored(2),
@@ -2433,7 +2333,6 @@ mod tests {
             );
         }
 
-        // Short-circuit: a predicate true for the first visited leaf visits no second.
         let mut seen = Vec::new();
         assert!(tab.root.any_leaf(&mut |view| {
             seen.push(*view);

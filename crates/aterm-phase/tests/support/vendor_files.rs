@@ -19,18 +19,8 @@ fn canary_prefix(home: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// The path the drift canaries read a program's build at, from the first line
-/// `aterm pkg which <program>` prints. Its head ends in the copy that runs in
-/// the shell that asked, and that is the MANAGED build only when it lies in
-/// the store (`claude → <shim> → … → <prefix>/store/claude/<build>/bin/claude
-/// — managed 2.1.286 — …`). Any other — a system copy, one SHADOWED by a copy
-/// ahead on PATH, or a managed program whose row says `not what runs outside
-/// aterm: … this shell's own copy` (atpkg's outside-aterm rows, `state.rs`) —
-/// names a copy aterm does not manage (an old brew build judged against the
-/// managed build's anchors fails the test). The managed copy is then read
-/// where the store keeps it
-/// (`<prefix>/store/<program>/current/bin/<program>`), and `None` where that
-/// is not there either.
+/// The path the drift canaries read a program's build at, from the first line `aterm pkg which
+/// <program>` prints.
 pub(crate) fn canary_path(
     which_line: &str,
     home: Option<&std::path::Path>,
@@ -67,15 +57,9 @@ fn in_store(path: &str, program: &str) -> bool {
     parts.windows(2).any(|w| w[0] == "store" && w[1] == program)
 }
 
-/// The version atpkg's record beside the build names (`<build>.vendor`'s
-/// `version = "…"`: the build of the binary's directory, reached through
-/// a `current` link, else of the file a link from outside the store
-/// names), or `None` where there is no record ([`version_in`]). The binary is never
-/// run, as the Gemini canary reads its `package.json`: a vendor build the
-/// suite starts runs with the owner's HOME, and its `--version` is no
-/// pure read there (measured 2026-10-17 in a scratch HOME: Muse Code
-/// 1.4.10's takes `~/.config/muse/.auth.json.lock`, Codex 0.163.0's makes
-/// its PATH-alias helpers under `~/.codex`).
+/// The version atpkg's record beside the build names (`<build>.vendor`'s `version = "…"`: the build
+/// of the binary's directory, reached through a `current` link, else of the file a link from
+/// outside the store names), or `None` where there is no record ([`version_in`]).
 pub(crate) fn build_version(path: &str) -> Option<String> {
     use std::path::{Path, PathBuf};
     let path = Path::new(path);
@@ -99,12 +83,9 @@ pub(crate) fn build_version(path: &str) -> Option<String> {
     version_in(version.trim().trim_matches('"'))
 }
 
-/// Gemini CLI's npm bundle, found from `bin` (a `gemini` on PATH, a
-/// Homebrew link or the script itself): the directory the script
-/// resolves into, every `.js` file in it (joined, NUL between), and the
-/// version its package's `package.json` (one up) names. `None` where
-/// `bin` leads to no `@google/gemini-cli` package: a stub, another
-/// program of that name.
+/// Gemini CLI's npm bundle, found from `bin` (a `gemini` on PATH, a Homebrew link or the script
+/// itself): the directory the script resolves into, every `.js` file in it (joined, NUL between),
+/// and the version its package's `package.json` (one up) names.
 pub(crate) fn gemini_bundle(bin: &std::path::Path) -> Option<(String, Vec<u8>, Option<String>)> {
     let script = std::fs::canonicalize(bin).ok()?;
     let dir = script.parent()?;

@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `windows smoke [--arch A]...`: the Windows lane's acceptance on each
-//! architecture, in the guest ([`crate::windows`]):
-//!
-//! 1. `cargo build -p aterm -p aterm-gui -p aterm-ctl` for the arch (MSVC;
-//!    x86_64 cross-built on the arm64 guest);
-//! 2. the shipped `aterm.exe --version`, which must print this checkout's
-//!    build number (`build: <HEAD's committer time>`: the lane pins the build
-//!    facts, the copy having no `.git`);
-//! 3. one `aterm-gui --headless` in a scratch config with the automatic lanes
-//!    off ([`crate::instance::CONFIG_OFF`]) and Windows PowerShell as its
-//!    shell, driven over its control socket by `aterm-ctl` (AF_UNIX over
-//!    winsock): `ready`, a typed line whose output ([`ECHO`]) only running it
-//!    prints, `resize 30 100` and `dims` showing it, `status` with
-//!    `render=ok`, `metrics percentiles`, one `image` copied to this Mac; and
-//!    the session must have drawn on the GPU (`metrics` says `backend=gpu`
-//!    once the frame is taken) on WARP, Windows' software Direct3D (the VM
-//!    has no GPU: its device line names the Microsoft Basic Render Driver).
-//!
-//! x86_64 runs under Prism. Exit 0 every row passed, 1 a row failed, 3 NOT
-//! RUN (no VM could be brought up). Frames and the report:
-//! `$LAB_STATE/windows/`.
+//! `windows smoke [--arch A]...`: Windows lane build, version, and headless WARP session checks.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -33,9 +13,7 @@ use crate::windows::{self, Layout, Up, lane_lock, not_run};
 use crate::windows_guest::{self as guest, Arch};
 use crate::{Fail, LAB, Res};
 
-/// What the session types: Windows PowerShell prints [`ECHO`] only by
-/// running it (the typed text never holds it). No double quote: Windows
-/// PowerShell 5.1 passes one to `aterm-ctl` unescaped.
+/// PowerShell expression typed into the smoke session to produce [`ECHO`].
 pub const TYPED: &str = "Write-Output ('LANE-' + 6*7)";
 
 /// The adapter WARP presents as (DXGI's software adapter).
@@ -71,11 +49,7 @@ pub const VERBS: [&[&str]; 11] = [
     &["metrics"],
 ];
 
-/// The PowerShell that runs `arch`'s session in one SSH call: aterm-gui
-/// started headless with its stderr kept, each of [`VERBS`] sent by
-/// `aterm-ctl` (every one, a failure included), each answer under a
-/// `@@ <exit> <verb>` line, then `@@ stderr` and aterm-gui's stderr; aterm-gui
-/// stopped last.
+/// PowerShell script that runs `arch`'s headless smoke session in one SSH call.
 #[must_use]
 pub fn session_script(arch: Arch) -> String {
     let q = guest::ps_quote;
@@ -126,8 +100,7 @@ pub struct Answer {
     pub text: String,
 }
 
-/// A session's output read back: each verb's answer in order, then
-/// aterm-gui's stderr.
+/// Parses a session's output into each verb's answer in order and `aterm-gui`'s stderr.
 #[must_use]
 pub fn parse_session(out: &str) -> (Vec<Answer>, String) {
     let mut answers: Vec<Answer> = Vec::new();
@@ -157,8 +130,7 @@ pub fn parse_session(out: &str) -> (Vec<Answer>, String) {
 /// A verb's name and what its answer must satisfy.
 type Want<'a> = (&'a str, &'a dyn Fn(&str) -> bool);
 
-/// The session's verdict from its answers and stderr: the detail of a
-/// pass, the guest path of its frame, and the device it named.
+/// Verifies a session's answers and stderr against the smoke expectations.
 ///
 /// # Errors
 /// The first verb whose answer was not what it must be, a session that did

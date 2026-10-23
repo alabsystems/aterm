@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Driving one oracle workspace (`libc-oracle/`, or a control's copy of it)
-//! with the Trust toolchain, and reading what cargo and libtest report as data:
-//! compiler errors from `--message-format json`, test verdicts from libtest's
-//! JSON events.
-//!
-//! Every command starts from the workspace directory, so its own
-//! `.cargo/config.toml` and the checkout's above it apply, and never names
-//! `--target`: an explicit target withholds `[target.*]` flags from host units
-//! (build scripts), so a plain host build is the one shape every unit agrees on.
+//! Driving an oracle workspace with the Trust toolchain and parsing cargo/libtest JSON.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -146,9 +138,7 @@ impl FailedTest {
 pub enum LockedFailure {
     /// `Cargo.lock` disagrees with the manifests: cargo would have to rewrite it.
     StaleLock,
-    /// Resolution needs an index entry or a crate this machine has not
-    /// downloaded. Also what a stale lock whose new requirement was never
-    /// downloaded looks like offline; an online `fetch --locked` tells them apart.
+    /// Resolution needs an index entry or crate not downloaded locally.
     NotDownloaded,
     /// Anything else: cargo refused the manifests or the config.
     Refused,
@@ -209,9 +199,7 @@ impl Outcome {
         outcome
     }
 
-    /// Whether a failure was the disk filling, which says nothing about the
-    /// tree. ENOSPC's sentence, so a linker's `write failed: No space left on
-    /// device` counts as well as an `(os error 28)` I/O error.
+    /// Whether a failure was caused by the disk filling (`ENOSPC`).
     #[must_use]
     pub fn out_of_space(&self) -> bool {
         const ENOSPC: &str = "No space left on device";
@@ -220,14 +208,12 @@ impl Outcome {
                 || self.errors.iter().any(|d| d.message.contains(ENOSPC)))
     }
 
-    /// How a `--locked --offline` command failed; `None` when it succeeded. A
-    /// command without `--locked` is never [`LockedFailure::StaleLock`].
+    /// How a `--locked --offline` command failed; `None` when it succeeded.
     #[must_use]
     pub fn locked_failure(&self) -> Option<LockedFailure> {
         if self.success {
             return None;
         }
-        // The stale-lock help line also names `--offline`, so it goes first.
         Some(if self.stderr.contains("because --locked was passed") {
             LockedFailure::StaleLock
         } else if self.stderr.contains("offline mode")
@@ -253,8 +239,7 @@ impl Outcome {
         self.failed.iter().any(|t| t.leaf() == leaf)
     }
 
-    /// What a person needs to see of a failure: the compiler's errors, else the
-    /// failed tests' output, else the end of cargo's stderr.
+    /// Compiler errors, failed test output, or the tail of cargo's stderr.
     #[must_use]
     pub fn detail(&self) -> String {
         const SHOWN: usize = 5;
@@ -387,9 +372,7 @@ impl<'t> Workspace<'t> {
         args
     }
 
-    /// `metadata --locked --offline`: the manifests are valid and resolve to
-    /// exactly `Cargo.lock`. Full resolution, not `--no-deps`, which never
-    /// consults the lock.
+    /// Runs `metadata --locked --offline`.
     ///
     /// # Errors
     /// When targo cannot be started.
@@ -444,8 +427,6 @@ impl<'t> Workspace<'t> {
             target.package(),
         ]);
         if target == DocTarget::Shim {
-            // The reference gets `extra_traits` through the conformance crate's
-            // edge; a selected workspace package needs the flag itself.
             args.extend(["--features", "extra_traits"].map(OsString::from));
         }
         args.extend(["--", "-Zunstable-options", "--output-format", "json"].map(OsString::from));

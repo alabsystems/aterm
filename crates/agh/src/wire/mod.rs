@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The wire (design §5, §11.4): methods, phases, origins, endpoints, deadlines and the
-//! transport trait. Exactly one file renders the credential header: `door.rs`.
+//! Wire types: methods, phases, origins, endpoints, deadlines, and the transport trait.
 
 pub mod door;
 pub mod hop;
@@ -95,8 +94,7 @@ pub enum WireKind {
 }
 
 impl WireKind {
-    /// `dns`, `connect`, `proxy`, `tls`, `trust`, `timeout`, `idle`, `reset`, `truncated`,
-    /// `too_large`, `protocol`, `revoked`, `local`.
+    /// Lowercase slug for this error kind.
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -128,17 +126,7 @@ pub struct WireError {
     pub detail: String,
 }
 
-/// The kind of an I/O error met while sending or reading, by the first row that matches:
-/// - a message starting `dns:` → Dns (aterm-http's own text, the same on every platform, so a
-///   resolver timeout is Dns and not Timeout);
-/// - `UnexpectedEof` → Truncated;
-/// - `InvalidData` → Protocol;
-/// - `TimedOut` or `WouldBlock` → Idle when the message contains `no bytes for`, else Timeout;
-/// - `ConnectionReset`, `ConnectionAborted` or `BrokenPipe` → Reset;
-/// - `PermissionDenied` → Revoked;
-/// - `ConnectionRefused` → Connect;
-/// - an inner `aterm_http::Error::TooLarge` (by `get_ref` and downcast) → TooLarge;
-/// - anything else → Local.
+/// Classify an I/O error met while sending or reading.
 #[must_use]
 pub fn wire_kind_of(e: &std::io::Error) -> WireKind {
     use std::io::ErrorKind as K;
@@ -186,8 +174,7 @@ pub enum OriginRole {
     AssetCdn,
 }
 
-/// A scheme, a lowercased host and a port. Opaque: built by `https`, `parse` and the
-/// `Endpoints` constructors, and read through its accessors.
+/// A scheme, a lowercased host, and a port.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Origin {
     pub(crate) scheme: &'static str,
@@ -244,9 +231,7 @@ impl Origin {
         }
     }
 
-    /// An `http` or `https` URL: its origin (host lowercased, default ports filled) and its
-    /// path and query (`/` when empty; a `#fragment` dropped). `None` for any other scheme,
-    /// for userinfo (`@` before the path), for a bracketed host, or for a bad port.
+    /// Parse an `http` or `https` URL into its origin and path-with-query.
     #[must_use]
     pub fn parse(url: &str) -> Option<(Origin, String)> {
         let (scheme, rest) = if let Some(rest) = strip_prefix_ci(url, "https://") {
@@ -315,9 +300,7 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
-    /// `https://api.github.com`, `https://uploads.github.com`, `https://github.com`, and the
-    /// CDN hosts `objects.githubusercontent.com`, `release-assets.githubusercontent.com` and
-    /// `github-releases.githubusercontent.com` (https, 443).
+    /// Production `github.com` API, upload, web, and asset CDN origins.
     #[must_use]
     pub fn github_com() -> Endpoints {
         Endpoints {
@@ -395,9 +378,7 @@ impl Endpoints {
         }
     }
 
-    /// `base() + path_and_query` for the role's origin (`AssetCdn`: the first CDN host). A
-    /// `path_and_query` that does not start with `/` gets one, so no path can extend the
-    /// authority (`.evil.example/x`, `:8443/x`): the URL is always on the origin.
+    /// Build `base() + path_and_query` for the role's origin.
     #[must_use]
     pub fn url(&self, role: OriginRole, path_and_query: &str) -> String {
         let slash = if path_and_query.starts_with('/') {
@@ -459,9 +440,7 @@ pub enum WireBody<'a> {
     },
 }
 
-/// One request, as the client hands it to a transport. `#[non_exhaustive]`: outside agh it is
-/// built with `WireRequest::new` and its fields set after, so M2 adds a crate-private `permit`
-/// field additively, which `HttpTransport` checks before it sends a write (design §10.1).
+/// One request, as the client hands it to a transport.
 #[non_exhaustive]
 pub struct WireRequest<'a> {
     /// The method.
@@ -470,8 +449,7 @@ pub struct WireRequest<'a> {
     pub url: String,
     /// Every header but the credential, in send order.
     pub headers: Vec<(String, String)>,
-    /// The credential header. Only `door::AuthHeader::for_origin` (or its test twin) makes one,
-    /// and `HttpTransport` sends it only to the origin it was made for (plan §8, step 0).
+    /// The credential header built for this origin.
     pub auth: Option<&'a door::AuthHeader>,
     /// The body.
     pub body: WireBody<'a>,
@@ -555,12 +533,11 @@ impl WireResponse {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The body, whole. Over `limit` → `WireError { Answered, TooLarge, "the answer is longer
-    /// than {limit} bytes" }`; an I/O error → `WireError { Answered, wire_kind_of(&e), e }`.
+    /// Read the whole body up to `limit` bytes.
     ///
     /// # Errors
     ///
-    /// As above.
+    /// Returns `WireError` when the body exceeds `limit` or reading fails.
     pub fn read_body(&mut self, limit: u64) -> Result<Vec<u8>, WireError> {
         let body = read_capped(&mut self.body, limit)?;
         if u64::try_from(body.len()).unwrap_or(u64::MAX) > limit {
@@ -583,17 +560,7 @@ impl std::fmt::Debug for WireResponse {
     }
 }
 
-/// Sends one request. `HttpTransport` in production, `ScriptedTransport` in unit tests. Only
-/// `fx/` calls `round_trip` (census `agh-fx`): the client reaches it through `Fx::gh` and
-/// `Fx::gh_stream`, so a tape sees every round trip. In M1 the client asks only for GET and
-/// HEAD (its pipeline's step 0). `HttpTransport` refuses any other method, and any credential
-/// on a URL of another origin than the one the door built it for.
-///
-/// Sealed: its supertrait `sealed::Sealed` is a public trait in a private module (the tree's
-/// pattern: `aterm-scrollback`'s `access.rs`, `aterm-provenance`'s `origin.rs`), so code outside
-/// agh can hold a `dyn Transport` and call it but never implement it. `HttpTransport` and
-/// `ScriptedTransport` are the only transports, and a header the pipeline built is handed to
-/// no code but agh's own (design §10.1).
+/// Transport that executes a single request-response exchange.
 pub trait Transport: Send + Sync + sealed::Sealed {
     /// One exchange.
     ///

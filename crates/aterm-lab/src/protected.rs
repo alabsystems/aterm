@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE list of the owner's data the jail denies, neither read nor written.
-//!
-//! One list: [`crate::jail::render`] makes a rule of each entry, the isolation
-//! probes walk the same entries (also against a replica home), and the lab's
-//! state directory is kept off it. These extra read/metadata/write denials sit
-//! inside the broader home-content fences; unlisted home files are not readable
-//! unless the lab explicitly selects their source, build or tool path.
 
 /// How a rule matches its path, in the sandbox profile language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +36,8 @@ enum Base {
 /// Where the owner's Claude Code sessions keep their messaging sockets.
 pub const CCSOCKS: &str = "/private/tmp/cc-socks";
 
-/// The Mach services of the keychain daemons, which Security.framework and
-/// `/usr/bin/security` talk to (and their iCloud, CoreAuthentication,
-/// SecureBackup and token-daemon kin).
+/// The Mach services of the keychain daemons, which Security.framework and `/usr/bin/security` talk
+/// to (and their iCloud, CoreAuthentication, SecureBackup and token-daemon kin).
 pub const MACH_DENY: &[&str] = &[
     "com.apple.SecurityServer",
     "com.apple.secd",
@@ -58,11 +51,7 @@ pub const MACH_DENY: &[&str] = &[
     "com.apple.ctkd.token-client",
 ];
 
-/// The Launch Services doors that OPEN something on the person's desktop: a
-/// URL handed to NSWorkspace or LSOpen (Codex's sign-in opens the browser that
-/// way; no `BROWSER` variable or `PATH` shim can catch it) goes through these
-/// daemons, which launch the browser OUTSIDE the jail. The Launch Services
-/// database stays readable.
+/// The Launch Services doors that OPEN something on the person's desktop.
 pub const MACH_DENY_OPEN: &[&str] = &[
     "com.apple.lsd.open",
     "com.apple.lsd.openurl",
@@ -70,16 +59,7 @@ pub const MACH_DENY_OPEN: &[&str] = &[
     "com.apple.coreservices.uiagent",
 ];
 
-/// The directories of a lab's scratch that the lab, OUTSIDE the jail, writes
-/// and reads through (`config.toml`, `auth.json`, the rollouts,
-/// `settings.json`, `aterm.toml`, the stub's modes, the decoys, Gemini CLI's
-/// and agy's homes and seeds, agy's log, their `TMPDIR`, the sleep clock's
-/// records: [`crate::clock`]). `up` makes
-/// each, and the jail may neither remove nor move one, nor the scratch itself,
-/// nor the project dir: a link a jailed process put in the place of one would
-/// lead the lab into the owner's data (a link needs no access to its target).
-/// A path the lab writes below them goes through [`crate::sys::put`], which
-/// follows no link on its whole path.
+/// The directories of a lab's scratch that the lab, OUTSIDE the jail, writes and reads through.
 pub const SCRATCH_DIRS: &[&str] = &[
     "home",
     "home/.claude",
@@ -114,13 +94,9 @@ const LIST: &[(Kind, Base, &str)] = &[
     (Kind::Subpath, Base::Home, ".codex"),
     (Kind::Subpath, Base::Home, ".gemini"),
     (Kind::Subpath, Base::Home, ".cursor"),
-    // aterm's machine key and a release credential (`machine.key`, `release-credentials.toml`)
     (Kind::Subpath, Base::Home, ".aterm"),
     (Kind::Subpath, Base::Home, ".secrets"),
-    // Muse Code's sessions (its config is under `.config`)
     (Kind::Subpath, Base::Home, ".local/share/muse"),
-    // the Antigravity app's extensions and server (`.antigravity`, `.antigravity-server`, …): agy's kin, whose
-    // binary links `os/user`, which names the account's home whatever HOME says
     (Kind::Prefix, Base::Home, ".antigravity"),
     (Kind::Literal, Base::Home, ".netrc"),
     (Kind::Literal, Base::Home, ".npmrc"),
@@ -155,14 +131,11 @@ const LIST: &[(Kind, Base, &str)] = &[
         Base::Home,
         "Library/Application Support/aterm",
     ),
-    // Muse Code's session-name authority (`session-name-authority/session-names.db`) and its computer-use state:
-    // 1.4.10 opened the account's own, whatever HOME and the XDG variables said
     (
         Kind::Subpath,
         Base::Home,
         "Library/Application Support/Muse",
     ),
-    // the Antigravity app's data (`Antigravity`, `Antigravity Nightly`, …: its sign-in among it)
     (
         Kind::Prefix,
         Base::Home,
@@ -197,8 +170,7 @@ pub fn inside_protected(path: &str, home: &str, ccsocks: &str) -> bool {
         })
 }
 
-/// Whether `path` is, or lies below, an entry of the list of any of `homes`
-/// (every home the lab guards: [`crate::paths::Paths::guarded_homes`]).
+/// Whether `path` is, or lies below, an entry of the list of any of `homes`.
 #[must_use]
 pub fn inside_any(path: &str, homes: &[String], ccsocks: &str) -> bool {
     homes.iter().any(|h| inside_protected(path, h, ccsocks))

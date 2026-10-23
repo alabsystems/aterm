@@ -4,26 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! The pointer cursor follows the resource database's theme and size as they change. GNOME's
-//! settings daemon rewrites `RESOURCE_MANAGER`'s `Xcursor.theme` and `Xcursor.size` live (Large
-//! Cursor, a theme picked in Settings), then its XSETTINGS, whose change the event loop hears.
-//! libXcursor read them once, at its first cursor, and the backend kept each shape it loaded for
-//! the process's life, so neither change showed in aterm until a restart (the desk audit, GNOME
-//! 46 on Xorg, 2026-10-22).
-//!
-//! A second connection stands in for the daemon: it rewrites `RESOURCE_MANAGER` on the display's
-//! root with a size and a theme no one uses, and the change's PropertyNotify is handed to the
-//! event processor's handler, as `focus_tests` hands it focus events. Each cursor load is
-//! counted with the size and theme libXcursor holds at it (`util::CURSOR_LOADS`): the window's
-//! cursor is loaded again at the new ones. The property is then put back as it was, and the
-//! change handed on again puts libXcursor back to its own size and theme.
-//!
-//! The negative controls: without the cache's clearing in `follow_cursor_settings`, the window's
-//! cursor is not loaded again; without `XcursorSetDefaultSize` it loads at the old size, and
-//! without `XcursorSetTheme` in the old theme; without `reload_cursor` in the event loop's
-//! settings change, it is not loaded again.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! The pointer cursor follows the resource database's theme and size as they change.
 
 use std::ffi::CString;
 
@@ -110,7 +91,6 @@ fn a_changed_cursor_size_and_theme_load_the_windows_cursor_anew() {
 
     let was = resources(&watcher, root);
     let put_back = PutBack { watcher: &watcher, root, was: was.clone() };
-    // The settings daemon's rewrite: what was there, less any cursor setting, and the new ones.
     let size = if own.1 == 48 { 64 } else { 48 };
     let mut changed: Vec<u8> = String::from_utf8_lossy(was.as_deref().unwrap_or_default())
         .lines()
@@ -137,7 +117,6 @@ fn a_changed_cursor_size_and_theme_load_the_windows_cursor_anew() {
         "the window's cursor is loaded again, at the new size and theme"
     );
 
-    // The settings put back: libXcursor's own again.
     drop(put_back);
     processor.property_notify(&notify, |_, _: Event<()>| {});
     assert_eq!(

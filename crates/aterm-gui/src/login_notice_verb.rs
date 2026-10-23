@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `login-notice [<code> [<label>]|disk [<cause>]|end|back]`: THE HARNESS'S
-//! LOGIN NOTICES ON DEMAND, in a development build (`dev-seams`), so each
-//! one's real rendering — the band's row, its expanded sentence, the digest's
-//! line, a loss's one row in Settings ▸ Messages as it moves and once the
-//! login is back — can be read and imaged in a private headless instance
-//! (`targo --unverified lab instance --pre 'login-notice si' --image …`)
-//! without a lost login to stand it up. Bare, the verb lists the notices
-//! (`aterm_agent::supervise::policy::notice::ALL`). `disk` raises the same
-//! story's disk-full alert ([`HostNote::DiskFull`]: 1.0 MiB left, 31.0 GiB
-//! freed, no folder named) for `<cause>` (`spent`, the default; `inodes`;
-//! `off`), and `end` ends it with the rest.
-//!
-//! The notice goes the way the harness's own does: an exception built by
-//! [`Exception::of_notice_reset`] — its `{why}` the longest clause the policy
-//! raises it with ([`NoticeText::whys`]), its label given only where it names
-//! one, a usage limit's reset the fixed [`SAMPLE_RESET`] — and handed to the
-//! host as the loop hands it
-//! ([`HostNote::ResumeException`] for the first window's first tab), or, for the two
-//! accounts lines, the roster's word ([`HostNote::Accounts`]); `back` is the
-//! loop's word that the tab's lost login is back ([`HostNote::LoginBack`]).
-//! Nothing here words a notice: the host's builders do.
+//! `login-notice [<code> [<label>]|disk [<cause>]|end|back]`.
 
 use aterm_agent::supervise::limit::ResetClock;
 use aterm_agent::supervise::policy::exception::Exception;
@@ -45,8 +25,7 @@ const LABEL: &str = "main";
 /// verb shows the words the loop would.
 const SAMPLE_RESET: &str = "Oct 23 at 9am (America/Los_Angeles)";
 
-/// What the verb asks: the list, a notice to raise (with its label), the
-/// raised one's end, or the tab's login back.
+/// What the verb asks: the list, a notice to raise, the raised one's end, or the tab's login back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Asked {
     List,
@@ -59,7 +38,7 @@ pub(crate) enum Asked {
     Back,
 }
 
-/// The verb's arguments, refused where this build does not inject. Pure.
+/// The verb's arguments, refused where this build does not inject.
 pub(crate) fn parse(rest: &str, injection: bool) -> Result<Asked, String> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let asked = match words.as_slice() {
@@ -106,8 +85,7 @@ pub(crate) fn list_line() -> String {
     format!("OK notices={}\n", notices.join(","))
 }
 
-/// The verb's control-thread half: the list here, a raise or an end on the
-/// main thread (`Wake::LoginNotice`).
+/// The verb's control-thread half: the list here, a raise or an end on the main thread.
 pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,
@@ -127,9 +105,7 @@ pub(crate) fn cmd(
     }
 }
 
-/// The host notes `asked` is, for tab `sid`: an exception the loop would
-/// tell (`None` ends it), the roster's word for the two accounts lines, or
-/// the loop's word that the login is back.
+/// The host notes `asked` is, for tab `sid`.
 pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
     let resume = |standing: Option<Exception>| HostNote::ResumeException {
         sid: sid.to_string(),
@@ -187,10 +163,7 @@ pub(crate) fn notes(asked: &Asked, sid: &str) -> Vec<HostNote> {
 }
 
 impl crate::App {
-    /// `login-notice`'s main-thread half: `asked` for the first window's
-    /// first tab ([`Self::first_tab_sid`]), through
-    /// the host's own path ([`crate::App::note_harness_host`]). Answers
-    /// `sid=<tab> notice=<id|end|back>`.
+    /// `login-notice`'s main-thread half.
     pub(crate) fn note_login_notice(&mut self, asked: &Asked) -> Result<String, String> {
         let sid = self
             .first_tab_sid()
@@ -264,7 +237,6 @@ mod tests {
             notes(&Asked::Disk(DiskFullCause::Spent), "s-1").as_slice(),
             [HostNote::DiskFull { .. }]
         ));
-        // NEGATIVE CONTROLS: a shipped build injects nothing; junk.
         assert!(parse("si", false).is_err());
         assert!(parse("end", false).is_err());
         assert!(parse("back", false).is_err());
@@ -300,11 +272,6 @@ mod tests {
             } = &notes[0]
             {
                 assert_eq!(e.notice.as_ref().map(|n| n.id), Some(text.id));
-                // Its `{why}` is one it is raised with (the review of the
-                // login carry, 2026-10-20: every one read "a draft is in the
-                // composer"), in what aterm did or in the step (a usage
-                // limit aterm.toml holds names the line that lets it go on:
-                // r3h-2). NEGATIVE CONTROL: no other notice's clause.
                 let did = e.notice.as_ref().map(|n| n.did.clone()).unwrap_or_default();
                 assert!(!did.contains('{'), "{}: {did}", text.id);
                 assert!(!e.action.contains('{'), "{}: {}", text.id, e.action);
@@ -320,9 +287,6 @@ mod tests {
                         assert!(!did.contains(other), "{}: {did}", text.id);
                     }
                 }
-                // A usage limit's notice names the sample's reset, as the
-                // loop names the limit's own; NEGATIVE CONTROL: no other
-                // notice says one.
                 let expect = e
                     .notice
                     .as_ref()

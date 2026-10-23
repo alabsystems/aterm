@@ -1,41 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-update handoff's history carry: every history line the outgoing process held
-//! crosses to the successor or is counted; none is dropped silently, replaced by lines that
-//! are no longer the session's history, or put back after the successor's pane cleared its
-//! scrollback.
-//!
-//! The export takes the whole history, fenced, with readers live; the park takes the
-//! screen checkpoint plus the fence as it then stands; the worker joins the two (the
-//! sidecar's older lines cross when the fence still holds and the checkpoint reaches back
-//! to the export's end); the successor imports the sidecar after Commit.
+//! The self-update handoff's history carry.
 
 use aterm_spec::derive::Model;
 
 /// One session's history across one handoff.
-///
-/// State: `phase` — 0 live, 1 exported, 2 parked (the join named the sidecar or counted
-/// the fallback), 3 settled (the successor imported after Commit). `exp` — lines the export
-/// fenced; `late` — lines output between export and park; `moved` — the history was
-/// rewrapped, cleared or reset after the export (its fence no longer holds); `total` — the
-/// history the park saw; `carried` — lines the screen checkpoint carries; `take` — sidecar
-/// lines the manifest names; `dropped` — lines the outgoing side counted as not crossing;
-/// `intact` — the sidecar matches its stamped length and sha; `cleared` — the successor's
-/// pane cleared its scrollback (ED3, a reset) before the import; `held` — lines the
-/// successor holds once settled; `failed` — lines it counted when the sidecar failed.
-///
-/// `Cap` stands for the screen carry's bound (`seamless::MAX_HANDOFF_HISTORY_LINES`, 256 in
-/// the product) and `Deep` for a history deeper than it; the shallow case is the join's
-/// `take == 0` arm, bound at Tier-1 on the real `join`.
-///
-/// `Buggy = 1` is four defects, each caught alone: a fallback that drops the export and
-/// counts nothing, a join that names the sidecar though the history moved under it, a
-/// successor that drops a sidecar failing its sha without counting it, and an import that
-/// puts history back after the pane cleared it.
-///
-/// Tier-1: `aterm-gui/src/handoff_history_conformance.rs` drives the real export, park,
-/// join, sidecar and import over every path, with `Buggy = 1` as the negative control.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_history_carry_model() -> Model {

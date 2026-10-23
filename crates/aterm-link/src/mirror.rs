@@ -422,7 +422,7 @@ impl Bucket {
     }
 
     /// Spend `n` records.
-    pub fn spend(&mut self, n: u64) {
+    pub const fn spend(&mut self, n: u64) {
         self.milli = self.milli.saturating_sub(n.saturating_mul(1000));
     }
 }

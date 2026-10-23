@@ -628,14 +628,14 @@ struct EngineRead {
     rows: Option<String>,
 }
 
-/// One `try_lock` of `h`'s engine: the facts every row carries and, with
-/// `shell` (a session no transcript excerpt speaks for), its command line
-/// and last rows.
+/// One `try_lock` of `h`'s engine: the facts every row carries and, with `shell`, its command line
+/// and last rows, no rows on an unfinished DEC 2026 frame (the survey never waits for one).
 fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
     let read = |t: &aterm_core::terminal::Terminal| {
         use crate::cwd_native::ReportedCwd as _;
         let title = crate::tab_label::without_console_program_path(t.title());
-        let rows = shell.then(|| last_rows(t)).flatten();
+        let whole = !crate::frame_unfinished_now(t);
+        let rows = (shell && whole).then(|| last_rows(t)).flatten();
         EngineRead {
             detail: crate::session_status::executing_detail(t),
             title: (!title.is_empty()).then(|| title.to_owned()),

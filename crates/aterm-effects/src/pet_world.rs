@@ -358,6 +358,10 @@ enum PetGlyph {
 pub struct PetWorld {
     cells: Vec<PetCell>,
     glyphs: Vec<Option<PetGlyph>>,
+    /// Per cell: a letterform (a letter or digit of any script, a wide lead
+    /// and its continuation alike), the ink a reader reads; a rule, a box's
+    /// border or punctuation is not one ([`Self::letter_at`]).
+    letters: Vec<bool>,
     blocked_prefix: Vec<u16>,
     protected_prefix: Vec<u16>,
     /// Per cell: is anything painted in the text layer (glyph, coloured background, selection,
@@ -399,6 +403,7 @@ impl Default for PetWorld {
         Self {
             cells: vec![PetCell::Unknown; MAX_WORLD_CELLS],
             glyphs: vec![None; MAX_WORLD_CELLS],
+            letters: vec![false; MAX_WORLD_CELLS],
             blocked_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
             protected_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
             inked: vec![true; MAX_WORLD_CELLS],
@@ -635,6 +640,7 @@ impl PetWorld {
             let Some(row) = input.cells.get(frame_r) else {
                 self.cells[row_base..row_base + cols].fill(PetCell::Unknown);
                 self.glyphs[row_base..row_base + cols].fill(None);
+                self.letters[row_base..row_base + cols].fill(false);
                 self.inked[row_base..row_base + cols].fill(true);
                 if track_ground {
                     self.ground_cells[row_base..row_base + cols].fill(PetCell::Unknown);
@@ -753,6 +759,13 @@ impl PetWorld {
                             && input.line_size_run_at(frame_r, column).0 == LineSize::SingleWidth
                             && input.cluster_at(frame_r, column).is_none()
                             && input.combining_at(frame_r, column).is_none()
+                    };
+                // A wide glyph's continuation reads as its lead does.
+                self.letters[row_base + c] = line == LineSize::SingleWidth
+                    && if cell.wide {
+                        c > 0 && self.letters[row_base + c - 1]
+                    } else {
+                        cell.ch.is_alphanumeric()
                     };
                 self.glyphs[row_base + c] = (line == LineSize::SingleWidth).then_some(if !glyph {
                     PetGlyph::Blank
@@ -924,6 +937,17 @@ impl PetWorld {
             return None;
         };
         Some(!matches!(glyph, PetGlyph::Blank))
+    }
+
+    /// Whether an observed cell holds a letterform ([`PetWorld::letters`]):
+    /// a letter or digit a reader reads, which a cat at rest never lays its
+    /// body on. `None` outside this observation.
+    #[inline]
+    #[must_use]
+    pub fn letter_at(&self, row: usize, col: usize) -> Option<bool> {
+        self.glyph_at(row, col)?;
+        let (r, c) = (row - self.coverage.row, col - self.coverage.col);
+        Some(self.letters[r * MAX_WORLD_COLS + c])
     }
 
     /// Ink substantial enough to displace a pet drawn beneath the glyphs.

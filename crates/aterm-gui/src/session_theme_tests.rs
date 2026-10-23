@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session themes and the `theme palette` read: what a session draws, what
-//! an install costs it, what reaches its program, and what a preview leaves
-//! alone.
+//! Per-session theme and `theme palette` tests.
 
 #[cfg(unix)]
 use std::sync::Arc;
@@ -17,8 +15,7 @@ use crate::app_colorscheme::ThemeChange;
 use crate::app_config::ThemeCatalog;
 use crate::control_theme::{PreviewHold, ThemeCtlOp};
 
-/// Take `session` into the pool as a spawn does: its engine built from the
-/// session factory's projection, then [`App::pool_insert`].
+/// Take `session` into the pool as a spawn does ([`App::pool_insert`]).
 fn insert(app: &mut App, session: crate::Session) {
     if let Some(tc) = &app.session_factory.terminal_config {
         crate::term_lock(&session.term).apply_config(tc);
@@ -26,8 +23,7 @@ fn insert(app: &mut App, session: crate::Session) {
     app.pool_insert(session);
 }
 
-/// A headless App drawing `toml` (installed as a config reload would), with
-/// a second session (1) beside session 0.
+/// Builds a two-session headless `App` configured with `toml`.
 fn two_sessions(toml: &str) -> App {
     let mut app = App::headless_for_test();
     app.config = aterm_toml::from_str(toml).expect("valid toml");
@@ -133,7 +129,6 @@ fn session_theme_draws_only_that_session() {
         app.engine_color_fanouts, fanouts,
         "the instance never moved"
     );
-    // Idempotent: a second clear answers the status and changes nothing.
     assert!(run_on(&mut app, ThemeCtlOp::SessionClear, Some(1)).is_ok());
     assert_eq!(bg(&app, 1), night);
 }
@@ -171,7 +166,6 @@ fn preview_does_not_reach_pinned_sessions() {
     assert_eq!(bg(&app, 1), builtin("Aterm Day").background);
     let status = app.theme_status_line(Instant::now());
     assert_eq!(field(&status, "pinned").as_deref(), Some("1"), "{status}");
-    // Negative control: unpinned, the preview reaches it.
     run_on(&mut app, ThemeCtlOp::SessionClear, Some(1)).expect("clear");
     assert_eq!(bg(&app, 1), builtin("Dracula").background);
     let status = app.theme_status_line(Instant::now());
@@ -231,14 +225,13 @@ fn drain(fd: i32) -> Vec<u8> {
     out
 }
 
-/// A pipe whose write end a session's sink owns; the read end is the
-/// program's side.
+/// A pipe whose write end a session's sink owns; the read end is the program's side.
 #[cfg(unix)]
 fn pipe_sink() -> (Arc<aterm_session::sink::SinkWriter>, i32) {
     let mut fds = [0; 2];
     // SAFETY: `fds` is a two-int array, as `pipe` requires.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: the read end was just opened.
+    // SAFETY: The read end was just opened.
     assert_eq!(
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
         0
@@ -249,9 +242,7 @@ fn pipe_sink() -> (Arc<aterm_session::sink::SinkWriter>, i32) {
     )
 }
 
-/// Spec `session-theme-install`: the mode-2031 push is per session. Pinning
-/// session 1 to a light theme tells session 1's program, and session 0's
-/// program, whose colours did not move, hears nothing.
+/// Spec `session-theme-install`: the mode-2031 push is per session.
 #[cfg(unix)]
 #[test]
 fn mode_2031_push_is_per_session() {
@@ -268,11 +259,10 @@ fn mode_2031_push_is_per_session() {
     set(&mut app, 1, "Aterm Day").expect("pinned");
     assert_eq!(drain(read1), b"\x1b[?997;2n", "the pinned session is told");
     assert!(drain(read0).is_empty(), "the other session hears nothing");
-    // Negative control: the same theme again moves nothing and pushes nothing.
     set(&mut app, 1, "Aterm Day").expect("again");
     assert!(drain(read1).is_empty());
     drop(app);
-    // SAFETY: the read ends are this test's own.
+    // SAFETY: The read ends are this test's own.
     unsafe {
         libc::close(read0);
         libc::close(read1);
@@ -409,7 +399,6 @@ fn spawn_with_bad_theme_spawns_nothing() {
     assert!(error.starts_with("theme \"NoSuchTheme\""), "{error}");
     assert_eq!(app.pool.ids().len(), before);
     assert!(app.tab_spawns.is_empty(), "nothing booked");
-    // The check itself: a built-in passes and becomes a spawn theme.
     assert_eq!(
         app.spawn_theme(Some("Hearth".to_string())),
         Ok(Some(SessionTheme {

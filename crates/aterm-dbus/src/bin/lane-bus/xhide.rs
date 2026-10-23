@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lane-bus xhide <display> <server> <extension>[,<extension>...]|-`: an X
-//! server that lacks the named extensions, made of one that has them. A
-//! proxy listening as X display `<display>` (`/tmp/.X11-unix/X<n>`) carries
-//! each client to X display `<server>` ([`crate::relay`], descriptors
-//! included) and answers every `QueryExtension` of a named extension as the
-//! X Window System Protocol answers it for one the server does not have:
-//! `present` false, no opcode, event or error base. `-` hides nothing (the
-//! lane's control: the proxy alone changes nothing a client sees). The
-//! token `XInput2` hides XInput 2 alone, as an XInput 1 server lacks it:
-//! XInputExtension stays present, and each `XIQueryVersion` (its request
-//! 47) is answered with the core `Request` error, which a server whose
-//! XInputExtension predates version 2 answers for a request it does not
-//! know.
-//!
-//! Xvfb can turn off RANDR (`-extension RANDR`) but not XInputExtension or
-//! XKEYBOARD, which Xorg's runtime-disable list leaves out, so the lane
-//! drives aterm's refusal of a server without XInput 2 or XKB through this
-//! (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7). Little-endian
-//! clients only (the lane's); a big-endian one's setup is refused.
-//!
-//! The core protocol, from the X Window System Protocol (X11R7.7): a
-//! client's setup request is 12 bytes (byte order, version, the
-//! authorization's name and data lengths) and the two padded strings; each
-//! request then carries its length in 4-byte units at bytes 2-3, or, as 0,
-//! a 32-bit length after the header (BIG-REQUESTS), and the server numbers
-//! requests from 1 in the 16 bits each reply, error and event repeats at
-//! bytes 2-3. The server's setup answer is 8 bytes and 4 times the length at
-//! bytes 6-7; then every error and event is 32 bytes, and a reply (type 1)
-//! and a generic event (type 35, XGE) 32 plus 4 times the length at bytes
-//! 4-7. `QueryExtension` is request 98, its name's length at bytes 4-5 and
-//! the name from byte 8; its reply's `present`, major opcode, first event
-//! and first error are bytes 8-11. An extension's request carries its major
-//! opcode in byte 0 and its minor in byte 1. An error is type 0, its code in
-//! byte 1, the sequence at bytes 2-3, the bad value at 4-7, the minor opcode
-//! at 8-9 and the major at byte 10.
+//! `lane-bus xhide`: X11 proxy that hides named extensions or `XInput2` from clients.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -44,17 +10,14 @@ use crate::relay::{self, Filter};
 
 /// `QueryExtension`'s request number.
 const QUERY_EXTENSION: u8 = 98;
-
 /// A reply's type byte, and the X Generic Event's.
 const REPLY: u8 = 1;
 const GENERIC_EVENT: u8 = 35;
-
 /// The token that hides XInput 2 alone, the extension it keeps, and
 /// `XIQueryVersion`'s minor opcode.
 const XINPUT2: &str = "XInput2";
 const XINPUT: &str = "XInputExtension";
 const XI_QUERY_VERSION: u8 = 47;
-
 /// The core protocol's `Request` error: a request the server does not know.
 const BAD_REQUEST: u8 = 1;
 
@@ -215,7 +178,6 @@ impl Filter for Replies {
                 }
             } else if let Some(i) = xi1.versions.iter().position(|s| *s == seq) {
                 xi1.versions.remove(i);
-                // The reply is 32 bytes (no extra words), as the error is.
                 if let (Some(major), 32) = (xi1.major, msg.len()) {
                     msg.fill(0);
                     msg[1] = BAD_REQUEST;
@@ -289,7 +251,7 @@ mod tests {
 
     fn setup_request() -> Vec<u8> {
         let mut s = vec![b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        s[6] = 3; // a 3-byte authorization name, padded to 4
+        s[6] = 3;
         s.extend_from_slice(b"abc\0");
         s
     }
@@ -340,7 +302,6 @@ mod tests {
         let mut stream = setup_request();
         stream.extend(query("RANDR"));
         stream.extend(query("XInputExtension"));
-        // A big request (length 0, 32-bit length 3 words) between.
         stream.extend([127, 0, 0, 0, 3, 0, 0, 0, 9, 9, 9, 9]);
         stream.extend(query("XKEYBOARD"));
         assert_eq!(
@@ -361,7 +322,6 @@ mod tests {
         for seq in 1..=4 {
             stream.extend(reply(seq));
         }
-        // An XGE event with 2 extra words, and a core event.
         let mut xge = vec![GENERIC_EVENT; 1];
         xge.resize(32, 0);
         xge[4] = 2;
@@ -404,9 +364,6 @@ mod tests {
         };
         let mut setup = vec![1, 0, 11, 0, 0, 0, 2, 0];
         setup.extend([7u8; 8]);
-        // The setup both ways, then QueryExtension (seq 1) and its answer
-        // (opcode 131), then XIQueryVersion (seq 2), XIGetClientPointer
-        // (seq 3, minor 45) and a core request (seq 4, opcode 47).
         through(&mut req, &setup_request());
         through(&mut rep, &setup);
         through(&mut req, &query(XINPUT));

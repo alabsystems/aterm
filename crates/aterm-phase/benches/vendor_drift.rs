@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! On-demand vendor-file drift acceptance. Run `targo --unverified bench -p
-//! aterm-phase --bench vendor_drift`; missing builds are COULD NOT RUN, never
-//! a pass. Reads vendor files and atpkg records without starting the vendors.
+//! On-demand vendor-file drift acceptance benchmark.
 
 use anchors::*;
 use aterm_phase::anchors;
@@ -62,11 +60,7 @@ fn main() -> ExitCode {
     support::run("phase_vendor_drift", ROWS, |check| check())
 }
 
-/// Whether `bytes` are a build of a program rather than a stub: a Mach-O or
-/// ELF header, or at least [`MIN_BUILD_BYTES`]. A reroute stub
-/// (`<prefix>/reroute/<program>`, a few lines of shell) answers `aterm pkg
-/// which` on a box whose resolved token is the stub itself; it holds none of
-/// the anchors, so "missing" would be the stub's, not the build's.
+/// Whether `bytes` are a native vendor executable rather than a stub script.
 pub(crate) fn looks_like_a_build(bytes: &[u8]) -> bool {
     const MAGICS: [[u8; 4]; 6] = [
         [0xfe, 0xed, 0xfa, 0xce],
@@ -84,14 +78,11 @@ pub(crate) fn looks_like_a_build(bytes: &[u8]) -> bool {
 /// Below this, a file that is no native executable is a stub script.
 const MIN_BUILD_BYTES: usize = 4 * 1024 * 1024;
 
-/// [`canary_path`] for `program`: `$<env>` first, else what `aterm pkg which`
-/// says (`None` where it says nothing).
+/// Resolve [`canary_path`] for `program` from `$<env>` or `aterm pkg which`.
 pub(crate) fn canary_binary(program: &str, env: &str) -> Option<std::path::PathBuf> {
     if let Some(path) = std::env::var_os(env) {
         return Some(path.into());
     }
-    // Through the workspace's one child builder (a dev-dependency: this
-    // crate has none), so the child holds its stdio and nothing else.
     let out = aterm_uds::spawnfd::command("aterm")
         .args(["pkg", "which", program])
         .output()
@@ -113,16 +104,10 @@ fn store_binary(program: &str, env: &str) -> Option<(String, Vec<u8>)> {
     Some((path, bytes))
 }
 
-/// Which of `needles` occur in `hay`, by ONE pass over it: a needle is
-/// compared only where its first three bytes are, and the pass ends once
-/// every needle is found. A vendor build is 190–375 MB and a table some two
-/// hundred needles, so a [`contains_bytes`] per needle, in the test
-/// profile's unoptimised code, took 31 s for Muse Code's table.
+/// Which of `needles` occur in `hay`, scanned in a single pass.
 pub(crate) fn found_in(hay: &[u8], needles: &[&[u8]]) -> Vec<bool> {
     const HEAD: usize = 3;
     let mut found: Vec<bool> = needles.iter().map(|n| n.is_empty()).collect();
-    // `heads[h]`: 1 + the index in `groups` of the needles whose first three
-    // bytes, big-endian, are `h`; 0 for none.
     let mut heads = vec![0u16; 1 << (8 * HEAD)];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut left = 0usize;
@@ -165,8 +150,7 @@ pub(crate) fn found_in(hay: &[u8], needles: &[&[u8]]) -> Vec<bool> {
     found
 }
 
-/// The literal anchors of `table` missing from `bytes`: a row whose
-/// parts (split at ` · `) are not all in them.
+/// The literal anchors of `table` missing from `bytes`.
 pub(crate) fn missing(bytes: &[u8], table: &[Anchor]) -> Vec<&'static str> {
     let literal: Vec<&Anchor> = table
         .iter()
@@ -202,10 +186,6 @@ fn literal_anchors_are_in_the_store(program: &str, env: &str, table: &[Anchor]) 
 }
 
 fn literal_anchors_in_build(path: &str, bytes: &[u8], table: &[Anchor]) -> Outcome {
-    // AN ANCHOR IS OWED ONLY BY THE BUILDS IT WAS WRITTEN FOR: each carries
-    // the version it was measured on (`since`), and a store holding an older
-    // build is not a build that lost it ([`Anchor::drawn_by`]). A version
-    // that cannot be read owes every anchor.
     let version = build_version(path);
     let (owed, other): (Vec<Anchor>, Vec<Anchor>) = table
         .iter()
@@ -417,8 +397,6 @@ fn every_wall_phrase_is_in_the_store_claude() -> Outcome {
         );
     };
     let lower = bytes.to_ascii_lowercase();
-    // The vendor draws `\u{b7}` and `\u{2019}` from escapes, and drops
-    // number tokens from a notice's head before the table reads it.
     let owed: Vec<&str> = PHRASES
         .iter()
         .map(|(p, _)| *p)

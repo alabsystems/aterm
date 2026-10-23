@@ -32,7 +32,9 @@ pub const SNAPSHOT: &str = "provisioned";
 /// Exit status of a lane that could not run: never a pass.
 pub const NOT_RUN: i32 = 3;
 
-/// Where Homebrew keeps QEMU and swtpm.
+/// Where the lane looks for QEMU and swtpm: the prefixes a person's own install of
+/// them lives under. aterm provides neither (init design §6.1 row 26: no check set runs
+/// this lane), so a missing one is a NOT RUN that names it, never an install command.
 const PREFIXES: [&str; 2] = ["/opt/homebrew", "/usr/local"];
 
 /// Microsoft's download page for Windows 11 on Arm64: it names the edition, and publishes each language's ISO digest.
@@ -252,7 +254,7 @@ impl Layout {
     }
 }
 
-/// QEMU, `qemu-img`, swtpm and the firmware, from Homebrew.
+/// QEMU, `qemu-img`, swtpm and the firmware, from the person's own install ([`PREFIXES`]).
 #[derive(Clone, Debug)]
 pub struct Tools {
     pub qemu: PathBuf,
@@ -266,29 +268,39 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// Homebrew's QEMU and swtpm.
+    /// QEMU and swtpm under the first of [`PREFIXES`] that has them.
+    ///
     /// # Errors
-    /// Not Apple silicon, or a tool missing: the lane cannot run here.
+    /// Not Apple silicon, or a tool missing: the lane cannot run here, and the NOT RUN
+    /// names what is missing and where it was looked for.
     pub fn find() -> Result<Tools, Fail> {
         if !cfg!(target_arch = "aarch64") {
             return Err(not_run(
                 "the lane needs Apple silicon (QEMU's hvf accelerator runs an arm64 Windows)",
             ));
         }
+        Tools::find_in(&PREFIXES.map(Path::new))
+    }
+
+    /// [`Tools::find`] under `prefixes` (the first that has each tool), on any
+    /// architecture: what a test points at scratch folders.
+    ///
+    /// # Errors
+    /// As [`Tools::find`], past its architecture check.
+    pub fn find_in(prefixes: &[&Path]) -> Result<Tools, Fail> {
         let ok = |p: &Path| crate::sys::executable(&p.to_string_lossy());
-        let prefix = PREFIXES
+        let prefix = prefixes
             .iter()
-            .map(Path::new)
             .find(|p| ok(&p.join("bin/qemu-system-aarch64")))
-            .ok_or_else(|| not_run("no qemu-system-aarch64 (brew install qemu)"))?;
+            .ok_or_else(|| not_run(missing("qemu-system-aarch64", "QEMU", prefixes)))?;
         let tools = Tools {
             qemu: prefix.join("bin/qemu-system-aarch64"),
             qemu_img: prefix.join("bin/qemu-img"),
-            swtpm: PREFIXES
+            swtpm: prefixes
                 .iter()
-                .map(|p| Path::new(p).join("bin/swtpm"))
+                .map(|p| p.join("bin/swtpm"))
                 .find(|p| ok(p))
-                .ok_or_else(|| not_run("no swtpm (brew install swtpm)"))?,
+                .ok_or_else(|| not_run(missing("swtpm", "swtpm", prefixes)))?,
             code: prefix.join("share/qemu/edk2-aarch64-code.fd"),
             vars: prefix.join("share/qemu/edk2-arm-vars.fd"),
             tpm_ppi: false,
@@ -314,6 +326,20 @@ impl Tools {
             ..tools
         })
     }
+}
+
+/// Why the lane cannot run without `bin` (of `what`): where it looked (`prefixes`' `bin`),
+/// and that aterm provides none. No install command: the lane runs on a person's own QEMU.
+fn missing(bin: &str, what: &str, prefixes: &[&Path]) -> String {
+    let looked: Vec<String> = prefixes
+        .iter()
+        .map(|p| p.join("bin").display().to_string())
+        .collect();
+    format!(
+        "no {bin} in {}: the Windows lane runs on your own {what}, and aterm provides none \
+         (no check set runs this lane)",
+        looked.join(" or ")
+    )
 }
 
 /// Run `bin ARGS` (in `dir` when given), capturing what it says.
@@ -2444,6 +2470,72 @@ pub fn released(code: i32, cleanup: Result<(), String>) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing QEMU or swtpm is named with where the lane looked, never with an install
+    /// command: aterm provides neither (init design §6.1 row 26). The lookup's own NOT RUN
+    /// says it, over scratch prefixes: no QEMU in either, then QEMU in the second and no
+    /// swtpm. NEGATIVE CONTROL: with both found, the lookup goes on to the firmware, which
+    /// the scratch prefix lacks, and runs nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_qemu_or_swtpm_is_named_without_an_install_command() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let default: Vec<String> = PREFIXES.iter().map(|p| format!("{p}/bin")).collect();
+        for (bin, what) in [("qemu-system-aarch64", "QEMU"), ("swtpm", "swtpm")] {
+            let why = missing(bin, what, &PREFIXES.map(Path::new));
+            assert!(
+                why.starts_with(&format!("no {bin} in {}: ", default.join(" or ")))
+                    && why.contains("aterm provides none"),
+                "{why}"
+            );
+            assert!(
+                !why.contains("install"),
+                "no remedy installs anything: {why}"
+            );
+        }
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+        let prefixes = [one.as_path(), two.as_path()];
+        let put = |path: &Path| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"#!/bin/sh\nexit 9\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let refusal = |prefixes: &[&Path]| match Tools::find_in(prefixes) {
+            Err(fail) => (fail.code, fail.msg.unwrap_or_default()),
+            Ok(tools) => panic!("{tools:?}"),
+        };
+        let looked = format!(
+            "{} or {}",
+            one.join("bin").display(),
+            two.join("bin").display()
+        );
+        let (code, msg) = refusal(&prefixes);
+        assert_eq!(code, NOT_RUN);
+        assert_eq!(
+            msg,
+            format!(
+                "NOT RUN: {}",
+                missing("qemu-system-aarch64", "QEMU", &prefixes)
+            )
+        );
+        assert!(msg.contains(&looked) && !msg.contains("brew"), "{msg}");
+        put(&two.join("bin/qemu-system-aarch64"));
+        let (_, msg) = refusal(&prefixes);
+        assert_eq!(
+            msg,
+            format!("NOT RUN: {}", missing("swtpm", "swtpm", &prefixes))
+        );
+        assert!(!msg.contains("brew"), "{msg}");
+        put(&one.join("bin/swtpm"));
+        let (code, msg) = refusal(&prefixes);
+        assert_eq!(code, NOT_RUN);
+        assert!(
+            msg.starts_with("NOT RUN: QEMU's firmware ")
+                && msg.contains(&two.join("share/qemu").display().to_string()),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn the_page_names_its_edition_and_each_isos_digest() {

@@ -6,32 +6,7 @@
 // src/hb/ot_shape_normalize.rs and modified by the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! The shaping pipeline: Unicode properties, grapheme clusters, native
-//! direction, character-to-glyph mapping, masks (automatic fractions, Arabic
-//! joining), `GSUB`, advances, and hiding default ignorables.
-//!
-//! What upstream does that this does not, each a deliberate delta of TF.6 of
-//! docs/AUDIT-third-party-2026-10-15.md:
-//!
-//! - **No normalization.** Each character maps to its own nominal glyph:
-//!   nothing is decomposed when the font lacks it, composed when the font
-//!   has the precomposed form, reordered by combining class, or given a
-//!   space or hyphen fallback glyph. Variation selectors still map through
-//!   `cmap` format 14 with their base. A terminal hands the run shaper one
-//!   character per cell and keeps marks on their base cell's cluster, and a
-//!   character the font lacks goes to the fallback face per cell.
-//! - **No mirroring.** UAX #9 L4 is the bidi step's (aterm-core's reorder
-//!   draws an odd-level cell with its `Bidi_Mirroring_Glyph`), so a run is
-//!   shaped with the characters it holds, in either direction. A backward
-//!   run still asks `rtlm` for each character whose mirror the font lacks,
-//!   as upstream does.
-//! - **Positions are advances.** Each glyph advances by `hmtx` (with `HVAR`)
-//!   at the face's instance; marks are zeroed by `GDEF` class; nothing reads
-//!   `GPOS`, `kern`, `kerx` or `trak`, and nothing positions marks by
-//!   fallback. The run shaper places glyphs by cell and reads only ids and
-//!   clusters.
-//! - **No AAT.** `morx` is never applied: macOS shapes its colour emoji
-//!   through CoreText, and every other face is shaped through its `GSUB`.
+//! The shaping pipeline.
 
 use super::ShapeFace;
 use super::buffer::{
@@ -73,10 +48,6 @@ pub(crate) fn shape_internal(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Bu
 }
 
 fn set_unicode_props(buffer: &mut Buffer) {
-    // Enough of UAX #29 that shaping in reverse keeps graphemes whole:
-    // marks, ZWJ and ZWJ+Extended_Pictographic, emoji modifiers, regional
-    // indicator pairs and the non-mark Other_Grapheme_Extend characters are
-    // continuations.
     let len = buffer.len;
     let mut i = 0;
     while i < len {
@@ -113,9 +84,6 @@ fn set_unicode_props(buffer: &mut Buffer) {
                 i += 1;
             }
         } else if matches!(info.glyph_id, 0xFF9E..=0xFF9F | 0xE0020..=0xE007F) {
-            // Other_Grapheme_Extend that is not a mark (ZWNJ aside, which
-            // keeps clusters finer): the halfwidth kana voicing marks
-            // (harfbuzz#3844) and TAG characters (harfbuzz#1556).
             set_continuation(&mut buffer.info[i]);
         }
         i += 1;
@@ -146,8 +114,6 @@ fn ensure_native_direction(buffer: &mut Buffer) {
         .script
         .and_then(Direction::from_script)
         .unwrap_or_default();
-    // A natively right-to-left script's digit run (with no letters) and its
-    // regional indicators are native left to right (harfbuzz#501, #3314).
     if hor == Direction::RightToLeft && dir == Direction::LeftToRight {
         let mut found_number = false;
         let mut found_letter = false;
@@ -169,8 +135,6 @@ fn ensure_native_direction(buffer: &mut Buffer) {
     if (dir.is_horizontal() && dir != hor && hor != Direction::Invalid)
         || (!dir.is_horizontal() && dir != Direction::TopToBottom)
     {
-        // Reverse grapheme by grapheme, merging no clusters (monotone
-        // graphemes).
         buffer.reverse_groups(grapheme_group, false);
         buffer.direction = buffer.direction.reverse();
     }
@@ -208,7 +172,6 @@ fn map_characters(face: &ShapeFace, buffer: &mut Buffer) {
             end += 1;
         }
         if end < count {
-            // Leave one base for the marks to cluster with.
             end -= 1;
         }
         while buffer.idx < end && buffer.successful {
@@ -218,12 +181,10 @@ fn map_characters(face: &ShapeFace, buffer: &mut Buffer) {
         if buffer.idx == count || !buffer.successful {
             break;
         }
-        // Find all the marks now.
         end = buffer.idx + 1;
         while end < count && is_unicode_mark(&buffer.info[end]) {
             end += 1;
         }
-        // idx to end is one cluster with marks.
         map_mark_cluster(face, buffer, end);
         if buffer.idx >= count || !buffer.successful {
             break;
@@ -231,8 +192,6 @@ fn map_characters(face: &ShapeFace, buffer: &mut Buffer) {
     }
     buffer.sync();
     if buffer.scratch_flags & SCRATCH_HAS_CGJ != 0 {
-        // A CGJ that separates no reorderable marks (with no reordering,
-        // none) is skippable (harfbuzz#554).
         for i in 1..buffer.len.saturating_sub(1) {
             if buffer.info[i].glyph_id == 0x034F {
                 unhide(&mut buffer.info[i]);
@@ -266,14 +225,12 @@ fn map_mark_cluster(face: &ShapeFace, buffer: &mut Buffer, end: usize) {
                 let unicode = buffer.cur(0).glyph_id;
                 buffer.replace_glyphs(2, 1, &[unicode]);
             } else {
-                // Pass the two characters on separately, for GSUB.
                 set_glyph(face, buffer, 0);
                 buffer.next_glyph();
                 set_variation_selector(buffer.cur_mut(0), true);
                 set_glyph(face, buffer, 0);
                 buffer.next_glyph();
             }
-            // Skip any further variation selectors.
             while buffer.idx < end && is_variation_selector(buffer.cur(0).as_char()) {
                 set_glyph(face, buffer, 0);
                 buffer.next_glyph();
@@ -367,8 +324,6 @@ fn position(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
             buffer.pos[i].x_advance = face.glyph_h_advance(buffer.info[i].as_glyph());
         }
     }
-    // With no GPOS to place them, a forward run's zeroed marks keep hanging
-    // over the glyph before them.
     let adjust_offsets = !plan.has_gpos && buffer.direction.is_forward();
     for i in 0..len {
         if layout::is_mark(&buffer.info[i]) {

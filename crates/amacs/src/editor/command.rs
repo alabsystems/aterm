@@ -23,7 +23,7 @@ pub(super) enum PrefixArgument {
 
 impl PrefixArgument {
     /// The number the argument stands for: 4ⁿ for `C-u` alone, else the digits.
-    pub(super) fn value(self) -> i64 {
+    pub(super) const fn value(self) -> i64 {
         let (Self::Raw(value) | Self::Numeric { value, .. }) = self;
         value
     }
@@ -36,7 +36,7 @@ impl PrefixArgument {
     /// The argument after one more `C-u`, as in Emacs: it multiplies a bare
     /// `C-u` by four, closes a number being typed, and starts over at four
     /// after a closed one.
-    pub(super) fn after_universal(argument: Option<Self>) -> Self {
+    pub(super) const fn after_universal(argument: Option<Self>) -> Self {
         match argument {
             None | Some(Self::Numeric { open: false, .. }) => Self::Raw(4),
             Some(Self::Raw(value)) => Self::Raw(value.saturating_mul(4)),

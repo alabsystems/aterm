@@ -549,15 +549,15 @@ mod filesystem {
 mod nss {
     use super::{Account, Group};
 
-    pub(super) fn account(_uid: u32) -> Option<Account> {
+    pub(super) const fn account(_uid: u32) -> Option<Account> {
         None
     }
 
-    pub(super) fn group(_gid: u32) -> Option<Group> {
+    pub(super) const fn group(_gid: u32) -> Option<Group> {
         None
     }
 
-    pub(super) fn primary_members(_gid: u32) -> Option<Vec<u32>> {
+    pub(super) const fn primary_members(_gid: u32) -> Option<Vec<u32>> {
         None
     }
 }
@@ -566,11 +566,11 @@ mod nss {
 /// (and none is asked for, since no group is private there).
 #[cfg(not(target_os = "linux"))]
 mod acl {
-    pub(super) fn on_file(_file: &std::fs::File) -> bool {
+    pub(super) const fn on_file(_file: &std::fs::File) -> bool {
         true
     }
 
-    pub(super) fn at_path(_path: &std::path::Path) -> bool {
+    pub(super) const fn at_path(_path: &std::path::Path) -> bool {
         true
     }
 }
@@ -579,11 +579,11 @@ mod acl {
 /// exemption.
 #[cfg(not(target_os = "linux"))]
 mod filesystem {
-    pub(super) fn of_file(_file: &std::fs::File) -> Option<u32> {
+    pub(super) const fn of_file(_file: &std::fs::File) -> Option<u32> {
         None
     }
 
-    pub(super) fn at_path(_path: &std::path::Path) -> Option<u32> {
+    pub(super) const fn at_path(_path: &std::path::Path) -> Option<u32> {
         None
     }
 }

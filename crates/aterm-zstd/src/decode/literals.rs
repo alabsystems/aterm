@@ -126,7 +126,7 @@ fn head<const N: usize>(raw: &[u8]) -> Result<[u8; N], DecodeError> {
     }
 }
 
-fn short_header() -> DecodeError {
+const fn short_header() -> DecodeError {
     DecodeError::Corrupt("literals section header runs past the block")
 }
 

@@ -4,12 +4,14 @@
 //! The tar writer, proven by the client: every archive it writes extracts through
 //! `atpkg::extract_tar_zst` under the client's own caps, to a tree whose `tree_root` is
 //! the stage's, with hard links kept as one file; and the signed `disk_installed` covers
-//! a small-file tree whose structure outweighs its content. Every pack here runs the
-//! `zstd` CLI, which must be on `PATH` (see the suite's docs).
+//! a small-file tree whose structure outweighs its content. The packs compress through
+//! aterm-zstd's raw-block writer ([`RawFrames`]), so no zstd CLI runs; the CLI's own path
+//! ([`tarwrite::ZstdCli`]) runs stand-ins that write known frames, and one test packs
+//! through the real zstd CLI a publish host packs with (COULD NOT RUN without one).
 
 use std::path::Path;
 
-use atpkg_publish::artifact::tarwrite;
+use atpkg_publish::artifact::tarwrite::{self, RawFrames, ZstdCli};
 
 use super::fixture::{put, put_exe, scratch, set_mode};
 
@@ -63,12 +65,11 @@ fn stage(root: &Path) {
 #[test]
 #[cfg(unix)]
 fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
-    crate::shared::need_compressor();
     let tmp = scratch("tar-roundtrip");
     let root = tmp.path().join("stage");
     stage(&root);
     let asset = tmp.path().join("x.tar.zst");
-    let packed = tarwrite::write(&root, &asset).expect("pack");
+    let packed = tarwrite::write_with(&root, &asset, &RawFrames::WHOLE).expect("pack");
     assert_eq!(
         packed.tree_root,
         atpkg::tree_root(&root).expect("stage root")
@@ -94,19 +95,30 @@ fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
     assert!(out.join("libexec").is_dir(), "an empty directory survives");
     assert_eq!(packed.sha256, atpkg::sha256_file(&asset).expect("hash"));
     assert_eq!(packed.size, std::fs::metadata(&asset).expect("stat").len());
+    // A stream over many frames (the CLI writes one per window) reads back the same.
+    let framed = tmp.path().join("framed.tar.zst");
+    let many = tarwrite::write_with(&root, &framed, &RawFrames { frame_max: 4096 })
+        .expect("pack in 4 KiB frames");
+    assert!(many.stream_bytes > 8 * 4096, "{} B", many.stream_bytes);
+    assert_eq!(many.tree_root, packed.tree_root);
+    extract(&framed, &tmp.path().join("framed-out"), many.disk_installed);
+    assert_eq!(
+        atpkg::tree_root(&tmp.path().join("framed-out")).expect("extracted root"),
+        packed.tree_root
+    );
 }
 
 #[test]
 #[cfg(unix)]
 fn the_archive_is_deterministic_whatever_the_stage_path_or_its_modes() {
-    crate::shared::need_compressor();
     let tmp = scratch("tar-determinism");
     let (a, b) = (tmp.path().join("one/stage"), tmp.path().join("two/x"));
     stage(&a);
     stage(&b);
     set_mode(&b.join("bin/trustc"), 0o755);
-    let pa = tarwrite::write(&a, &tmp.path().join("a.tar.zst")).expect("pack a");
-    let pb = tarwrite::write(&b, &tmp.path().join("b.tar.zst")).expect("pack b");
+    let raw = &RawFrames::WHOLE;
+    let pa = tarwrite::write_with(&a, &tmp.path().join("a.tar.zst"), raw).expect("pack a");
+    let pb = tarwrite::write_with(&b, &tmp.path().join("b.tar.zst"), raw).expect("pack b");
     assert_eq!(pa.sha256, pb.sha256);
     assert_eq!(pa.tree_root, pb.tree_root);
 }
@@ -133,7 +145,6 @@ fn a_symlink_or_an_empty_tree_is_refused() {
 /// create, a read, an extract and an unlink.
 #[test]
 fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content() {
-    crate::shared::need_compressor();
     let tmp = scratch("tar-size");
     let small = tmp.path().join("small");
     let dir = small
@@ -145,7 +156,8 @@ fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content(
         let name = format!("{i:03}{}", "f".repeat(150));
         std::fs::write(dir.join(name), [0u8; 100]).expect("write fixture");
     }
-    let packed = tarwrite::write(&small, &tmp.path().join("small.tar.zst")).expect("pack");
+    let packed = tarwrite::write_with(&small, &tmp.path().join("small.tar.zst"), &RawFrames::WHOLE)
+        .expect("pack");
     assert_eq!(packed.content_bytes, 50_000);
     assert!(
         packed.stream_bytes - packed.content_bytes > 1 << 20,
@@ -162,23 +174,81 @@ fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content(
     let big = tmp.path().join("big");
     put(&big.join("share/blob"), &vec![0u8; 400_000]);
     put(&big.join("share/note"), b"x");
-    let packed = tarwrite::write(&big, &tmp.path().join("big.tar.zst")).expect("pack");
+    let packed = tarwrite::write_with(&big, &tmp.path().join("big.tar.zst"), &RawFrames::WHOLE)
+        .expect("pack");
     assert_eq!(packed.disk_installed, 400_001);
+}
+
+/// The compressor every real pack runs, [`HostTools`]' (the zstd CLI on `PATH`, as
+/// [`tarwrite::write`] runs it too), packs what aterm-zstd's raw-block writer packs: the
+/// same tree root, extracted by the client, the same bytes from a second pack, and a stream
+/// actually compressed. NEGATIVE CONTROL: the raw-block writer's asset is no smaller than
+/// its stream, so the size check tells a real compressor from raw frames. Without a zstd
+/// on `PATH` the test ends COULD NOT RUN naming the `zstd` row's provider.
+#[test]
+#[cfg(unix)]
+fn the_hosts_compressor_is_the_zstd_cli_and_packs_what_raw_frames_pack() {
+    use atpkg_publish::artifact::tools::{HostTools, Tools as _};
+
+    if let Err(why) = tarwrite::compressor_on_path() {
+        aterm_uds::host::could_not_run(format!(
+            "{why}: {}",
+            aterm_uds::host::tool("zstd").remedy()
+        ));
+    }
+    let tmp = scratch("tar-real-cli");
+    let root = tmp.path().join("stage");
+    stage(&root);
+    let raw = tarwrite::write_with(&root, &tmp.path().join("raw.tar.zst"), &RawFrames::WHOLE)
+        .expect("the raw-block pack");
+    let host = tarwrite::write_with(
+        &root,
+        &tmp.path().join("host.tar.zst"),
+        HostTools.compressor(),
+    )
+    .expect("the host's compressor packs");
+    let default =
+        tarwrite::write(&root, &tmp.path().join("default.tar.zst")).expect("the default pack");
+    assert_eq!(host.tree_root, raw.tree_root);
+    assert_eq!(host.stream_bytes, raw.stream_bytes, "the same tar stream");
+    assert_eq!(
+        host.sha256, default.sha256,
+        "the CLI's bytes are the same twice"
+    );
+    assert!(
+        host.size * 4 < host.stream_bytes,
+        "compressed: {} B of a {} B stream",
+        host.size,
+        host.stream_bytes
+    );
+    assert!(
+        raw.size >= raw.stream_bytes,
+        "raw frames are not compressed: {} B of a {} B stream",
+        raw.size,
+        raw.stream_bytes
+    );
+    let out = tmp.path().join("out");
+    extract(&host.asset, &out, host.disk_installed);
+    assert_eq!(
+        atpkg::tree_root(&out).expect("extracted root"),
+        raw.tree_root
+    );
 }
 
 /// The pack trusts no compressor's word: one that fails, or exits 0 having written a
 /// stream other than the archive (or one without the content checksum), fails the pack.
-/// The control: the real `zstd` CLI through the same entry point packs the same tree.
+/// The control: a CLI stand-in that writes the archive's own frames, run with the flags
+/// every pack passes, packs the same tree through the same entry point.
 #[test]
 #[cfg(unix)]
 fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
-    crate::shared::need_compressor();
     use aterm_zstd::frame::{self, Checksum};
-    use std::ffi::OsStr;
 
     let tmp = scratch("tar-compressor");
     let root = tmp.path().join("stage");
     put(&root.join("bin/tool"), b"tool bytes\n");
+    let right = tmp.path().join("right.zst");
+    tarwrite::write_with(&root, &right, &RawFrames::WHOLE).expect("the archive's frames");
     let frame_of = |name: &str, checksum| {
         let mut zst = Vec::new();
         frame::write_raw(&mut zst, b"hello", checksum).expect("frame");
@@ -216,17 +286,34 @@ fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
         ),
     ] {
         let asset = tmp.path().join("x.tar.zst");
-        let err = tarwrite::write_with(&root, &asset, compressor.as_os_str())
-            .expect_err("a stand-in's stream");
+        let cli = ZstdCli {
+            program: compressor.clone().into(),
+        };
+        let err = tarwrite::write_with(&root, &asset, &cli).expect_err("a stand-in's stream");
         assert!(
             err.to_string().contains(want),
             "{}: {err}",
             compressor.display()
         );
     }
-    let asset = tmp.path().join("real.tar.zst");
-    let packed = tarwrite::write_with(&root, &asset, OsStr::new(tarwrite::COMPRESSOR))
-        .expect("the real compressor");
+    let argv = tmp.path().join("argv");
+    let control = stand_in(
+        "right",
+        format!(
+            "echo \"$@\" > '{}'\ncat > /dev/null\ncat '{}'\n",
+            argv.display(),
+            right.display()
+        ),
+    );
+    let asset = tmp.path().join("cli.tar.zst");
+    let cli = ZstdCli {
+        program: control.into(),
+    };
+    let packed = tarwrite::write_with(&root, &asset, &cli).expect("the archive's own frames");
+    assert_eq!(
+        std::fs::read_to_string(&argv).expect("the stand-in ran"),
+        "-q -19 --single-thread -c\n"
+    );
     extract(&asset, &tmp.path().join("out"), packed.disk_installed);
 }
 
@@ -260,7 +347,6 @@ fn the_compressor_probe_finds_only_an_executable_zstd() {
 #[test]
 #[cfg(unix)]
 fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
-    crate::shared::need_compressor();
     const CHILD: &str = "ATERM_PUBLISH_LOUD_COMPRESSOR_CHILD";
     const TEST: &str =
         "artifact::tarwrite::a_compressor_loud_on_stderr_before_it_reads_still_packs";
@@ -293,12 +379,22 @@ fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
     let tmp = std::path::PathBuf::from(path);
     let root = tmp.join("stage");
     put(&root.join("share/blob"), &vec![7u8; 1 << 20]);
+    // What it writes once it has read the stream: the archive's own frames.
+    let frames = tmp.join("frames.zst");
+    tarwrite::write_with(&root, &frames, &RawFrames::WHOLE).expect("the archive's frames");
     let loud = put_exe(
         &tmp.join("loud"),
-        b"#!/bin/sh\nhead -c 1048576 /dev/zero >&2\nexec zstd \"$@\"\n",
+        format!(
+            "#!/bin/sh\nhead -c 1048576 /dev/zero >&2\ncat > /dev/null\ncat '{}'\n",
+            frames.display()
+        )
+        .as_bytes(),
     );
     let asset = tmp.join("loud.tar.zst");
-    let packed = tarwrite::write_with(&root, &asset, loud.as_os_str()).expect("the pack");
+    let cli = ZstdCli {
+        program: loud.into(),
+    };
+    let packed = tarwrite::write_with(&root, &asset, &cli).expect("the pack");
     extract(&asset, &tmp.join("out"), packed.disk_installed);
     std::fs::write(tmp.join("packed"), b"packed\n").expect("case completed");
 }

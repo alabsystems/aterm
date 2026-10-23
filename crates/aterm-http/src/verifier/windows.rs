@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows: chain building and SSL policy verification over `crypt32`.
-//!
-//! # Measured against the fixture corpus, on one Windows host
-//!
-//! The claims below came from binding and header inspection plus a cross-target
-//! `cargo check` on macOS. Since 2026-10-17 [`super::tests`]' corpus also runs on
-//! Windows (11, build 26200) and records this arm's verdicts in its `windows`
-//! column; that first run found crypt32 accepting a leaf with no subjectAltName on
-//! its CN, now refused in [`Verifier::verify`]. Revocation and network fetching
-//! below are still unmeasured.
-//!
-//! `CERT_CHAIN_PARA` is used as `windows-sys` declares it (all nine fields;
-//! `rustls-platform-verifier` redefines it only to drop two on Windows 7, which
-//! aterm does not support), so `cbSize` is its full size.
-//!
-//! The chain flags are `rustls-platform-verifier`'s: end-entity revocation, an
-//! accumulated retrieval timeout and an end-cert cache, with a 10 s
-//! `dwUrlRetrievalTimeout`. So unlike the Apple arm this one may make a bounded
-//! network request: on Windows revocation checking is the URL retrieval, and
-//! `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL` would drop both. Keep that until the
-//! alternative is measured on Windows.
+//! Windows chain building and SSL policy verification over `crypt32`.
+//! Implements [`Verifier::verify`] and is tested by [`super::tests`].
 
 use std::ffi::c_void;
 use std::mem;
@@ -56,8 +37,6 @@ const UNIX_TO_WINDOWS_SECS: u64 = 11_644_473_600;
 /// `FILETIME` counts 100-nanosecond intervals.
 const INTERVALS_PER_SEC: u64 = 10_000_000;
 
-// The `dwError` values translated to a specific `rustls::CertificateError`, as
-// `rustls-platform-verifier` maps them.
 const CERT_E_EXPIRED: i32 = -2146762495; // 0x800B0101
 const CERT_E_UNTRUSTEDROOT: i32 = -2146762487; // 0x800B0109
 const CERT_E_CN_NO_MATCH: i32 = -2146762481; // 0x800B010F
@@ -65,23 +44,17 @@ const CERT_E_WRONG_USAGE: i32 = -2146762480; // 0x800B0110
 const CERT_E_INVALID_NAME: i32 = -2146762476; // 0x800B0114
 const CRYPT_E_REVOKED: i32 = -2146885616; // 0x80092010
 
-/// The last OS error, as a rustls error. Used only where a `crypt32` call
-/// reported failure, so the resulting `Err` is a rejection either way.
+/// The last OS error, as a rustls error.
 fn last_os_error(what: &str) -> rustls::Error {
     invalid_certificate(format!("{what}: {}", std::io::Error::last_os_error()))
 }
 
-/// An in-memory certificate store, closed exactly once on drop.
-///
-/// Opened with `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG`, which is what
-/// makes it sound for a [`CertContext`] to outlive this handle.
+/// An in-memory certificate store, closed exactly once on drop ([`CertContext`]).
 struct Store(HCERTSTORE);
 
 impl Store {
     fn new() -> Result<Self, rustls::Error> {
-        // SAFETY: `CERT_STORE_PROV_MEMORY` takes no provider and no `pvPara`;
-        // the two zeroed arguments are the documented values for it. The result
-        // is checked for null before it is used.
+        // SAFETY: `CERT_STORE_PROV_MEMORY` takes no provider and no `pvPara`.
         let handle = unsafe {
             CertOpenStore(
                 CERT_STORE_PROV_MEMORY,
@@ -101,9 +74,7 @@ impl Store {
     fn add(&self, der: &[u8]) -> Result<CertContext, rustls::Error> {
         let len = u32::try_from(der.len()).map_err(|_| bad_encoding())?;
         let mut context: *mut CERT_CONTEXT = ptr::null_mut();
-        // SAFETY: `self.0` is a live store; `der` is valid for `len` bytes for
-        // the duration of the call (crypt32 copies); `context` is a valid place
-        // to write one pointer.
+        // SAFETY: `self.0` is a live store.
         let ok = unsafe {
             CertAddEncodedCertificateToStore(
                 self.0,
@@ -115,7 +86,6 @@ impl Store {
             )
         };
         if ok != TRUE || context.is_null() {
-            // Attacker-controlled bytes that crypt32 will not decode.
             return Err(bad_encoding());
         }
         Ok(CertContext(context))
@@ -125,8 +95,6 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         // SAFETY: `self.0` is a live store handle and this is its only close.
-        // Contexts handed out by `add` remain valid because of the
-        // `CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG` this store was opened with.
         unsafe { CertCloseStore(self.0, 0) };
     }
 }
@@ -151,8 +119,7 @@ impl Drop for ChainContext {
     }
 }
 
-/// A chain engine, freed exactly once on drop. Only ever constructed on the
-/// test-only extra-anchor path.
+/// A chain engine, freed exactly once on drop.
 struct ChainEngine(HCERTCHAINENGINE);
 
 impl Drop for ChainEngine {
@@ -169,8 +136,6 @@ fn build_chain(
     now: UnixTime,
     engine: Option<&ChainEngine>,
 ) -> Result<ChainContext, rustls::Error> {
-    // Saturating: wrapping would move the clock into the past, which turns an
-    // expired certificate valid.
     let intervals = now
         .as_secs()
         .saturating_add(UNIX_TO_WINDOWS_SECS)
@@ -180,11 +145,8 @@ fn build_chain(
         dwHighDateTime: (intervals >> 32) as u32,
     };
 
-    // `CTL_USAGE` wants `PSTR` but crypt32 only reads it. The OID is already
-    // NUL-terminated (see the module docs).
     let mut ekus: [PCSTR; 1] = [szOID_PKIX_KP_SERVER_AUTH];
-    // SAFETY: `CERT_CHAIN_PARA` is a plain integer/pointer aggregate; MSDN
-    // requires every unused field to be zero, which is exactly what this gives.
+    // SAFETY: `CERT_CHAIN_PARA` is a plain integer/pointer aggregate.
     let mut parameters: CERT_CHAIN_PARA = unsafe { mem::zeroed() };
     parameters.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_PARA>())
         .map_err(|_| invalid_certificate("CERT_CHAIN_PARA is impossibly large"))?;
@@ -202,9 +164,7 @@ fn build_chain(
         | CERT_CHAIN_CACHE_END_CERT;
 
     let mut chain: *mut CERT_CHAIN_CONTEXT = ptr::null_mut();
-    // SAFETY: `cert` and `store` are live; `time` and `parameters` are valid for
-    // reads for the duration of the call, and `ekus` outlives `parameters`;
-    // `chain` is a valid place to write one pointer. `pvReserved` must be null.
+    // SAFETY: `cert` and `store` are live.
     let ok = unsafe {
         CertGetCertificateChain(
             engine.map_or(ptr::null_mut(), |e| e.0),
@@ -224,24 +184,17 @@ fn build_chain(
 }
 
 /// Windows chain verification.
-///
-/// `extra_roots` holds DER rather than a live chain engine, so this type needs
-/// no `unsafe impl Send`/`Sync` and the shipped path (`extra_roots` empty)
-/// never creates an engine at all.
 #[derive(Debug)]
 pub(super) struct Verifier {
     extra_roots: Vec<Vec<u8>>,
 }
 
 impl Verifier {
-    /// `extra_roots` is empty on every shipped path. `_provider` is unused
-    /// (crypt32 brings its own crypto); every arm takes the same arguments so
-    /// `PlatformVerifier::build` needs no `#[cfg]` fork.
+    /// `extra_roots` is empty on every shipped path.
     pub(super) fn new(
         extra_roots: Vec<CertificateDer<'static>>,
         _provider: Arc<CryptoProvider>,
     ) -> Result<Self, rustls::Error> {
-        // Reject an unusable anchor at construction, not at first handshake.
         let store = Store::new()?;
         for root in &extra_roots {
             store.add(root.as_ref())?;
@@ -251,21 +204,19 @@ impl Verifier {
         })
     }
 
-    /// An engine whose only roots are `self.extra_roots`, plus a store holding
-    /// them. The store must outlive the engine, so both are returned.
+    /// An engine whose only roots are `self.extra_roots`, plus a store holding them.
     fn exclusive_engine(&self) -> Result<(Store, ChainEngine), rustls::Error> {
         let roots = Store::new()?;
         for der in &self.extra_roots {
             roots.add(der)?;
         }
-        // SAFETY: plain integer/pointer aggregate; MSDN requires unused fields zeroed.
+        // SAFETY: Plain integer/pointer aggregate; MSDN requires unused fields zeroed.
         let mut config: CERT_CHAIN_ENGINE_CONFIG = unsafe { mem::zeroed() };
         config.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_ENGINE_CONFIG>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_ENGINE_CONFIG is impossibly large"))?;
         config.hExclusiveRoot = roots.0;
         let mut engine: HCERTCHAINENGINE = ptr::null_mut();
-        // SAFETY: `config` is valid for reads for the duration of the call and
-        // names a live store; `engine` is a valid place to write one handle.
+        // SAFETY: `config` is valid for reads for the duration of the call and names a live store.
         let ok = unsafe { CertCreateCertificateChainEngine(&config, &mut engine) };
         if ok != TRUE || engine.is_null() {
             return Err(last_os_error("CertCreateCertificateChainEngine failed"));
@@ -273,8 +224,7 @@ impl Verifier {
         Ok((roots, ChainEngine(engine)))
     }
 
-    /// The presented chain, judged by crypt32: `Ok(())` only when the SSL chain
-    /// policy reported `dwError == 0`.
+    /// The presented chain, judged by crypt32.
     pub(super) fn verify(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -286,8 +236,6 @@ impl Verifier {
     ) -> Result<(), rustls::Error> {
         let store = Store::new()?;
         let leaf = store.add(end_entity.as_ref())?;
-        // The intermediates go into the store for chain building; dropping their
-        // contexts is safe because the store defers its close until the last free.
         let _intermediates = intermediates
             .iter()
             .map(|der| store.add(der.as_ref()))
@@ -300,9 +248,7 @@ impl Verifier {
                 })?,
                 pbData: ocsp.as_ptr().cast_mut(),
             };
-            // SAFETY: `leaf` is a live context; `blob` matches the layout
-            // `CERT_OCSP_RESPONSE_PROP_ID` expects and is valid for reads for
-            // the duration of the call, as is the buffer it points at.
+            // SAFETY: `leaf` is a live context.
             let ok = unsafe {
                 CertSetCertificateContextProperty(
                     leaf.0,
@@ -318,11 +264,6 @@ impl Verifier {
 
         let mut chain = build_chain(&store, &leaf, now, None)?;
 
-        // Test-only extra anchors; empty on every shipped path. `TrustStatus`
-        // here has not been through policy verification: it only says whether
-        // the system roots completed the chain. A chain context must not outlive
-        // the engine that built it, so the engine is bound at this scope, not
-        // inside `if partial`.
         let mut _engine_keepalive = None;
         if !self.extra_roots.is_empty() {
             // SAFETY: `chain.0` is a live, non-null chain context.
@@ -335,56 +276,36 @@ impl Verifier {
             }
         }
 
-        // UTF-16, NUL-terminated; `encode_utf16` is correct for any `&str`.
         let mut server: Vec<u16> = server_text.encode_utf16().chain(Some(0)).collect();
 
-        // SAFETY: plain aggregate containing a union of two `u32`s; zeroing is
-        // required by MSDN for the unused fields.
+        // SAFETY: Plain aggregate containing a union of two `u32`s.
         let mut https: HTTPSPolicyCallbackData = unsafe { mem::zeroed() };
         https.Anonymous.cbSize = u32::try_from(mem::size_of::<HTTPSPolicyCallbackData>())
             .map_err(|_| invalid_certificate("HTTPSPolicyCallbackData is impossibly large"))?;
         https.dwAuthType = AUTHTYPE_SERVER;
-        // `server` outlives `https`, which outlives `params`, which outlives the
-        // call below.
         https.pwszServerName = server.as_mut_ptr();
 
-        // SAFETY: plain integer/pointer aggregate; zeroing the unused fields is
-        // required by MSDN.
+        // SAFETY: Plain integer/pointer aggregate; zeroing the unused fields is required by MSDN.
         let mut params: CERT_CHAIN_POLICY_PARA = unsafe { mem::zeroed() };
         params.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_POLICY_PARA>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_POLICY_PARA is impossibly large"))?;
-        // Unknown revocation status does not fail a chain (as in OpenSSL and
-        // `rustls-platform-verifier`); a revoked one still arrives as
-        // `CRYPT_E_REVOKED` below.
         params.dwFlags = CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS;
         params.pvExtraPolicyPara = (&raw mut https).cast::<c_void>();
 
-        // SAFETY: plain aggregate; zeroed, so an unwritten `dwError` reads as 0 —
-        // which is why the `BOOL` is checked first.
+        // SAFETY: Plain aggregate.
         let mut status: CERT_CHAIN_POLICY_STATUS = unsafe { mem::zeroed() };
         status.cbSize = u32::try_from(mem::size_of::<CERT_CHAIN_POLICY_STATUS>())
             .map_err(|_| invalid_certificate("CERT_CHAIN_POLICY_STATUS is impossibly large"))?;
 
-        // SAFETY: `chain.0` is a live chain context; `params` is valid for reads
-        // (and everything it points at outlives the call); `status` is a valid
-        // place to write one `CERT_CHAIN_POLICY_STATUS`.
+        // SAFETY: `chain.0` is a live chain context.
         let ok = unsafe {
             CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, chain.0, &params, &mut status)
         };
-        // The `BOOL` only says the policy engine ran.
         if ok != TRUE {
             return Err(invalid_certificate(
                 "CertVerifyCertificateChainPolicy could not evaluate the chain",
             ));
         }
-        // THE VERDICT. Acceptance requires an explicit zero — and a subjectAltName
-        // that names the server. crypt32's SSL policy still falls back to the subject
-        // CN for a leaf with NO subjectAltName (measured on Windows 11: `nosan.der`
-        // accepted for its CN), which RFC 9525 retired and the Apple and Unix arms
-        // both refuse. So an accepted chain's name is checked again the way the Unix
-        // arm checks it, by webpki over the SAN alone. That parses nothing new: the
-        // handshake's own signature check (`verify_tls13_signature`) parses this
-        // leaf with webpki already.
         if status.dwError == 0 {
             let leaf = rustls::server::ParsedCertificate::try_from(end_entity)?;
             return rustls::client::verify_server_name(&leaf, server_name);

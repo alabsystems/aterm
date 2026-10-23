@@ -71,7 +71,7 @@ pub const QUEUE_BYTES_MAX: usize = 8 * 1024 * 1024;
 pub const EVENT_RUN_MAX: u32 = 64;
 
 /// The bytes one queued record occupies, as the bound counts them.
-fn record_bytes(r: &Record) -> usize {
+const fn record_bytes(r: &Record) -> usize {
     r.1.len() + r.2.len()
 }
 
@@ -191,14 +191,14 @@ fn is_drain_event(line: &str) -> bool {
 
 /// Whether one source is over a bound and non-empty: an empty queue must accept one record
 /// however large, or the lane wedges forever.
-fn over_bound(rows: usize, bytes: usize) -> bool {
+const fn over_bound(rows: usize, bytes: usize) -> bool {
     rows > 0 && (rows >= QUEUE_ROWS_MAX || bytes >= QUEUE_BYTES_MAX)
 }
 
 /// Whether a paused source has drained far enough to subscribe again: half of
 /// each bound, so one pause moves at least half a queue and the new
 /// subscription is open while the loop still has the other half to take.
-fn at_low_water(rows: usize, bytes: usize) -> bool {
+const fn at_low_water(rows: usize, bytes: usize) -> bool {
     rows <= QUEUE_ROWS_MAX / 2 && bytes <= QUEUE_BYTES_MAX / 2
 }
 
@@ -220,7 +220,7 @@ impl Queues {
 
     /// A broker source's face; `None` for aterm's own lane, which carries no
     /// records and no generation.
-    fn face(&mut self, s: Source) -> Option<&mut Face> {
+    const fn face(&mut self, s: Source) -> Option<&mut Face> {
         match s {
             Source::Fleet => Some(&mut self.fleet),
             Source::Inbox => Some(&mut self.inbox),

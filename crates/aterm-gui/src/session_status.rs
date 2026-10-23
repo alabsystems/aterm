@@ -3013,8 +3013,10 @@ impl crate::App {
             }
         };
         let detail = term.as_deref().and_then(executing_detail);
+        // `-` on a contended lock or an unfinished DEC 2026 frame: the event loop never waits on a program.
         let stamp = term
             .as_deref()
+            .filter(|t| !crate::frame_unfinished_now(t))
             .map(|t| (t.content_seq(), look.text(t).fnv()));
         let resize_probe = term
             .as_deref()

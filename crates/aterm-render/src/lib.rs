@@ -27010,6 +27010,93 @@ mod tests {
         }
     }
 
+    /// A BOLD GLASS MARK IS ITS REGULAR ONE'S SIZE: the ring family (every glass mark but
+    /// `⤓`) in its own cell, as the glass and the menus' lit rows lay it, at 10 to 36 px on
+    /// the system face (SF Mono on macOS) and on Menlo, wherever the two weights measure the
+    /// same capitals, `●`, head and baseline ([`Renderer::icon_metrics`]), inks the same box
+    /// in bold as in regular, so it is one size and its foot stands on one row, and the bold
+    /// mark has at least the regular one's ink. Centred for its stroke's parity, a bold
+    /// stroke of the cell's other parity stood half a pixel off the cell's middle and the
+    /// room on the short side cut the family a pixel under the regular one, its foot a row
+    /// higher: SF Mono at 26 px (a 2x menu at 13 px) drew a bold `●` 15 × 15 on rows -17..-3
+    /// beside the regular 16 × 16 on -17..-2, and at 14 px 8 × 8 beside 9 × 9; Menlo at 24 px
+    /// 13 × 13 beside 14 × 14. NEGATIVE CONTROL: `⤓`, whose stem keeps its stroke's crisp
+    /// centre, inks another box in bold at some size on each macOS face, so the measure tells
+    /// a mark centred by its stroke apart.
+    #[test]
+    fn a_bold_glass_mark_is_its_regular_ones_size() {
+        let faces: &[Option<&str>] = if cfg!(target_os = "macos") {
+            &[None, Some("Menlo")]
+        } else {
+            &[None]
+        };
+        // The ink box `(x0, x1, y0, y1)`, half-open, of a mark's own-cell raster, and its ink.
+        let measure = |r: &mut Renderer, icon: BandIcon, style| {
+            let key = band_icon_key(icon, style, false, r.px_q);
+            let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
+                panic!("{icon:?}: a Mono raster");
+            };
+            let w = *width;
+            let (mut b, mut ink) = ((usize::MAX, 0, usize::MAX, 0), 0u32);
+            for (i, &c) in bytes.iter().enumerate().filter(|&(_, &c)| c > 0) {
+                let (x, y) = (i % w, i / w);
+                b = (b.0.min(x), b.1.max(x + 1), b.2.min(y), b.3.max(y + 1));
+                ink += u32::from(c);
+            }
+            assert!(b.0 < b.1, "{icon:?} draws");
+            (b, ink)
+        };
+        for &face in faces {
+            let mut stem_parted = Vec::new();
+            for px in 10..=36 {
+                let mut r = Renderer::from_system_with_family(face, px as f32, Theme::default())
+                    .expect(NO_FONT);
+                if let Some(name) = face {
+                    assert!(
+                        r.primary_source_path().is_some_and(|p| p.contains(name)),
+                        "{name} is the primary face"
+                    );
+                }
+                r.debug_block_on_lazy_fallbacks();
+                let (cw, ch) = r.cell_size();
+                let (mr, mb) = (r.icon_metrics(false), r.icon_metrics(true));
+                if (mr.cap, mr.disc, mr.head, mr.baseline)
+                    != (mb.cap, mb.disc, mb.head, mb.baseline)
+                {
+                    continue;
+                }
+                for icon in BandIcon::ALL.into_iter().filter(|i| i.is_glass_mark()) {
+                    let (regular, regular_ink) = measure(&mut r, icon, StyleBits::REGULAR);
+                    let (bold, bold_ink) = measure(&mut r, icon, StyleBits::BOLD);
+                    if icon == BandIcon::ToBar {
+                        if bold != regular {
+                            stem_parted.push(px);
+                        }
+                        continue;
+                    }
+                    let at = format!(
+                        "{face:?} {px} px ({cw}x{ch}) {icon:?}, stems {:.2} and {:.2}",
+                        mr.stem, mb.stem
+                    );
+                    assert_eq!(
+                        bold, regular,
+                        "{at}: the bold ink box (x0, x1, y0, y1) is not the regular one's"
+                    );
+                    assert!(
+                        bold_ink >= regular_ink,
+                        "{at}: bold ink {bold_ink} under the regular {regular_ink}"
+                    );
+                }
+            }
+            if cfg!(target_os = "macos") {
+                assert!(
+                    !stem_parted.is_empty(),
+                    "{face:?}: control, ⤓ keeps its stroke's centre and parts its weights"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_spilled_icon_repaints_with_its_neighbours() {
         let mut r = renderer();

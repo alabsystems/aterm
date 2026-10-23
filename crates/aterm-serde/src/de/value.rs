@@ -421,7 +421,7 @@ mod private {
         marker: PhantomData<E>,
     }
 
-    pub fn unit_only<T, E>(t: T) -> (T, UnitOnly<E>) {
+    pub const fn unit_only<T, E>(t: T) -> (T, UnitOnly<E>) {
         (
             t,
             UnitOnly {
@@ -479,7 +479,7 @@ mod private {
         map: A,
     }
 
-    pub fn map_as_enum<A>(map: A) -> MapAsEnum<A> {
+    pub const fn map_as_enum<A>(map: A) -> MapAsEnum<A> {
         MapAsEnum { map }
     }
 

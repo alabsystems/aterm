@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The checked-in momentum trace: a small typing story's exported trace file (the identity,
-//! the ancestor checkpoint, the sealed log and the head the live run reached), recorded per
-//! target under `tests/fixtures/aos-momentum/<target>.trace` because the profile artifact
-//! names the target and its libm.
-//!
-//! Playing the story again in this process must export exactly the checked-in bytes, and the
-//! checked-in bytes, decoded on another epoch and replayed from their checkpoint, must reach
-//! the head they record. The second half is what a reader in another process does: nothing
-//! in the file is an instant, only offsets from the recording epoch.
-//!
-//! `ATERM_BLESS_GOLDEN=1` re-records this target's file (and then checks it as usual). A
-//! target listed in [`RECORDED`] fails without its file; any other target skips, saying so.
-//! Re-record only for an intended change to what the story exports (an encoding, the
-//! engine, the story), and say which in the commit.
+//! Golden trace export and replay tests for `aos_momentum` ([`RECORDED`]).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -65,10 +52,7 @@ fn cfg(dark: bool) -> MomentumGlowConfig {
     }
 }
 
-/// The story, attached at `t0` under the shipped code: six keys 70 ms apart on a dark page
-/// with a frame after each, the host's lane (frame cadence while active, the named wake
-/// while settling) until it parks, a reset (the page change), and the same on a light
-/// page. Every instant is `t0` plus a fixed offset.
+/// The story, attached at `t0` under the shipped code.
 fn story(t0: Instant) -> MomentumHost {
     let mut host = MomentumHost::default();
     host.aos_attach(t0, MomentumCode::Shipped, BUILD, 1);

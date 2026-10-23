@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GL programs and fixed-function state built from [`crate::pipeline_table`],
-//! the rows the wgpu and Metal pipelines are built from.
-//!
-//! A GLSL twin (`shaders/<library>.glsl`) holds every entry point of its
-//! library; [`compose`] turns it into one stage's source for one row (see the
-//! header of `shaders/cell.glsl`). The vertex `main` ends by flipping clip-space
-//! y and remapping z exactly as naga's `ADJUST_COORDINATE_SPACE` does for
-//! wgpu's GL backend: row 0 of every texture the arm draws into is the top row,
-//! so readbacks, copies, scissors and `gl_FragCoord` all count rows the way
-//! wgpu and Metal do.
-//!
-//! The mappings off the table's neutral enums are total, so a variant added to
-//! the table fails to compile here until GL spells it. GL expresses REPLACE as
-//! blending disabled ([`crate::pipeline_table::Blend::is_replace`]).
+//! GL programs and fixed-function state built from [`crate::pipeline_table`], the rows the wgpu and
+//! Metal pipelines are built from.
 
 use super::device::{Current, GlDevice};
 use super::ffi::{self, GLenum, GLuint};
@@ -52,8 +40,8 @@ const fn gl_mode(t: Topology) -> GLenum {
     }
 }
 
-/// The blend state a row sets: `None` disables blending (no blend, or
-/// REPLACE), else `(src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a)`.
+/// The blend state a row sets: `None` disables blending, else
+/// `(src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a)`.
 #[inline]
 pub(crate) const fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
     let Some(b) = blend else {
@@ -72,9 +60,7 @@ pub(crate) const fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
     ])
 }
 
-/// One stage of one row: the twin's `#version` line, the defines that select
-/// the stage and the row's entry points, the rest of the twin (line numbers
-/// kept for driver messages), and a `main` calling the entry point.
+/// One stage of one row.
 pub(crate) fn compose(src: &str, vertex: bool, vs: &str, fs: &str) -> Result<String, String> {
     let (version, body) = src
         .split_once('\n')
@@ -86,7 +72,6 @@ pub(crate) fn compose(src: &str, vertex: bool, vs: &str, fs: &str) -> Result<Str
         "ATERM_FRAGMENT"
     };
     let main = if vertex {
-        // naga's ADJUST_COORDINATE_SPACE, verbatim.
         format!(
             "void main() {{\n    {vs}();\n    gl_Position.yz = vec2(-gl_Position.y, \
              gl_Position.z * 2.0 - gl_Position.w);\n}}\n"
@@ -99,12 +84,10 @@ pub(crate) fn compose(src: &str, vertex: bool, vs: &str, fs: &str) -> Result<Str
     ))
 }
 
-/// A row as GL draws it: the linked program and vertex array, and the
-/// fixed-function state `set_pipeline` applies.
+/// A row as GL draws it.
 pub(crate) struct GlPipeline {
     pub(crate) program: GLuint,
-    /// The row's own vertex array: the instance stream's attribute layout is
-    /// specified into it at each stream bind.
+    /// The row's own vertex array.
     pub(crate) vao: GLuint,
     pub(crate) blend: Option<[GLenum; 6]>,
     pub(crate) mask: [bool; 4],
@@ -227,14 +210,9 @@ impl GlDevice {
                 spec.label, spec.vs, spec.fs
             ));
         }
-        // Bind by name (GLSL ES 3.00 has no binding qualifier): uniform block
-        // `aterm_b<n>` to binding point n, sampler `aterm_t<n>` to unit n,
-        // for exactly the row's BindSpec slots. A block or sampler the
-        // compiler eliminated (an entry point that never reads it) has no
-        // index, and needs no binding.
         let b = spec.binds;
-        // SAFETY: the context is current; NUL-terminated names; the program
-        // is linked and bound for the uniform writes.
+        // SAFETY: the context is current; NUL-terminated names; the program is linked and bound for
+        // the uniform writes.
         unsafe {
             (gl.use_program)(program);
             for n in b
@@ -278,9 +256,8 @@ impl GlDevice {
     }
 }
 
-/// Specify `layout`'s attributes over the buffer bound to `GL_ARRAY_BUFFER`,
-/// one instance per step, into the bound vertex array.
-///
+/// Specify `layout`'s attributes over the buffer bound to `GL_ARRAY_BUFFER`, one instance per step,
+/// into the bound vertex array.
 /// # Safety
 /// The context is current, a vertex array and the stream buffer are bound.
 pub(crate) unsafe fn specify_instance_layout(cur: &Current<'_>, layout: &VertexLayoutSpec) {
@@ -288,8 +265,8 @@ pub(crate) unsafe fn specify_instance_layout(cur: &Current<'_>, layout: &VertexL
     let stride = layout.stride as i32;
     for a in layout.attrs {
         let offset = a.offset as usize as *const std::ffi::c_void;
-        // SAFETY: the caller's contract; offsets and strides from the table
-        // (pinned to the Rust instance structs by const asserts).
+        // SAFETY: the caller's contract; offsets and strides from the table (pinned to the Rust
+        // instance structs by const asserts).
         unsafe {
             (gl.enable_vertex_attrib_array)(a.location);
             match a.format {

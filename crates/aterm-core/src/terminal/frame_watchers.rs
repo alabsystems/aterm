@@ -14,8 +14,9 @@
 
 use std::sync::Arc;
 
-/// Who watches a terminal's frame (see the module doc).
-pub trait FrameWatchers: Send + Sync {
+/// Who watches a terminal's frame (see the module doc); `Any`, so a reader waiting out a frame
+/// gets the host's own list back to park on.
+pub trait FrameWatchers: std::any::Any + Send + Sync {
     /// Whether anyone watches the frame now. A hold is compared only while
     /// someone does.
     fn watched(&self) -> bool;

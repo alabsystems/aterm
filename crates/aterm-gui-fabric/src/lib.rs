@@ -1993,7 +1993,16 @@ const STALE_AFTER: std::time::Duration = LINK_REFRESH.saturating_mul(3);
 
 const STALE_AFTER_SEAM: &str = "ATERM_FABRIC_STALE_AFTER_MS";
 
+/// A link test's own stale horizon in ms (0: none); the link reset clears it.
+#[cfg(test)]
+static STALE_AFTER_IN_TEST: AtomicU64 = AtomicU64::new(0);
+
 fn stale_after() -> std::time::Duration {
+    #[cfg(test)]
+    match STALE_AFTER_IN_TEST.load(Ordering::Relaxed) {
+        0 => {}
+        ms => return std::time::Duration::from_millis(ms),
+    }
     static AT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
         aterm_types::dev_seam!(STALE_AFTER_SEAM)
@@ -3554,6 +3563,8 @@ pub fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     static LINK_TESTS: Mutex<()> = Mutex::new(());
 
     fn reset_now() {
+        #[cfg(test)]
+        STALE_AFTER_IN_TEST.store(0, Ordering::Relaxed);
         LINK.state.store(FABRIC_ABSENT, Ordering::Relaxed);
         LINK.supervised.store(false, Ordering::Relaxed);
         #[cfg(any(unix, test, debug_assertions))]
@@ -7358,6 +7369,9 @@ mod inbox_hold {
     fn a_wait_parked_with_nothing_owed_answers_stale_when_a_later_debt_goes_stale() {
         use std::time::Duration;
         with_link(|| {
+            // A fetch parked with nothing owed looks again a whole horizon later: shorten the
+            // horizon so the test waits 300 ms of it, not the instance's 6 s.
+            STALE_AFTER_IN_TEST.store(300, Ordering::Relaxed);
             let store = new_store();
             let (_sid, ctx) = registered(&store);
             let (_peer_sid, peer) = registered_as(&store, 2);

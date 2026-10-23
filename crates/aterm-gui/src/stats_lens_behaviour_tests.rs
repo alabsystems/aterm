@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stats lens and the sill driven through the App's own routing
-//! (`on_cursor_moved`, `on_mouse_input`, `on_mouse_wheel`, `on_key`,
-//! `on_focus` and the config apply), each read off what the tab's program
-//! received: the lens opening on a rest and leaving with the pointer, a
-//! press pinning it, a press outside closing it and going on, focus loss
-//! closing it, the keyboard and pinned lenses taking their own keys (the
-//! arrows, ⌘C, Esc) while any other key closes them and reaches the
-//! terminal, ⌘I reopening the last instrument, the Disk lens asking for the
-//! "where" survey, the Deck's rows, scope cells and state labels opening
-//! their lens, the header opening How to read, the sill's instruments
-//! taking the pointer before the grid does, and View ▸ Stats Bars'
-//! checkmark and write.
+//! Input and focus routing tests for the stats lens and sill.
 
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
@@ -33,8 +22,7 @@ use crate::stats_paint::{Bar, Hit, Instrument};
 use crate::stats_plan::DeckForm;
 use crate::{App, WindowId, term_lock};
 
-/// A private observer of the session's PTY input: the read end, and a sink
-/// writing into the other end.
+/// A private observer of the session's PTY input.
 fn observer() -> (UnixStream, Arc<SinkWriter>) {
     let (reader, writer) = UnixStream::pair().expect("private input observer");
     reader.set_nonblocking(true).unwrap();
@@ -55,8 +43,7 @@ fn drain(reader: &mut UnixStream) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One window drawing `form`, its session writing to a private wire, with
-/// a snapshot to draw and a 24 px bottom pad for the sill.
+/// One window drawing `form`.
 struct Rig {
     app: App,
     wid: WindowId,
@@ -88,9 +75,7 @@ fn rig(form: &str) -> Rig {
 }
 
 impl Rig {
-    /// Everything the program was sent before a marker pasted to it now: the
-    /// marker rides the session's one ordered writer, so anything a gesture
-    /// sent is in the text and nothing can arrive later.
+    /// Everything the program was sent before a marker pasted to it now.
     fn sent(&mut self) -> String {
         const MARK: &str = "<marker>";
         self.app.input_to_session(
@@ -100,7 +85,6 @@ impl Rig {
             Some(self.session),
             crate::app_input::PressPhase::Initial,
         );
-        // A hang detector, not a latency budget.
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut seen = String::new();
         loop {
@@ -116,7 +100,7 @@ impl Rig {
         }
     }
 
-    /// Turn on the program's mouse reporting (`modes`, e.g. SGR any-motion).
+    /// Turn on the program's mouse reporting (`modes`).
     fn report_mouse(&mut self, modes: &[u8]) {
         let term = self
             .app
@@ -133,8 +117,7 @@ impl Rig {
         self.app.windows[&self.wid].stats_lens.open
     }
 
-    /// The window's Deck in `form`, its band in the head as the head's
-    /// layout reserves it, the window `width_pt` wide where given.
+    /// The window's Deck in `form`.
     fn deck(&mut self, form: DeckForm, width_pt: Option<f64>) {
         let (cw, cell) = self.app.win_cell_size(self.wid);
         let pad = self.app.win_pad(self.wid);
@@ -494,8 +477,6 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
     crate::control::PBPASTE_STUB.with(|b| *b.borrow_mut() = None);
     assert!(r.app.copy_selection_in(r.wid), "Edit ▸ Copy copies it too");
     assert_eq!(r.clipboard(), Some(r.sentence(Instrument::Processes)));
-    // So does the chord `[keybindings]` binds to Copy (Ctrl+Shift+C off
-    // macOS), keeping the lens.
     r.app.keybindings = crate::keybinding::Keybindings::resolved(Some(
         &[("ctrl+shift+c".to_owned(), "copy".to_owned())]
             .into_iter()
@@ -511,7 +492,6 @@ fn a_pinned_lens_steps_the_instruments_and_command_c_copies_their_sentence() {
     assert_eq!(r.clipboard(), Some(r.sentence(Instrument::Processes)));
     assert_eq!(r.sent(), "", "and reaches no program");
 
-    // A hover lens takes no key: the arrow closes it and goes on.
     r.named(KeyCode::Escape, NamedKey::Escape);
     r.rest_on(Instrument::Cpu);
     r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
@@ -637,7 +617,6 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
         "a hover lens's Esc goes on to the program"
     );
 
-    // fwide: the blocks have their scope cells.
     r.deck(DeckForm::Folded, Some(1200.0));
     r.rest_on_hit(|h| h.kind == HitKind::Row(Instrument::Disk, Bar::Tab));
     assert_eq!(
@@ -662,8 +641,6 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
     r.named(KeyCode::Escape, NamedKey::Escape);
     assert_eq!(r.lens(), None);
 
-    // fslim: a block's worst state names itself in the header, over the
-    // rows.
     let trouble =
         crate::stats_deck::paint_tests::scene(crate::stats_deck::paint_tests::Scene::Trouble);
     r.app.vitals.snapshot = Some(Arc::new(trouble.clone()));
@@ -699,7 +676,6 @@ fn the_decks_rows_cells_and_state_labels_open_their_lens() {
 #[test]
 fn a_rest_on_the_decks_header_opens_how_to_read() {
     let mut r = rig("deck");
-    // The Deck's band in the window's head, as the head's layout reserves it.
     let (_, cell) = r.app.win_cell_size(r.wid);
     let ws = r.app.windows.get_mut(&r.wid).expect("window");
     let deck = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
@@ -780,8 +756,6 @@ fn the_tree_reads_the_deck_and_its_lens() {
         super::how_to_read_words(aterm_vitals::words::Platform::host())
     );
 
-    // ⌘I, then Return: the pinned lens still takes the arrows, so the
-    // reader's focus stays on its first well.
     let _ = r.app.close_stats_lens(r.wid);
     assert!(r.app.toggle_stats_lens());
     r.named(KeyCode::Enter, NamedKey::Enter);
@@ -829,7 +803,6 @@ fn the_sills_instruments_take_motion_presses_and_the_wheel_before_the_grid() {
     let (on, _) = r.instrument(Instrument::Cpu);
     let last_row = r.app.windows[&r.wid].rows - 1;
 
-    // CONTROL: over the grid's last row, the program sees each gesture.
     r.move_to(r.cell(last_row, 5));
     r.app
         .on_mouse_wheel(r.wid, MouseScrollDelta::LineDelta(0.0, 1.0));

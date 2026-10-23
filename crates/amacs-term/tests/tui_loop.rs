@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The terminal face's loop, headless (design §5.4): each test scripts an
-//! in-memory terminal (`MemTty`) that answers the capability probe as aterm
-//! does, types keys at the editor, and feeds everything the editor wrote into
-//! aterm's own engine (`aterm_core::terminal::Terminal`), which is the screen
-//! oracle: what a row shows is what aterm would show. The files are real, in
-//! a scratch directory, and are read and written through amacs-files.
+//! The terminal face's loop, headless (design §5.4).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,8 +22,8 @@ const RESTORE: &[u8] = b"\x1b[?2026l\x1b[m\x1b[0 q\x1b[?25h";
 
 /// A face whose store edits through a test-minted capability.
 fn tui(options: Options) -> Tui {
-    // SAFETY: a test process holding no untrusted input; the launcher-mint
-    // guard lets a test, and only a test, mint below the launchers.
+    // SAFETY: a test process holding no untrusted input; the launcher-mint guard lets a test, and
+    // only a test, mint below the launchers.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
     Tui::new(authority.grant(aterm_cap::Tier::Trusted), options)
 }
@@ -45,8 +40,6 @@ fn file(name: &str, bytes: &[u8]) -> (aterm_tempfile::TempDir, PathBuf) {
     let dir = aterm_tempfile::tempdir().expect("a scratch directory");
     let path = dir.path().join(name);
     std::fs::write(&path, bytes).expect("the file to edit");
-    // The realpath, as the face names the file (`/var` is `/private/var` on
-    // macOS).
     let path = std::fs::canonicalize(&path).expect("realpath");
     (dir, path)
 }
@@ -156,7 +149,6 @@ fn type_save_quit_round_trip() {
     assert_eq!(std::fs::read(&path).expect("read"), b"hello world\n");
     assert_eq!(peer.modes(), Modes::NONE, "every mode put back");
     assert!(peer.script_done());
-    // The kitty flags were pushed as 1|4 (D-20) and popped.
     let text = String::from_utf8_lossy(&output);
     assert!(text.contains("\x1b[>5u"), "kitty flags 1|4 pushed");
     assert!(
@@ -168,7 +160,6 @@ fn type_save_quit_round_trip() {
     let term = last_frame(&output, SIZE);
     assert_eq!(row(&term, 0), "hello world");
     let (at, modeline, echo) = modeline_and_echo(&term, SIZE);
-    // The design's modeline, cut at the screen's 80 columns.
     let full =
         "-UU-:--- COMMIT_EDITMSG  (GitCommit) L1 C6  [for git · C-c C-c done · C-c C-k abort]";
     assert_eq!(modeline, full.chars().take(80).collect::<String>());
@@ -177,7 +168,6 @@ fn type_save_quit_round_trip() {
         "a reverse-video modeline"
     );
     assert_eq!(echo, format!("Wrote {}", path.display()));
-    // The commit summary is a heading: bold.
     let summary = term.grid().cell(0, 0).expect("a cell");
     assert!(summary.flags().0 & 1 != 0, "the summary line is bold");
     let cursor = term.cursor();
@@ -197,12 +187,9 @@ fn isearch_and_kill_yank_in_terminal_profile() {
     assert_eq!(tui.run(&mut tty, &mut buffer).expect("runs"), Close::Hangup);
     let term = shown(&peer.take_output(), SIZE);
     assert_eq!(modeline_and_echo(&term, SIZE).2, "I-search: two");
-    // The match is the region, in reverse video.
     assert!(reversed(&term, 0, 4) && reversed(&term, 0, 6));
     assert!(!reversed(&term, 0, 3) && !reversed(&term, 0, 7));
 
-    // Enter ends the search with the match selected; C-w kills it, C-e
-    // goes to the end of the line, C-y yanks the kill there.
     for key in [
         &b"\r"[..],
         b"\x17",
@@ -230,13 +217,11 @@ fn dirty_quit_prompts_and_n_discards() {
     let mut tui = tui(Options::default());
     let mut buffer = tui.open(&target(&path)).expect("opens");
     assert_eq!(tui.run(&mut tty, &mut buffer).expect("runs"), Close::Hangup);
-    // One oracle for the whole run: each later frame is drawn as a diff.
     let mut term = shown(&peer.take_output(), SIZE);
     let question = format!("Save {}? (y, n, q)", path.display());
     let (at, modeline, echo) = modeline_and_echo(&term, SIZE);
     assert_eq!(echo, question);
     assert!(modeline.starts_with("-UU-:**- notes.txt"), "{modeline}");
-    // The question wraps; the cursor waits after it, on the last row.
     let rows = question.len().div_ceil(80);
     assert_eq!(usize::from(SIZE.rows - at - 1), rows, "{question}");
     let cursor = term.cursor();
@@ -246,7 +231,6 @@ fn dirty_quit_prompts_and_n_discards() {
         "the cursor waits after the question"
     );
 
-    // A key that answers nothing asks again; q takes the question back.
     peer.send(b"z");
     peer.send(b"q");
     assert_eq!(tui.run(&mut tty, &mut buffer).expect("runs"), Close::Hangup);
@@ -269,7 +253,6 @@ fn dirty_quit_prompts_and_n_discards() {
     );
     assert_eq!(peer.modes(), Modes::NONE);
 
-    // y saves, then closes.
     let (outcome, _, _) = edit(&path, Options::default(), &[b"y", b"\x18\x03", b"y"]);
     assert_eq!(outcome, done());
     assert_eq!(std::fs::read(&path).expect("read"), b"ykept\n");
@@ -329,7 +312,6 @@ fn save_refuses_when_disk_changed() {
     );
     assert_eq!(std::fs::read(&path).expect("read"), b"theirs\n");
 
-    // Anything between takes the offer back: the save refuses again.
     peer.send(b"\x06");
     peer.send(b"\x18\x13");
     assert_eq!(tui.run(&mut tty, &mut buffer).expect("runs"), Close::Hangup);
@@ -341,8 +323,6 @@ fn save_refuses_when_disk_changed() {
     tui.finish(&mut tty).expect("put back");
     assert_eq!(std::fs::read(&path).expect("read"), b"ours base\n");
 
-    // revert-buffer takes the disk's version instead: the buffer is the
-    // file again, so it closes without a question.
     let (mut tty, peer) = terminal(SIZE);
     let mut buffer = tui.open(&target(&path)).expect("opens");
     std::fs::write(&path, b"theirs again\n").expect("an edit from elsewhere");
@@ -395,8 +375,6 @@ fn a_refused_save_says_why_in_the_save_words() {
             )
         )
     };
-    // Open the file, refuse its save with `before`, type a key, `C-x C-s`;
-    // `after` puts the permissions back. The echo area's text.
     let save = |before: &dyn Fn(), after: &dyn Fn()| {
         let (mut tty, peer) = terminal(SIZE);
         let mut tui = tui(Options::default());
@@ -411,8 +389,6 @@ fn a_refused_save_says_why_in_the_save_words() {
         echo
     };
     let denied = |stage, touch| said(stage, ErrorKind::PermissionDenied, touch);
-    // What the case is, how it refuses the save and puts things back, and
-    // what the echo area says.
     type Case<'a> = (&'a str, &'a dyn Fn(), &'a dyn Fn(), String);
     let cases: [Case<'_>; 4] = [
         (
@@ -456,8 +432,6 @@ fn a_refused_save_says_why_in_the_save_words() {
         denied(AtomicSaveStage::Preflight, SaveTouch::Lock).contains("amacs can"),
         "the face names itself"
     );
-    // A save lock another writer holds past the writer's wait, taken
-    // through the door every flock contender goes through.
     let held = amacs_files::host::HeldAdvisoryLock::lock(
         std::fs::OpenOptions::new()
             .write(true)
@@ -533,7 +507,6 @@ fn a_refused_open_says_why_in_the_save_words() {
 #[test]
 fn kill_writes_osc52_when_enabled() {
     let (_dir, path) = file("notes.txt", b"copy me\n");
-    // C-k kills "copy me"; the file is then closed without saving.
     let keys: [&[u8]; 3] = [b"\x0b", b"\x18\x03", b"n"];
     let (outcome, output, _) = edit(&path, Options::default(), &keys);
     assert_eq!(outcome, done());
@@ -582,10 +555,8 @@ fn a_press_sets_point_and_the_wheel_scrolls() {
     let lines: String = (0..100).map(|n| format!("line {n}\n")).collect();
     let (_dir, path) = file("notes.txt", lines.as_bytes());
     let (mut tty, peer) = terminal(SIZE);
-    // A press and release at row 3, column 4 (SGR reports count from 1).
     peer.send(b"\x1b[<0;4;3M\x1b[<0;4;3m");
     peer.send(b"X");
-    // One notch of the wheel, down.
     peer.send(b"\x1b[<65;1;1M");
     let mut tui = tui(Options::default());
     let mut buffer = tui.open(&target(&path)).expect("opens");
@@ -617,15 +588,12 @@ fn files_in_turn_share_the_kill_ring_and_nothing_else() {
     std::fs::write(&second, b"bbbb\n").expect("the second file");
     let (mut tty, peer) = terminal(SIZE);
     for key in [
-        // a.txt: x, kill "aaaa", yank it back, set a mark, save, close.
         &b"x"[..],
         b"\x0b",
         b"\x19",
         b"\x00",
         b"\x18\x13",
         b"\x18\x03",
-        // b.txt: M-y and C-u C-SPC find no yank and no mark of this file's;
-        // C-y yanks a.txt's kill, and two undos take it back, then stop.
         b"\x1by",
         b"\x15\x00",
         b"\x19",
@@ -640,9 +608,6 @@ fn files_in_turn_share_the_kill_ring_and_nothing_else() {
     let outcome = tui(Options::default()).edit(&mut tty, &[target(&first), target(&second)]);
     assert_eq!(outcome, done());
     assert_eq!(std::fs::read(&first).expect("read"), b"xaaaa\n");
-    // With a.txt's history carried over, the second undo would replay its
-    // yank's inverse here (deleting `bbb`), and the pop-mark would move
-    // point to a.txt's mark at offset 5, past the line `z` is typed at.
     assert_eq!(
         std::fs::read(&second).expect("read"),
         b"zbbbb\n",
@@ -660,8 +625,6 @@ fn finish_saves_and_abort_ends_the_run() {
     let (_dir, first) = file("a.txt", b"aaaa\n");
     let second = first.with_file_name("b.txt");
     std::fs::write(&second, b"bbbb\n").expect("the second file");
-    // A file that cannot be opened: had the run gone on to it, it would end
-    // saying so.
     let unopenable = first.with_file_name("gone").join("c.txt");
     let (mut tty, peer) = terminal(SIZE);
     for key in [&b"x"[..], b"\x03\x03", b"y", b"\x03\x0b"] {

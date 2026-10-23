@@ -9,8 +9,8 @@
 //! `the_round_refines_its_exactly_once_model`).
 
 use aterm_models_session::fabric_exactly_once_model;
+use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
-use aterm_spec::{interp, verify};
 
 /// Every action of the committed machine, so a guard tightened by mistake shows up as a
 /// dead action, not a quieter proof. `CommitEarly` is the defect 2's alone.
@@ -30,7 +30,7 @@ const ACTIONS: [&str; 12] = [
 ];
 
 #[test]
-fn fabric_exactly_once_proves_and_catches() {
+fn fabric_exactly_once_fires_every_committed_move() {
     let model = fabric_exactly_once_model();
     let committed = interp::fired_actions(&model);
     for action in ACTIONS {
@@ -42,11 +42,6 @@ fn fabric_exactly_once_proves_and_catches() {
     assert!(
         !committed.contains("CommitEarly"),
         "the early commit is the defect's, never the committed machine's"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "exactly once at one inbox offset: no record is a row twice, and the group never \
-         passes a record that is not a row, across kills, relaunches and moves of the log",
     );
 }
 

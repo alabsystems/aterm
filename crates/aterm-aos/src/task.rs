@@ -3,26 +3,6 @@
 
 //! The task ABI: a [`Schema`] (what the state, inputs and observations are and how they are
 //! encoded) and a [`Code`] (one implementation of the step function over that schema).
-//!
-//! # The law
-//!
-//! A step is a pure function of `(state, input)` apart from the effects it submits through
-//! the port it is handed: it reads no clock, no randomness and no host state, so the same
-//! state and input give the same state and observation on every run. Time enters only as
-//! recorded input (a signed nanosecond offset from a declared epoch).
-//!
-//! A step that refuses its input ([`StepRefusal`], e.g. admission) must leave the state
-//! untouched: the input is then as if it never arrived. Replay stops at the first refusal,
-//! and a boundary never records a refused input in its log.
-//!
-//! The state is plain owned data whose canonical encoding ([`Schema::encode_state`]) is its
-//! identity: [`state_digest`] is a digest of those bytes under the schema's digest, so two
-//! states with equal digests are the same declared state, and a state that carries something
-//! its encoding drops (a cache) must re-derive it identically.
-//!
-//! A [`Code`] also declares its entry invariants ([`Code::entry`]): what a state must satisfy
-//! before this code may continue from it. Sharing a schema is not enough to apply other code
-//! to a state (plan §3); a candidate must accept the state it continues from.
 
 use core::fmt;
 
@@ -36,11 +16,11 @@ pub const STATE_DOMAIN: &[u8] = b"aterm-aos-state-v1\0";
 /// While a boundary is paused, what an input does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PausedClass {
-    /// It mutates task state the host cannot re-derive (a key, a reset): it waits in the
-    /// bounded queue and is delivered once, in order, when the pause ends.
+    /// It mutates task state the host cannot re-derive (a key, a reset): it waits in the bounded
+    /// queue and is delivered once, in order, when the pause ends.
     Queue,
-    /// It is a frame or query the task simply does not observe while paused: it is skipped,
-    /// neither recorded nor delivered.
+    /// It is a frame or query the task simply does not observe while paused: it is skipped, neither
+    /// recorded nor delivered.
     Skip,
 }
 
@@ -65,8 +45,8 @@ pub trait Schema {
     fn decode_input(&self, d: &mut Dec<'_>) -> Result<Self::Input, WireFault>;
     /// Writes an observation's canonical encoding (folded into a run's observation chain).
     fn encode_observation(&self, o: &Self::Observation, e: &mut Enc);
-    /// While paused: does this input queue (it mutates task state the host cannot re-derive)
-    /// or is it skipped (a frame/query the task simply does not observe)?
+    /// While paused: does this input queue (it mutates task state the host cannot re-derive) or is
+    /// it skipped (a frame/query the task simply does not observe)?
     fn paused_class(&self, i: &Self::Input) -> PausedClass;
 }
 
@@ -75,11 +55,7 @@ pub trait Code<S: Schema> {
     /// The code's artifact (kind [`crate::ident::ArtifactKind::Code`]).
     fn id(&self) -> &ArtifactId;
 
-    /// The digest of the schema this code reads and writes. The default is the schema the
-    /// boundary holds, which is what every implementation over the same `S` type uses; code
-    /// built against another version of the schema overrides it, and a boundary refuses to
-    /// publish it in place of code with a different schema digest
-    /// ([`crate::publish::PublishRefusal::SchemaChanged`]).
+    /// The digest of the schema this code reads and writes.
     #[inline]
     fn schema_digest(&self, schema: &S) -> Digest {
         schema.id().digest
@@ -88,8 +64,7 @@ pub trait Code<S: Schema> {
     /// The candidate's entry invariants on a state it is asked to continue from.
     fn entry(&self, schema: &S, state: &S::State) -> Result<(), EntryRefusal>;
 
-    /// One step. Pure in (state, input) apart from effects submitted through `port`. A
-    /// refusal must leave `state` untouched.
+    /// One step.
     fn step(
         &self,
         schema: &S,
@@ -99,7 +74,7 @@ pub trait Code<S: Schema> {
     ) -> Result<S::Observation, StepRefusal>;
 }
 
-/// A state the code may not continue from: the law it breaks and how. The state is untouched.
+/// A state the code may not continue from: the law it breaks and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntryRefusal {
     /// The entry invariant broken (a stable name, e.g. `toy.non-negative`).
@@ -120,8 +95,7 @@ impl fmt::Display for EntryRefusal {
 
 impl std::error::Error for EntryRefusal {}
 
-/// An input the code refused (e.g. admission): the law and the offending values. The state
-/// is untouched.
+/// An input the code refused (e.g. admission): the law and the offending values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepRefusal {
     /// The law the input breaks (a stable name).
@@ -156,8 +130,8 @@ pub(crate) fn state_digest_of(schema_digest: &Digest, encoded: &[u8]) -> Digest 
     Digest::of(STATE_DOMAIN, &[&schema_digest.0, encoded])
 }
 
-/// The state's canonical digest: `Digest::of(b"aterm-aos-state-v1\0", [schema digest,
-/// encoded state])`.
+/// The state's canonical digest: `Digest::of(b"aterm-aos-state-v1\0", [schema digest, encoded
+/// state])`.
 #[inline]
 #[must_use]
 pub fn state_digest<S: Schema>(schema: &S, s: &S::State) -> Digest {

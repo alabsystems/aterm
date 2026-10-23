@@ -402,32 +402,81 @@ fn emit_halo(
         let v = (y as f32 + half_row_h - cy) / ry;
         let v2 = v * v;
         let w2 = 1.0 - v2;
-        if w2 > 0.0 {
+        // Near the effects box's edges the halo fades out instead of being
+        // cut by them (a caret on the grid's last row).
+        let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + half_row_h);
+        if w2 > 0.0 && fade_y > 0.0 {
             let half = rx * w2.sqrt();
+            // Knot `k` of the row: its rounded edges and the ramp ends there
+            // on the right and the left (premultiplied light, opacity 0:
+            // additive).
             let knot = |k: usize| {
                 let t = k as f32 / HALO_SEGMENTS as f32;
                 let dx = half * t;
                 let (rx_i, lx_i) = ((cx + dx).round() as i32, (cx - dx).round() as i32);
                 let rho2 = v2 + w2 * t * t;
                 let f = (1.0 - rho2).max(0.0);
-                let cov = (peak * f * f).round().min(HALO_PEAK_COV) as u8;
-                if cov == 0 {
-                    return (rx_i, lx_i, 0, (0, 0));
-                }
                 let colour = halo_colour(tint, a, rho2.sqrt());
-                (rx_i, lx_i, cov, (premul_rgb(colour, cov), 0u8))
+                let end = |x: f32| {
+                    let fade = fade_y * crate::effect_util::fx_fade_x(geom, x);
+                    let cov = (peak * f * f * fade).round().min(HALO_PEAK_COV) as u8;
+                    (
+                        cov,
+                        (if cov == 0 { 0 } else { premul_rgb(colour, cov) }, 0u8),
+                    )
+                };
+                let ((cov_r, right), (cov_l, left)) = (end(cx + dx), end(cx - dx));
+                (rx_i, lx_i, cov_r, right, cov_l, left)
             };
             let knots: [_; HALO_SEGMENTS + 1] = std::array::from_fn(knot);
             for pair in knots.windows(2) {
-                let ((r0, l1, cov_in, inner), (r1, l0, cov_out, outer)) = (pair[0], pair[1]);
-                if cov_in == 0 && cov_out == 0 {
-                    continue;
+                let (r0, l1, r_in, right_in, l_in, left_in) = pair[0];
+                let (r1, l0, r_out, right_out, l_out, left_out) = pair[1];
+                if r_in > 0 || r_out > 0 {
+                    push_fx_ramp(out, geom, r0, y, r1 - r0, row_h, right_in, right_out);
                 }
-                push_fx_ramp(out, geom, r0, y, r1 - r0, row_h, inner, outer);
-                push_fx_ramp(out, geom, l0, y, l1 - l0, row_h, outer, inner);
+                if l_in > 0 || l_out > 0 {
+                    push_fx_ramp(out, geom, l0, y, l1 - l0, row_h, left_out, left_in);
+                }
             }
         }
         y += row_h;
+    }
+}
+
+/// How much of a fire's ember a dark page's typing halo takes
+/// ([`warm_halo`]).
+pub const MOMENTUM_FIRE_WARMTH: f32 = 0.8;
+
+/// Warm a dark page's additive halo (`quads`, as [`MomentumGlow::tick`] laid
+/// them) toward `hue` (a fire's ember): each end of each quad keeps its
+/// brightest channel and takes `share` of the hue's colour at that level.
+/// The momentum ramp climbs to white-hot, which over a dark page is a grey
+/// fog round a fire's caret, not the forge's light; warmed, it is the
+/// fire's own glow, and no brighter (no channel rises). Source-over quads
+/// (a light page's ink) are left alone.
+pub fn warm_halo(quads: &mut [GlowQuad], hue: u32, share: f32) {
+    let share = share.clamp(0.0, 1.0);
+    let hue = hue & 0x00FF_FFFF;
+    let top = ((hue >> 16) & 0xff).max((hue >> 8) & 0xff).max(hue & 0xff);
+    if top == 0 || share <= 0.0 {
+        return;
+    }
+    let warm = |c: u32| -> u32 {
+        let m = ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff);
+        if m == 0 {
+            return c;
+        }
+        let ch = |sh: u32| {
+            let own = ((c >> sh) & 0xff) as f32;
+            let lit = ((hue >> sh) & 0xff) as f32 * m as f32 / top as f32;
+            ((own + (lit - own) * share).round() as u32).min(m) << sh
+        };
+        (c & 0xFF00_0000) | ch(16) | ch(8) | ch(0)
+    };
+    for q in quads.iter_mut().filter(|q| q.alpha == 0) {
+        q.color = warm(q.color);
+        q.color2 = warm(q.color2);
     }
 }
 

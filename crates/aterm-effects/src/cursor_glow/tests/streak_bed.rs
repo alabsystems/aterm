@@ -430,7 +430,10 @@ fn the_bed_keeps_each_streaks_fade() {
 /// Over cells with no text the streak is light at full strength: a leap
 /// along a row the probe shows blank lights the cells it crosses exactly as
 /// the streak with no bed and no account does, pixel for pixel, with the bed
-/// under it besides.
+/// under it besides (but the beam's, whose leap is its tube alone:
+/// [`a_beam_leap_is_its_ice_tube_and_only_the_comet_burns_a_head`]). Over a
+/// typed run the bridge onto the caret's cell keeps the head as bright as it
+/// was: the bed takes the letters, not the caret's light.
 #[test]
 fn the_dark_beam_keeps_full_strength_over_air_and_onto_the_caret() {
     let g = tall_geom();
@@ -475,7 +478,7 @@ fn the_dark_beam_keeps_full_strength_over_air_and_onto_the_caret() {
             "{style:?}: control: the leap draws a beam"
         );
         assert!(
-            bedded == bare,
+            bedded == bare || style == GlowStyle::Beam,
             "{style:?}: the beam over air is the full beam"
         );
         assert!(bed > 0, "{style:?}: the bed lies under the leap too");
@@ -1273,12 +1276,22 @@ fn the_account_holds_a_letter_on_its_own_ground() {
 /// leap down from the end of one line to the start of the next crosses a
 /// cell or two past the lower line's end before it reaches its letters; the
 /// bed lays one tube through them (two tubes with a gap between read as two
-/// offset slabs).
+/// offset slabs). Negative control: across a long stretch of air the bed
+/// still leaves the air to the beam (no tube in the middle of the gap). A
+/// shape whose leap leaves the air to its light (the phaser's); the comet's,
+/// the beam's, the lumen's and the laser's lay the whole leap
+/// ([`BedShape::leap_air`]).
 #[test]
 fn a_leap_bed_is_one_tube_across_a_short_gap() {
     use crate::cursor_glow::bed::{BedScratch, BedShape, lay_dark_bed};
     let g = tall_geom();
-    let shape = BedShape::of(GlowStyle::Beam, 1.0).expect("the beam lays a bed");
+    let shape = BedShape::of(GlowStyle::Phaser, 1.0).expect("the phaser lays a bed");
+    assert!(
+        !shape.leap_air,
+        "fixture: the phaser's leap leaves the air to its light"
+    );
+    // The leap's cells: row 2 from col 14 left, then row 3; the lower line's
+    // text ends `gap` cells before the leap reaches it.
     let tube_at_gap = |gap: u16| -> u32 {
         let end3 = 11 - gap;
         let cells: Vec<(u16, u16)> = (11..=14u16)
@@ -1482,4 +1495,373 @@ fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
         &long_after[path.clone()],
         &short_after[path]
     );
+}
+
+/// One dark Enter's leap, as the trail gallery's `enter-bottom` shoots it:
+/// the command's line `$ echo the quick brown fox` on row 2, its output
+/// `the quick brown fox` on row 3, the new prompt `$ ` on row 4, and the
+/// caret leaping from the end of the command's line to the prompt. `split`
+/// is the negative control [`CursorGlow::leap_split`]. The composite with
+/// every light on, the under-ink stream alone, how many particles the leap
+/// shed, and the leap's two ends (window px).
+fn enter_leap(style: GlowStyle, split: bool) -> (Glass, Glass, usize, (f32, f32), (f32, f32)) {
+    let g = tall_geom();
+    let (c, _) = style_cfg(style, false);
+    let mut cells = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+    for (row, text) in [
+        (2, "$ echo the quick brown fox"),
+        (3, "the quick brown fox"),
+        (4, "$ "),
+    ] {
+        for (cell, ch) in cells[row].iter_mut().zip(text.chars()) {
+            cell.ch = ch;
+        }
+    }
+    let (from, to) = ((2u16, 26u16), (4u16, 2u16));
+    let mut glow = CursorGlow {
+        leap_split: split,
+        ..CursorGlow::default()
+    };
+    let (mut out, t0) = (Vec::new(), Instant::now());
+    glow.observe_frame_text(Some(from), &cells, t0);
+    glow.tick(Some(from), t0, &c, g, &mut out);
+    let t = t0 + Duration::from_millis(16);
+    glow.note_synthetic_move(t);
+    glow.observe_frame_text(Some(to), &cells, t);
+    glow.tick(Some(to), t, &c, g, &mut out);
+    let mut lit = Glass::new(g, c.theme_bg);
+    lit.add_quads(glow.under_quads());
+    lit.add_quads(&out);
+    lit.add_halos(glow.halos());
+    let mut under = Glass::new(g, c.theme_bg);
+    under.add_quads(glow.under_quads());
+    (
+        lit,
+        under,
+        glow.particles.len(),
+        g.cell_center(from.0, from.1),
+        g.cell_center(to.0, to.1),
+    )
+}
+
+/// The points of the straight leap from `a` to `b` (window px), one a
+/// pixel, from `skip_a` px past `a` to `skip_b` px short of `b`.
+fn along(a: (f32, f32), b: (f32, f32), skip_a: f32, skip_b: f32) -> Vec<(f32, f32)> {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let n = (len - skip_a - skip_b).max(0.0) as usize;
+    (0..=n)
+        .map(|i| {
+            let d = skip_a + i as f32;
+            (a.0 + dx * d / len, a.1 + dy * d / len)
+        })
+        .collect()
+}
+
+/// The most a glass lifts the page in a short column across the spine at
+/// `(x, y)`: the leap's light or tube, wherever it crosses that column.
+fn lift_across(glass: &Glass, (x, y): (f32, f32), bg: i32) -> i32 {
+    (-5..=5)
+        .map(|k| glass.level(y as i32 + k, x as i32) - bg)
+        .max()
+        .unwrap_or(0)
+}
+
+/// How white a pixel is: its least channel.
+fn whiteness(p: u32) -> u32 {
+    ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff)
+}
+
+/// THE BEAM'S LEAP IS ITS ICE TUBE (2026-10-22, the owner: the beam must not
+/// borrow the comet's Return or jump look). On a dark Enter the beam arrives
+/// as the steady tube it is while typing: no additive light anywhere along
+/// the leap short of the caret's own glow (the composite there is its tube
+/// alone, pixel for pixel, and never white), its tube over the air the leap
+/// crosses as well as under the letters, and no dust. NEGATIVE CONTROL: the
+/// comet, whose head and dust these are, burns a white-hot head over the
+/// same air and sheds its dust.
+#[test]
+fn a_beam_leap_is_its_ice_tube_and_only_the_comet_burns_a_head() {
+    let bg = Glass::new(tall_geom(), BG).level(0, 0);
+    let (lit, under, dust, a, b) = enter_leap(GlowStyle::Beam, false);
+    let cell = tall_geom().cw as f32;
+    // From the leap's first spark (born a cell and a half along it,
+    // [`CursorGlow::LEAP_BIRTH_SKIP_CELLS`]) to two cells and a half short of
+    // the caret's centre, clear of its own glow.
+    let path = along(a, b, 2.0 * cell, 2.5 * cell);
+    for &(x, y) in &path {
+        for k in -6..=6 {
+            let (y, x) = (y as i32 + k, x as i32);
+            assert_eq!(
+                lit.at(y, x),
+                under.at(y, x),
+                "the beam lights its leap at ({x}, {y}): {:06x} over its tube's {:06x}",
+                lit.at(y, x),
+                under.at(y, x)
+            );
+        }
+    }
+    let white = path
+        .iter()
+        .map(|&(x, y)| whiteness(lit.at(y as i32, x as i32)))
+        .max()
+        .unwrap_or(0);
+    assert!(white < 160, "the beam's leap burns white ({white})");
+    let thin = path
+        .iter()
+        .map(|&p| lift_across(&under, p, bg))
+        .min()
+        .unwrap_or(0);
+    assert!(
+        thin > 8,
+        "the beam's tube breaks along its leap (lift {thin})"
+    );
+    assert_eq!(dust, 0, "the beam's leap sheds dust");
+
+    let (lit, _, dust, a, b) = enter_leap(GlowStyle::Comet, false);
+    let white = along(a, b, 0.0, 1.5 * cell)
+        .iter()
+        .map(|&(x, y)| whiteness(lit.at(y as i32, x as i32)))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        white >= 200,
+        "control: the comet burns no white head ({white})"
+    );
+    assert!(dust > 0, "control: the comet's leap sheds no dust");
+}
+
+/// THE LEAP IS ONE PIECE (2026-10-22: the beam's, the comet's, the lumen's
+/// and the laser's Return leap came out in two, a dim tube under the
+/// letters and the light over the air apart from it across a gap with a
+/// hard edge). Along the whole leap, from its first spark to half a cell
+/// short of the caret, what lifts the page (each point the median of the
+/// seven around it along the leap, so a grain of the comet's dust is not
+/// the leap) never falls below [`DIP`] of the most it lifted in the cell and
+/// a half behind: the comet's, the lumen's and the laser's heads rise over
+/// their own tubes, and the beam is its tube. NEGATIVE CONTROL: the leap split as it was
+/// ([`CursorGlow::leap_split`]: the tube under the text alone, the light
+/// over the air alone) dips where they meet.
+#[test]
+fn an_enter_leap_is_one_piece_from_its_tail_to_its_head() {
+    /// The least share of the lift just behind that a point keeps: the
+    /// laser's white strike over the air steps down onto its violet cable
+    /// under the letters (about two thirds of it), which is no gap; a split
+    /// leap falls to a quarter or less.
+    const DIP: f32 = 0.6;
+    let bg = Glass::new(tall_geom(), BG).level(0, 0);
+    let cell = tall_geom().cw as f32;
+    for style in [
+        GlowStyle::Comet,
+        GlowStyle::Beam,
+        GlowStyle::Lumen,
+        GlowStyle::Laser,
+    ] {
+        let worst = |split: bool| {
+            let (lit, _, _, a, b) = enter_leap(style, split);
+            let raw: Vec<i32> = along(a, b, 2.0 * cell, 0.5 * cell)
+                .iter()
+                .map(|&p| lift_across(&lit, p, bg))
+                .collect();
+            let lifts: Vec<i32> = (0..raw.len())
+                .map(|i| {
+                    let mut w = raw[i.saturating_sub(3)..(i + 4).min(raw.len())].to_vec();
+                    w.sort_unstable();
+                    w[w.len() / 2]
+                })
+                .collect();
+            let behind = (1.5 * cell) as usize;
+            (1..lifts.len())
+                .map(|i| {
+                    let most = lifts[i.saturating_sub(behind)..i]
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0);
+                    lifts[i] as f32 / most.max(1) as f32
+                })
+                .fold(f32::INFINITY, f32::min)
+        };
+
+        let (whole, split) = (worst(false), worst(true));
+        assert!(
+            whole >= DIP,
+            "{style:?}: the leap dips to {whole:.2} of itself between its pieces"
+        );
+        assert!(
+            split < DIP,
+            "{style:?}: control: the split leap keeps {split:.2} of itself"
+        );
+    }
+}
+
+/// `style`'s under-ink stream (the bed, the band) `after_ms` past an Enter
+/// that leaves a typed line: `echo the quick brown fox` typed on row 2 after
+/// its `$ ` at 60 ms a key, then the caret leaps to row 4's home. On `dark`
+/// the shipped dark pair, else GitHub Light's; `square` lays the heads cut
+/// square ([`CursorGlow::heads_square`]). Returns the glass and its page.
+fn left_head(style: GlowStyle, dark: bool, square: bool, after_ms: u64) -> (Glass, u32) {
+    use crate::cursor_fx::{GlowKnobs, GlowSpelling, resolve_glow_config};
+    let g = tall_geom();
+    let (fg, bg) = if dark {
+        (FG, BG)
+    } else {
+        (0x001F_2328, 0x00FF_FFFF)
+    };
+    let c = resolve_glow_config(
+        GlowKnobs {
+            enabled: true,
+            color: None,
+            accent: None,
+            duration_ms: 260,
+            length: 24,
+            intensity: crate::cursor_fx::default_trail_intensity(Some(style), false),
+            radius: 0.6,
+            ring: true,
+        },
+        GlowSpelling {
+            style: Some(style),
+            beam: true,
+            ribbon_tall: true,
+            ribbon_flat: false,
+            classic_mono: false,
+        },
+        CURSOR,
+        dark,
+        fg,
+        bg,
+        0.5,
+    );
+    let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
+    let frame = |lines: &[(u16, &[char])]| {
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for line in &mut rows {
+            for cell in line.iter_mut() {
+                (cell.fg, cell.bg) = (rgb(fg), rgb(bg));
+            }
+        }
+        for &(row, text) in lines {
+            for (col, &ch) in text.iter().enumerate() {
+                rows[usize::from(row)][col].ch = ch;
+            }
+        }
+        rows
+    };
+    let mut glow = CursorGlow {
+        heads_square: square,
+        ..CursorGlow::default()
+    };
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    text[0] = '$';
+    let mut t = Instant::now();
+    for (k, ch) in std::iter::once(' ').chain(LINE.chars()).enumerate() {
+        if k > 0 {
+            t += Duration::from_millis(60);
+            text[START as usize + k - 1] = ch;
+            glow.note_synthetic_typed(t, 1);
+        }
+        let caret = (2u16, START + k as u16);
+        glow.observe_row(caret.0, caret.1, &text, t);
+        glow.observe_frame_text(Some(caret), &frame(&[(2, &text)]), t);
+        glow.tick(Some(caret), t, &c, g, &mut out);
+    }
+    t += Duration::from_millis(30);
+    let mut prompt = vec![' '; g.cols];
+    prompt[0] = '$';
+    let output: Vec<char> = "the quick brown fox"
+        .chars()
+        .chain(std::iter::repeat(' '))
+        .take(g.cols)
+        .collect();
+    let rows = frame(&[(2, &text), (3, &output), (4, &prompt)]);
+    glow.note_synthetic_move(t);
+    let landing = (4u16, START);
+    let mut at = 0u64;
+    loop {
+        let now = t + Duration::from_millis(at);
+        glow.observe_row(landing.0, landing.1, &prompt, now);
+        glow.observe_frame_text(Some(landing), &rows, now);
+        glow.tick(Some(landing), now, &c, g, &mut out);
+        if at >= after_ms {
+            break;
+        }
+        at = (at + 16).min(after_ms);
+    }
+    let mut glass = Glass::new(g, bg);
+    glass.add_quads(glow.under_quads());
+    (glass, bg)
+}
+
+/// A RUN THE HAND HAS LEFT MELTS OUT OVER ITS LAST LETTER (round-2 judges,
+/// item 5: on a Return the phaser's bar stood cut square where its emitter
+/// had stood, on dark at the far edge of `fox`'s `x`, on paper through it).
+/// After an Enter leaves a typed line, the under-ink light across the run's
+/// last letter and the cell past it (the one the caret left) never drops by
+/// more than three tenths of the bar's level from one pixel column to the
+/// next (about a sixth, measured), and the cell past it holds none of it, on
+/// dark and on paper. Negative control: the heads laid cut square
+/// ([`CursorGlow::heads_square`]) drop by more than three fifths of it at
+/// the letter's edge (nine tenths and more, measured).
+#[test]
+fn a_run_the_hand_has_left_melts_out_over_its_last_letter() {
+    let g = tall_geom();
+    let cw = g.cw as i32;
+    let last = i32::from(START) + LINE.len() as i32 - 1;
+    let (y0, y1) = (2 * g.ch as i32, 3 * g.ch as i32);
+    for dark in [true, false] {
+        // Per pixel column of row 2, the most the under-ink stream moves the
+        // page there (its largest channel's change).
+        let profile = |glass: &Glass, page: u32| -> Vec<i32> {
+            (0..g.win_w as i32)
+                .map(|x| {
+                    (y0..y1)
+                        .map(|y| {
+                            let p = glass.at(y, x);
+                            [16, 8, 0]
+                                .iter()
+                                .map(|&sh| {
+                                    (((p >> sh) & 0xff) as i32 - ((page >> sh) & 0xff) as i32).abs()
+                                })
+                                .max()
+                                .unwrap_or(0)
+                        })
+                        .max()
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
+        let worst = |square: bool| -> (f32, i32) {
+            let (glass, page) = left_head(GlowStyle::Phaser, dark, square, 40);
+            let col = profile(&glass, page);
+            let level = col[((last - 1) * cw + cw / 2) as usize];
+            assert!(
+                level > 8,
+                "fixture: the bar lies under the line ({dark}, {level})"
+            );
+            let step = ((last * cw - 2)..((last + 2) * cw))
+                .map(|x| (col[x as usize] - col[x as usize + 1]).max(0))
+                .max()
+                .unwrap_or(0);
+            let past = ((last + 1) * cw + 1..(last + 2) * cw)
+                .map(|x| col[x as usize])
+                .max()
+                .unwrap_or(0);
+            (step as f32 / level as f32, past)
+        };
+        let (eased, past) = worst(false);
+        assert!(
+            eased <= 0.3,
+            "dark {dark}: the bar drops by {eased:.2} of itself in a column over its last letter"
+        );
+        assert!(
+            past <= 2,
+            "dark {dark}: the cell the caret left holds {past} of the bar"
+        );
+        let (square, _) = worst(true);
+        assert!(
+            square >= 0.6,
+            "control, dark {dark}: cut square, the bar drops by only {square:.2}"
+        );
+    }
 }

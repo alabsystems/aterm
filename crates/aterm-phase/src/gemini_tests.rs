@@ -696,6 +696,51 @@ fn the_accounts_usage_limit_dialog_names_its_reset_and_is_the_same_box() {
     assert!(roles(&p).iter().all(|&r| r == Role::Other));
 }
 
+/// THE PER-MODEL BUCKET'S DIALOG (a terminal quota on a Pro model whose
+/// fallback is another, HAND-BUILT by the bundle's `ProQuotaDialog`) is the
+/// same [`PromptKind::UsageLimit`] box: its title names `all Pro models`,
+/// its reset is read as the account's, and its options are `Switch to
+/// <fallback>` over `Stop` — under the Google login with `Upgrade for higher
+/// limits` between them — none with a role. NEGATIVE CONTROL: the measured
+/// account dialog offers `Keep trying` over `Stop`, and no switch.
+#[test]
+fn the_buckets_usage_limit_dialog_offers_its_switch_and_stop() {
+    for (fixture, want) in [
+        (
+            LIMIT_DIALOG_BUCKET,
+            vec!["Switch to gemini-3.5-flash", "Stop"],
+        ),
+        (
+            LIMIT_DIALOG_BUCKET_UPGRADE,
+            vec![
+                "Switch to gemini-3.5-flash",
+                anchor_text("gemini.usage.upgrade"),
+                "Stop",
+            ],
+        ),
+    ] {
+        let r = gemini(fixture);
+        assert_eq!((r.phase, r.phase_authoritative), (Phase::Prompt, true));
+        assert_eq!((r.wall, r.composer), (None, None));
+        let p = r.prompt.expect("the dialog");
+        assert_eq!(p.kind, PromptKind::UsageLimit);
+        assert_eq!(p.title, "Usage limit reached for all Pro models.");
+        assert_eq!(labels(&p), want);
+        assert!(labels(&p)[0].starts_with(anchor_text("gemini.usage.switch")));
+        assert!(roles(&p).iter().all(|&r| r == Role::Other));
+        assert_eq!(
+            limit_reset(&screen(fixture)),
+            Some(reset_of("5:06 AM", Some("PDT")))
+        );
+    }
+    let measured = prompt(&screen(LIMIT_DIALOG_ACCOUNT)).expect("the dialog");
+    assert!(
+        !labels(&measured)
+            .iter()
+            .any(|l| l.starts_with(anchor_text("gemini.usage.switch")))
+    );
+}
+
 /// The reset as [`limit_reset`] reads it: `clock` and `zone`.
 fn reset_of(clock: &str, zone: Option<&str>) -> LimitReset {
     LimitReset {
@@ -2248,6 +2293,59 @@ fn a_long_paste_is_drawn_as_its_chip() {
     ] {
         assert_eq!(reader.folded_paste(&text), None, "{:?}", reader.program());
     }
+}
+
+/// THE SEAT GEMINI CLI'S SCREEN NAMES: its footer's model ([`footer_model`],
+/// `Auto` as measured, the chosen model's name in its place) and its
+/// banner's login ([`banner_login`], `Authenticated with gemini-api-key` as
+/// measured, `Signed in with Google: <email>` as the bundle draws it).
+/// NEGATIVE CONTROLS: a screen with no footer names no model (the dialog's
+/// own rows are no footer), a screen whose banner scrolled off names no
+/// login, and the footer's other columns are no model.
+#[test]
+fn the_footer_names_its_model_and_the_banner_its_login() {
+    let idle = screen(IDLE);
+    assert_eq!(footer_model(&idle).as_deref(), Some("Auto"));
+    assert_eq!(
+        footer_model(&screen(LIMIT_STOPPED)).as_deref(),
+        Some("Auto")
+    );
+    let at = idle
+        .iter()
+        .rposition(|r| r.contains(anchor_text("gemini.footer.workspace")))
+        .expect("the footer")
+        + 1;
+    let mut chosen = idle.clone();
+    chosen[at] = idle[at].replacen("          Auto", "gemini-3.5-pro", 1);
+    assert_eq!(footer_model(&chosen).as_deref(), Some("gemini-3.5-pro"));
+    let no_footer: Vec<String> = idle[..at - 1].to_vec();
+    assert_eq!(footer_model(&no_footer), None);
+    assert_ne!(footer_model(&idle).as_deref(), Some("no sandbox"));
+
+    assert_eq!(
+        banner_login(&idle).as_deref(),
+        Some("Authenticated with gemini-api-key")
+    );
+    let google: Vec<String> = idle
+        .iter()
+        .map(|r| {
+            r.replacen(
+                "Authenticated with gemini-api-key",
+                "Signed in with Google: user@example.com",
+                1,
+            )
+        })
+        .collect();
+    assert_eq!(
+        banner_login(&google).as_deref(),
+        Some("Signed in with Google: user@example.com")
+    );
+    let scrolled: Vec<String> = idle
+        .iter()
+        .filter(|r| !r.contains(anchor_text("gemini.banner.auth.tail").trim()))
+        .cloned()
+        .collect();
+    assert_eq!(banner_login(&scrolled), None);
 }
 
 /// GEMINI CLI'S TRUST NOTICES ARE CHROME UNDER A REPLY

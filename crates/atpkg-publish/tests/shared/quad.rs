@@ -79,8 +79,8 @@ fn the_head_is_the_newest_published_index_and_a_transient_500_is_retried() {
     assert_eq!(q.index.index_build, 34);
 }
 
-/// A KEYLESS BUILDER READS THE HEAD ANONYMOUSLY (D17): with no token file and no `gh`
-/// login, every authenticated call fails, so the head is walked and fetched on the
+/// A KEYLESS BUILDER READS THE HEAD ANONYMOUSLY (D17): with no token file, every
+/// authenticated call fails, so the head is walked and fetched on the
 /// download host as a client does, and verified by the client chain as before — the
 /// newest published build, a draft above it a hole, a forged quad still refused.
 #[test]

@@ -69,7 +69,7 @@ pub enum PromptKind {
 
 impl PromptKind {
     /// Returns the lowercase CLI token for this prompt kind.
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             PromptKind::Bash => "bash",
             PromptKind::Edit => "edit",
@@ -100,18 +100,18 @@ impl PromptKind {
         }
     }
 
-    fn is_shell(self) -> bool {
+    const fn is_shell(self) -> bool {
         matches!(self, PromptKind::Bash | PromptKind::PowerShell)
     }
 
-    fn is_file(self) -> bool {
+    const fn is_file(self) -> bool {
         matches!(
             self,
             PromptKind::Edit | PromptKind::Write | PromptKind::Overwrite | PromptKind::Read
         )
     }
 
-    fn is_subject(self) -> bool {
+    const fn is_subject(self) -> bool {
         matches!(
             self,
             PromptKind::Fetch
@@ -123,7 +123,7 @@ impl PromptKind {
         )
     }
 
-    fn may_be_footerless(self) -> bool {
+    const fn may_be_footerless(self) -> bool {
         matches!(
             self,
             PromptKind::Fetch
@@ -153,7 +153,7 @@ pub enum Origin {
 impl Origin {
     /// Returns the lowercase ledger label (`workflow`, `subagent`, `remote-agent`, `plugin`).
     #[must_use]
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Origin::Workflow { .. } => "workflow",
             Origin::Subagent { .. } => "subagent",
@@ -322,7 +322,7 @@ pub enum Role {
 
 impl Role {
     /// Returns the lowercase CLI token for this option role.
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Role::Once => "once",
             Role::Session => "session",
@@ -339,7 +339,7 @@ impl Role {
 
     /// Returns `true` if this role grants standing permission beyond a single call.
     #[must_use]
-    pub fn standing(self) -> bool {
+    pub const fn standing(self) -> bool {
         matches!(self, Role::Session | Role::Persist | Role::ModeSwitch)
     }
 }
@@ -4599,7 +4599,7 @@ pub enum ReviewKind {
 impl ReviewKind {
     /// Returns the human-readable phrase describing this review trigger.
     #[must_use]
-    pub fn words(self) -> &'static str {
+    pub const fn words(self) -> &'static str {
         match self {
             ReviewKind::Rule => "a permission rule",
             ReviewKind::AutoModeRule => "an ask rule that overrides auto mode",

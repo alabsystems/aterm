@@ -2,56 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! aterm-gui's ONE TIMING VALUE.
-//!
-//! Some of aterm-gui's waits are lengths a person never sees but a test or a
-//! live headless instance waits out in full. Each such site keeps its
-//! PRODUCTION length as a constant beside it and reads the length it waits
-//! through [`Timing::of`] on the process's [`current`] value. Three families:
-//!
-//! * the fabric's commit-fence bound and its still-waiting notice
-//!   (aterm-gui-fabric);
-//! * the harness host's cadences: its named pauses, its restart back-off, the
-//!   restart act's grace and its looks;
-//! * the host's answers at its loop's turn ends and idle points (aterm-gui's
-//!   `WorkerIdle`): the next look at a background break, and the moment a
-//!   lagging or resetting account is decided again.
-//!
-//! The supervise loop's own turn-end and idle waits are aterm-agent's, read
-//! under the same development seam. Three host timers stay at production in
-//! every build: the disk watch's first look and its period (a fast one would
-//! reclaim the machine's real build caches within a second of a test
-//! instance's boot), the program check watch's period (a fast one would start
-//! a setuid `ps` every 60 ms in each live test instance), and the activation
-//! wake's fallback poll (a test pulls its trigger instead).
-//!
-//! * [`Timing::PRODUCTION`] — the constant itself. The default, and the only
-//!   value a shipped build can have: production lengths never change.
-//! * [`Timing::FAST`] — a thousandth of it (never under a millisecond): the
-//!   test values. A debug build (or a `dev-seams` one) selects it when the
-//!   development seam `ATERM_DEV_FAST_TIMERS` is set, so a live headless
-//!   instance a test boots runs its timers fast; the unit tests' helpers
-//!   select it for their whole process ([`select_fast`]).
-//!
-//! The choice is made once per process and only ever moves from production to
-//! fast, so a timer read before a test helper ran and one read after agree from
-//! then on. A test that must see a production length passes
-//! [`Timing::PRODUCTION`] to what it drives, or runs in a process of its own
-//! that never selects fast (aterm-gui-fabric's `tests/production_clock.rs`).
-//!
-//! It also keeps aterm-gui's one monotonic millisecond clock ([`now_ms`]),
-//! which the window crate and the fabric endpoint below it both stamp on.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-/// The development seam that selects [`Timing::FAST`] in a debug build: set
-/// (to anything) by the live headless test lanes. It is aterm-types' one name
-/// for it, which aterm-agent's harness reads by the same rule, and which
-/// `env_sanitize` denies to a nested aterm's children.
+/// The development seam that selects [`Timing::FAST`] in a debug build.
 pub const DEV_FAST_TIMERS: &str = aterm_types::domain::ENV_DEV_FAST_TIMERS;
 
-/// A timing value: the factor every routed wait divides its production length
-/// by.
+/// A timing value: the factor every routed wait divides its production length by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     divisor: u32,
@@ -61,9 +19,7 @@ impl Timing {
     /// Every wait at its production length.
     pub const PRODUCTION: Self = Self { divisor: 1 };
 
-    /// Every wait at a thousandth of its production length, and never under
-    /// [`FAST_FLOOR`]: the 10 s fence bound waits 10 ms, a one-hour back-off
-    /// 3.6 s.
+    /// Every wait at a thousandth of its production length, and never under [`FAST_FLOOR`].
     pub const FAST: Self = Self { divisor: 1000 };
 
     /// The length to wait for a wait whose production length is `production`.
@@ -80,10 +36,7 @@ impl Timing {
         }
     }
 
-    /// [`Self::of`], never under `floor` when scaled: for a wait that races a
-    /// real process (a signal's delivery and handling, a poll that reads the
-    /// disk), whose test value must still leave the OS its time under load.
-    /// The production length is `production`, whatever the floor.
+    /// [`Self::of`], never under `floor` when scaled.
     #[must_use]
     #[inline]
     pub const fn of_at_least(self, production: Duration, floor: Duration) -> Duration {
@@ -112,9 +65,6 @@ impl Timing {
     }
 
     /// Scale a production wait given in whole milliseconds (`production_ms`).
-    /// Under [`Timing::PRODUCTION`] returns `production_ms` unchanged; under
-    /// [`Timing::FAST`] divides by `1000`, clamping any non-zero wait to at
-    /// least `1` ms so a cadence loop never spins.
     #[must_use]
     #[inline]
     pub const fn scale_millis(self, production_ms: u64) -> u64 {
@@ -125,7 +75,7 @@ impl Timing {
         if scaled >= 1 { scaled } else { 1 }
     }
 
-    /// Scale `production_ms`, clamping the scaled wait to `[min(floor_ms, production_ms), production_ms]`.
+    /// Scale `production_ms`, clamping the scaled wait to `[min, production_ms]`.
     #[must_use]
     #[inline]
     pub const fn scale_millis_at_least(self, production_ms: u64, floor_ms: u64) -> u64 {
@@ -139,9 +89,7 @@ impl Timing {
         }
     }
 
-    /// Compute a bounded exponential backoff in milliseconds (`base_ms << shift`,
-    /// capped at `cap_ms`, with `shift` clamped to `<= 20`) and scale it by
-    /// `self`.
+    /// Compute a bounded exponential backoff in milliseconds and scale it by `self`.
     #[must_use]
     #[inline]
     pub const fn exponential_backoff_ms(self, base_ms: u64, attempt: u32, cap_ms: u64) -> u64 {
@@ -151,8 +99,7 @@ impl Timing {
         self.scale_millis(bounded)
     }
 
-    /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian
-    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    /// Encode `` into a 20-byte little-endian wire snapshot.
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_le(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
@@ -166,8 +113,7 @@ impl Timing {
     }
 
     /// Decode a 20-byte little-endian cadence snapshot produced by
-    /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors (`1`
-    /// or `1000`).
+    /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors (`1` or `1000`).
     #[must_use]
     #[inline]
     pub const fn decode_cadence_wire_le(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
@@ -186,8 +132,7 @@ impl Timing {
         Some((timing, production_ms, floor_ms))
     }
 
-    /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian
-    /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
+    /// Encode `` into a 20-byte big-endian wire snapshot.
     #[must_use]
     #[inline]
     pub const fn encode_cadence_wire_be(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
@@ -200,9 +145,8 @@ impl Timing {
         ]
     }
 
-    /// Decode a 20-byte big-endian cadence snapshot produced by
-    /// [`Self::encode_cadence_wire_be`], accepting only canonical divisors (`1`
-    /// or `1000`).
+    /// Decode a 20-byte big-endian cadence snapshot produced by [`Self::encode_cadence_wire_be`],
+    /// accepting only canonical divisors (`1` or `1000`).
     #[must_use]
     #[inline]
     pub const fn decode_cadence_wire_be(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
@@ -250,9 +194,8 @@ const fn u64_be(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8) 
     ((u32_be(b0, b1, b2, b3) as u64) << 32) | (u32_be(b4, b5, b6, b7) as u64)
 }
 
-/// The shortest wait [`Timing::FAST`] scales to: a non-zero production wait
-/// stays a wait (a zero one stays zero), so a loop that waits a cadence never
-/// becomes a spin.
+/// The shortest wait [`Timing::FAST`] scales to: a non-zero production wait stays a wait (a zero
+/// one stays zero), so a loop that waits a cadence never becomes a spin.
 pub const FAST_FLOOR: Duration = Duration::from_millis(1);
 
 const UNREAD: u8 = 0;
@@ -261,9 +204,7 @@ const FAST: u8 = 2;
 
 static CHOSEN: AtomicU8 = AtomicU8::new(UNREAD);
 
-/// This process's timing value: [`Timing::FAST`] once [`select_fast`] ran or
-/// when the development seam [`DEV_FAST_TIMERS`] is set in a build that reads
-/// seams; [`Timing::PRODUCTION`] otherwise. The seam is read once.
+/// This process's timing value.
 #[must_use]
 pub fn current() -> Timing {
     let chosen = match CHOSEN.load(Ordering::Acquire) {
@@ -273,8 +214,6 @@ pub fn current() -> Timing {
             } else {
                 PRODUCTION
             };
-            // A `select_fast` that ran meanwhile wins: the choice only moves
-            // from production to fast.
             match CHOSEN.compare_exchange(UNREAD, read, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => read,
                 Err(now) => now,
@@ -289,18 +228,13 @@ pub fn current() -> Timing {
     }
 }
 
-/// Select [`Timing::FAST`] for the rest of this process: what the unit tests'
-/// helpers call before they build what waits. A debug build's door only; a
-/// release build cannot leave production lengths.
+/// Select [`Timing::FAST`] for the rest of this process.
 #[cfg(debug_assertions)]
 pub fn select_fast() {
     CHOSEN.store(FAST, Ordering::Release);
 }
 
-/// Milliseconds since this process first read the clock: the one monotonic
-/// millisecond clock aterm-gui stamps turns, mail rows and status ages on, so a
-/// stamp one module took reads against another's `now_ms`. One epoch per
-/// process, wherever it is read from.
+/// Milliseconds since this process first read the clock.
 #[must_use]
 pub fn now_ms() -> u64 {
     use std::sync::OnceLock;

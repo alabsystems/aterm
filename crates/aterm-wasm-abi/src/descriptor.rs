@@ -395,7 +395,7 @@ pub enum ValType {
 impl Ty {
     /// Whether this is a scalar: one word, no memory.
     #[must_use]
-    pub fn is_scalar(&self) -> bool {
+    pub const fn is_scalar(&self) -> bool {
         matches!(
             self,
             Ty::Bool
@@ -418,7 +418,7 @@ impl Ty {
     /// Whether this can be a `&[T]` or `Vec<T>` element: a number with a JS
     /// typed array.
     #[must_use]
-    pub fn is_element(&self) -> bool {
+    pub const fn is_element(&self) -> bool {
         matches!(
             self,
             Ty::U8
@@ -436,7 +436,7 @@ impl Ty {
 
     /// A scalar's one word (`None` for the others).
     #[must_use]
-    pub fn scalar_word(&self) -> Option<ValType> {
+    pub const fn scalar_word(&self) -> Option<ValType> {
         Some(match self {
             Ty::U64 | Ty::I64 => ValType::I64,
             Ty::F32 => ValType::F32,

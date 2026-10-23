@@ -239,7 +239,7 @@ pub const REMEDY_DIRECTORY: &str = concat!(
 impl Demoted {
     /// Remediation command for this demoted entry based on whether it is a symlink.
     #[must_use]
-    pub fn remedy(&self) -> &'static str {
+    pub const fn remedy(&self) -> &'static str {
         if self.linked {
             REMEDY_LINK
         } else {
@@ -563,7 +563,7 @@ impl Toolchain {
         "unset TRUST_STAGE2_BIN, or point it at a sealed toolchain's bin";
 
     /// Select [`Self::OVERRIDE_REMEDY`] or [`Self::INSTALL_REMEDY`].
-    fn remedy(&self) -> &'static str {
+    const fn remedy(&self) -> &'static str {
         if self.store_bin.is_none() {
             Self::OVERRIDE_REMEDY
         } else {

@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab halfdraw scan`: a tab's cast (`aterm ctl @<sid> cast`, asciicast v2) replayed into the
-//! engine aterm draws with, one event per batch, and every state a turn-end reader could read
-//! judged: the half-drawn frames of `docs/measured/half-drawn-frame-2026-10-22.md`.
-//!
-//! A cast's `o` event is one BURST of output as the PTY reader delivered it, not one read: the
-//! recorder coalesces the reads of a burst, and the live kernel observes after each of the
-//! reader's holds inside it (`aterm-gui`'s `cast.rs`). So the replay sees no finer than the
-//! burst. For a program that brackets its redraws in DEC 2026 that loses nothing (any read
-//! boundary inside a bracketed redraw lies inside the bracket); for one that brackets nothing,
-//! the gaps counted are a lower bound on what the live kernel could see.
-//!
-//! Per cast it says how many DEC 2026 brackets the program opened and closed, how many events
-//! ended inside an open bracket (a frame split across bursts), and every BUSY GAP: a state
-//! whose busy row ([`ScreenReader::busy_guard`], over the live zone a supervisor's `await gone`
-//! watches) is gone while the state before showed it and a later state shows it again, within
-//! [`GAP_WINDOW_S`] — the read a bare row scan latched `gone <busy>` on mid-reply. Each gap says
-//! how soon the busy row was back (`back=`), and is classed by what reads it today:
-//!
-//! - `open`: the program's frame is unfinished there (`Terminal::frame_unfinished_at`), so the
-//!   observation kernel holds `await gone`, `text --json` says `"frame":"open"` and the
-//!   supervisor waits for the frame (`await frame`) before it reads;
-//! - `settle`: whole to the kernel, but no frame the program closed vouches for it
-//!   (`Terminal::screen_is_closed_frame`), and the busy row is back within
-//!   [`GONE_SETTLE`]: `await gone` settles there and does not latch;
-//! - `torn`: neither, and its reader judges the frame not whole ([`ScreenReader::frame_torn`]);
-//! - `UNGUARDED`: none of these — a gap `await gone` latches on and a turn-end reader would
-//!   read as the screen shows it. Its phase follows (`idle` there is the defect).
-//!
-//! `--show N` prints the first N gaps' screens; `--event I` prints the screen after event I.
+//! `lab halfdraw scan`: replays an asciicast v2 into a terminal and classifies busy-row gaps.
 
 use aterm_core::terminal::{ClockReading, GONE_SETTLE, SurfaceSource, Terminal};
 use aterm_phase::reader::{Program, ScreenReader};
@@ -117,7 +89,7 @@ fn count(hay: &str, needle: &str) -> usize {
     hay.matches(needle).count()
 }
 
-/// The verb.
+/// Runs `lab halfdraw scan`.
 pub fn cmd_halfdraw(args: &[String]) -> Res {
     let usage = || {
         Fail::usage(format!(
@@ -161,8 +133,7 @@ pub fn cmd_halfdraw(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// The replay's base instant: every event's clock is this plus its cast time, so the replay
-/// reads no wall clock after it.
+/// Returns the base instant to which cast event timestamps are added.
 pub(crate) fn base_instant() -> std::time::Instant {
     std::time::Instant::now()
 }

@@ -167,6 +167,11 @@ pub trait Tools {
         stage: &Path,
         donors: &[PathBuf],
     ) -> Result<crate::artifact::relocate::Report, String>;
+
+    /// What compresses the pack's tar stream: the zstd CLI on `PATH` for a real pack
+    /// ([`super::tarwrite::ZstdCli`]), aterm-zstd's raw-block writer in a test that has no
+    /// CLI to run (`tarwrite::RawFrames`).
+    fn compressor(&self) -> &dyn super::tarwrite::Compressor;
 }
 
 /// A compiler's `-vV`, bounded — the probe the client's lineage checker takes.
@@ -324,5 +329,11 @@ impl Tools for HostTools {
         donors: &[PathBuf],
     ) -> Result<crate::artifact::relocate::Report, String> {
         crate::artifact::relocate::relocate_stage(stage, None, donors)
+    }
+
+    fn compressor(&self) -> &dyn super::tarwrite::Compressor {
+        static ON_PATH: std::sync::LazyLock<super::tarwrite::ZstdCli> =
+            std::sync::LazyLock::new(super::tarwrite::ZstdCli::default);
+        &*ON_PATH
     }
 }

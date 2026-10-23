@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `spec_xref_closure`: the toolchain-free source↔spec closure over every anchored crate.
-//!
-//! The registry only collects anchors linked into the binary. Anchors expand in every test
-//! and debug build of their crate (`#[cfg_attr(any(test, debug_assertions),
-//! aterm_spec_anchor::refines(…))]`, the `macro_rules!` attributes on a Trust compiler), so
-//! this test — which links every anchored crate as a dev-dependency and every model through
-//! `aterm_models::link_all` — sees them from outside. It enforces:
-//!   1. Action exists: every anchor names a real action of its machine.
-//!   3. Coverage: every actively bound machine has every action bound or waived
-//!      (`ratio == 1.0`); others are reported (`aterm_spec::xref::check_closure`).
-//!   4. Machine exists: every named machine resolves to a registered model.
-//!
-//! Every machine closes here, aterm-gui's included: a waiver sits on a non-test item
-//! (a debug-and-test carrier fn where no shipping fn performs the action), so the
-//! registry this binary links is the whole of it. aterm-gui's `spec_xref_gate` only runs
-//! the two custody machines' Tier-1 bodies with the per-step execution evidence, which
-//! reads crate-private seams. Obligation 2 (symbols resolve
-//! to live DefIds) needs typed Trust `FuncId`s, which aterm does not have, so it is not
-//! checked. `ty --strict-vacuity` over the registry is `spec-check vacuity`.
+//! Source-to-spec refinement closure checks across all anchored crates.
 
 use std::collections::BTreeSet;
 
@@ -36,7 +18,6 @@ fn registered_modules() -> Vec<SpecModule> {
 /// Each collected list as one line per record, sorted, digested (FNV-1a 64): the line SP.2
 /// compares across hosts, whose load-time constructor sections differ (Mach-O
 /// `__mod_init_func`, ELF `.init_array`, PE `.CRT$XCU`; `aterm_spec_anchor::registry`).
-/// Printed, never pinned: every new anchor moves it.
 fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]) -> String {
     fn digest(mut lines: Vec<String>) -> String {
         lines.sort_unstable();
@@ -75,10 +56,6 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 
 #[test]
 fn spec_xref_closure() {
-    // LINK every anchored crate and every model. The registry sees only object code the
-    // binary links, and a crate this test never names is not linked at all: one root per
-    // crate pulls in its anchored code (the window's entry reaches the GUI and the libraries
-    // it drives).
     let _domains = aterm_models::link_all();
     #[expect(
         clippy::disallowed_methods,
@@ -91,8 +68,6 @@ fn spec_xref_closure() {
         aterm_keeper::RelaunchBrake::new as fn() -> aterm_keeper::RelaunchBrake,
         aterm_keeper::core::classify_death
             as fn(aterm_keeper::core::DeathEvidence) -> aterm_keeper::core::Verdict,
-        // aterm-restore's anchored modules hold generic fns only but for these two, which
-        // keep `recover.rs` and `writer.rs` linked whether or not the window reaches them.
         aterm_restore::recover::Restored::history_admissible
             as fn(&aterm_restore::recover::Restored) -> bool,
         <aterm_restore::writer::WriteError as std::fmt::Display>::fmt
@@ -100,15 +75,12 @@ fn spec_xref_closure() {
                 &aterm_restore::writer::WriteError,
                 &mut std::fmt::Formatter<'_>,
             ) -> std::fmt::Result,
-        // agh: the CLI reaches both anchored functions; the waivers' host keeps them linked.
         agh::cli::main_entry as fn(Vec<std::ffi::OsString>) -> std::process::ExitCode,
         agh::policy::route_wall_environment as fn(),
     ));
-    // ---- Proof #1: the registry ACTUALLY collected the anchors, cross-crate. ----
     let refs: Vec<_> = xref::refinements().collect();
     let waivers: Vec<_> = xref::waivers().collect();
 
-    // Per-machine collected counts (the cross-crate collection evidence).
     let machines: BTreeSet<&str> = refs
         .iter()
         .map(|r| r.machine)
@@ -133,8 +105,6 @@ fn spec_xref_closure() {
     }
     eprintln!("spec_xref_closure: {}", collected_digests(&refs, &waivers));
 
-    // Phase 0 not regressed: the terminal_modes anchors (from aterm-core, expanded in
-    // its debug build) must still be collected here.
     let tm = refs
         .iter()
         .filter(|r| r.machine == "terminal_modes")
@@ -145,11 +115,9 @@ fn spec_xref_closure() {
          aterm-core (Phase 0 must not regress), found {tm}"
     );
 
-    // ---- Build the registered SpecModule set ----
     let modules = registered_modules();
     eprintln!("spec_xref_closure: {} registered model(s)", modules.len());
 
-    // ---- Run the obligations (1, 3, 4) ----
     let report = xref::check_closure(&modules);
 
     eprintln!("spec_xref_closure: per-machine coverage ledger:");
@@ -174,7 +142,6 @@ fn spec_xref_closure() {
         );
     }
 
-    // ---- Proof #2: GREEN (no obligation violations) ----
     assert!(
         report.is_ok(),
         "spec_xref_closure FAILED — source↔spec obligations violated:\n{}",

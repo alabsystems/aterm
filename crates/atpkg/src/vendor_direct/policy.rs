@@ -271,7 +271,7 @@ impl YankLatch {
     }
 
     /// [`Self::admits`] for an index declaring `generation` at `index_build`.
-    fn admits_at(&self, generation: u64, index_build: u64) -> bool {
+    const fn admits_at(&self, generation: u64, index_build: u64) -> bool {
         match self.roster_seq {
             Some(roster_seq) => BuildFloor {
                 index_build: self.index_build,

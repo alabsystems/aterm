@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The names a baseline gives the Macs (design §5.1, names): the placeholders the
-//! controller fills for each host, the Local hostname each host's baseline asks for, so
-//! that no two Macs are ever given one, and the `.local` address that follows a Mac's new
-//! Local hostname in machines.toml: from the report of the run that renamed it, or, when
-//! that report never came back, from the name its baseline and its hardware give it. A Mac
-//! held by an IP address that DHCP moved is looked for at its Local hostname too.
-//!
-//! The Mac fills `{hardware}` itself, so the controller compares the Local hostnames with
-//! it still a placeholder: two hosts whose baselines ask for the same `m1-{hardware}` (a
-//! shared tag, a literal name in a shared baseline, a template with no per-host part) are
-//! refused even when their hardware differs, and hosts whose names differ before the
-//! hardware is filled can only collide after it when one host's name spells out another's
-//! hardware by hand.
+//! Baseline naming, Local hostname collision checks, and `.local` address tracking.
 
 use super::inventory::{self, Host, Inventory, Paths};
 use crate::hardware::{self, Description, PLACEHOLDER};
@@ -23,9 +11,7 @@ use crate::port::System;
 use crate::protocol::Hello;
 use std::collections::BTreeMap;
 
-/// The placeholders the controller fills for `host` before the baseline is signed:
-/// `{name}`, `{tag}` and `{uuid}` (the caller adds `{serial}` when it has the Mac's
-/// hello). `{hardware}` is left for the Mac, `{user}` for each account.
+/// The placeholders the controller fills for `host` before the baseline is signed.
 #[must_use]
 pub fn vars(host: &Host) -> [(&'static str, &str); 3] {
     [
@@ -53,9 +39,7 @@ fn template(text: &str, host: &Host, serial: Option<&str>) -> Option<String> {
     )
 }
 
-/// The Local hostname `text` (a baseline) asks for on `host`, in the label form the Mac sets
-/// it in (`lab_03.b-{hardware}` is `lab-03-b-{hardware}`) with `{hardware}` unfilled: `None`
-/// when it sets none, does not parse, or names the Mac by `{serial}`, which is its own.
+/// The Local hostname `text` asks for on `host`, in label form with `{hardware}` unfilled.
 #[must_use]
 pub fn local_host_name(text: &str, host: &Host) -> Option<String> {
     let name = template(text, host, None)?;
@@ -72,8 +56,7 @@ fn baseline_text(sys: &dyn System, paths: &Paths, name: &str) -> Option<String> 
     String::from_utf8(bytes).ok()
 }
 
-/// The Local hostname each host's baseline asks for, by uuid: the baselines read once
-/// each. A host whose baseline cannot be read is left out (its own run says why).
+/// The Local hostname each host's baseline asks for, keyed by uuid.
 #[must_use]
 pub fn wanted(sys: &dyn System, paths: &Paths, inv: &Inventory) -> BTreeMap<String, String> {
     let mut texts: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -101,12 +84,7 @@ fn dot_local(host: &Host) -> Option<&str> {
     (domain.eq_ignore_ascii_case("local") && names::dns_label(name)).then_some(name)
 }
 
-/// The `.local` address `host` answers at once its baseline (`text`) renamed it: the Local
-/// hostname that baseline gives the Mac that answered `hello` (its serial, and `{hardware}`
-/// from the parts the hello described), exactly as its run sets it
-/// ([`names::planned_local_host_name`]). `None` unless machines.toml reaches the host by a
-/// `.local` name and the baseline names it another one; a hello that described no hardware
-/// (a fact the Mac could not read, an older agent) gives none for a `{hardware}` name.
+/// The `.local` address `host` answers at once its baseline (`text`) renamed it.
 #[must_use]
 pub fn renamed_address(host: &Host, text: &str, hello: &Hello) -> Option<String> {
     let now = dot_local(host)?;
@@ -116,12 +94,7 @@ pub fn renamed_address(host: &Host, text: &str, hello: &Hello) -> Option<String>
     (!local.eq_ignore_ascii_case(now)).then(|| format!("{local}.local"))
 }
 
-/// The `.local` address of the Local hostname the Mac that answered `hello` says it has, when
-/// machines.toml reached it by another `.local` name: a name some cache still resolves to
-/// it after a rename (measured on the controller against the VM, 27.0: the old name still
-/// resolved to the VM 266 s after the rename, `dns-sd` showing a 4500 s TTL). `None` for an
-/// address that is no `.local` name, an answer with no Local hostname or one that is no DNS
-/// label, and the name machines.toml already holds (case aside).
+/// The `.local` address of the Local hostname `hello` reports when it differs from `host`.
 #[must_use]
 pub fn own_address(host: &Host, hello: &Hello) -> Option<String> {
     let now = dot_local(host)?;
@@ -129,11 +102,7 @@ pub fn own_address(host: &Host, hello: &Hello) -> Option<String> {
     (names::dns_label(own) && !own.eq_ignore_ascii_case(now)).then(|| format!("{own}.local"))
 }
 
-/// The `.local` address of the Local hostname the Mac that answered `hello` has, for a host
-/// machines.toml holds by an IP address: where it answers once DHCP gave it another one,
-/// since every Mac answers for its Local hostname over multicast DNS with nothing turned on.
-/// `None` for an address that is no IP address (a name follows the Mac already), and for an
-/// answer with no Local hostname or one that is no DNS label.
+/// The `.local` address of `hello`'s Local hostname for a host held by IP address.
 #[must_use]
 pub fn named_address(host: &Host, hello: &Hello) -> Option<String> {
     host.address.parse::<std::net::IpAddr>().ok()?;
@@ -141,9 +110,7 @@ pub fn named_address(host: &Host, hello: &Hello) -> Option<String> {
     names::dns_label(own).then(|| format!("{own}.local"))
 }
 
-/// `host` at its Local hostname ([`named_address`]), from the newest hello `state/` keeps for
-/// it: where to look for a Mac held by an IP address that stopped answering there. `None`
-/// when there is nowhere else to look.
+/// Return `host` at its Local hostname from the newest hello in `state/`.
 #[must_use]
 pub fn named(sys: &dyn System, paths: &Paths, host: &Host) -> Option<Host> {
     let state = inventory::load_state(sys, paths, &host.uuid).ok()?;
@@ -155,11 +122,7 @@ pub fn named(sys: &dyn System, paths: &Paths, host: &Host) -> Option<Host> {
     })
 }
 
-/// `host` at the address its baseline renamed it to ([`renamed_address`]), from its baseline
-/// file and the newest hello `state/` keeps for it: where to look for a Mac whose `.local`
-/// name stopped resolving, or another Mac took, because an apply renamed it and its report
-/// never came back (the connection dropped after the rename). `None` when there is nowhere
-/// else to look.
+/// Return `host` at the address its baseline renamed it to using the newest hello in `state/`.
 #[must_use]
 pub fn renamed(sys: &dyn System, paths: &Paths, host: &Host) -> Option<Host> {
     let state = inventory::load_state(sys, paths, &host.uuid).ok()?;
@@ -172,8 +135,7 @@ pub fn renamed(sys: &dyn System, paths: &Paths, host: &Host) -> Option<Host> {
     })
 }
 
-/// Why `host` may not be given the Local hostname its baseline asks for (`local`): another
-/// host in `inv` is asked the same (case does not count in a `.local` name).
+/// Explain why `host` cannot be given the Local hostname `local` when another host claims it.
 #[must_use]
 pub fn clash(
     inv: &Inventory,
@@ -196,9 +158,7 @@ pub fn clash(
     ))
 }
 
-/// The address `host` answers at after `report` changed its Local hostname: its old
-/// `<name>.local` with the new name, when that is the address machines.toml holds (an IP
-/// address, or another name, stays as it is).
+/// The address `host` answers at after `report` changed its Local hostname.
 #[must_use]
 pub fn followed_address(host: &Host, report: &HostReport) -> Option<String> {
     let row = report
@@ -243,7 +203,6 @@ mod tests {
         );
         let filled = crate::baseline::fill(DESCRIBED, &vars(&h)).unwrap();
         assert!(filled.contains("\"m10 {hardware}\""), "{filled}");
-        // A plain name is the inventory name, as before.
         let plain = "schema = 1\n[names]\nlocal_host_name = \"{name}\"\n";
         assert_eq!(
             local_host_name(plain, &h).as_deref(),
@@ -287,7 +246,6 @@ mod tests {
             "{m1}"
         );
         assert!(why(1).is_some());
-        // m10's tag is m10, not m1.
         assert_eq!(why(2), None);
         assert!(why(3).unwrap().contains("lab-a and lab-b"));
     }
@@ -330,7 +288,6 @@ mod tests {
             local_host_name(DESCRIBED, &h).as_deref(),
             Some("lab-03-b-{hardware}")
         );
-        // lab_03.b and lab-03-b would both be lab-03-b-<hardware> on their Macs.
         let sys = crate::port::Fake::root();
         let paths = Paths {
             root: "/ctl".into(),
@@ -373,7 +330,6 @@ mod tests {
             renamed_address(&vm, DESCRIBED, &vm_hello()).as_deref(),
             Some("lab-03-Virtual-Machine-M5-8GB-90GB.local")
         );
-        // In label form, as the run sets it, and from the serial the hello gave.
         vm.name = "lab_03".into();
         assert_eq!(
             renamed_address(&vm, DESCRIBED, &vm_hello()).as_deref(),
@@ -384,9 +340,6 @@ mod tests {
             renamed_address(&vm, by_serial, &vm_hello()).as_deref(),
             Some("mac-ZPXWJY6KDJ.local")
         );
-        // Nowhere else to look: already at that name (case aside), a name the hello's
-        // hardware cannot fill, a baseline that names nothing, an address that is no
-        // `.local` name.
         vm.address = "LAB-03-virtual-machine-m5-8gb-90gb.local.".into();
         assert_eq!(renamed_address(&vm, DESCRIBED, &vm_hello()), None);
         vm.address = "lab-03.local".into();
@@ -394,10 +347,8 @@ mod tests {
         assert_eq!(renamed_address(&vm, "schema = 1\n", &vm_hello()), None);
         vm.address = "192.168.64.4".into();
         assert_eq!(renamed_address(&vm, DESCRIBED, &vm_hello()), None);
-        // A name in a unicast DNS domain that ends in `.local` is no Local hostname.
         vm.address = "lab-03.corp.local".into();
         assert_eq!(renamed_address(&vm, DESCRIBED, &vm_hello()), None);
-        // From the controller's files: the baseline and the hello state/ keeps.
         let sys = crate::port::Fake::root();
         let paths = Paths {
             root: "/ctl".into(),
@@ -424,7 +375,6 @@ mod tests {
             own_address(&vm, &said).as_deref(),
             Some("lab-03-Virtual-Machine-M5-8GB-90GB.local")
         );
-        // Its own name already, case aside; an empty or impossible one; an IP address.
         said.local_host_name = "LAB-03".into();
         assert_eq!(own_address(&vm, &said), None);
         for odd in ["", "-lab", "lab 03", "lab.03"] {
@@ -434,8 +384,6 @@ mod tests {
         said.local_host_name = "lab-03-Virtual-Machine-M5-8GB-90GB".into();
         vm.address = "192.168.64.4".into();
         assert_eq!(own_address(&vm, &said), None);
-        // A name the owner chose in a unicast DNS domain ending in `.local` (an Active
-        // Directory `corp.local`) answered: it is not a stale Local hostname, and stays.
         said.local_host_name = "lab-03".into();
         vm.address = "lab-03.corp.local".into();
         assert_eq!(own_address(&vm, &said), None);
@@ -456,12 +404,10 @@ mod tests {
                 "{ip}"
             );
         }
-        // A name follows the Mac already: a `.local` one, or one in unicast DNS.
         for name in ["lab-09.local", "lab-09.corp.example"] {
             vm.address = name.into();
             assert_eq!(named_address(&vm, &said), None, "{name}");
         }
-        // No Local hostname to look at, or one no DNS label spells.
         vm.address = "192.168.64.9".into();
         for odd in ["", "-lab", "lab 09", "lab.09"] {
             said.local_host_name = odd.into();
@@ -484,7 +430,6 @@ mod tests {
         assert_eq!(followed_address(&h, &report), None);
         h.address = "m1.lab.example".into();
         assert_eq!(followed_address(&h, &report), None);
-        // A plan changes nothing; nothing follows.
         h.address = "m1-Air-M2-24GB-1TB-2.local".into();
         let mut plan = report;
         plan.items[0].outcome = Outcome::Planned;

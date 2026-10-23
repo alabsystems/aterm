@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The live wrapper against the shipped engine, and the live recording against its replay:
-//! unattached the host is the engine; attached under the shipped code it shows the host the
-//! same frames, quads and wakes; and the recorded stream replayed through `Code::step` from
-//! the attach checkpoint lands on the live state and observation chain exactly, from every
-//! boundary.
+//! Live wrapper tests against the shipped engine and recorded replay.
 
 use aterm_aos::checkpoint::{Checkpoint, Provenance};
 use aterm_aos::effects::NoEffects;
@@ -384,7 +380,6 @@ fn a_hot_glow_crossing_the_horizon_ends_the_attach_and_still_cools() {
     assert!(!parked.stranded, "the glow cools and the lane parks");
     assert_eq!(host.next_change_deadline(parked.at + ms(1), LANE), None);
 
-    // Paused, the attach is kept past the horizon: the pause is the operator's.
     let mut paused = attached(t0, MomentumCode::Shipped);
     let (last, _) = burst(&mut paused, start, 4, &c, &mut seen);
     paused.aos_pause(last, LANE).expect("pauses");
@@ -448,7 +443,6 @@ fn the_reused_encoder_and_recycled_overlay_change_no_link_and_no_held_quad() {
         }
     }
     for dark in [true, false] {
-        // The story's calls, recorded on an engine and played on the host one at a time.
         let c = cfg(dark);
         let mut recorder = Recorder {
             glow: MomentumGlow::default(),

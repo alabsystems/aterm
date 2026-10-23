@@ -633,7 +633,7 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
         if !std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
             pf.problems.push(format!(
                 "--upload needs the staging owner's token at {} (every pack is uploaded to {} \
-                 first, and gh's own login never writes)",
+                 first, and a write never goes anonymously)",
                 ctx.shown(&ctx.tokens.staging),
                 ctx.accounts.staging
             ));

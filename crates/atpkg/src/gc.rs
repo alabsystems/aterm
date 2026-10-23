@@ -26,7 +26,7 @@ impl LiveBuild {
 
     /// The build proven live.
     #[must_use]
-    pub fn build(&self) -> u64 {
+    pub const fn build(&self) -> u64 {
         self.build
     }
 }

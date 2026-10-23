@@ -1624,7 +1624,7 @@ enum WriteStep {
     Advance(usize),
 }
 
-fn classify_write_result(r: isize, is_eintr: bool) -> WriteStep {
+const fn classify_write_result(r: isize, is_eintr: bool) -> WriteStep {
     if r < 0 {
         if is_eintr {
             WriteStep::Retry
@@ -1697,7 +1697,7 @@ pub fn as_reply<T>(write: impl FnOnce() -> T) -> T {
 
 /// Unix twin of the Windows `settle_input`, which runs a ConPTY session's resize-guard client before an input writer takes the lock the terminal's answers need: a PTY has no such guard, so this does nothing.
 #[inline]
-pub fn settle_input(_master: i32) {}
+pub const fn settle_input(_master: i32) {}
 
 /// A single non-parking `write(2)`, classified for aterm-session's `SinkWriter::write_frame_nonparking`, which must tell `WouldBlock` from a fatal error without dropping an `io::Error`.
 #[cfg(unix)]
@@ -2025,11 +2025,11 @@ pub enum ReadOutcome {
     Proc,
 }
 
-fn proc_fired(entry: &libc::pollfd) -> bool {
+const fn proc_fired(entry: &libc::pollfd) -> bool {
     entry.revents & libc::POLLIN != 0
 }
 
-fn exit_fired(entry: &libc::pollfd) -> bool {
+const fn exit_fired(entry: &libc::pollfd) -> bool {
     entry.revents & (libc::POLLIN | libc::POLLHUP) != 0
 }
 
@@ -2650,7 +2650,7 @@ pub fn close_fd(fd: i32) {
 }
 
 /// Focus-linked shell QoS boost: a no-op on Unix.
-pub fn set_focus_boost(_master: i32, _on: bool) {}
+pub const fn set_focus_boost(_master: i32, _on: bool) {}
 
 /// Resize the PTY to `rows`×`cols` (`TIOCSWINSZ`) with the pixel fields zero; prefer [`resize_with_cell_px`] when the cell metrics are known.
 pub fn resize(master: i32, rows: u16, cols: u16) {

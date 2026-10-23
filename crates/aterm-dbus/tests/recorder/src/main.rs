@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The D-Bus oracle's recorder (A11Y.3 of docs/AUDIT-third-party-2026-10-15.md,
-//! a11y decision 5), built outside the aterm workspace (see Cargo.toml):
-//! registry zbus 5.16.0 / zvariant 5.12.0 write the bytes, and aterm-dbus is
-//! held to the committed recordings with no zbus in its graph.
-//!
-//!   values                         the rows of zvariant-5.12.0-values.tsv
-//!   messages                       the rows of zbus-5.16.0-messages.tsv
-//!   session <messages.tsv> unix|tcp
-//!                                  one transport's rows of
-//!                                  zbus-5.16.0-session.tsv: a zbus client
-//!                                  against a scripted bus that answers from
-//!                                  the recorded messages
+//! D-Bus oracle recorder that emits serialized value, message, and session TSV
+//! fixtures using upstream `zbus` and `zvariant`.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -272,7 +262,6 @@ fn messages() -> Vec<(&'static str, Message)> {
     let bus = "org.freedesktop.DBus";
     let me = ":1.42";
 
-    // The session: the client's calls with serials 1-5 and the bus's answers.
     let hello = Message::method_call("/org/freedesktop/DBus", "Hello")
         .unwrap()
         .destination(bus)
@@ -383,7 +372,6 @@ fn messages() -> Vec<(&'static str, Message)> {
     out.push(("get_prop_error", get_prop_error));
     out.push(("state_changed", state_changed));
 
-    // Standalone shapes the AT-SPI publisher sends or answers.
     let get_prop_reply = Message::method_return(&get_prop.header())
         .unwrap()
         .sender(":1.7")
@@ -493,7 +481,6 @@ fn messages() -> Vec<(&'static str, Message)> {
     .unwrap();
     out.push(("props_changed", props_changed));
 
-    // An AT asks the publisher for a role; the publisher answers, or refuses.
     let get_role = Message::method_call("/org/a11y/atspi/accessible/7", "GetRole")
         .unwrap()
         .sender(":1.9")
@@ -578,7 +565,6 @@ fn messages() -> Vec<(&'static str, Message)> {
         .unwrap();
     out.push(("no_reply_ping", no_reply));
 
-    // Big-endian twins: what a big-endian peer sends.
     let hello_be = Message::method_call("/org/freedesktop/DBus", "Hello")
         .unwrap()
         .destination(bus)

@@ -2299,7 +2299,7 @@ fn outdated_json_row(prefix: &Prefix, kind: Kind, name: &str, latest: &str) -> a
     aterm_json::Value::Object(map)
 }
 
-fn outdated_failed(any: bool, named: bool) -> bool {
+const fn outdated_failed(any: bool, named: bool) -> bool {
     any && named
 }
 
@@ -3045,7 +3045,7 @@ enum UnpinOutcome {
     FailUnknown,
 }
 
-fn unpin_outcome(pinned: bool, installed: bool, definitively_unknown: bool) -> UnpinOutcome {
+const fn unpin_outcome(pinned: bool, installed: bool, definitively_unknown: bool) -> UnpinOutcome {
     if pinned {
         UnpinOutcome::Remove
     } else if installed {
@@ -4271,16 +4271,19 @@ fn print_options(rows: &[super::api::OptionsRow], compact: bool) {
     }
 }
 
-fn is_macho(first: &[u8]) -> bool {
+fn is_macho(head: &[u8]) -> bool {
     matches!(
-        first,
-        [0xfe, 0xed, 0xfa, 0xce]
-            | [0xfe, 0xed, 0xfa, 0xcf]
-            | [0xce, 0xfa, 0xed, 0xfe]
-            | [0xcf, 0xfa, 0xed, 0xfe]
-            | [0xca, 0xfe, 0xba, 0xbe]
-            | [0xbe, 0xba, 0xfe, 0xca]
-    )
+        head.get(..4),
+        Some(
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        )
+    ) && !crate::macho::is_java_class(head)
 }
 
 fn linkage_problem(
@@ -4322,29 +4325,30 @@ fn linkage_problem(
     None
 }
 
-fn linked_dylibs(otool_out: &str) -> Vec<String> {
-    otool_out
-        .lines()
-        .skip(1)
-        .map(|l| l.trim().split(" (").next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect()
+/// The install name and the dylibs the Mach-O at `path` loads, each once
+/// in load-command order: what `otool -L` lists, read in house
+/// ([`crate::macho::load_names_at`]) rather than through `otool`, whose
+/// `/usr/bin` shim raises Apple's install dialog on a Mac without the
+/// developer tools.
+///
+/// # Errors
+/// The file cannot be read or its load commands are malformed: a problem
+/// to report, never an empty list.
+fn linked_dylibs(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let names = crate::macho::load_names_at(path)
+        .map_err(|error| format!("inspection failed: {error}"))?
+        .once();
+    let mut rows = names.id;
+    for dylib in names.loads {
+        if !rows.contains(&dylib) {
+            rows.push(dylib);
+        }
+    }
+    Ok(rows)
 }
 
 fn linked_library_exists(path: &std::path::Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
-}
-
-fn linkage_capture(captured: Result<(bool, &[u8], &[u8]), &str>) -> Result<Vec<String>, String> {
-    let (success, stdout, stderr) =
-        captured.map_err(|error| format!("inspection failed: {error}"))?;
-    if !success {
-        return Err(format!(
-            "otool -L failed: {}",
-            String::from_utf8_lossy(stderr).trim()
-        ));
-    }
-    Ok(linked_dylibs(&String::from_utf8_lossy(stdout)))
 }
 
 pub(super) fn cmd_linkage(prefix: &Prefix, rest: &[String]) -> ExitCode {
@@ -4365,7 +4369,7 @@ pub(super) fn cmd_linkage(prefix: &Prefix, rest: &[String]) -> ExitCode {
         let short = short.as_str();
         let keg = prefix.keg(short, &inst.version);
         if !cfg!(target_os = "macos") {
-            println!("{short}: linkage inspection is macOS (otool) only in v1");
+            println!("{short}: linkage inspection reads Mach-O load commands: macOS only");
             continue;
         }
         let lib_dirs = [keg.join("lib"), prefix.root.join("lib")];
@@ -4392,7 +4396,7 @@ pub(super) fn cmd_linkage(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 if !ft.is_file() {
                     continue;
                 }
-                let mut head = [0u8; 4];
+                let mut head = [0u8; 8];
                 let is_bin = std::fs::File::open(&p)
                     .and_then(|mut f| {
                         use std::io::Read as _;
@@ -4403,20 +4407,7 @@ pub(super) fn cmd_linkage(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 if !is_bin {
                     continue;
                 }
-                let captured = fetch::run_capture("otool", &["-L", &p.to_string_lossy()]);
-                let rows = linkage_capture(
-                    captured
-                        .as_ref()
-                        .map(|out| {
-                            (
-                                out.status.success(),
-                                out.stdout.as_slice(),
-                                out.stderr.as_slice(),
-                            )
-                        })
-                        .map_err(String::as_str),
-                );
-                let rows = match rows {
+                let rows = match linked_dylibs(&p) {
                     Ok(rows) => rows,
                     Err(problem) => {
                         println!("{}: {problem}", p.display());
@@ -5311,28 +5302,81 @@ mod tests {
             linkage_problem("/nope/libgone.dylib", dir, &libs, &present)
                 .is_some_and(|p| p.contains("missing"))
         );
+        assert!(is_macho(&[0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 0x01]));
+        assert!(!is_macho(b"#!/bin/sh"));
+        assert!(
+            !is_macho(&[0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 52]),
+            "a Java class file"
+        );
+
+        // The rows are the install name then each loaded dylib, once per
+        // file however many slices carry them, read without otool, a 32-bit
+        // file's as a 64-bit one's; a universal static archive has none; an
+        // unreadable or malformed file is a problem, never an empty list.
+        use crate::macho::fixtures::{
+            ID_DYLIB, LOAD_DYLIB, archive, dylib_command, dylib_command32, fat, thin, thin32,
+        };
+        let files = aterm_tempfile::tempdir().expect("owned keg directory");
+        let tool = thin(
+            &[
+                dylib_command(LOAD_DYLIB, "/usr/lib/libSystem.B.dylib", true),
+                dylib_command(LOAD_DYLIB, "@rpath/libfoo.dylib", true),
+            ],
+            true,
+        );
+        std::fs::write(files.path().join("tool"), &tool).unwrap();
         assert_eq!(
-            linked_dylibs(
-                "/x/tool:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n\t@rpath/libfoo.dylib (compatibility version 1.0.0, current version 2.0.0)\n"
-            ),
+            linked_dylibs(&files.path().join("tool")).unwrap(),
             ["/usr/lib/libSystem.B.dylib", "@rpath/libfoo.dylib"]
         );
-        assert!(is_macho(&[0xcf, 0xfa, 0xed, 0xfe]));
-        assert!(!is_macho(b"#!/bin/sh"));
-
-        let output = b"/x/tool:\n\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n";
+        let lib = thin(
+            &[
+                dylib_command(ID_DYLIB, "@rpath/libfoo.dylib", false),
+                dylib_command(LOAD_DYLIB, "/usr/lib/libSystem.B.dylib", false),
+            ],
+            false,
+        );
+        std::fs::write(files.path().join("libfoo"), fat(&[lib.clone(), lib], true)).unwrap();
         assert_eq!(
-            linkage_capture(Ok((true, output, b""))).unwrap(),
+            linked_dylibs(&files.path().join("libfoo")).unwrap(),
+            ["@rpath/libfoo.dylib", "/usr/lib/libSystem.B.dylib"]
+        );
+        let watch = thin32(
+            &[dylib_command32(
+                LOAD_DYLIB,
+                "/usr/lib/libSystem.B.dylib",
+                true,
+            )],
+            true,
+        );
+        std::fs::write(files.path().join("watch"), &watch).unwrap();
+        assert!(is_macho(&watch[..8]));
+        assert_eq!(
+            linked_dylibs(&files.path().join("watch")).unwrap(),
             ["/usr/lib/libSystem.B.dylib"]
         );
+        std::fs::write(
+            files.path().join("libx.a"),
+            fat(&[archive(), archive()], false),
+        )
+        .unwrap();
         assert!(
-            linkage_capture(Ok((true, b"/x/static:\n", b"")))
+            linked_dylibs(&files.path().join("libx.a"))
                 .unwrap()
                 .is_empty()
         );
-        assert!(linkage_capture(Err("captured launch refusal")).is_err());
-        assert!(linkage_capture(Ok((false, b"", b"captured failure"))).is_err());
-        assert!(linkage_capture(Ok((false, output, b"captured failure"))).is_err());
+        std::fs::write(files.path().join("static"), thin(&[], true)).unwrap();
+        assert!(
+            linked_dylibs(&files.path().join("static"))
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(files.path().join("cut"), &tool[..40]).unwrap();
+        assert!(
+            linked_dylibs(&files.path().join("cut"))
+                .is_err_and(|e| e.starts_with("inspection failed: malformed"))
+        );
+        assert!(linked_dylibs(&files.path().join("absent")).is_err());
 
         let scratch = aterm_tempfile::tempdir().expect("owned library directory");
         let library = scratch.path().join("libok.dylib");

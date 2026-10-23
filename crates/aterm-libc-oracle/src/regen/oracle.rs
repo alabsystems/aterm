@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The conformance oracle's cell module, `libc-oracle/conformance/src/
-//! cell_<cell>.rs`, written from the reference's rustdoc over the cell's
-//! declaration set, and its COVERAGE AUDIT.
-//!
-//! Every assertion compares the shim (`libc_shim`) with the reference
-//! (`libc_real`): each constant's type and value, each function's signature,
-//! each type's size and alignment, each public field's offset and type, each
-//! discriminant, each alias's identity, each `siginfo_t` accessor's signature,
-//! and the behaviour of every hand-written body ([`super::behaviour`]).
-//!
-//! The ledger records what was actually asserted, name by name and field by
-//! field, and the audit diffs it against what the shim DECLARES ([`Decls`], the
-//! emitter's own input) — never against the list the assertions came from, which
-//! would share their blind spot and read zero uncovered forever.
+//! The conformance oracle's cell module, `libc-oracle/conformance/src/ cell_<cell>.rs`, written
+//! from the reference's rustdoc over the cell's declaration set, and its COVERAGE AUDIT.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -126,8 +114,6 @@ impl<'d> Reference<'d> {
                 if self.public.contains_key(segment) || PRIMS.contains(&segment) {
                     format!("{krate}::{segment}{args}")
                 } else if segment == "Option" {
-                    // core's own `Option`, ONE type in both crates: written
-                    // unqualified, its argument carries the contract.
                     format!("Option{args}")
                 } else {
                     return Err(format!("an unresolved named type {segment}"));
@@ -396,12 +382,10 @@ impl Asserter<'_, '_> {
 
     fn missing(&mut self, name: &str) {
         if name == "c_void" {
-            // An opaque enum, not a value type: its layout is its contract.
             self.size_align("c_void");
             self.ledger.count("prim");
             self.ledger.check(name, "prim_layout");
         } else if PRIMS.contains(&name) {
-            // Identity coercion BOTH ways: the same type, not two of one width.
             self.identity(name);
             self.ledger.count("prim");
             self.ledger.check(name, "prim_identity");
@@ -437,7 +421,6 @@ impl Asserter<'_, '_> {
             ));
             self.ledger.count("const_value_rt");
         } else {
-            // A struct-valued initialiser: compared byte for byte.
             self.lines.extend([
                 "const _: () = {".to_string(),
                 format!("    const NS: usize = ::core::mem::size_of::<{shim_ty}>();"),
@@ -480,12 +463,10 @@ impl Asserter<'_, '_> {
             && r.transparent(sig.get("output").unwrap_or(&Value::Null), 0);
         let real_ty = fn_type(REAL)?;
         if shared {
-            // The strongest form: both items coerce to ONE fn-pointer type.
             self.line(format!("const _: {real_ty} = {SHIM}::{name};"));
             self.line(format!("const _: {real_ty} = {REAL}::{name};"));
             self.ledger.count("fn_shared");
         } else {
-            // Mirrored: one shape, each in its own crate's nominal types.
             self.line(format!("const _: {} = {SHIM}::{name};", fn_type(SHIM)?));
             self.line(format!("const _: {real_ty} = {REAL}::{name};"));
             self.ledger.count("fn_mirrored");
@@ -534,15 +515,12 @@ impl Asserter<'_, '_> {
                 format!("|v| v.{f}")
             };
             if r.transparent(ty, 0) {
-                // The field has ONE type in both crates.
                 let real_ty = r.render(ty, REAL)?;
                 self.line(format!(
                     "const _: fn({SHIM}::{name}) -> {real_ty} = {read};"
                 ));
                 self.ledger.count("field_type");
             } else {
-                // A named type of this cell, pinned on each side to its own
-                // crate's item of that name, whose own shape is asserted in turn.
                 let (shim_ty, real_ty) = (r.render(ty, SHIM)?, r.render(ty, REAL)?);
                 self.line(format!(
                     "const _: fn({SHIM}::{name}) -> {shim_ty} = {read};"
@@ -563,8 +541,6 @@ impl Asserter<'_, '_> {
             self.ledger.count("struct_opaque");
         }
         if name == "siginfo_t" {
-            // The exact public inherent method set, each signature pinned; the
-            // receiver makes every one nominal.
             for (method, function) in r.inherent_methods(name)? {
                 let shim_ty = r.method_type(name, function, SHIM)?;
                 let real_ty = r.method_type(name, function, REAL)?;
@@ -606,14 +582,10 @@ impl Asserter<'_, '_> {
         let r = self.reference;
         let ty = inner.get("type").unwrap_or(&Value::Null);
         if r.transparent(ty, 0) {
-            // Identity coercion: the two aliases are the SAME type.
             self.identity(name);
             self.ledger.count("alias_identity");
             self.ledger.check(name, "alias_identity");
         } else {
-            // A nominal referent is a distinct type in each crate, so pin each
-            // alias both ways to the reference type rendered into its own crate:
-            // size and alignment alone let a pointer drift to any of one width.
             for krate in [SHIM, REAL] {
                 let target = r.render(ty, krate)?;
                 self.line(format!("const _: fn({krate}::{name}) -> {target} = |x| x;"));
@@ -656,8 +628,8 @@ pub struct Generated {
     pub checked_items: usize,
     pub checked_members: usize,
     pub runtime_tests: usize,
-    /// Coverage-audit failures: each a declaration or body the oracle does not
-    /// check, or a check of something the shim does not declare.
+    /// Coverage-audit failures: each a declaration or body the oracle does not check, or a check of
+    /// something the shim does not declare.
     pub audit: Vec<String>,
 }
 
@@ -761,7 +733,6 @@ fn coverage(decls: &Decls, ledger: &Ledger) -> Vec<String> {
 }
 
 /// The cell's oracle module and its audit.
-///
 /// # Errors
 /// When the reference holds an item or type the oracle cannot check.
 pub fn emit(
@@ -955,36 +926,28 @@ mod tests {
         let text = &generated.text;
         let triple = "aarch64-apple-darwin";
         for want in [
-            // A transparent constant shares one type pin; its value is compared.
             "const _: libc_real::c_int = libc_shim::K;".to_string(),
             format!("const _: () = assert!(libc_shim::K as i128 == libc_real::K as i128, \"libc constant K differs on {triple}\");"),
-            // A transparent signature coerces to ONE fn-pointer type...
             "const _: unsafe extern \"C\" fn(libc_real::t, ...) = libc_shim::g;".into(),
-            // ...a nominal one is mirrored, each crate in its own types.
             "const _: unsafe extern \"C\" fn(libc_shim::e) -> libc_shim::c_int = libc_shim::f;".into(),
             "const _: unsafe extern \"C\" fn(libc_real::e) -> libc_real::c_int = libc_real::f;".into(),
-            // A field of alias type shares its type; one of enum type mirrors.
             "const _: fn(libc_shim::s) -> libc_real::t = |v| v.x;".into(),
             "const _: fn(libc_shim::s) -> libc_shim::e = |v| v.y;".into(),
             "const _: fn(libc_real::s) -> libc_real::e = |v| v.y;".into(),
             "// s: has private fields; size_of/align_of are the only public contract for them".into(),
             format!("const _: () = assert!(libc_shim::e::A as i128 == libc_real::e::A as i128, \"libc e::A: discriminant differs on {triple}\");"),
-            // A nominal alias is pinned both ways inside each crate.
             "const _: fn(libc_shim::n) -> *mut libc_shim::s = |x| x;".into(),
             "const _: fn(*mut libc_real::s) -> libc_real::n = |x| x;".into(),
             "const _: fn(libc_shim::c_int) -> libc_real::c_int = |x| x;".into(),
             format!("const _: () = assert!(::core::mem::size_of::<libc_shim::c_void>() == ::core::mem::size_of::<libc_real::c_void>(), \"libc c_void: size_of differs on {triple}\");"),
             "// !! gone: ABSENT from oracle libc on this cell".into(),
-            // A pointer constant is compared where it can be evaluated: natively.
             "    #[test] fn const_p() { assert_eq!(libc_shim::P as usize, libc_real::P as usize, \"libc pointer constant P differs\"); }".into(),
-            // Each public inherent accessor's signature, pinned per crate.
             "const _: unsafe fn(&libc_shim::siginfo_t) -> libc_shim::c_int = libc_shim::siginfo_t::si_pid;".into(),
             "const _: unsafe fn(&libc_real::siginfo_t) -> libc_real::c_int = libc_real::siginfo_t::si_pid;".into(),
         ] {
             assert!(text.lines().any(|line| line == want), "missing: {want}\n{text}");
         }
         assert!(text.contains("    #[test] fn behaviour_siginfo_si_pid() { unsafe {"));
-        // The reference here has one accessor; the Darwin family emits five.
         assert_eq!(
             generated.audit,
             [
@@ -1008,7 +971,6 @@ mod tests {
         let mut decls = decls::read(&parsed, &public, &union).expect("declarations");
         let clean = emit(&crate::cells::CELLS[0], &parsed, &public, &decls).expect("emits");
         assert_eq!(clean.audit.len(), 1, "only the fixture's missing accessors");
-        // A field the oracle never saw, declared on the shim's side.
         decls.structs.push(crate::regen::decls::Record {
             name: "s".into(),
             repr: None,

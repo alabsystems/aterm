@@ -7,8 +7,7 @@
 use crate::error::{Error, Result};
 use crate::path;
 
-/// A repository, `owner/name`. Compared, ordered and hashed by `key()`, case-insensitively;
-/// shown as given.
+/// A repository, `owner/name`, compared case-insensitively and shown as given.
 #[derive(Clone, Debug)]
 pub struct Slug {
     owner: String,
@@ -38,8 +37,7 @@ impl Slug {
     ///
     /// # Errors
     ///
-    /// Usage: `not an owner name: "{owner}" (1-39 of A-Z a-z 0-9 -, not starting with -)`, or
-    /// `not a repository name: "{repo}" (1-100 of A-Z a-z 0-9 . _ -, not . or ..)`.
+    /// Returns a usage error if `owner` or `repo` is not a valid GitHub name.
     pub fn new(owner: &str, repo: &str) -> Result<Slug> {
         if !owner_ok(owner) {
             return Err(Error::usage(format!(
@@ -116,8 +114,6 @@ impl Slug {
 impl PartialEq for Slug {
     #[inline]
     fn eq(&self, other: &Slug) -> bool {
-        // `Slug::new` holds both halves to ASCII, so each half's case-insensitive equality is
-        // `key()`'s equality.
         self.owner.eq_ignore_ascii_case(&other.owner) && self.repo.eq_ignore_ascii_case(&other.repo)
     }
 }
@@ -162,8 +158,7 @@ pub enum RepoArg {
     Target(String),
 }
 
-/// Whether `name` is a target name: `[a-z][a-z0-9-]{0,31}` (L10's one rule,
-/// `config::is_row_name`).
+/// Whether `name` is a target name: `[a-z][a-z0-9-]{0,31}` (`config::is_row_name`).
 #[inline]
 pub(crate) fn target_name_ok(name: &str) -> bool {
     crate::config::is_row_name(name)
@@ -174,9 +169,7 @@ impl RepoArg {
     ///
     /// # Errors
     ///
-    /// Usage: `not a target name: "{text}"`;
-    /// `no cwd inference in M1: name the repository (OWNER/NAME or @TARGET)`; or
-    /// `Slug::parse`'s errors.
+    /// Returns a usage error if `text` is `.` or an invalid target or repository name.
     pub fn parse(text: &str) -> Result<RepoArg> {
         if text == "." {
             return Err(Error::usage(
@@ -205,17 +198,11 @@ pub struct ContentRef {
 }
 
 impl ContentRef {
-    /// With `with_repo`, a leading `@target` runs to the next `@` or `:`, and an `owner/name`
-    /// runs to the first `@` or `:`. Then `@REF` runs to the first `:`, and `:PATH` is the rest
-    /// with any leading `/` stripped. An empty PATH (`:`) is `Some("")`, the root. No `:` is
-    /// `None`.
+    /// Parses `[REPO][@REF][:PATH]`, stripping any leading `/` from `PATH`.
     ///
     /// # Errors
     ///
-    /// Usage: `an empty @REF: name a branch, tag or sha`; `"{text}" holds a . or .. part: agh
-    /// sends no dot-segment`, for a REF or a PATH with one (`path::has_dot_segment`), because
-    /// a server that resolved it would move the request off the repository it was routed
-    /// for; and `RepoArg::parse`'s errors.
+    /// Returns a usage error for an empty `@REF`, a dot-segment, or an invalid `RepoArg`.
     pub fn parse(text: &str, with_repo: bool) -> Result<ContentRef> {
         let mut rest = text;
         let mut repo = None;

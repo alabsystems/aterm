@@ -4,13 +4,6 @@
 //! The census's reads of the checkout it walks. The walkers ask here, never
 //! `std::fs` directly, and outside tests each function is the `std::fs` call
 //! it names.
-//!
-//! Under `cfg(test)` a path under a [`memory::Tree`]'s root is answered from
-//! that tree's files instead, so a test hands a census a synthetic workspace
-//! held in memory: the thirty-odd files a fixture workspace needs cost no
-//! create, write or unlink, which a suite of them paid per tree and, run in
-//! parallel, paid mostly in file-system contention. A path under no tree's
-//! root reads the disk, as in production.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,10 +45,7 @@ pub(crate) fn exists(path: &Path) -> bool {
     path.exists()
 }
 
-/// The entries of the directory at `path`, each as `path` joined with its
-/// name or as the error reading it, in no promised order
-/// (`std::fs::read_dir`). The caller decides what an unreadable entry means:
-/// a walk that must fail closed stops on it, a lookup skips it.
+/// List the entries of the directory at `path`.
 pub(crate) fn read_dir(path: &Path) -> io::Result<Vec<io::Result<PathBuf>>> {
     #[cfg(test)]
     if let Some(answer) = memory::answer(path, |files, rel| files.read_dir(path, rel)) {
@@ -68,8 +58,6 @@ pub(crate) fn read_dir(path: &Path) -> io::Result<Vec<io::Result<PathBuf>>> {
 
 #[cfg(test)]
 pub(crate) mod memory {
-    //! Checkouts held in memory for the census's tests (module doc).
-
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
     use std::path::{Path, PathBuf};
@@ -175,16 +163,13 @@ pub(crate) mod memory {
         Some(ask(files, rel))
     }
 
-    /// A checkout held in memory while this lives. It derefs to its root, a
-    /// path that is nowhere on the disk, so it is handed to a census as any
-    /// checkout is.
+    /// A checkout held in memory while this value lives.
     pub(crate) struct Tree {
         root: PathBuf,
     }
 
     impl Tree {
-        /// A tree of `files` (repo-relative path, contents); `name` labels
-        /// its root.
+        /// Create an in-memory tree of `files` labeled `name`.
         pub(crate) fn new(name: &str, files: &[(String, String)]) -> Self {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let root = Path::new("/aterm-census-memory").join(format!("{name}-{n}"));
@@ -216,19 +201,14 @@ pub(crate) mod memory {
             }
         }
 
-        /// Make the entry at `rel` unreadable: a listing of its directory
-        /// yields an error in its place, as a `readdir` that fails partway
-        /// through a directory does on the disk, which no test can make
-        /// happen there.
+        /// Mark the entry at `rel` unreadable during directory listing.
         pub(crate) fn unreadable(&self, rel: &str) {
             if let Some(files) = trees().get_mut(&self.root) {
                 files.unreadable.insert(PathBuf::from(rel));
             }
         }
 
-        /// Make the directory at `rel` unlistable: its parent lists it and it
-        /// is a directory, but a listing of it is refused (`PermissionDenied`),
-        /// as the disk refuses a directory its reader may not read.
+        /// Mark the directory at `rel` unlistable (`PermissionDenied`).
         pub(crate) fn unlistable(&self, rel: &str) {
             if let Some(files) = trees().get_mut(&self.root) {
                 files.unlistable.insert(PathBuf::from(rel));
@@ -327,7 +307,6 @@ pub(crate) mod memory {
             );
             let on_disk = answers(&disk, &queries);
             assert_eq!(answers(&tree, &queries), on_disk);
-            // The answers are not vacuous: the disk read, listed and refused.
             assert!(on_disk.iter().any(|a| a.contains("Ok(\"// a\\n\")")));
             assert!(on_disk.iter().any(|a| a.contains("IsADirectory")));
             assert!(on_disk.iter().any(|a| a.contains("NotADirectory")));

@@ -252,7 +252,6 @@ fn step(model: &Model, state: &mut State, s: &Scene, frame: PetFrame, action: &s
 #[test]
 fn real_cursor_home_placement_conforms_and_rejects_the_historical_hidden_body() {
     let model = console_cursor_home_model();
-    aterm_spec::verify::prove_and_catch_scalar(&model, "real cursor-home placement");
     let mut s = Scene::dense(false);
     s.term.process(
         b"\x1b[3;100H\x1b]133;A\x07> \x1b]133;B\x07build\r\n\x1b]133;C\x07output\x1b[55;3H",

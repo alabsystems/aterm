@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE POKE: anything in this process that SEES the disk full — a write
-//! that failed with `ENOSPC` or `EDQUOT`, a driven Claude Code's "Transcript
-//! writes are failing (disk full — ENOSPC)" on its screen — asks the window's
-//! disk watch to look NOW instead of at its next probe.
-//!
-//! A poke removes nothing: it asks for a measurement. What a pass then
-//! removes is decided by the measured free figure and the watch's
-//! witnesses, so a misread screen costs one `statvfs` and nothing else.
-//! The host registers the one handler ([`set_handler`]); without one (a
-//! process with no disk watch: the CLI) a poke does nothing. What the watch
-//! makes of a screen's poke is journalled into `disk.jsonl` by the host
-//! (`cli::disk_poke_journal`), where `aterm harness disk` reads it.
+//! THE POKE: anything in this process that SEES the disk full.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -28,8 +17,8 @@ pub enum Cause {
     },
     /// A write of aterm's own failed for want of space (`what` failed).
     Write(String),
-    /// An agent's wait (`await sys free>=`) needs `need` bytes the volume
-    /// does not have: a DEMAND, which the next pass adopts.
+    /// An agent's wait (`await sys free>=`) needs `need` bytes the volume does not have: a DEMAND,
+    /// which the next pass adopts.
     Demand {
         /// The session that waits.
         sid: String,
@@ -63,8 +52,8 @@ pub fn set_handler(handler: Handler) {
     *HANDLER.lock().unwrap_or_else(PoisonError::into_inner) = Some(handler);
 }
 
-/// Ask the disk watch to look now, for `cause`: handed to the handler when
-/// one is registered, and nothing otherwise.
+/// Ask the disk watch to look now, for `cause`: handed to the handler when one is registered, and
+/// nothing otherwise.
 pub fn poke(cause: Cause) {
     let handler = HANDLER
         .lock()
@@ -75,8 +64,7 @@ pub fn poke(cause: Cause) {
     }
 }
 
-/// Is `e` the file system saying it is out of space or quota (`ENOSPC`,
-/// `EDQUOT`)?
+/// Is `e` the file system saying it is out of space or quota (`ENOSPC`, `EDQUOT`)?
 #[must_use]
 pub fn is_out_of_space(e: &std::io::Error) -> bool {
     matches!(

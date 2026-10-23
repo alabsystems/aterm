@@ -2152,7 +2152,7 @@ impl RawCapture {
     /// The bytes this capture holds.
     #[must_use]
     #[inline]
-    pub fn allocation(&self) -> usize {
+    pub const fn allocation(&self) -> usize {
         self.bytes.capacity()
     }
 
@@ -2613,7 +2613,7 @@ impl PresentedFrameTap {
         }
     }
 
-    fn apply_transition(
+    const fn apply_transition(
         &mut self,
         event: PresentedFrameEvent,
         t_us: Option<u64>,
@@ -2764,7 +2764,7 @@ impl PresentedFrameTap {
 
     /// Whether this one-shot stages through the armed (Metal) arm.
     #[cfg(target_os = "macos")]
-    pub(crate) fn tap_is_metal(&self) -> bool {
+    pub(crate) const fn tap_is_metal(&self) -> bool {
         !self.buffer.is_wgpu()
     }
 
@@ -2924,7 +2924,7 @@ impl PresentedFrameTap {
 }
 
 /// IEEE 754 half → f32, local so this module needs no renderer helper.
-fn f16_to_f32(bits: u16) -> f32 {
+const fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let frac = (bits & 0x3ff) as u32;

@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE LISTERS: one directory's entries with the attributes a walk sums, a
-//! bounded batch per call, read relative to the directory's descriptor.
-//!
-//! * macOS: `getattrlistbulk` with one 16 KiB buffer per depth level (a shared
-//!   buffer corrupted the parent's parse in the first probe), about 100-150
-//!   entries a call; the child directory's entry count comes free
-//!   (`ATTR_DIR_ENTRYCOUNT`), and the private size on request
-//!   (`ATTR_CMNEXT_PRIVATESIZE`).
-//! * Linux: `getdents64` into the same buffer, then one `statx(…,
-//!   AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT)` per entry.
-//! * Portable (any Unix, and the native arms' oracle in tests): `readdir` and
-//!   one `fstatat(…, AT_SYMLINK_NOFOLLOW)` per entry. macOS uses it for a
-//!   directory that holds a remote or automounted mount point, whose name it
-//!   skips unread.
-//!
-//! None opens a regular file or follows a symlink.
+//! THE LISTERS: one directory's entries with the attributes a walk sums, a bounded batch per call,
+//! read relative to the directory's descriptor.
 
 /// What one entry is.
 #[cfg(unix)]
@@ -32,7 +18,7 @@ pub(crate) enum Kind {
     Other,
 }
 
-/// One entry as a lister read it. `name` borrows the lister's buffer.
+/// One entry as a lister read it.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EntryRef<'a> {
@@ -84,8 +70,8 @@ pub enum ListerChoice {
     /// The platform's bulk lister (`getattrlistbulk`, `getdents64` + `statx`).
     #[default]
     Native,
-    /// `readdir` + `fstatat` everywhere: the fallback, and the oracle the
-    /// native arms are tested against.
+    /// `readdir` + `fstatat` everywhere: the fallback, and the oracle the native arms are tested
+    /// against.
     Portable,
 }
 
@@ -93,24 +79,17 @@ pub enum ListerChoice {
 #[cfg(unix)]
 pub(crate) const LEVEL_BUFFER: usize = 16 * 1024;
 
-/// A device number as every lister and `fstat` spell it, so a child's device
-/// compares equal to its root's whichever call read each (a mismatch makes
-/// every subfolder a mount boundary, never entered).
-///
-/// * macOS: `dev_t` is an `i32`, and `getattrlistbulk`'s `ATTR_CMN_DEVID` is
-///   its `u32` bits; a volume whose number has the top bit set (`/dev` reads
-///   -801893391 here) would sign-extend under a plain cast, so both read as
-///   the same 32 unsigned bits.
-/// * Linux: `fstat`'s `st_dev` is glibc's and the kernel's `makedev`
-///   encoding, which [`dev_of_parts`] builds from `statx`'s major and minor.
+/// A device number as every lister and `fstat` spell it, so a child's device compares equal to its
+/// root's whichever call read each (a mismatch makes every subfolder a mount boundary, never
+/// entered).
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub(crate) fn dev_of(st_dev: libc::dev_t) -> u64 {
     u64::from(u32::from_ne_bytes(st_dev.to_ne_bytes()))
 }
 
-/// A device number as every lister and `fstat` spell it (see the macOS arm):
-/// Linux's `dev_t` is already the `u64` both read.
+/// A device number as every lister and `fstat` spell it (see the macOS arm): Linux's `dev_t` is
+/// already the `u64` both read.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) const fn dev_of(st_dev: libc::dev_t) -> u64 {
@@ -121,13 +100,11 @@ pub(crate) const fn dev_of(st_dev: libc::dev_t) -> u64 {
 #[cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux"))))]
 #[must_use]
 pub(crate) fn dev_of(st_dev: libc::dev_t) -> u64 {
-    // Through the alias: dev_t's width and sign differ across the other Unixes.
     st_dev as u64
 }
 
-/// `statx`'s device as `fstat`'s `st_dev` spells it: `makedev(major, minor)`
-/// (`(minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)` and the high
-/// bits), never `major << 32 | minor`.
+/// `statx`'s device as `fstat`'s `st_dev` spells it: `makedev(major, minor)` (`(minor & 0xff) |
+/// (major << 8) | ((minor & !0xff) << 12)` and the high bits), never `major << 32 | minor`.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) fn dev_of_parts(major: u32, minor: u32) -> u64 {
@@ -153,9 +130,7 @@ mod imp {
     }
 
     impl Lister {
-        /// A lister for one directory. `skip` names mount points it must not
-        /// ask anything (the macOS arm hands such a directory to the portable
-        /// lister, which skips names unread).
+        /// A lister for one directory.
         #[cfg_attr(
             not(target_vendor = "apple"),
             expect(
@@ -194,13 +169,10 @@ mod imp {
             }
         }
 
-        /// One bounded call: visit each entry it returned. `Ok(true)` while
-        /// more may follow, `Ok(false)` at the end.
-        ///
+        /// One bounded call: visit each entry it returned.
         /// # Errors
-        ///
-        /// The raw errno of a listing call that failed (the directory became
-        /// unreadable or vanished mid-listing).
+        /// The raw errno of a listing call that failed (the directory became unreadable or vanished
+        /// mid-listing).
         pub(crate) fn next_batch(
             &mut self,
             fd: BorrowedFd<'_>,
@@ -228,8 +200,8 @@ mod imp {
     }
 }
 
-/// Little-endian-agnostic native reads from a byte buffer, bounds-checked: the two
-/// listers that parse a kernel buffer (`getattrlistbulk` records, `getdents64` records).
+/// Little-endian-agnostic native reads from a byte buffer, bounds-checked: the two listers that
+/// parse a kernel buffer (`getattrlistbulk` records, `getdents64` records).
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 pub(crate) struct Rd<'a> {
     pub(crate) b: &'a [u8],
@@ -267,10 +239,6 @@ pub(crate) const fn any_exec(mode: u32) -> bool {
 
 #[cfg(target_vendor = "apple")]
 pub(crate) mod bulk {
-    //! `getattrlistbulk(2)`: `<sys/attr.h>` ABI values, stable since macOS
-    //! 10.10 (`ATTR_CMNEXT_PRIVATESIZE` since 10.15). Declared here because the
-    //! generated `libc` shim must match the pinned reference libc, which does
-    //! not export them; the tests hold every parsed field to `fstatat`.
 
     use super::{EntryRef, Kind, Rd, any_exec};
     use std::os::fd::{AsRawFd as _, BorrowedFd};
@@ -314,8 +282,6 @@ pub(crate) mod bulk {
     const VDIR: u32 = 2;
     const VLNK: u32 = 5;
 
-    // SAFETY (declaration): libSystem exports these with these C signatures on
-    // every supported macOS (`int` return, errno on failure).
     unsafe extern "C" {
         fn getattrlistbulk(
             dirfd: libc::c_int,
@@ -392,9 +358,9 @@ pub(crate) mod bulk {
             } else {
                 0
             };
-            // SAFETY: `fd` is a live directory descriptor, `al` a valid
-            // attrlist and `buf` writable for its length; the kernel writes at
-            // most that many bytes and answers how many entries it packed.
+            // SAFETY: `fd` is a live directory descriptor, `al` a valid attrlist and `buf` writable
+            // for its length; the kernel writes at most that many bytes and answers how many
+            // entries it packed.
             let n = unsafe {
                 getattrlistbulk(
                     fd.as_raw_fd(),
@@ -436,9 +402,7 @@ pub(crate) mod bulk {
         }
     }
 
-    /// One packed entry (its leading length included). Fields come in the
-    /// order `<sys/attr.h>` packs them: the returned set, the error, then the
-    /// common attributes by bit, the directory's, the file's, the extended.
+    /// One packed entry (its leading length included).
     pub(crate) fn parse(entry: &[u8], private: bool) -> Option<EntryRef<'_>> {
         let mut rd = Rd { b: entry, at: 4 };
         let common = rd.u32()?;
@@ -581,8 +545,8 @@ pub(crate) mod bulk {
         rd.u32().ok_or(libc::EIO)
     }
 
-    /// `ATTR_DIR_ENTRYCOUNT` of the directory `name` in `dir`, not following
-    /// a link, without listing or opening it.
+    /// `ATTR_DIR_ENTRYCOUNT` of the directory `name` in `dir`, not following a link, without
+    /// listing or opening it.
     pub(crate) fn entry_count_at(dir: BorrowedFd<'_>, name: &std::ffi::CStr) -> Result<u32, i32> {
         let mut al = AttrList {
             bitmapcount: ATTR_BIT_MAP_COUNT,
@@ -594,8 +558,8 @@ pub(crate) mod bulk {
             forkattr: 0,
         };
         let mut buf = [0u8; 16];
-        // SAFETY: a live descriptor, a NUL-terminated name, a valid attrlist
-        // and a 16-byte writable buffer.
+        // SAFETY: a live descriptor, a NUL-terminated name, a valid attrlist and a 16-byte writable
+        // buffer.
         let r = unsafe {
             getattrlistat(
                 dir.as_raw_fd(),
@@ -616,9 +580,6 @@ pub(crate) mod bulk {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod dents {
-    //! `getdents64(2)` and `statx(2)`, issued through `syscall(2)` so the arm
-    //! works on a musl or pre-2.28 glibc with no `statx` wrapper (as
-    //! aterm-dirfd issues `renameat2`). `<linux/stat.h>` ABI values.
 
     use super::{EntryRef, Kind, Rd, any_exec};
     use std::ffi::OsString;
@@ -700,8 +661,8 @@ pub(crate) mod dents {
             fd: BorrowedFd<'_>,
             visit: &mut dyn FnMut(&EntryRef<'_>),
         ) -> Result<bool, i32> {
-            // SAFETY: a live directory descriptor and a writable buffer of
-            // its length; the kernel fills at most that many bytes.
+            // SAFETY: a live directory descriptor and a writable buffer of its length; the kernel
+            // fills at most that many bytes.
             let n = unsafe {
                 libc::syscall(
                     SYS_GETDENTS64,
@@ -757,8 +718,7 @@ pub(crate) mod dents {
         };
         // SAFETY: `Statx` is integers: all-zero is a value.
         let mut st: Statx = unsafe { std::mem::zeroed() };
-        // SAFETY: a live descriptor, a NUL-terminated name and a writable
-        // 256-byte `statx` buffer.
+        // SAFETY: a live descriptor, a NUL-terminated name and a writable 256-byte `statx` buffer.
         let r = unsafe {
             libc::syscall(
                 SYS_STATX,
@@ -811,7 +771,6 @@ pub(crate) mod dents {
 
 #[cfg(unix)]
 pub(crate) mod portable {
-    //! `readdir` + `fstatat(…, AT_SYMLINK_NOFOLLOW)`.
 
     use super::{EntryRef, Kind, any_exec};
     use std::ffi::OsString;

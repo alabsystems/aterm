@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An app-band instance's launchd job (`aterm-lab band-launch`, the load
-//! `instance --band app` makes, whose first process is `aterm-lab band`) runs
-//! its program as launchd runs an app: it heads a coalition of its own, where
-//! a child of this test shares the test's coalition; it runs at darwin role
-//! `UI_FOCAL`; it is an APP-type task, so it may set its own darwin role as
-//! aterm-pty sets each shell's (a DAEMON-type task gets `ENOTSUP`); and it
-//! carries no QoS clamp, so a user-interactive thread lands at the UI band
-//! (46), where a `launchctl submit` job's `ProcessType` `Standard` lands at 20.
-//! Once its program ends (the lifeline cut), launchd's KeepAlive restart
-//! removes the job by its label instead of starting the program again.
-//!
-//! The program is `aterm-lab band-standin` in aterm's place: it records one
-//! line per start (its role, whether its own role change took, and the
-//! priority a user-interactive request landed at), then reads the lifeline to
-//! its end of file.
+//! Tests that `aterm-lab band-launch` runs in its own app coalition and removes the job.
 
 #![cfg(target_os = "macos")]
 
@@ -26,16 +12,13 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::Stdio;
 
-/// A hang detector, never a latency budget: the job's KeepAlive restart, which
-/// removes it, comes its `ThrottleInterval` (1 s) after the program ends.
+/// A hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
 /// `PRIO_DARWIN_ROLE_UI_FOCAL`, the role the job's program must start at.
 const UI_FOCAL: i32 = 1;
 
-/// The base priority of a user-interactive thread at role `UI` (aterm-pty's
-/// role for a shell, which the stand-in takes): 46. Under launchd's utility
-/// clamp it is 20.
+/// The base priority of a user-interactive thread at role `UI` (46).
 const UI_BAND: i32 = 46;
 
 /// `pid`'s resource and jetsam coalition ids (`PROC_PIDCOALITIONINFO`, 20).
@@ -57,17 +40,13 @@ fn launchctl(args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// The job `label` in this user's GUI domain, where `band-launch` loads it:
-/// asked and removed by that domain, never through the legacy `list` and
-/// `remove`, which read the caller's (another one over SSH, where a check of
-/// the job's removal would pass with the job still loaded).
+/// The job `label` in this user's GUI domain, where `band-launch` loads it.
 fn target(label: &str) -> String {
     // SAFETY: `getuid` takes no arguments and cannot fail.
     format!("gui/{}/{label}", unsafe { libc::getuid() })
 }
 
-/// Removes the job by its label however the test ends, so a failing run
-/// leaves no KeepAlive job behind for launchd to restart.
+/// Removes the job by its label however the test ends.
 struct Loaded<'a>(&'a str);
 
 impl Drop for Loaded<'_> {
@@ -87,8 +66,7 @@ fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The job's world: its environment file and the lifeline FIFO, whose held
-/// end is returned.
+/// The job's world: its environment file and the lifeline FIFO, whose held end is returned.
 fn world(dir: &Path) -> OwnedFd {
     let fifo = dir.join("band.lifeline");
     let c = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("path");
@@ -109,7 +87,6 @@ fn world(dir: &Path) -> OwnedFd {
 
 #[test]
 fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_removed_once_it_ends() {
-    // First declared, so the job-removal guard and FIFO end drop before its world.
     let owned_world = aterm_tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("exclusive scratch world");
     let dir = owned_world.path().to_path_buf();
@@ -163,8 +140,6 @@ fn an_app_band_job_runs_its_program_as_an_app_in_its_own_coalition_and_is_remove
     let _ = child.wait();
     let job = coalition(pid);
     let loaded = launchctl(&["print", &target(&label)]);
-    // The job's end: its lifeline cut, the program reads end of file and exits;
-    // launchd restarts the job, which removes itself by its label.
     drop(held);
     wait_for("the job's removal", || {
         (!launchctl(&["print", &target(&label)])).then_some(())

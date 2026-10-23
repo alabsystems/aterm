@@ -121,14 +121,14 @@ impl RcBlock {
     /// The block pointer, borrowed.
     #[inline]
     #[must_use]
-    pub fn as_ptr(&self) -> *mut c_void {
+    pub const fn as_ptr(&self) -> *mut c_void {
         self.ptr.as_ptr()
     }
 
     /// The same pointer typed as [`BlockPtr`] (`"@?"`), for a block that is an argument of a declared method or another block.
     #[inline]
     #[must_use]
-    pub fn as_block_ptr(&self) -> BlockPtr {
+    pub const fn as_block_ptr(&self) -> BlockPtr {
         BlockPtr(self.ptr.as_ptr())
     }
 
@@ -207,7 +207,7 @@ macro_rules! block_ctor {
 
                 /// `_Block_copy` has already `memmove`d the closure, which is
                 /// the Rust move; there is nothing left to copy.
-                unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
+                const unsafe extern "C" fn copy_helper(_dst: *mut c_void, _src: *const c_void) {}
 
                 /// Guarded like `invoke`, so a panicking `Drop` in a capture
                 /// aborts with a name rather than Rust's anonymous message.

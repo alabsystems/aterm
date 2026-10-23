@@ -198,8 +198,8 @@ pub struct GateOpts {
 pub struct GateReport {
     /// Short (8-hex) HEAD sha for the banner.
     pub head_short: String,
-    /// The gh account name, when it could be parsed from `gh auth status`.
-    pub gh_account: Option<String>,
+    /// The login the release token speaks as (`GET /user`); `None` when none was asked.
+    pub github_login: Option<String>,
     /// Free disk in GiB at gate time.
     pub free_disk_gib: u64,
     /// `Some(version)` when the public update channel's source tree was read and carries exactly this version.
@@ -233,14 +233,14 @@ pub fn run_all(
     }
     own_cutter_gate(git, &head, opts.allow_stale_cutter)?;
     tag_free(git, &opts.version)?;
-    let gh_account = gh_auth()?;
+    let github_login = github_identity_gate(opts.offline)?;
     let free_disk_gib = disk_gate(tree)?;
     let processes_checked =
         staged_bundle_liveness_gate(&state.join("dist"), &crate::bundle::running_processes)?;
     let channel_version = channel_version_gate(tree, &opts.version, opts.offline)?;
     Ok(GateReport {
         head_short: head.chars().take(8).collect(),
-        gh_account,
+        github_login,
         free_disk_gib,
         channel_version,
         processes_checked,
@@ -1335,16 +1335,16 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
 
     let out = channel_api(&format!("repos/{slug}/contents/Cargo.toml?ref=main"))?;
 
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !is_not_found(&err) {
+    if out.status != 200 {
+        if out.status != 404 {
             return Err(Error::new(format!(
-                "cannot read Cargo.toml from the public channel {slug}: {}",
-                err.trim()
+                "cannot read Cargo.toml from the public channel {slug}: HTTP {}: {}",
+                out.status,
+                out.message()
             )));
         }
         let probe = channel_api(&format!("repos/{slug}"))?;
-        if !probe.status.success() {
+        if probe.status != 200 {
             return Err(Error::new(format!(
                 "the public channel {slug} is not readable with the available credential, so \
                  this cut cannot confirm it carries v{version} (GitHub's 404 means missing \
@@ -1355,86 +1355,221 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
         return Ok(None);
     }
 
-    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    let body = String::from_utf8_lossy(&out.body).to_string();
     match channel::check_channel_version(version, &body)? {
         channel::ChannelVersion::Agrees => Ok(Some(version.to_string())),
         channel::ChannelVersion::NoManifest => Ok(None),
     }
 }
 
-/// One `gh api` call against the public channel, credentialed for the release org: the
-/// channel is a different org than the dev remote, whose `gh auth` account can read it
-/// (a pull) but has no push there; the release org's token, when present, reads it as
-/// the publisher.
-fn channel_api(path: &str) -> Result<std::process::Output> {
-    let mut command = command("gh");
-    command
-        .arg("api")
-        .arg(path)
-        .args(["-H", "Accept: application/vnd.github.raw"]);
-    if let Some(token) = crate::publish::channel_token() {
-        command.env("GH_TOKEN", token);
+/// One raw read of `path` on the public channel ([`crate::github::raw`]), as the release org's token when present, else anonymously; its answer, whatever the status.
+fn channel_api(path: &str) -> Result<aterm_update_core::github_rest::Answer> {
+    crate::github::raw(path)
+        .map_err(|e| Error::new(format!("cannot read the public channel ({path}): {e}")))
+}
+
+/// Whether the lock itself was observed missing/changed, or metadata could not prove it.
+#[derive(Debug)]
+pub enum LockedMetadataError {
+    /// Cargo.lock was observed missing or different from its prior bytes.
+    Lockfile(String),
+    /// The metadata check could not establish an exact offline resolution.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for LockedMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lockfile(why) | Self::Unavailable(why) => f.write_str(why),
+        }
     }
-    command
-        .output()
-        .map_err(|e| Error::new(format!("cannot run gh to read the public channel: {e}")))
 }
 
-/// Does this `gh` stderr report a 404 (`gh: Not Found (HTTP 404)` plus the JSON body)?
-fn is_not_found(stderr: &str) -> bool {
-    stderr.contains("404") || stderr.contains("Not Found")
+/// Prove the committed Cargo.lock resolves the workspace with no rewrite or network access.
+/// A failed Cargo invocation proves neither a stale lock nor a complete offline cache.
+pub fn locked_metadata_gate(repo: &Path) -> std::result::Result<(), LockedMetadataError> {
+    locked_metadata_gate_with(repo, None)
 }
 
-/// Prove the committed Cargo.lock resolves the workspace with no rewrite or network access, so a stale lock fails before the claim rather than dirtying the tree during the build.
-pub fn locked_metadata_gate(repo: &Path) -> Result<()> {
+fn locked_metadata_gate_with(
+    repo: &Path,
+    cargo_home: Option<&Path>,
+) -> std::result::Result<(), LockedMetadataError> {
+    use LockedMetadataError::{Lockfile, Unavailable};
     let lock_path = repo.join("Cargo.lock");
     let lock_before = fs::read(&lock_path).map_err(|error| {
-        Error::new(format!(
-            "read committed Cargo.lock before release metadata check: {error}"
-        ))
+        let why = format!("read committed Cargo.lock before release metadata check: {error}");
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Lockfile(why)
+        } else {
+            Unavailable(why)
+        }
     })?;
-    let targo = resolve_targo()?;
-    let out = command(&targo)
+    let targo = resolve_targo().map_err(|error| Unavailable(error.to_string()))?;
+    let mut metadata = command(&targo);
+    metadata
         .args(["metadata", "--locked", "--offline", "--format-version", "1"])
-        .current_dir(repo)
+        .current_dir(repo);
+    if let Some(home) = cargo_home {
+        metadata.env("CARGO_HOME", home);
+    }
+    let out = metadata
         .output()
-        .map_err(|error| Error::new(format!("failed to run locked targo metadata: {error}")))?;
+        .map_err(|error| Unavailable(format!("failed to run locked targo metadata: {error}")))?;
     let lock_after = match fs::read(&lock_path) {
         Ok(bytes) => bytes,
-        Err(read_error) => {
+        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
             fs::write(&lock_path, &lock_before).map_err(|restore_error| {
-                Error::new(format!(
+                Lockfile(format!(
                     "Cargo.lock disappeared during locked metadata ({read_error}) and restoring \
                      its exact prior bytes failed: {restore_error}"
                 ))
             })?;
-            return Err(Error::new(format!(
+            return Err(Lockfile(format!(
                 "Cargo.lock disappeared during locked metadata ({read_error}); exact prior bytes \
                  were restored"
+            )));
+        }
+        Err(read_error) => {
+            return Err(Unavailable(format!(
+                "read Cargo.lock after locked metadata: {read_error}"
             )));
         }
     };
     if lock_after != lock_before {
         fs::write(&lock_path, &lock_before).map_err(|error| {
-            Error::new(format!(
+            Lockfile(format!(
                 "locked Cargo metadata changed Cargo.lock and restoring its exact prior bytes \
                  failed: {error}"
             ))
         })?;
-        return Err(Error::new(
+        return Err(Lockfile(
             "locked Cargo metadata attempted to rewrite Cargo.lock; exact prior bytes were \
              restored — refresh and commit the lock before cutting"
                 .to_string(),
         ));
     }
     if !out.status.success() {
-        return Err(Error::new(format!(
-            "Cargo.lock is not an exact offline resolution of Cargo.toml — refresh and commit \
-             it before cutting: {}",
+        return Err(Unavailable(format!(
+            "locked offline Cargo metadata could not be verified; Cargo.lock is unchanged:\n{}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod locked_metadata_tests {
+    use super::*;
+
+    struct Fixture {
+        root: aterm_tempfile::TempDir,
+        cargo_home: PathBuf,
+        package: PathBuf,
+        lock: String,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            if let Err(none) = resolve_targo() {
+                aterm_spec::host::could_not_run(format!(
+                    "locked metadata requires the Trust toolchain: {none}"
+                ));
+            }
+            let root = aterm_tempfile::Builder::new()
+                .prefix("aterm-locked-metadata-")
+                .tempdir()
+                .unwrap();
+            let repo = root.path();
+            let cargo_home = repo.join("cargo-home");
+            let package = repo.join("vendor/offline-fixture-1.0.0");
+            for path in [repo.join("src"), repo.join(".cargo"), package.join("src")] {
+                fs::create_dir_all(path).unwrap();
+            }
+            fs::write(
+                repo.join("Cargo.toml"),
+                "[package]\nname = \"lock-gate-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n\n[dependencies]\noffline-fixture = \"=1.0.0\"\n",
+            )
+            .unwrap();
+            fs::write(repo.join("src/lib.rs"), "").unwrap();
+            fs::write(
+                repo.join(".cargo/config.toml"),
+                "[source.crates-io]\nreplace-with = \"fixture\"\n\n[source.fixture]\ndirectory = \"vendor\"\n",
+            )
+            .unwrap();
+            fs::write(
+                package.join("Cargo.toml"),
+                "[package]\nname = \"offline-fixture\"\nversion = \"1.0.0\"\nedition = \"2024\"\n",
+            )
+            .unwrap();
+            fs::write(package.join("src/lib.rs"), "").unwrap();
+            let checksum = "0".repeat(64);
+            fs::write(
+                package.join(".cargo-checksum.json"),
+                format!("{{\"files\":{{}},\"package\":\"{checksum}\"}}"),
+            )
+            .unwrap();
+            let lock = format!(
+                "version = 4\n\n[[package]]\nname = \"lock-gate-fixture\"\nversion = \"0.1.0\"\ndependencies = [\"offline-fixture\"]\n\n[[package]]\nname = \"offline-fixture\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{checksum}\"\n"
+            );
+            fs::write(repo.join("Cargo.lock"), &lock).unwrap();
+            Self {
+                root,
+                cargo_home,
+                package,
+                lock,
+            }
+        }
+
+        fn check(&self) -> std::result::Result<(), LockedMetadataError> {
+            locked_metadata_gate_with(self.root.path(), Some(&self.cargo_home))
+        }
+
+        fn assert_lock(&self, expected: &str) {
+            assert_eq!(
+                fs::read_to_string(self.root.path().join("Cargo.lock")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn exact_offline_registry_resolution_passes_without_touching_the_lock() {
+        let fixture = Fixture::new();
+        fixture.check().unwrap();
+        fixture.assert_lock(&fixture.lock);
+    }
+
+    #[test]
+    fn missing_offline_registry_dependency_does_not_prove_a_stale_lock() {
+        let fixture = Fixture::new();
+        fixture.check().unwrap();
+        fs::rename(&fixture.package, fixture.root.path().join("unavailable")).unwrap();
+        let error = fixture.check().unwrap_err();
+        assert!(
+            matches!(error, LockedMetadataError::Unavailable(_)),
+            "{error}"
+        );
+        fixture.assert_lock(&fixture.lock);
+    }
+
+    #[test]
+    fn missing_and_stale_locks_both_keep_admission_closed() {
+        let fixture = Fixture::new();
+        let path = fixture.root.path().join("Cargo.lock");
+        fs::remove_file(&path).unwrap();
+        let missing = fixture.check().unwrap_err();
+        assert!(matches!(missing, LockedMetadataError::Lockfile(_)));
+        assert!(!path.exists());
+        let stale = fixture.lock.replacen("0.1.0", "0.0.9", 1);
+        fs::write(&path, &stale).unwrap();
+        let error = fixture.check().unwrap_err();
+        assert!(
+            matches!(error, LockedMetadataError::Unavailable(_)),
+            "{error}"
+        );
+        fixture.assert_lock(&stale);
+    }
 }
 
 /// Releases are cut only on an arm64 Mac.
@@ -2266,38 +2401,30 @@ fn handoff_refusal(release: &str, missing: &str) -> Error {
     ))
 }
 
-/// `gh auth status` must succeed.
-pub fn gh_auth() -> Result<Option<String>> {
-    let out = command("gh")
-        .args(["auth", "status"])
-        .output()
-        .map_err(|e| {
-            Error::new(format!(
-                "failed to run `gh auth status` — is the GitHub CLI installed? ({e})"
-            ))
-        })?;
-    if !out.status.success() {
+/// The release token must be present and GitHub must take it (`GET /user` names its login), before the build; a run that publishes nothing asks no one.
+///
+/// # Errors
+/// No token in its file, a token GitHub refuses, or no answer from GitHub.
+pub fn github_identity_gate(offline: bool) -> Result<Option<String>> {
+    if offline {
+        return Ok(None);
+    }
+    let token_path = crate::publish::channel_token_path().map_or_else(
+        || "~/.secrets/gh_access_token_alabsystems".to_string(),
+        |path| path.display().to_string(),
+    );
+    if !crate::github::has_token() {
         return Err(Error::new(format!(
-            "`gh auth status` failed — run `gh auth login` first: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "no release token in {token_path}: the cut publishes as the release org's token, \
+             so put it there (one line, nothing else); nothing was claimed"
         )));
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let account = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find_map(|w| {
-            (w[0] == "account").then(|| {
-                w[1].trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
-                    .to_string()
-            })
-        });
-    Ok(account)
+    let user = crate::github::get("user").map_err(|e| {
+        Error::new(format!(
+            "GitHub did not take the release token in {token_path}: {e}; nothing was claimed"
+        ))
+    })?;
+    Ok(user["login"].as_str().map(str::to_string))
 }
 
 /// trustc's own words for "the off-switch took effect": the gate asks the compiler, not a

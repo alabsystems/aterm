@@ -1092,7 +1092,7 @@ mod unix {
 
     impl Approver {
         /// Whether an approver runs on this Mac now.
-        pub(super) fn runs(&self) -> bool {
+        pub(super) const fn runs(&self) -> bool {
             matches!(self, Approver::Running | Approver::Installed(_))
         }
     }
@@ -1132,7 +1132,7 @@ mod unix {
     }
 
     /// Who an approver for `approval` lets in.
-    fn joiner(approval: Approval) -> &'static str {
+    const fn joiner(approval: Approval) -> &'static str {
         match approval {
             Approval::Password => "a machine that types the join password",
             Approval::Open => "a machine that asks to join",

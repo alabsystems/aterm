@@ -4697,18 +4697,12 @@ impl App {
                                         .unwrap_or_default()
                                 })
                                 .collect();
-                            let top_rule = match prog {
-                                aterm_phase::Program::Muse => {
-                                    aterm_phase::muse::composer_rules(&rows).map(|(t, _)| t)
-                                }
-                                _ => aterm_phase::agy::composer_rules(&rows).map(|(t, _)| t),
-                            };
                             collect_agy_transcript_edits(
                                 &ws.input_scratch,
                                 prog,
                                 &rows,
                                 region,
-                                top_rule,
+                                None,
                                 blank,
                                 rule_cell,
                                 mark_fg,
@@ -7539,11 +7533,21 @@ fn collect_pill_relabel(
     true
 }
 
-/// Whether a bare ```` ``` ```` at `at` in `rows[..limit]` has a matching closing bare
-/// ```` ``` ```` before the next opening ```` ```lang ```` or user-prompt boundary.
-fn has_matching_closing_fence(rows: &[String], at: usize, limit: usize, is_muse: bool) -> bool {
-    for r in (at + 1)..limit {
-        let row_str = &rows[r];
+/// Whether row 0 of `rows[..limit]` begins inside a fenced code block whose
+/// opening fence scrolled off above the top of the viewport.
+fn starts_in_code_block(
+    rows: &[String],
+    limit: usize,
+    is_muse: bool,
+    card_range: &Option<std::ops::Range<usize>>,
+) -> bool {
+    let mut fences: Vec<(usize, bool)> = Vec::new();
+    let mut seg_end = limit;
+    for (r, row_str) in rows.iter().enumerate().take(limit) {
+        if card_range.as_ref().is_some_and(|rng| rng.contains(&r)) {
+            seg_end = r;
+            break;
+        }
         if is_muse {
             if row_str == "\u{276f}"
                 || row_str.starts_with("\u{276f} ")
@@ -7551,17 +7555,20 @@ fn has_matching_closing_fence(rows: &[String], at: usize, limit: usize, is_muse:
                 || row_str.starts_with("  \u{276f} ")
                 || row_str.starts_with("\u{25c6} ")
             {
-                return false;
+                seg_end = r;
+                break;
             }
         } else {
             if r > 0 && (row_str == ">" || row_str.starts_with("> ")) {
                 let prev = rows[r - 1].trim_end_matches(' ');
                 if prev.chars().count() >= 10 && prev.chars().all(|c| c == '\u{2500}') {
-                    return false;
+                    seg_end = r;
+                    break;
                 }
             }
             if row_str.starts_with("● ") {
-                return false;
+                seg_end = r;
+                break;
             }
         }
         let body = row_str
@@ -7570,31 +7577,70 @@ fn has_matching_closing_fence(rows: &[String], at: usize, limit: usize, is_muse:
             .unwrap_or(row_str)
             .trim_start();
         if let Some(after) = body.strip_prefix("```") {
-            return after.trim().is_empty();
+            fences.push((r, !after.trim().is_empty()));
         }
     }
-    false
+    if fences.is_empty() {
+        return false;
+    }
+    if let Some(first_tagged) = fences.iter().position(|&(_, has_tag)| has_tag) {
+        return !first_tagged.is_multiple_of(2);
+    }
+    if fences.len().is_multiple_of(2) {
+        return false;
+    }
+    if seg_end < limit {
+        return true;
+    }
+    let f0 = fences[0].0;
+    let f1 = fences.get(1).map_or(limit, |&(r, _)| r);
+    let is_md_block = |row: &str| {
+        let trimmed = row.trim_start();
+        trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+            || trimmed.starts_with("#### ")
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("+ ")
+            || trimmed.starts_with("> ")
+            || trimmed.find(". ").is_some_and(|d| {
+                d > 0 && d <= 3 && trimmed[..d].bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+    let before_f0 = rows[..f0].iter().filter(|r| is_md_block(r)).count();
+    let after_f0 = rows[f0 + 1..f1].iter().filter(|r| is_md_block(r)).count();
+    before_f0 <= after_f0
 }
 
 /// Find the top row of a bottom `agy` approval or question dialog when the composer
-/// rules are absent (a full-width `─` rule not followed by a `>` user prompt).
+/// rules are absent (either a parsed bottom prompt box or a full-width `─` rule
+/// under an explicit box title at the bottom of the screen).
 fn agy_bottom_dialog_top(rows: &[String], max_rows: usize, cols: usize) -> Option<usize> {
     let n = rows.len().min(max_rows);
-    let min_rule = (cols * 3 / 4).max(40);
+    if let Some(prompt) = aterm_phase::agy::prompt(&rows[..n]) {
+        return Some(prompt.span.0);
+    }
+    if cols < 40 {
+        return None;
+    }
     for r in (1..n).rev() {
         let trimmed = rows[r].trim_end_matches(' ');
         let width = trimmed.chars().count();
-        if width >= min_rule && trimmed.chars().all(|c| c == '\u{2500}') {
-            let next_is_caret = rows
-                .get(r + 1)
-                .is_some_and(|next| next == ">" || next.starts_with("> "));
-            if !next_is_caret {
-                let prev = rows[r - 1].trim();
-                return Some(if !prev.is_empty() && !prev.contains(' ') {
-                    r - 1
-                } else {
-                    r
-                });
+        if width == cols && trimmed.chars().all(|c| c == '\u{2500}') {
+            let prev = rows[r - 1].trim_end_matches(' ');
+            let is_box_title = matches!(
+                prev,
+                "Command" | "Create file" | "Pending edit" | "Question"
+            );
+            let has_later_turn = (r + 1..n).any(|i| {
+                rows[i].starts_with("● ")
+                    || ((rows[i] == ">" || rows[i].starts_with("> ")) && {
+                        let rule = rows[i - 1].trim_end_matches(' ');
+                        rule.chars().count() >= 10 && rule.chars().all(|c| c == '\u{2500}')
+                    })
+            });
+            if is_box_title && !has_later_turn {
+                return Some(r - 1);
             }
         }
     }
@@ -7638,11 +7684,11 @@ fn collect_agy_transcript_edits(
         let (_, agy_place) = aterm_phase::agy::launch_card_scan(&rows[..limit]);
         agy_place.map(|p| p.top..p.top + 5)
     };
+    let cursor_in_pane = scratch.cursor_visible
+        && (region.col_off..region.col_off + region.cols).contains(&scratch.cursor_col);
     let mut in_user_msg = false;
     let mut in_muse_reply = false;
-    let mut in_code_block = false;
-    let mut seen_turn_boundary = false;
-    let initial_out_len = out.len();
+    let mut in_code_block = starts_in_code_block(rows, limit, is_muse, &card_range);
     let inks = MarkdownInks::of(blank, rule, mark_fg);
 
     for (r, row_str) in rows.iter().enumerate().take(limit) {
@@ -7653,19 +7699,7 @@ fn collect_agy_transcript_edits(
             .trim_start();
         if let Some(after_fence) = body.strip_prefix("```") {
             let has_tag = !after_fence.trim().is_empty();
-            if in_code_block {
-                in_code_block = false;
-            } else if has_tag || has_matching_closing_fence(rows, r, limit, is_muse) {
-                in_code_block = true;
-            } else {
-                // Orphaned closing fence from a code block whose opening fence
-                // scrolled off the top of the viewport above row 0.
-                if !seen_turn_boundary {
-                    out.truncate(initial_out_len);
-                    seen_turn_boundary = true;
-                }
-                in_code_block = false;
-            }
+            in_code_block = if has_tag { true } else { !in_code_block };
             continue;
         }
         if in_code_block {
@@ -7675,7 +7709,6 @@ fn collect_agy_transcript_edits(
             in_user_msg = false;
             in_muse_reply = false;
             in_code_block = false;
-            seen_turn_boundary = true;
             continue;
         }
         let orig_width = row_str
@@ -7685,7 +7718,6 @@ fn collect_agy_transcript_edits(
             .min(region.cols);
         if orig_width == 0 {
             in_user_msg = false;
-            in_muse_reply = false;
             continue;
         }
         if is_muse {
@@ -7697,21 +7729,11 @@ fn collect_agy_transcript_edits(
                 in_user_msg = true;
                 in_muse_reply = false;
                 in_code_block = false;
-                seen_turn_boundary = true;
                 continue;
             }
-        } else if r > 0 && (row_str == ">" || row_str.starts_with("> ")) {
-            let prev = rows[r - 1].trim_end_matches(' ');
-            if prev.chars().count() >= 10 && prev.chars().all(|c| c == '\u{2500}') {
-                in_user_msg = true;
-                in_code_block = false;
-                seen_turn_boundary = true;
-            }
-        }
-        if is_muse {
             if row_str.starts_with("\u{25c6} ") {
+                in_user_msg = false;
                 in_muse_reply = true;
-                seen_turn_boundary = true;
             } else if in_muse_reply {
                 let trimmed_lead = row_str.trim_start();
                 if !row_str.starts_with("  ")
@@ -7726,11 +7748,14 @@ fn collect_agy_transcript_edits(
                     in_muse_reply = false;
                 }
             }
-        } else if row_str.starts_with("● ") {
-            seen_turn_boundary = true;
+        } else if r > 0 && (row_str == ">" || row_str.starts_with("> ")) {
+            let prev = rows[r - 1].trim_end_matches(' ');
+            if prev.chars().count() >= 10 && prev.chars().all(|c| c == '\u{2500}') {
+                in_user_msg = true;
+            }
         }
         let frame_row = region.strip + region.row_off + r;
-        if scratch.cursor_visible && scratch.cursor_row == frame_row {
+        if cursor_in_pane && scratch.cursor_row == frame_row {
             continue;
         }
         let Some(frame_cells) = scratch.cells.get(frame_row) else {
@@ -7755,7 +7780,7 @@ fn collect_agy_transcript_edits(
                 });
         if is_agy_raw_user_cell {
             in_user_msg = true;
-            seen_turn_boundary = true;
+            in_code_block = false;
             let mut cells: Vec<RenderCell> = pane_slice[..orig_width.min(pane_slice.len())]
                 .iter()
                 .map(|c| {
@@ -7829,6 +7854,8 @@ fn collect_agy_transcript_edits(
         }
     }
     if !is_muse
+        && top_rule.is_some()
+        && scratch.display_offset == 0
         && let Some((_, bottom)) = aterm_phase::agy::composer_rules(rows)
         && let Some(row_str) = rows.get(bottom + 1)
         && bottom + 1 < region.rows
@@ -7841,7 +7868,7 @@ fn collect_agy_transcript_edits(
             .count()
             .min(region.cols);
         if orig_width > 0
-            && !(scratch.cursor_visible && scratch.cursor_row == frame_row)
+            && !(cursor_in_pane && scratch.cursor_row == frame_row)
             && scratch.visual_to_logical_row(frame_row).is_empty()
             && let Some(frame_cells) = scratch.cells.get(frame_row)
         {
@@ -13856,6 +13883,222 @@ mod tests {
         assert_eq!(
             text_of(&scrolled_edits[1].cells).trim_end(),
             "  \u{2022} Scrolled bold and code item"
+        );
+
+        // Scrolled viewport with an orphaned closing fence at row 1 followed by a second
+        // bare code block at rows 4..6: fence parity stays aligned so prose between and
+        // after the blocks renders while both code blocks stay literal.
+        let multi_block_rows = [
+            "  let **literal_block_1** = 1;",
+            "  ```",
+            "  ## Between Blocks",
+            "  - **Important** point",
+            "  ```",
+            "  let **literal_block_2** = 2;",
+            "  ```",
+            "  - **Final** summary",
+        ];
+        scrolled.rows = multi_block_rows.len();
+        scrolled.cells = multi_block_rows
+            .iter()
+            .map(|r| row_of(r, [0, 0, 0]))
+            .collect();
+        let multi_block_text: Vec<String> =
+            multi_block_rows.iter().map(|r| (*r).to_owned()).collect();
+        scrolled_edits.clear();
+        collect_agy_transcript_edits(
+            &scrolled,
+            aterm_phase::Program::Agy,
+            &multi_block_text,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 0,
+                rows: scrolled.rows,
+                cols: scrolled.cols,
+            },
+            None,
+            RenderCell::default(),
+            RenderCell {
+                fg: [80, 80, 80],
+                ..RenderCell::default()
+            },
+            [180, 100, 80],
+            &mut scrolled_edits,
+        );
+        assert_eq!(
+            scrolled_edits
+                .iter()
+                .map(|e| e.frame_row)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 7],
+            "only markdown rows between and after the two code blocks (2, 3, 7) are styled"
+        );
+
+        // Scrolled viewport with markdown prose above an unclosed bare opening fence
+        // whose closing fence scrolled off the bottom of the viewport: prose above the
+        // fence still renders as rich text while code below it stays literal.
+        let bottom_open_rows = [
+            "  ## Overview Above Fence",
+            "  - **First** item",
+            "  ```",
+            "  # shell comment in unclosed code block",
+            "  echo **literal**",
+        ];
+        scrolled.rows = bottom_open_rows.len();
+        scrolled.cells = bottom_open_rows
+            .iter()
+            .map(|r| row_of(r, [0, 0, 0]))
+            .collect();
+        let bottom_open_text: Vec<String> =
+            bottom_open_rows.iter().map(|r| (*r).to_owned()).collect();
+        scrolled_edits.clear();
+        collect_agy_transcript_edits(
+            &scrolled,
+            aterm_phase::Program::Agy,
+            &bottom_open_text,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 0,
+                rows: scrolled.rows,
+                cols: scrolled.cols,
+            },
+            None,
+            RenderCell::default(),
+            RenderCell {
+                fg: [80, 80, 80],
+                ..RenderCell::default()
+            },
+            [180, 100, 80],
+            &mut scrolled_edits,
+        );
+        assert_eq!(
+            scrolled_edits
+                .iter()
+                .map(|e| e.frame_row)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "markdown above unclosed bottom fence renders (0, 1); code below fence stays literal"
+        );
+
+        // Scrolled viewport (`top_rule: None`) in an 80-col pane containing an earlier
+        // full-width rule and a 60-col user separator rule at the bottom row (whose `>`
+        // row scrolled off below the viewport): markdown rows below the earlier rule must
+        // still render as rich text instead of being truncated by `agy_bottom_dialog_top`.
+        let rule_80 = "\u{2500}".repeat(80);
+        let rule_60 = "\u{2500}".repeat(60);
+        let scrolled_rule_rows = [
+            "  ## Above Earlier Rule",
+            rule_80.as_str(),
+            "  ## Below Earlier Rule",
+            "  - **Rich** item after rule",
+            rule_60.as_str(),
+        ];
+        scrolled.cols = 80;
+        scrolled.rows = scrolled_rule_rows.len();
+        scrolled.cells = scrolled_rule_rows
+            .iter()
+            .map(|r| row_of(r, [0, 0, 0]))
+            .collect();
+        let scrolled_rule_text: Vec<String> =
+            scrolled_rule_rows.iter().map(|r| (*r).to_owned()).collect();
+        scrolled_edits.clear();
+        collect_agy_transcript_edits(
+            &scrolled,
+            aterm_phase::Program::Agy,
+            &scrolled_rule_text,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 0,
+                rows: scrolled.rows,
+                cols: scrolled.cols,
+            },
+            None,
+            RenderCell::default(),
+            RenderCell {
+                fg: [80, 80, 80],
+                ..RenderCell::default()
+            },
+            [180, 100, 80],
+            &mut scrolled_edits,
+        );
+        assert_eq!(
+            scrolled_edits
+                .iter()
+                .map(|e| e.frame_row)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3],
+            "markdown rows both above (0) and below (2, 3) a rule in a scrolled viewport render"
+        );
+
+        // In a split-pane frame (`col_off > 0`), a visible cursor in an adjacent pane
+        // (`cursor_col < col_off`) on the same `frame_row` must not skip markdown rendering
+        // in the agy pane, whereas a cursor inside the agy pane (`col_off..col_off + cols`)
+        // does skip its row.
+        let mut split_scratch = RenderInput::empty();
+        split_scratch.cols = 120;
+        split_scratch.rows = 1;
+        let mut full_row = vec![RenderCell::default(); 40];
+        full_row.extend(row_of("  ## Split Heading", [0, 0, 0]));
+        full_row.resize(120, RenderCell::default());
+        split_scratch.cells = vec![full_row];
+        split_scratch.cursor_visible = true;
+        split_scratch.cursor_row = 0;
+        split_scratch.cursor_col = 5;
+        let split_rows = vec!["  ## Split Heading".to_owned()];
+        scrolled_edits.clear();
+        collect_agy_transcript_edits(
+            &split_scratch,
+            aterm_phase::Program::Agy,
+            &split_rows,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 40,
+                rows: 1,
+                cols: 80,
+            },
+            None,
+            RenderCell::default(),
+            RenderCell {
+                fg: [80, 80, 80],
+                ..RenderCell::default()
+            },
+            [180, 100, 80],
+            &mut scrolled_edits,
+        );
+        assert_eq!(
+            scrolled_edits.len(),
+            1,
+            "adjacent pane cursor outside col_off..col_off+cols must not skip agy markdown row"
+        );
+        split_scratch.cursor_col = 45;
+        scrolled_edits.clear();
+        collect_agy_transcript_edits(
+            &split_scratch,
+            aterm_phase::Program::Agy,
+            &split_rows,
+            PaneTextRegion {
+                strip: 0,
+                row_off: 0,
+                col_off: 40,
+                rows: 1,
+                cols: 80,
+            },
+            None,
+            RenderCell::default(),
+            RenderCell {
+                fg: [80, 80, 80],
+                ..RenderCell::default()
+            },
+            [180, 100, 80],
+            &mut scrolled_edits,
+        );
+        assert!(
+            scrolled_edits.is_empty(),
+            "cursor inside the agy pane's own columns skips the active cursor row"
         );
     }
 }

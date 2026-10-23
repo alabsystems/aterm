@@ -43,6 +43,9 @@ pub fn fine_grained_token(seed: &str) -> String {
     )
 }
 
+/// An asset as [`FakeGithub::release_state`] reports it: its name and its bytes.
+pub type NamedBytes = (String, Vec<u8>);
+
 /// Loopback ports bound by the four fake origins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ports {
@@ -575,6 +578,35 @@ impl FakeGithub {
             fault,
             always: true,
         });
+    }
+
+    /// The ids of `slug`'s releases, in the order added (a write's among them).
+    #[must_use]
+    pub fn release_ids(&self, slug: &str) -> Vec<u64> {
+        let state = self.state();
+        let Some(repo) = state.repo_index(slug).map(|i| state.repos[i].id) else {
+            return Vec::new();
+        };
+        state
+            .releases
+            .iter()
+            .filter(|r| r.repo == repo)
+            .map(|r| r.id)
+            .collect()
+    }
+
+    /// Release `release_id` as the fake holds it now: what it says, and each asset's name and
+    /// bytes in the order added; `None` once it is deleted.
+    #[must_use]
+    pub fn release_state(&self, release_id: u64) -> Option<(ReleaseSpec, Vec<NamedBytes>)> {
+        let state = self.state();
+        let release = state.releases.iter().find(|r| r.id == release_id)?;
+        let assets = release
+            .assets
+            .iter()
+            .map(|a| (a.spec.name.clone(), a.spec.bytes.clone()))
+            .collect();
+        Some((release.spec.clone(), assets))
     }
 
     /// Returns all recorded requests in arrival order.

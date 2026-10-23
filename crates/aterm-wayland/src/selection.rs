@@ -70,12 +70,12 @@ impl Manager {
     }
 
     /// Which selection it manages.
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         self.kind
     }
 
     /// The version bound.
-    pub fn version(&self) -> u32 {
+    pub const fn version(&self) -> u32 {
         self.version
     }
 }
@@ -262,7 +262,7 @@ impl Device {
     }
 
     /// Which selection it carries.
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         self.kind
     }
 
@@ -468,7 +468,7 @@ pub struct Dropped {
 
 impl Dropped {
     /// What the offer said: its types, and the action the compositor chose.
-    pub fn info(&self) -> &OfferInfo {
+    pub const fn info(&self) -> &OfferInfo {
         &self.info
     }
 
@@ -769,7 +769,7 @@ impl Source {
     }
 
     /// Which selection it serves.
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         self.kind
     }
 

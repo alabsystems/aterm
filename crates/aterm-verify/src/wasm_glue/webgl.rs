@@ -1,36 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `aterm_gl` import module: WebGL2 under aterm-gpu's GL arm
-//! (`crates/aterm-gpu/src/gl`, docs/AUDIT-third-party-2026-10-15.md,
-//! wasm-platform WP.8), which calls the GLES 3.0 entry points it calls on
-//! Linux, by their GL names and C signatures, and five of its own for the
-//! context.
-//!
-//! The glue keeps two tables. A context id names a WebGL2 context made on a
-//! canvas the module holds as a JS object (`context_create`); calls act on
-//! the one `make_current` chose, as GL calls act on the thread's current
-//! context. A GL name is an index into the object table (0 is "none"), so
-//! the arm sees GL's integer names and the glue the WebGL objects; a
-//! uniform location is a name too, and -1 is "none", as GL spells it.
-//! Each context owns its names and allocated strings; uniform locations
-//! additionally belong to their program. Program deletion and final context
-//! retirement release only that owner's names, and context retirement frees
-//! each string with the exact allocation length and alignment.
-//!
-//! Pointer arguments are offsets into the module's memory, read and written
-//! through the glue's cached views, and strings GL hands out (`glGetString`)
-//! are NUL-terminated copies the module owns for the context's life, as a
-//! driver's are. A call that would throw in JS (`getContext` on something
-//! that is no canvas) answers as a failure instead: a throw must never
-//! unwind through the module.
-//!
-//! The glue knows each import by name and signature and refuses a module
-//! importing anything else (`model.rs`), so the arm's table
-//! (`crates/aterm-gpu/src/gl/ffi.rs`) and this one change together.
+//! The `aterm_gl` import module: WebGL2 bindings for `aterm-gpu`'s GL arm.
 
-/// One import: its name, its wasm signature, and the JS behind it (a
-/// function expression, indented as the import object's entries are).
+/// One import: its name, its wasm signature, and its JS function expression.
 pub(crate) struct GlImport {
     pub(crate) name: &'static str,
     pub(crate) params: &'static [u8],
@@ -45,8 +18,7 @@ pub(crate) const MODULE: &str = "aterm_gl";
 /// pointers into the module's memory.
 const I: u8 = 0x7f;
 
-/// The state every import reads, written once before them: the context and
-/// object tables, the current context, and the string helpers.
+/// Shared JS state for context and object tables and string helpers.
 pub(crate) const STATE: &str = "\
 const glContexts = [null];
 const glContextFree = [];
@@ -135,8 +107,7 @@ function glDeleteNames(n, ptr, destroy) {
 }
 ";
 
-/// The typed views [`STATE`] and the imports read, so the glue defines
-/// them whatever else the module uses.
+/// Typed array views required by [`STATE`] and the imports.
 pub(crate) const VIEWS: [&str; 4] = ["Uint8Array", "Uint16Array", "Uint32Array", "Float32Array"];
 
 /// Every import the arm may make, sorted by name.

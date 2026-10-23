@@ -4,32 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A display that goes between two of the event loop's looks at its connection fails every
-//! request a caller makes in between, and none of those calls panics: each returns what it can,
-//! and the loop's next look ends the run with `EventLoopError::DisplayLost` (X11-GONE). The
-//! Linux lane found the crash journal's `outer_position` panicking there, at upstream's unwrap
-//! of `XTranslateCoordinates` (`docs/LINUX-RUNTIME-LANE.md`, "The display gone").
-//!
-//! The loss is the client's socket shut down under libxcb and Xlib (`shutdown(2)`, both ways):
-//! a write fails and a read finds end of file, as when the server dies, and the lane's Xvfb
-//! stays up for the other tests. The X11 backend is one connection per process
-//! (`X11_BACKEND`), and Xlib's IO error is noted process-wide, so the work runs in a child: this
-//! test binary run again on this one test, with [`CHILD`] set. The parent holds the child to a
-//! one-minute hang detector and passes only when it exited 0, printed [`DONE`] and never
-//! panicked.
-//!
-//! Its negative controls: upstream's unwrap restored in `UnownedWindow::inner_position_physical`,
-//! and the child panics in `outer_position`; the broken connection's check taken out of
-//! `XConnection::set_cursor_icon`, and the child dies of SIGSEGV inside libXcursor, as it did
-//! when this test was first run; the full-screen state kept when `set_fullscreen` found no
-//! position, and the child's assertion fails; the lost display's check taken out of
-//! `ImeInner::server_side_gone`, and on a desk with an input method (IBus under GNOME) the child
-//! dies of SIGSEGV in libX11's `XSendEvent` under the event loop's `XDestroyIC`, as it did on such
-//! a desk on 2026-10-22 (Xvfb, with no input method, makes no input context). Each way the parent
-//! fails.
-//!
-//! It runs where `$DISPLAY` names an X server (the Linux lane's Xvfb); elsewhere it says SKIP and
-//! returns.
+//! Tests that a lost X11 display connection fails window calls cleanly and ends with `DisplayLost`.
 
 use std::io::Read as _;
 use std::time::{Duration, Instant};
@@ -97,8 +72,6 @@ fn a_lost_display_fails_each_call_and_ends_the_run_without_a_panic() {
     assert!(!stderr.contains("panicked at"), "the child panicked; {said}");
     assert!(status.success(), "the child exited {status}; {said}");
     assert!(stdout.contains(DONE), "the child never got through its calls; {said}");
-    // The loss is said once, by the run's end: a broken connection's failed requests say
-    // nothing of their own (`XConnection::report`).
     assert!(!stderr.contains("aterm-window:"), "a failed request was reported; {said}");
 }
 
@@ -112,22 +85,17 @@ fn lose_the_display_under_a_window() {
     let window = Window::new(target, WindowAttributes::default()).expect("an X11 window");
     let xconn = std::sync::Arc::clone(&window.xconn);
 
-    // Live, the server answers: the position (and with it the frame extents, now cached) and
-    // the size the window was made with (800x600, no window manager to change it).
     assert!(window.outer_position().is_ok(), "the position, live");
     assert_eq!(window.inner_size(), PhysicalSize::new(800, 600), "the size, live");
     assert!(!xconn.is_broken(), "the connection, live");
 
-    // The display goes.
     let socket = xconn.xcb_connection().file_descriptor();
     // SAFETY: the connection's own socket, open; shutting it down closes nothing.
     assert_eq!(unsafe { libc::shutdown(socket, libc::SHUT_RDWR) }, 0, "shutdown(2)");
 
-    // What the crash journal asks between the loop's looks: the round trip upstream unwrapped.
     assert!(window.outer_position().is_err(), "a position from a display that has gone");
     assert!(xconn.is_broken(), "the failed round trip found the connection broken");
     assert!(window.inner_position().is_err(), "no inner position either");
-    // A size is the last the server reported, here the one the window was made with.
     assert_eq!(window.inner_size(), PhysicalSize::new(800, 600), "the size, gone");
     let _ = window.outer_size();
     let _ = window.is_maximized();
@@ -148,19 +116,15 @@ fn lose_the_display_under_a_window() {
     window.set_resize_increments(Some(PhysicalSize::new(8, 16).into()));
     window.request_user_attention(Some(UserAttentionType::Critical));
     window.focus_window();
-    // IME requests wait for the loop, which ends on the loss before it sends them.
     window
         .set_ime_cursor_area(PhysicalPosition::new(10, 10).into(), PhysicalSize::new(9, 20).into());
     window.set_ime_allowed(true);
-    // A shown window's full screen asks its position first, and without one sends nothing and
-    // keeps the state the window had.
     window.shared_state_lock().visibility = Visibility::Yes;
     assert!(!window.shared_state_lock().last_monitor.is_dummy(), "a monitor to fill");
     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
     assert!(window.fullscreen().is_none(), "a full screen the server never heard of");
     window.request_redraw();
 
-    // The loop's look at the connection ends the run with the loss.
     let run = event_loop.run_on_demand(|_, _| {});
     match run {
         Err(EventLoopError::DisplayLost(why)) => println!("{DONE}; the run ended: {why}"),

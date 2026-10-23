@@ -1,36 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `label_enum!`: a fieldless enum whose variants each carry a dense index and
-//! a wire label, declared once.
-//!
-//! One declaration yields the enum, `ALL` (in declaration order), `COUNT`,
-//! `index`/`from_index` (the dense index, which is the discriminant), `as_str`
-//! (the wire label) and `ident` (the variant's own name, for a log line). A
-//! per-variant table is a `[_; COUNT]` indexed by `index()` with no bounds
-//! guard, and no label table can fall out of step with its enum.
-//!
-//! The index never leaves the process. A value stored in an atomic is decoded
-//! by the same build that stored it, and the wire carries only the label, so a
-//! variant is added or removed anywhere in the list and leaves no tombstone.
-//! Declaration order is the order a table's readers iterate in.
-//!
-//! The compiler checks every table at its declaration: each `ALL[i]` has index
-//! `i`, the labels are pairwise distinct, and every label is wire-safe
-//! ([`labels_wire_safe`]). A table that breaks one does not compile.
+//! `label_enum!`.
 
-/// Declare a label table. Attributes before `enum` (docs, `#[repr(u8)]`,
-/// `#[cfg_attr(..)]`) pass through to the enum; the derives are fixed.
-///
-/// ```text
-/// label_enum! {
-///     /// Where a terminal-mutex wait was booked.
-///     pub(crate) enum TermWaitSite {
-///         Redraw => "redraw",
-///         Press => "press",
-///     }
-/// }
-/// ```
+/// Declare a label table.
 macro_rules! label_enum {
     (
         $(#[$meta:meta])*
@@ -121,11 +94,7 @@ pub(crate) const fn labels_distinct(labels: &[&str]) -> bool {
     true
 }
 
-/// Whether every label is non-empty and spelled in `[a-z0-9_]` only. A label
-/// rides bare in the text form, between its `,` `:` `/` `=` and space
-/// separators, and quoted in the JSON form, so none of those, no quote and no
-/// backslash may appear in one; an allowlist keeps out every byte a reader
-/// could split or unescape on.
+/// Whether every label is non-empty and spelled in `[a-z0-9_]` only.
 #[must_use]
 pub(crate) const fn labels_wire_safe(labels: &[&str]) -> bool {
     let mut i = 0;

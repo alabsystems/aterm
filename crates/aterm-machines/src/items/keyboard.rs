@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keyboard remaps: Caps Lock as Control, per keyboard model and per user, as ByHost
-//! `modifiermapping` keys that take effect at login (design §1.5, §5.1).
-//!
-//! macOS keeps a modifier remap per keyboard model in the user's ByHost global domain:
-//! `defaults -currentHost write -g com.apple.keyboard.modifiermapping.<vendor>-<product>-0`
-//! holds an array of `{HIDKeyboardModifierMappingSrc, HIDKeyboardModifierMappingDst}`
-//! dictionaries (HID usages, `0x700000000 | usage`). The keys are decimal, vendor first:
-//! the 27.0 VM's virtual keyboard (`hidutil list`: `0x5ac 0x1`, built in) maps as
-//! `1452-1-0`, and Apple silicon's built-in keyboard as `0-0-0`.
-//!
-//! A model gets an item when it is the built-in keyboard, a keyboard `hidutil` saw
-//! (`ctx.facts.keyboards`), or listed in `[keyboard] models`. The models this Mac has
-//! seen before, in `/Library/Preferences/com.apple.keyboardtype`, are read when the
-//! items probe, since nothing reads them before: one more item per user covers each of
-//! those the others do not. That domain names a model PRODUCT first
-//! (`keyboardtype = {"49299-1133-0" = 40}` on a 27.0.1 Mac with a Logitech keyboard,
-//! vendor 1133 = 0x46d), the reverse of the mapping key; the VM's is empty.
-//!
-//! Only the Caps Lock entry of an array is touched: a remap of another key the user made
-//! stays. Caps Lock to either Control counts as done (System Settings writes Right
-//! Control, 0x7000000E4; this crate writes Left Control, 0x7000000E0, as design §1.5
-//! says). `"caps-lock"` removes the Caps Lock entry, and the key with it when nothing
-//! else is left.
+//! Per-keyboard Caps Lock to Control `modifiermapping` remaps in ByHost defaults.
 
 use super::defaults::{Target, Want, render, revert_line};
 use super::{Ctx, Item};
@@ -35,7 +13,7 @@ use std::sync::{Mutex, PoisonError};
 
 /// Caps Lock's HID usage, as the mapping stores it (30064771129).
 pub const CAPS_LOCK: i64 = 0x7_0000_0039;
-/// Left Control (30064771296): what this crate maps Caps Lock to.
+/// Left Control HID usage (30064771296).
 pub const LEFT_CONTROL: i64 = 0x7_0000_00E0;
 /// Right Control (30064771300): what System Settings writes for "Control".
 pub const RIGHT_CONTROL: i64 = 0x7_0000_00E4;
@@ -50,10 +28,10 @@ pub const KEYBOARD_TYPE: &str = "com.apple.keyboardtype";
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// `"control"` maps Caps Lock to Control; `"caps-lock"` removes the mapping; absent leaves it alone.
+    /// `"control"` maps Caps Lock to Control.
     #[serde(default)]
     pub caps_lock: Option<String>,
-    /// Extra keyboard models as `<vendor>-<product>` decimal ids, for keyboards not attached at apply time.
+    /// Extra keyboard models as `<vendor>-<product>` decimal ids.
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -102,12 +80,10 @@ impl Model {
     }
 }
 
-/// The models `com.apple.keyboardtype` lists, from its domain's entries. Its keys are
-/// `<product>-<vendor>-<n>`, decimal; no `keyboardtype` key means no model was seen.
+/// The models `com.apple.keyboardtype` lists, from its domain's entries.
 ///
 /// # Errors
-/// One line when `keyboardtype` holds something else: what it lists is then unknown, not
-/// empty.
+/// One line when `keyboardtype` holds something else: what it lists is then unknown, not empty.
 pub fn seen_models(entries: &Entries) -> Result<Vec<Model>, String> {
     let types = match entries.iter().find(|(k, _)| k == "keyboardtype") {
         None => return Ok(Vec::new()),
@@ -194,12 +170,10 @@ fn describe(read: &Read<PValue>) -> String {
     }
 }
 
-/// What the key must become for Caps Lock to do what `mode` says; `None` when it already
-/// does. Every entry but Caps Lock's stays where it is.
+/// What the key must become for Caps Lock to do what `mode` says; `None` when it already does.
 ///
 /// # Errors
-/// The read's reason when it was unusable, or a key holding something other than an
-/// array of mappings (left alone rather than overwritten).
+/// Returns an error if the read failed or the key holds a non-array value.
 fn plan(read: &Read<PValue>, mode: CapsLock) -> Result<Option<Want>, String> {
     let items: &[PValue] = match read {
         Read::Unusable(why) => return Err(why.clone()),
@@ -233,7 +207,7 @@ fn plan(read: &Read<PValue>, mode: CapsLock) -> Result<Option<Want>, String> {
     }
 }
 
-fn wanted_words(mode: CapsLock) -> &'static str {
+const fn wanted_words(mode: CapsLock) -> &'static str {
     match mode {
         CapsLock::Control => "Caps Lock→Control",
         CapsLock::CapsLock => "Caps Lock unmapped",
@@ -330,7 +304,6 @@ impl Item for CapsLockKey {
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
-        // Planned again from a fresh read, so a mapping changed since the probe is kept.
         let target = self.target();
         match plan(&target.read(sys), self.mode)? {
             None => Ok(()),
@@ -352,8 +325,7 @@ impl Item for CapsLockKey {
     }
 }
 
-/// Caps Lock on every model `com.apple.keyboardtype` lists that no other item covers, for
-/// one user.
+/// Caps Lock on every model `com.apple.keyboardtype` lists that no other item covers, for one user.
 #[derive(Debug)]
 pub struct SeenKeyboards {
     /// Whose ByHost global domain holds the keys.
@@ -486,8 +458,7 @@ impl Item for SeenKeyboards {
     }
 }
 
-/// The items `table` asks for: for each user, one per known keyboard model (built in,
-/// attached, listed), then one for the models this Mac has seen.
+/// Expands `table` into per-keyboard items.
 ///
 /// # Errors
 /// One line naming what cannot be expanded.
@@ -513,8 +484,6 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
             models.push((model, source));
         }
     };
-    // Apple silicon laptops report their keyboard as vendor 0, product 0 whether or not
-    // hidutil was read.
     if ctx.facts.arch == "arm64" && ctx.facts.form == Form::Laptop {
         add(
             Model {
@@ -577,20 +546,17 @@ mod tests {
     use crate::model::{Keyboard, Mode, Outcome};
     use crate::port::{Fake, Ran};
 
-    /// `defaults -currentHost export -g -` for the 27.0 VM's admin: it holds
-    /// `com.apple.keyboard.modifiermapping.1452-1-0` = Caps Lock → Left Control.
+    /// `defaults -currentHost export -g -` for the 27.0 VM's admin.
     const VM_CURRENT_HOST_GLOBAL: &[u8] =
         include_bytes!("../../fixtures/prefs/vm-27.0-currenthost-global.plist");
 
-    /// `defaults export /Library/Preferences/com.apple.keyboardtype -` on a 27.0.1
-    /// (26A434) Mac that has seen three external keyboards (read only).
+    /// `defaults export /Library/Preferences/com.apple.keyboardtype -` fixture.
     const SEEN_KEYBOARDTYPE: &str = "<dict>\n\t<key>keyboardtype</key>\n\t<dict>\n\t\t<key>321-9456-0</key>\n\t\t<integer>40</integer>\n\t\t<key>49299-1133-0</key>\n\t\t<integer>40</integer>\n\t\t<key>8352-9456-0</key>\n\t\t<integer>40</integer>\n\t</dict>\n</dict>";
 
     const GLOBAL: &str = "admin$ /usr/bin/defaults -currentHost export -g -";
     const TYPES: &str = "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -";
 
-    /// The VM's keyboards, as its `hidutil list` printed them: `0x5ac 0x1` Virtual
-    /// Keyboard (built in) and `0x5ac 0x8105` Virtual USB Keyboard.
+    /// The VM's keyboards, as its `hidutil list` printed them.
     fn vm_ctx() -> Ctx {
         let mut c = ctx(&[user("admin", 501)]);
         c.facts.form = Form::Virtual;
@@ -661,7 +627,6 @@ mod tests {
                 "keyboard.caps-lock.seen@bob",
             ]
         );
-        // An Intel laptop's built-in keyboard has real ids, so it comes from hidutil.
         c.facts.arch = "x86_64".into();
         let items = expand(&table("control", &[]), &c).unwrap();
         assert_eq!(items.len(), 2);
@@ -748,7 +713,6 @@ mod tests {
 
     #[test]
     fn caps_lock_to_the_right_control_system_settings_writes_counts_as_done() {
-        // The 27.0.1 Mac's own 0-0-0 entry, set in System Settings.
         let read = Read::Value(mapping(&[(CAPS_LOCK, RIGHT_CONTROL)]));
         assert_eq!(plan(&read, CapsLock::Control), Ok(None));
         assert_eq!(describe(&read), "Caps Lock→Right Control");
@@ -764,7 +728,6 @@ mod tests {
                 caps_to_control(),
             ]))))
         );
-        // Caps Lock to Escape is replaced in place; the other entry stays.
         let read = Read::Value(mapping(&[
             (CAPS_LOCK, 0x7_0000_0029),
             (LEFT_COMMAND, LEFT_OPTION),
@@ -774,7 +737,6 @@ mod tests {
         };
         assert_eq!(next[0], caps_to_control());
         assert_eq!(int(&next[1], SRC), Some(LEFT_COMMAND));
-        // Unmapping keeps the other entry, and deletes the key when nothing is left.
         let read = Read::Value(mapping(&[
             (CAPS_LOCK, LEFT_CONTROL),
             (LEFT_COMMAND, LEFT_OPTION),
@@ -903,14 +865,12 @@ mod tests {
             "{revert}"
         );
         assert_eq!(revert.lines().count(), 2, "{revert}");
-        // 9456-321 is listed in [keyboard] models, so its own item covers it.
         assert!(!sys.calls().iter().any(|c| c.contains("9456-321")));
     }
 
     #[test]
     fn a_mac_that_has_seen_no_other_keyboard_probes_ok() {
         let sys = Fake::root();
-        // The 27.0 VM's keyboardtype domain does not exist.
         sys.on(TYPES, missing());
         let c = vm_ctx();
         let items = expand(&table("control", &[]), &c).unwrap();

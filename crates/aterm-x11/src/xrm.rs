@@ -12,37 +12,19 @@
 // has already expanded), only into regular files and within a byte budget,
 // and a bound on the matcher's states.
 
-//! The X resource manager's database (Xrm): `name.class*rest: value` lines,
-//! as `RESOURCE_MANAGER` on the root window holds them (`xrdb`) or a resource
-//! file such as `~/.Xresources` does, and the precedence rules that pick one
-//! entry for a query such as `Xft.dpi`. The answers are x11rb's for the same
-//! database and query (`tests/recorded/x11rb-protocol-0.13.2-xrm.tsv`, and
-//! `-xrm-include.tsv` for files that `#include` others).
-//!
-//! Any client may write `RESOURCE_MANAGER`, so the parser takes arbitrary
-//! bytes: it never panics, skips what it cannot read, and the matcher keeps
-//! at most [`MAX_STATES`] partial matches per entry. A file's includes are
-//! read at most [`MAX_INCLUDE_DEPTH`] deep and [`MAX_INCLUDED_BYTES`] in all.
+//! X resource manager (Xrm) database parser and query matcher.
 
 use std::cmp::Ordering;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-/// The most partial matches the matcher tracks for one entry. A query is a
-/// handful of components, which needs a handful; a hostile entry of many
-/// loose bindings cannot make it more.
+/// Maximum partial match states tracked per database entry.
 pub const MAX_STATES: usize = 256;
 
-/// The deepest `#include` a resource file's database follows: a file the
-/// root file reaches through more includes than this is not read. Xlib's
-/// limit, and x11rb's (`MAX_INCLUSION_DEPTH`), so a file that includes itself
-/// ends.
+/// Maximum `#include` nesting depth followed in a resource file.
 pub const MAX_INCLUDE_DEPTH: u8 = 100;
 
-/// The most bytes of included files one resource file's database reads, all
-/// of its includes together; an include that would pass it is not read. A
-/// resource file is a few kilobytes. x11rb had no bound, so a large file that
-/// includes itself was parsed [`MAX_INCLUDE_DEPTH`] + 1 times.
+/// Maximum total bytes read across all `#include` directives for one resource file.
 pub const MAX_INCLUDED_BYTES: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,28 +72,18 @@ const fn is_octal(c: u8) -> bool {
     c >= b'0' && c <= b'7'
 }
 
-/// What a resource file's `#include` reads: the file at a path, given the
-/// bytes it may still take ([`MAX_INCLUDED_BYTES`] less what earlier includes
-/// read), or `None` to skip it.
+/// Callback that reads an `#include` file up to the remaining byte budget.
 pub type IncludeReader<'a> = dyn FnMut(&Path, u64) -> Option<Vec<u8>> + 'a;
 
 impl Database {
-    /// Parse a database. Lines that do not parse are skipped, as Xlib skips
-    /// them; `#include` and every other directive is ignored: this is the
-    /// `RESOURCE_MANAGER` property's reading, whose text `xrdb` has already
-    /// run through cpp.
+    /// Parses an Xrm database from `data`, ignoring `#include` directives.
     pub fn parse(data: &[u8]) -> Database {
         let mut entries = Vec::new();
         parse_into(data, &mut entries, &mut |_, _| {});
         Database { entries }
     }
 
-    /// Parse a resource file's text, `data`, read from a file in `dir`: each
-    /// `#include "path"` line is replaced by the entries of the file it names,
-    /// a relative path taken from the including file's directory, as Xlib and
-    /// x11rb read `~/.Xresources`. A file that cannot be read (missing, not a
-    /// regular file, past [`MAX_INCLUDED_BYTES`] or [`MAX_INCLUDE_DEPTH`]) is
-    /// skipped, as a line that does not parse is.
+    /// Parses an Xrm resource file from `data`, resolving `#include` paths relative to `dir`.
     pub fn parse_file(data: &[u8], dir: &Path) -> Database {
         Database::parse_file_with(data, dir, &mut read_regular_file)
     }
@@ -124,14 +96,12 @@ impl Database {
         Database { entries }
     }
 
-    /// `other`'s entries after this one's, as the text of `other` read after
-    /// this one's would give them: a later entry of equal precedence wins.
+    /// Appends `other`'s entries after `self`'s so later entries of equal precedence win.
     pub fn append(&mut self, other: Database) {
         self.entries.extend(other.entries);
     }
 
-    /// The value of the best entry for the query `name` / `class` (dotted,
-    /// no wildcards: `Xft.dpi`), or `None`.
+    /// Returns the value of the highest-precedence entry matching `name` and `class`.
     pub fn get(&self, name: &str, class: &str) -> Option<&[u8]> {
         let name = parse_query(name.as_bytes())?;
         let class = parse_query(class.as_bytes())?;
@@ -202,8 +172,6 @@ fn parse_file_into(
     budget: &mut u64,
 ) {
     parse_into(data, entries, &mut |file, entries| {
-        // x11rb read the file one level past the limit and then parsed
-        // nothing of it; it is not read at all here.
         let Ok(name) = std::str::from_utf8(file) else {
             return;
         };
@@ -228,13 +196,8 @@ fn parse_file_into(
     });
 }
 
-/// [`Database::parse_file`]'s reader: the regular file at `path` (a symbolic
-/// link followed), when it holds at most `limit` bytes. Anything else (a
-/// directory, a FIFO a read would block on, a device, a file that grew past
-/// the limit while it was read) is `None`.
+/// Reads a regular file at `path` if its size is at most `limit` bytes.
 pub fn read_regular_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    // Asked of the path before the open: opening a FIFO for reading waits
-    // for a writer. Asked again of what was opened.
     let regular = |meta: std::fs::Metadata| meta.is_file() && meta.len() <= limit;
     if !regular(std::fs::metadata(path).ok()?) {
         return None;
@@ -431,10 +394,10 @@ fn check_match(entry: &Entry, name: &[&[u8]], class: &[&[u8]]) -> Vec<Vec<Step>>
 /// skip; an instance beats a class, which beats `?`; a tight binding beats a
 /// loose one.
 fn compare(a: &[Step], b: &[Step]) -> Ordering {
-    fn rule1(a: Step, b: Step) -> bool {
+    const fn rule1(a: Step, b: Step) -> bool {
         matches!((a, b), (Step::Matched(..), Step::Skipped))
     }
-    fn rule2(a: Step, b: Step) -> bool {
+    const fn rule2(a: Step, b: Step) -> bool {
         matches!(
             (a, b),
             (
@@ -446,7 +409,7 @@ fn compare(a: &[Step], b: &[Step]) -> Ordering {
             )
         )
     }
-    fn rule3(a: Step, b: Step) -> bool {
+    const fn rule3(a: Step, b: Step) -> bool {
         matches!(
             (a, b),
             (
@@ -499,7 +462,6 @@ mod tests {
         line.extend_from_slice(b": x\n");
         let db = Database::parse(&line);
         let query = vec!["a"; 64].join(".");
-        // Any answer, in bounded time and memory: it must simply return.
         let _ = db.get(&query, &query);
     }
 }

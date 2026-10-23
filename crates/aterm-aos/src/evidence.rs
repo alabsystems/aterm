@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The evidence a publication carries: its grade and its witness.
-//!
-//! # The law
-//!
-//! Aos M2 earns exactly one grade, [`EvidenceGrade::Tested`]: the live code's replay
-//! reproduced the paused head from the ancestor checkpoint over one recorded trace, and the
-//! candidate's replay over the same inputs from the same checkpoint satisfied the corrected
-//! contract. That is execution evidence over one trace, not a proof over all of them; there
-//! is no `Proved` or `Certified` grade to claim, and the witness lists its assumptions.
-//!
-//! A [`Witness`] has private fields and is built only by
-//! [`crate::publish::Boundary::prepare`], from the runs it performed itself and judged by the
-//! contract the boundary was constructed with, so a witness whose verdicts were not
-//! recomputed from the artifacts and the trace cannot be constructed.
-//! [`crate::publish::Boundary::commit`] still re-checks it against the boundary's own head,
-//! ancestor checkpoint, log and contract before publishing, so a genuine witness from another
-//! boundary (or another history) is refused too, unless that boundary has the same identity,
-//! ancestor, log and head and was constructed with a contract declaring the same artifact:
-//! the constructor is trusted to give each boundary the contract its id names.
+//! Publication evidence grades and witnesses.
 
 use crate::contract::Verdict;
 use crate::ident::{ArtifactId, Digest};
@@ -41,8 +23,7 @@ pub const TESTED_ASSUMPTIONS: [&str; 5] = [
     "the verdicts hold for this one recorded trace; nothing is claimed for other inputs",
 ];
 
-/// Built only by `publish::Boundary::prepare` (private fields): a forged witness cannot be
-/// constructed, and `commit` re-checks it against the boundary's own head and log.
+/// Witness built by [`crate::publish::Boundary::prepare`] and verified by `commit`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Witness {
     trace_digest: Digest,
@@ -82,8 +63,7 @@ pub(crate) struct WitnessParts {
 }
 
 impl Witness {
-    /// Only `publish` builds a witness, and only after the same-code replay reproduced the
-    /// head.
+    /// Builds a witness after same-code replay reproduced the paused head.
     pub(crate) fn reproduced(p: WitnessParts) -> Witness {
         Witness {
             trace_digest: p.trace_digest,
@@ -196,8 +176,7 @@ impl Witness {
         self.candidate_state_digest
     }
 
-    /// Whether the live code's replay reproduced the paused head (always true in a witness
-    /// `prepare` returned).
+    /// Whether the live code's replay reproduced the paused head.
     #[inline]
     #[must_use]
     pub const fn same_code_reproduced(&self) -> bool {

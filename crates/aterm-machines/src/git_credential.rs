@@ -675,9 +675,8 @@ pub(crate) mod script {
 mod tests {
     use super::*;
     use crate::items::defaults::tests::user;
-    use crate::port::{Fake, Live, Ran, RunFailed, Scratch, Stat};
-    use std::path::Path;
-    use std::sync::Mutex;
+    use crate::port::spawns::Spawns;
+    use crate::port::{Fake, Live, Ran, Scratch};
 
     const TOKEN: &str = "fixture_credential_token_only";
 
@@ -1003,81 +1002,6 @@ mod tests {
         assert!(sys.calls().is_empty());
     }
 
-    /// Every run the credential steps make through a real `System`, as that `System` spawns it:
-    /// the program, its arguments, and every variable of its environment (the fixed ones the
-    /// live arm sets and the run's own), plus the bytes it was handed on standard input.
-    struct Spawns<'a> {
-        live: &'a Live,
-        record: Mutex<Vec<(Cmd, Option<Vec<u8>>)>>,
-    }
-
-    impl System for Spawns<'_> {
-        fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
-            self.record.lock().unwrap().push((cmd.clone(), None));
-            self.live.run(cmd)
-        }
-        fn run_complete_stdout(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
-            self.record.lock().unwrap().push((cmd.clone(), None));
-            self.live.run_complete_stdout(cmd)
-        }
-        fn run_complete_stdout_input(&self, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
-            self.record
-                .lock()
-                .unwrap()
-                .push((cmd.clone(), Some(input.to_vec())));
-            self.live.run_complete_stdout_input(cmd, input)
-        }
-        fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
-            self.record.lock().unwrap().push((cmd.clone(), None));
-            self.live.run_tty(cmd)
-        }
-        fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-            self.live.read_file(path)
-        }
-        fn write_file(&self, path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-            self.live.write_file(path, bytes, mode)
-        }
-        fn write_user_file(
-            &self,
-            user: &User,
-            path: &Path,
-            bytes: &[u8],
-            mode: u32,
-        ) -> std::io::Result<()> {
-            self.live.write_user_file(user, path, bytes, mode)
-        }
-        fn remove(&self, path: &Path) -> std::io::Result<()> {
-            self.live.remove(path)
-        }
-        fn create_dir_all(&self, path: &Path, mode: u32) -> std::io::Result<()> {
-            self.live.create_dir_all(path, mode)
-        }
-        fn chown(&self, path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-            self.live.chown(path, uid, gid)
-        }
-        fn stat(&self, path: &Path) -> std::io::Result<Stat> {
-            self.live.stat(path)
-        }
-        fn list_dir(&self, path: &Path) -> std::io::Result<Vec<String>> {
-            self.live.list_dir(path)
-        }
-        fn sha256(&self, path: &Path) -> std::io::Result<String> {
-            self.live.sha256(path)
-        }
-        fn copy_file(&self, from: &Path, to: &Path, mode: u32) -> std::io::Result<()> {
-            self.live.copy_file(from, to, mode)
-        }
-        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
-            self.live.rename(from, to)
-        }
-        fn euid(&self) -> u32 {
-            self.live.euid()
-        }
-        fn now(&self) -> u64 {
-            self.live.now()
-        }
-    }
-
     /// Where `secret` shows in what `live` spawned for the runs of `record`: the program,
     /// argument or variable that holds it, or `None`.
     fn exposed(record: &[(Cmd, Option<Vec<u8>>)], live: &Live, secret: &str) -> Option<String> {
@@ -1107,10 +1031,7 @@ mod tests {
         let file = scratch.path().join("credentials");
         let mut who = user("fixture", live.euid());
         who.home = scratch.path().to_string_lossy().into_owned();
-        let sys = Spawns {
-            live: &live,
-            record: Mutex::new(Vec::new()),
-        };
+        let sys = Spawns::new(&live);
         let git = Git::isolated(&format!("store --file={}", file.display()));
         let token = Secret::new(TOKEN.as_bytes()).unwrap();
         assert_eq!(
@@ -1135,7 +1056,7 @@ mod tests {
         );
         let stored = std::fs::read_to_string(&file).unwrap();
         assert!(stored.contains(TOKEN), "the helper received the token");
-        let record = sys.record.lock().unwrap().clone();
+        let record = sys.record();
         assert!(record.len() >= 4, "{record:?}");
         assert_eq!(exposed(&record, &live, TOKEN), None);
         assert!(

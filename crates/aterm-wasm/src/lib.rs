@@ -419,13 +419,13 @@ impl AtermTerminal {
 
     /// Chrome edge padding in pixels set via [`Self::set_chrome`].
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn chrome_pad(&self) -> u16 {
+    pub const fn chrome_pad(&self) -> u16 {
         self.renderer.pad() as u16
     }
 
     /// Chrome top header band height in pixels set via [`Self::set_chrome`].
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn chrome_head(&self) -> u16 {
+    pub const fn chrome_head(&self) -> u16 {
         self.renderer.head() as u16
     }
 
@@ -698,7 +698,7 @@ impl AtermTerminal {
 
     /// Mark a renderer or presentation state change that requires a frame.
     #[inline]
-    pub(crate) fn note_host_visual_change(&mut self) {
+    pub(crate) const fn note_host_visual_change(&mut self) {
         self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
@@ -722,31 +722,31 @@ impl AtermTerminal {
 
     /// Mark the chrome band dirty for the next frame.
     #[inline]
-    pub(crate) fn note_band_change(&mut self, _rows_moved: bool) {
+    pub(crate) const fn note_band_change(&mut self, _rows_moved: bool) {
         self.note_host_visual_change();
     }
 
     /// Last-rendered framebuffer width in pixels.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.width
     }
 
     /// Last-rendered framebuffer height in pixels.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn height(&self) -> usize {
+    pub const fn height(&self) -> usize {
         self.height
     }
 
     /// Cell width in device pixels.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cell_width(&self) -> usize {
+    pub const fn cell_width(&self) -> usize {
         self.renderer.cell_size().0
     }
 
     /// Cell height in device pixels.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cell_height(&self) -> usize {
+    pub const fn cell_height(&self) -> usize {
         self.renderer.cell_size().1
     }
 
@@ -772,13 +772,13 @@ pub struct SearchMeta {
 impl SearchMeta {
     /// Whether search results may be truncated due to index eviction or match caps.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn incomplete(&self) -> bool {
+    pub const fn incomplete(&self) -> bool {
         self.incomplete
     }
 
     /// Number of matches returned by the paired [`AtermTerminal::search`] call.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn match_count(&self) -> u32 {
+    pub const fn match_count(&self) -> u32 {
         self.match_count
     }
 }
@@ -807,49 +807,49 @@ impl BudgetedSearchResult {
 
     /// Whether all retained rows have been scanned and all match deltas delivered.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.complete
     }
 
     /// Continuation cursor token, or `None` once complete.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn cursor(&self) -> Option<u64> {
+    pub const fn cursor(&self) -> Option<u64> {
         self.cursor
     }
 
     /// Stable identifier for the logical search stream.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn search_id(&self) -> Option<u64> {
+    pub const fn search_id(&self) -> Option<u64> {
         self.search_id
     }
 
     /// Whether the caller must discard previously accumulated match deltas.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn reset(&self) -> bool {
+    pub const fn reset(&self) -> bool {
         self.reset
     }
 
     /// Whether results may be truncated due to index eviction or match caps.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn incomplete_index(&self) -> bool {
+    pub const fn incomplete_index(&self) -> bool {
         self.incomplete_index
     }
 
     /// Oldest absolute line retained by the completed search index.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn lowest_retained_line(&self) -> u32 {
+    pub const fn lowest_retained_line(&self) -> u32 {
         self.lowest_retained_line
     }
 
     /// Rows scanned so far.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn rows_fed(&self) -> u32 {
+    pub const fn rows_fed(&self) -> u32 {
         self.rows_fed
     }
 
     /// Total rows to scan in this search.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn total_rows(&self) -> u32 {
+    pub const fn total_rows(&self) -> u32 {
         self.total_rows
     }
 }
@@ -917,19 +917,19 @@ impl LinkHit {
 
     /// Inclusive start grid column.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_col(&self) -> u16 {
+    pub const fn start_col(&self) -> u16 {
         self.start_col
     }
 
     /// Exclusive end grid column.
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_col(&self) -> u16 {
+    pub const fn end_col(&self) -> u16 {
         self.end_col
     }
 
     /// Link kind (`0` = OSC 8, `1` = URL, `2` = file path, `3` = other).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn kind(&self) -> u8 {
+    pub const fn kind(&self) -> u8 {
         self.kind
     }
 }
@@ -947,25 +947,25 @@ pub struct SelectionRange {
 impl SelectionRange {
     /// Inclusive start column (viewport-relative).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_x(&self) -> u16 {
+    pub const fn start_x(&self) -> u16 {
         self.start_x
     }
 
     /// Start row (`0` = top visible row).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn start_y(&self) -> u16 {
+    pub const fn start_y(&self) -> u16 {
         self.start_y
     }
 
     /// Inclusive end column (viewport-relative).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_x(&self) -> u16 {
+    pub const fn end_x(&self) -> u16 {
         self.end_x
     }
 
     /// End row (`0` = top visible row).
     #[cfg_attr(target_arch = "wasm32", export(getter))]
-    pub fn end_y(&self) -> u16 {
+    pub const fn end_y(&self) -> u16 {
         self.end_y
     }
 }

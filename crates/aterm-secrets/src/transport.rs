@@ -299,7 +299,7 @@ fn foreign_status(status: u16) -> bool {
 }
 
 /// Whether `err` is an answer the vault server never gives ([`aterm_http::Error::Io`]).
-fn foreign_reply(error: &aterm_http::Error) -> bool {
+const fn foreign_reply(error: &aterm_http::Error) -> bool {
     matches!(
         error,
         aterm_http::Error::Protocol(_) | aterm_http::Error::TooLarge { .. }

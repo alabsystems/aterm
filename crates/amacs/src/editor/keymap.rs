@@ -146,7 +146,7 @@ pub enum Profile {
 
 impl Profile {
     /// The rows this profile adds after [`EMACS_CHORDS`], in binding order.
-    fn chord_rows(self) -> &'static [&'static [ChordRow]] {
+    const fn chord_rows(self) -> &'static [&'static [ChordRow]] {
         match self {
             Self::Gui(Platform::Mac) => &[PAGE_CHORDS],
             Self::Gui(Platform::Other) => &[PAGE_CHORDS, OFF_MAC_CHORDS],

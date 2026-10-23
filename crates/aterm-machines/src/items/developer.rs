@@ -2,21 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Apple's Command Line Tools, installed headlessly through `softwareupdate` (design §1.13).
-//!
-//! `xcode-select --install` raises a dialog a person must answer, so the install takes
-//! Homebrew's route instead, as root: touch the on-demand placeholder, which makes
-//! `softwareupdate -l` list the tools. Create it exclusively: an existing marker belongs
-//! to another run and is left alone. Install the newest `Command Line Tools for Xcode …`
-//! label with `softwareupdate -i`; remove only the marker this install created; and select the
-//! tools with `xcode-select --switch` when no developer directory is selected.
-//!
-//! Measured in the macOS 27.0 VM (no tools installed): `xcode-select -p` exits 2 with
-//! `Unable to get active developer directory`; `pkgutil --pkg-info` of the tools' receipt
-//! exits 1 with `No receipt …`; with the placeholder in place, `softwareupdate -l` (about
-//! five seconds) lists `* Label: Command Line Tools for Xcode 27.0-27.0` followed by a
-//! `Title: …, Version: 27.0, …` line. Labels before macOS 26 joined the version with a
-//! hyphen (`for Xcode-15.3`); both forms are read. Nothing here runs `/usr/bin/git` or
-//! another tool shim, which would raise Apple's install dialog on the console.
 
 use super::{Ctx, Item};
 use crate::model::Probe;
@@ -35,9 +20,7 @@ pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
 /// The tools' package receipt (its version is the report's).
 pub const CLT_RECEIPT: &str = "com.apple.pkg.CLTools_Executables";
 
-/// The placeholder that makes `softwareupdate -l` list the tools. An install creates it
-/// exclusively and removes only that creation. An existing marker is left for explicit
-/// recovery; its presence does not prove that this run owns it.
+/// The placeholder that makes `softwareupdate -l` list the tools.
 pub const PLACEHOLDER: &str = "/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress";
 
 /// `softwareupdate`.
@@ -59,14 +42,12 @@ pub const INSTALL_BUDGET: Duration = Duration::from_secs(2 * 60 * 60);
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Table {
-    /// `true` installs the newest `Command Line Tools for Xcode` label when none is
-    /// installed, and selects them when nothing is selected. `false` (or leaving it out)
-    /// leaves the tools alone: this family never removes them.
+    /// `true` installs the newest `Command Line Tools for Xcode` label when none is installed, and
+    /// selects them when nothing is selected.
     pub command_line_tools: Option<bool>,
 }
 
 /// The items `table` asks for.
-///
 /// # Errors
 /// Never today; the signature is the family contract.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -233,7 +214,6 @@ impl CommandLineTools {
     fn install(sys: &dyn System) -> Result<(), String> {
         sys.create_new(Path::new(PLACEHOLDER), b"", 0o644)
             .map_err(|e| format!("{PLACEHOLDER}: {e}"))?;
-        // A failed creation never grants cleanup authority over this fixed path.
         let _placeholder = Placeholder { sys };
         let list = Cmd::new(SOFTWAREUPDATE).arg("-l").budget(LIST_BUDGET);
         let listed = run_ok(sys, &list)?;
@@ -253,9 +233,6 @@ impl CommandLineTools {
         if !ran.success() {
             return Err(format!("{}: {}", install.display(), ran.describe()));
         }
-        // softwareupdate exits 0 when it refuses, too: in the VM, short of space, it printed
-        // `Not enough free disk space: a total of 9.52 GB is required.` on standard error
-        // and installed nothing. The tools on disk, or their receipt, are the evidence.
         if !installed(sys)? && receipt_version(sys).is_none() {
             let said = ran
                 .err()
@@ -307,9 +284,6 @@ impl Item for CommandLineTools {
             (true, None) => Planned::Select,
             (false, _) => {
                 // A plan must not promise a download from a catalog this Mac cannot reach.
-                // `--disable` first: this curl runs as root, and a `.curlrc` in whatever
-                // `HOME` it inherits (Apple's sudoers keeps the admin's, design §1.3) could
-                // add `--output` and turn the probe into a root write.
                 let probe = Cmd::new("/usr/bin/curl")
                     .args([
                         "--disable",
@@ -352,7 +326,6 @@ impl Item for CommandLineTools {
                 Planned::Install => "not installed".to_owned(),
                 Planned::Select => "installed; no developer directory selected".to_owned(),
             },
-            // A developer directory already selected (an Xcode) stays selected.
             to: format!(
                 "installed; selected {}",
                 selected.as_deref().unwrap_or(CLT_DIR)
@@ -372,8 +345,6 @@ impl Item for CommandLineTools {
 
     fn revert(&self) -> Option<String> {
         match (*self.planned.lock().ok()?)? {
-            // Apple's documented removal of the tools, and their receipt: a receipt left
-            // behind would later pass for an install that put nothing on disk.
             Planned::Install => Some(format!(
                 "{}; {}",
                 Cmd::new("/bin/rm").args(["-rf", CLT_DIR]).display(),
@@ -509,7 +480,6 @@ Software Update found the following new or updated software:\n\
             version_after_xcode("Command Line Tools for Xcode 26.4-26.4.1"),
             vec![26, 4]
         );
-        // The VM's list without its Command Line Tools entry (as without the placeholder).
         let without = VM_LIST.replace(
             "* Label: Command Line Tools for Xcode 27.0-27.0\n\tTitle: Command Line Tools for Xcode 27.0, Version: 27.0, Size: 519460KiB, Recommended: YES, \n",
             "",
@@ -580,8 +550,6 @@ Software Update found the following new or updated software:\n\
             &ctx(),
         )
         .unwrap();
-        // The install lands git; the fake's stat answers from what the test seeds, so the
-        // read-back sees it only once the install has run.
         let rows = {
             let probe = items[0].probe(&sys, &ctx());
             assert_eq!(
@@ -620,7 +588,6 @@ Software Update found the following new or updated software:\n\
             .on(CURL, reachable())
             .on(
                 "/usr/sbin/softwareupdate -l",
-                // The VM's list, short of its Command Line Tools entry.
                 Ran::ok(&VM_LIST.replace("Command Line Tools for Xcode 27.0", "Safari 27.0")),
             );
         let items = expand(
@@ -649,7 +616,6 @@ Software Update found the following new or updated software:\n\
 
     #[test]
     fn an_install_softwareupdate_refused_with_exit_0_fails_with_its_own_words() {
-        // The VM, 8.7 GiB free: `Not enough free disk space: a total of 9.52 GB is required.`
         let sys = Fake::root();
         sys.on("/usr/bin/xcode-select -p", none_selected())
             .on(CURL, reachable())
@@ -671,7 +637,6 @@ Software Update found the following new or updated software:\n\
         let why = rows[0].why.as_deref().unwrap();
         assert!(why.contains("installed nothing"), "{why}");
         assert!(why.contains("9.52 GB is required"), "{why}");
-        // Nothing is selected that is not there, and the placeholder is gone.
         let calls = sys.calls();
         assert!(calls.iter().all(|c| !c.contains("--switch")));
         assert!(
@@ -794,7 +759,6 @@ Software Update found the following new or updated software:\n\
             sys
         };
 
-        // A newly created marker permits an ordinary install and is cleaned afterwards.
         let fresh = ready();
         CommandLineTools::install(&fresh).unwrap();
         assert!(fresh.written(PLACEHOLDER).is_none());
@@ -817,7 +781,6 @@ Software Update found the following new or updated software:\n\
                 .any(|c| c == &format!("remove {PLACEHOLDER}"))
         );
 
-        // An owned marker is also cleaned when the catalog refuses an install.
         let no_tools = Fake::root();
         no_tools.on("/usr/sbin/softwareupdate -l", Ran::ok("no tools listed\n"));
         assert!(CommandLineTools::install(&no_tools).is_err());

@@ -167,7 +167,7 @@ fn block(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
 }
 
 /// A cursor over the same line, back at `pos`.
-fn rewind<'a>(cur: &Cursor<'a>, pos: usize) -> Cursor<'a> {
+const fn rewind<'a>(cur: &Cursor<'a>, pos: usize) -> Cursor<'a> {
     Cursor {
         line: cur.line,
         pos,

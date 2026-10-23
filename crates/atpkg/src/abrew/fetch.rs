@@ -84,7 +84,7 @@ pub(super) struct GetError {
 }
 
 impl GetError {
-    pub(super) fn other(message: String) -> Self {
+    pub(super) const fn other(message: String) -> Self {
         Self {
             code: None,
             status: None,

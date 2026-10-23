@@ -82,7 +82,16 @@ pub(crate) fn light_body_ink(rgb: u32, theme_fg: u32, theme_bg: u32, a_max: u8) 
 /// [`light_body_ink`]'s solve against any `floor` (a WCAG relative luminance the composite at `a_max` over `theme_bg` keeps): `rgb`'s vivid ink walked toward white only as far as that floor asks, with the same light exception.
 #[must_use]
 pub(crate) fn light_ink_over_floor(rgb: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
-    let ink = light_ink_bold(rgb & 0x00FF_FFFF);
+    ink_over_floor_from(light_ink_bold(rgb & 0x00FF_FFFF), theme_bg, a_max, floor)
+}
+
+/// [`light_ink_over_floor`]'s walk from a given starting `ink` rather than
+/// the vivid ink of its hue: `ink` itself where its composite at `a_max`
+/// keeps `floor`, else walked toward white only as far as the floor asks,
+/// with the same light exception.
+#[must_use]
+pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32) -> u32 {
+    let ink = ink & 0x00FF_FFFF;
     if a_max == 0 {
         return ink;
     }
@@ -368,6 +377,21 @@ impl LightGround {
             return light_ink_bold(rgb & 0x00FF_FFFF);
         }
         light_body_ink(rgb, self.fg, self.bg, LIGHT_BODY_ALPHA_CAP as u8)
+    }
+
+    /// [`Self::body_ink`] for a body that keeps its own colour: `rgb` as
+    /// itself rather than its hue's one-weight vivid ink, walked toward
+    /// white only as far as the theme's text over it at the body ceiling
+    /// asks ([`ink_over_floor_from`]).
+    #[inline]
+    #[must_use]
+    pub(crate) fn vivid_body_ink(self, rgb: u32) -> u32 {
+        ink_over_floor_from(
+            rgb,
+            self.bg,
+            LIGHT_BODY_ALPHA_CAP as u8,
+            light_body_floor(self.fg),
+        )
     }
 }
 

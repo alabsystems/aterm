@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The stats Deck's layout rows (`linux deck`, and a proof's): LWI-LAND of
-//! L-WAYLAND-INPUT (`docs/AUDIT-third-party-2026-10-15.md` §7).
-//!
-//! Every other session of the lane holds the Deck off
-//! ([`crate::linux_proof::DECK_OFF`]), as it holds the cursor still: the Deck
-//! redraws live figures every second, which races each check that
-//! photographs a frame and holds it to the server's pixels. These rows turn
-//! it on, one per display family ([`guest::Screen::DECK`]), and run
-//! aterm-gui twice under it: on the GPU (the renderer a Linux window draws
-//! with; its `image` is its own render) and on the CPU (`--cpu`, the
-//! presenter whose remainder bands are aterm's own, the cursor still). Each
-//! reads the Deck's layout, never its figures:
-//!
-//! 1. `head`: `dims`' `deck_h` is the Deck's 62 pt at the window's scale and
-//!    `deck_y` the head's top, where the strip is the window's band;
-//! 2. `buttons`: under the Deck, each header button's slot is drawn (a
-//!    window the window system frames has none);
-//! 3. `off`: with the Deck turned off (`invoke StatsBarsOff`) the head is
-//!    smaller by exactly the Deck, and the strip band under the Deck is,
-//!    pixel for pixel, the band without it: the Deck paints over none of it
-//!    (the lane's `proof-20261019-174123` found the Deck over the band's
-//!    middle, its cards, `+` and buttons hidden);
-//! 4. `click`: a press on the strip under the Deck selects the tab it is on;
-//! 5. `bands` (the CPU's): a window not whole cells (maximized through its button where
-//!    aterm draws the frame, sized with `xdotool windowsize` on X11) is held
-//!    to the server's pixels, the Deck's rows left out, and its remainder
-//!    bands each continue the frame's nearest pixel, the Deck's rule
-//!    included (the same proof found 5 of 26790 band pixels short of it).
+//! Layout checks for the stats Deck across Linux display families.
 
 use std::ops::Range;
 use std::path::Path;
@@ -82,8 +55,7 @@ pub(crate) fn row_name(arch: Arch, screen: Screen) -> String {
     )
 }
 
-/// One family's Deck row, from the aterm-gui, aterm-ctl and lane-bus built
-/// in `bin`.
+/// Runs one display family's stats Deck layout row.
 pub(crate) fn row(up: &Up, arch: Arch, screen: Screen, bin: &str, results: &Path) -> proof::Row {
     let name = row_name(arch, screen);
     println!("\n=== {name} ===");
@@ -99,7 +71,6 @@ pub(crate) fn row(up: &Up, arch: Arch, screen: Screen, bin: &str, results: &Path
             } else {
                 proof::Verdict::Fail
             };
-            // The failures first, so the report's first line names one.
             let lines: Vec<String> = failed
                 .iter()
                 .copied()
@@ -140,8 +111,6 @@ fn drive(
     bin: &str,
     results: &Path,
 ) -> Result<Vec<Check>, String> {
-    // Headless weston with its capture protocol, so the CPU session reads its
-    // output's pixels; weston-x11's runs with it always.
     if screen.display == Display::Weston {
         linux::start_weston_capturing(up)?;
     } else {
@@ -271,9 +240,6 @@ fn session_checks(s: &Session<'_>, presenter: &'static str, on: &str) -> Vec<Che
         }
     };
     out.push(Check::new(named("head"), head(&d)));
-    // weston-x11's seat has a pointer, which weston draws on its output over
-    // whatever window it is on: parked in the output's top-left corner, on
-    // desktop-shell's panel, as the baseline's CPU item parks it.
     if s.screen.display.seat() == Some(Seat::Xtest)
         && let Err(e) = s.seat_unit_of("", "-", &["move:0,0"]).and_then(|seat| {
             let done = seat.done(s);
@@ -443,8 +409,6 @@ fn click(s: &Session<'_>) -> Result<String, String> {
     let second = active(&made).ok_or_else(|| format!("`tab new` answered {made}"))?;
     let r = (|| -> Result<String, String> {
         s.click_strip(FIRST_TAB_COL)?;
-        // `tab next` cycles: from the first tab it reaches the second, from
-        // the second (the click selected nothing) it wraps to the first.
         let next = s.ctl(&["tab", "next"])?;
         if active(&next).as_deref() == Some(second.as_str()) {
             Ok(format!(
@@ -536,7 +500,6 @@ mod tests {
 
     #[test]
     fn the_band_under_the_deck_is_held_to_the_band_without_it() {
-        // Without the Deck: a 4-row band (a card at x 1..3 on rows 1..3).
         let band = |x: usize, y: usize| {
             if (1..3).contains(&x) && (1..3).contains(&y) {
                 [200, 200, 200, 255]
@@ -545,7 +508,6 @@ mod tests {
             }
         };
         let off = frame(5, 8, band);
-        // With it: 3 Deck rows on top, then the same band.
         let deck = |x: usize, y: usize| {
             if y < 3 {
                 [90, 0, 0, 255]
@@ -559,8 +521,6 @@ mod tests {
             held.contains("5x4 band under the Deck (rows 3..7)"),
             "{held}"
         );
-        // Negative controls: the Deck over the band's middle (its card row
-        // covered), and the band read from the wrong row.
         let over = frame(5, 11, |x, y| {
             if (1..4).contains(&y) {
                 [90, 0, 0, 255]
@@ -587,8 +547,6 @@ mod tests {
         assert!(head(&dims("1.00", 76, 0, 62)).is_ok());
         assert!(head(&dims("1.50", 114, 0, 93)).is_ok());
         assert!(head(&dims("2.00", 152, 0, 124)).is_ok());
-        // Negative controls: the Deck at the head's foot (macOS's place),
-        // a height that is not its points at the scale, no Deck.
         assert!(head(&dims("1.00", 76, 14, 62)).is_err());
         assert!(head(&dims("2.00", 152, 0, 62)).is_err());
         assert!(head(&dims("1.00", 14, 0, 0)).is_err());

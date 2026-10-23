@@ -8,11 +8,12 @@ use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aterm_uds::process::{
     END_GRACE, EndControlLive, EndRefusal, Ended, GroupMembers, Identity, Lineage, Markers,
-    ProcessBirth, at_program_check, boot_id, end_proven, group_members, launchd_idversion,
-    read_lineage, read_process_birth, read_process_markers,
+    ProcessBirth, ProcessPresence, at_program_check, boot_id, end_proven, group_members,
+    launchd_idversion, process_presence, read_lineage, read_process_birth, read_process_markers,
 };
 
 use crate::Ctx;
@@ -23,8 +24,12 @@ pub const VERIFY_RUN_ENV: &str = aterm_uds::process::VERIFY_RUN_VAR;
 
 /// The kernel reads the passes take, injected so the classification is a unit test over a fake.
 pub trait Kernel {
-    /// `pid`'s birth now, or `None` when it names no live process of this uid.
+    /// `pid`'s birth now, or `None` when gone, unreadable, or not of this uid.
     fn birth(&self, pid: i32) -> Option<ProcessBirth>;
+    /// Whether the pid exists when identity cannot be read. Unsupported readers stay unknown.
+    fn presence(&self, _pid: i32) -> ProcessPresence {
+        ProcessPresence::Unknown
+    }
     /// `pid`'s lineage (flavor 18), or `None` when gone or not ours.
     fn lineage(&self, pid: i32) -> Option<Lineage>;
     /// `pgid`'s members, or `None` when the table cannot answer.
@@ -57,6 +62,9 @@ pub struct LiveKernel;
 impl Kernel for LiveKernel {
     fn birth(&self, pid: i32) -> Option<ProcessBirth> {
         read_process_birth(pid)
+    }
+    fn presence(&self, pid: i32) -> ProcessPresence {
+        process_presence(pid)
     }
     fn lineage(&self, pid: i32) -> Option<Lineage> {
         read_lineage(pid)
@@ -298,6 +306,8 @@ pub struct Runs {
     roots: Vec<PathBuf>,
     /// The lines the receipt carries: each stage's survivors, as their sweeps found them.
     said: Mutex<Vec<String>>,
+    /// Only a fresh, admitted run-end sweep with no survivors permits removal.
+    may_forget: AtomicBool,
 }
 
 /// One stage group's survivors: what verify ended and what it named and left.
@@ -408,21 +418,33 @@ enum Fate {
     Left,
 }
 
-/// is left and named; one that reads nothing is gone, or ended when a signal reached it.
+/// A failed birth read preserves the process unless a separate query confirms absence.
+fn may_match_birth(
+    kernel: &impl Kernel,
+    pid: i32,
+    matches: impl FnOnce(ProcessBirth) -> bool,
+) -> bool {
+    match kernel.birth(pid) {
+        Some(birth) => matches(birth),
+        None => kernel.presence(pid) != ProcessPresence::Absent,
+    }
+}
+
+/// Name unreadable survivors; only changed birth or confirmed absence establishes departure.
 fn settle(
     kernel: &impl Kernel,
     pid: i32,
     end: impl FnOnce(Identity) -> Option<Result<Ended, EndRefusal>>,
 ) -> Fate {
     let Some(lin) = kernel.lineage(pid) else {
-        return if kernel.birth(pid).is_some() {
+        return if may_match_birth(kernel, pid, |_| true) {
             Fate::Left
         } else {
             Fate::Gone
         };
     };
     let answer = end(lin.identity);
-    if kernel.birth(pid) == Some(lin.identity.birth) {
+    if may_match_birth(kernel, pid, |birth| birth == lin.identity.birth) {
         Fate::Left
     } else if answer.is_some_and(|a| a.is_ok_and(|e| e.termed || e.killed)) {
         Fate::Ended
@@ -488,6 +510,7 @@ impl Runs {
             uniqueid,
             roots,
             said: Mutex::new(Vec::new()),
+            may_forget: AtomicBool::new(false),
         })
     }
 
@@ -518,9 +541,17 @@ impl Runs {
 
     /// Sweep remaining run processes and return survivor report lines.
     pub fn end_of_run(&self, kernel: &impl Kernel) -> Vec<String> {
+        self.may_forget.store(false, Ordering::Relaxed);
         let line = match self.run_end_sweep(kernel) {
-            Some(left) => left.line("the run"),
-            None => Some("could not list this user's processes at the run's end".to_owned()),
+            Some(left) => {
+                self.may_forget.store(!left.leaves_any(), Ordering::Relaxed);
+                left.line("the run")
+            }
+            None => Some(
+                "could not admit the run records or list this user's processes at the run's end; \
+                 this run's record is kept"
+                    .to_owned(),
+            ),
         };
         let mut said = self.said.lock().map(|s| s.clone()).unwrap_or_default();
         said.extend(line);
@@ -529,7 +560,7 @@ impl Runs {
 
     /// The W-run sweep.
     fn run_end_sweep(&self, kernel: &impl Kernel) -> Option<Left> {
-        let records = self.path.parent().map(read_records).unwrap_or_default();
+        let records = read_records(self.path.parent()?).ok()?;
         let claims = Claims::of(
             records
                 .iter()
@@ -551,8 +582,11 @@ impl Runs {
         Some(judge.pass(&pids))
     }
 
-    /// The run's orderly end: its `end` line, then the record's removal.
+    /// Finish only after an admitted run-end sweep left no named or unjudged processes.
     pub fn finish(&self, kernel: &impl Kernel) {
+        if !self.may_forget.load(Ordering::Relaxed) {
+            return;
+        }
         self.line(&format!("end at={}", kernel.now_ms()));
         let _ = std::fs::remove_file(&self.path);
     }
@@ -772,26 +806,181 @@ fn table(kernel: &impl Kernel, me: i32) -> Option<(Vec<i32>, u64)> {
     Some((pids, high))
 }
 
-/// The records in `dir` that name their run (a `run` line with its id and boot).
-fn read_records(dir: &Path) -> Vec<(PathBuf, Record)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Bound the text read even if a record grows after its size was checked.
+const RECORD_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_record_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a bounded regular run record",
+        )
     };
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid());
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // Open a reparse point itself, never the object it redirects to.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        open.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > RECORD_BYTES {
+        return Err(invalid());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > RECORD_BYTES {
+        return Err(invalid());
+    }
+    String::from_utf8(bytes)
+        .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidData, why))
+}
+
+/// The writer's ordered v1 fields, each present once. Unknown text conveys no cleanup authority.
+fn cleanup_fields<'a>(line: &'a str, keys: &[&str]) -> Option<Vec<&'a str>> {
+    let mut words = line.split_whitespace().skip(1);
+    let values = keys
+        .iter()
+        .map(|expected| {
+            let (key, value) = words.next()?.split_once('=')?;
+            (key == *expected).then_some(value)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    words.next().is_none().then_some(values)
+}
+
+fn cleanup_number(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()) && value.parse::<u64>().is_ok()
+}
+
+/// Unlike the public projection's decoder, a malformed escape or UTF-8 is unknown.
+fn cleanup_decoded(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut chars = value.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let hi = char::from(chars.next()?).to_digit(16)?;
+            let lo = char::from(chars.next()?).to_digit(16)?;
+            bytes.push((hi * 16 + lo) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Validate the cleanup protocol without changing [`Record::parse`]'s lenient projection.
+fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
+    if text.is_empty() || !text.ends_with('\n') {
+        return None;
+    }
+    for (index, line) in text.lines().enumerate() {
+        match line.split_whitespace().next()? {
+            "run" if index == 0 => {
+                let fields =
+                    cleanup_fields(line, &["v", "boot", "id", "uniqueid", "start", "sid"])?;
+                let [version, boot, id, uniqueid, start, sid] = fields.as_slice() else {
+                    return None;
+                };
+                let parsed = RunId::parse(id)?;
+                if *version != "1"
+                    || boot.is_empty()
+                    || parsed.pid <= 1
+                    || parsed.birth_us == 0
+                    || parsed.text() != *id
+                    || path.file_name()?.to_str()? != format!("{}.run", parsed.text())
+                    || !cleanup_number(uniqueid)
+                    || !cleanup_number(start)
+                {
+                    return None;
+                }
+                cleanup_decoded(sid)?;
+            }
+            "root" if index > 0 => {
+                let fields = cleanup_fields(line, &["path"])?;
+                if cleanup_decoded(fields.first()?)?.is_empty() {
+                    return None;
+                }
+            }
+            "group" if index > 0 => {
+                let fields =
+                    cleanup_fields(line, &["pgid", "leader_birth", "leader_uniqueid", "stage"])?;
+                let [pgid, birth, uniqueid, stage] = fields.as_slice() else {
+                    return None;
+                };
+                if pgid.parse::<u32>().ok()? <= 1
+                    || !cleanup_number(pgid)
+                    || !cleanup_number(birth)
+                    || !cleanup_number(uniqueid)
+                {
+                    return None;
+                }
+                cleanup_decoded(stage)?;
+            }
+            "closed" if index > 0 => {
+                let fields = cleanup_fields(line, &["pgid"])?;
+                let pgid = fields.first()?;
+                if pgid.parse::<u32>().ok()? <= 1 || !cleanup_number(pgid) {
+                    return None;
+                }
+            }
+            "dead_seen" if index > 0 => {
+                let fields = cleanup_fields(line, &["uniqueid", "at"])?;
+                if !fields.iter().all(|value| cleanup_number(value)) {
+                    return None;
+                }
+            }
+            "end" if index > 0 => {
+                let fields = cleanup_fields(line, &["at"])?;
+                if !cleanup_number(fields.first()?) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(Record::parse(text))
+}
+
+/// A complete admitted snapshot, or unknown. Never build partial competing claims.
+fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
+    let entries = std::fs::read_dir(dir)?;
     let mut records = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for entry in entries {
+        let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("run") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let rec = Record::parse(&text);
-        if rec.id.is_some() && !rec.boot.is_empty() {
-            records.push((path, rec));
-        }
+        let text = read_record_text(&path)?;
+        let rec = cleanup_record(&path, &text).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not a complete supported run record", path.display()),
+            )
+        })?;
+        records.push((path, rec));
     }
-    records
+    Ok(records)
 }
 
 /// Sweep processes left behind by dead verify runs recorded in `dir`.
@@ -802,8 +991,17 @@ pub fn end_dead_runs(
     kernel: &impl Kernel,
     out: &mut dyn FnMut(&str),
 ) -> usize {
+    let admitted = match read_records(dir) {
+        Ok(records) => records,
+        Err(why) => {
+            out(&format!(
+                "could not admit all verify run records: {why}; all records are kept"
+            ));
+            return 0;
+        }
+    };
     let mut records = Vec::new();
-    for (path, rec) in read_records(dir) {
+    for (path, rec) in admitted {
         if rec.boot == this_boot {
             records.push((path, rec));
         } else {
@@ -867,14 +1065,14 @@ fn append(path: &Path, line: &str) {
     }
 }
 
-/// Whether a record's launcher reads alive by a direct read.
+/// Whether a record's launcher may still be alive; unreadable identities retain its claims.
 fn launcher_alive(rec: &Record, kernel: &impl Kernel) -> bool {
     let Some(id) = rec.id else {
         return false;
     };
-    kernel
-        .birth(id.pid)
-        .is_some_and(|b| RunId::birth_us(b) == id.birth_us)
+    may_match_birth(kernel, id.pid, |birth| {
+        RunId::birth_us(birth) == id.birth_us
+    })
 }
 
 /// Format the summary line for a dead run at the next run's start.

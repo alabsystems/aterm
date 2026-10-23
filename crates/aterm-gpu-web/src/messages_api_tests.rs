@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright 2026 Andrew Yates
 
-// aterm-gpu-web's tests of the message band surface: `messages_api.rs`, which both web
-// crates compile, includes this file into its tests, so these drive this
-// crate's own frame path.
-
 use super::*;
 use crate::AtermGpuTerminal;
 
@@ -87,7 +83,6 @@ fn the_band_composes_into_the_gpu_frame() {
         "a settled band gates the next frame"
     );
     assert_eq!(t.messages_next_wake_ms_at(t0 + ms(1)), 5000.0);
-    // The hold ends, the shrink's quiet passes, the row count follows.
     let _ = t.messages_tick_at(t0 + ms(5001));
     let bits = t.messages_tick_at(t0 + ms(5001) + aterm_messages::SHRINK_QUIET);
     assert_eq!(bits & 2, 2, "the row count moved");
@@ -157,7 +152,6 @@ fn the_band_frame_is_one_picture_on_both_web_renderers() {
         "the frame grows by the band's two rows"
     );
     assert_eq!((gpu.width, gpu.height), (cpu.width, cpu.height));
-    // Per channel of the packed `0x00RRGGBB` the page's RGBA8 carries.
     let channel = |p: u32, s: u32| (p >> s) & 0xff;
     let delta = cpu
         .pixels
@@ -191,7 +185,6 @@ fn the_gpu_band_has_the_twins_exports() {
     t.set_band_visible_at(false, t0);
     assert_eq!(t.messages_next_wake_ms_at(t0), -1.0);
     t.set_band_visible_at(true, t0);
-    // Five distinct colours: a swap between any two slots fails.
     let hc = ForcedPalette {
         window: [0x00, 0x00, 0x10],
         window_text: [0xff, 0xff, 0xff],
@@ -326,7 +319,6 @@ fn the_gpu_page_is_the_twins_page() {
     )));
     assert!(problems.contains("\nchip\ttag=ci\twords=CI\tcount=1\ton=0\tlabel=CI \u{00b7} 1\n"));
     assert!(!problems.contains("\ttitle=Build finished\t"), "{problems}");
-    // A chip down: the chrome names it, `All tags` is up.
     let deploy = t.messages_page_at("deploy", false, 0, wall);
     assert!(
         deploy.contains(&format!(
@@ -391,8 +383,6 @@ fn the_gpu_page_offers_what_the_twin_offers() {
         ],
         "{page}"
     );
-    // Nothing pressable, nothing leads: the engine's rule
-    // gives no Primary, and the key is the last of its line (appended).
     assert!(!page.contains("\tprimary=1"), "{page}");
     assert_eq!(
         t.notice_at("act 1 1", t0, stamp()),

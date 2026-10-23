@@ -62,8 +62,10 @@ aterm-digest = { workspace = true }
 aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
-# The loopback GitHub the read contract drives AghHost against.
+# The loopback GitHub the read contract drives AghHost and RestHost against.
 agh-fake = { workspace = true }
+# Base64, for the Basic credential a loopback git host sees (tests/channel/rest.rs).
+aterm-codec = { workspace = true }
 # The derived `AtpkgIndexPublishWalk` model, whose writer half drives the index's
 # compare-and-swap (tests/channel/).
 aterm-spec = { workspace = true }

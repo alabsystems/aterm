@@ -139,7 +139,7 @@ pub(crate) fn class_style(class: SyntaxClass) -> Style {
 
 /// `style` drawn in reverse video: the region, an isearch match, a caret
 /// that is not the terminal's own.
-fn reversed(style: Style) -> Style {
+const fn reversed(style: Style) -> Style {
     Style {
         attrs: style.attrs.union(Attrs::REVERSE),
         ..style
@@ -148,7 +148,7 @@ fn reversed(style: Style) -> Style {
 
 /// The blank cells a tab at display column `column` takes: up to the next
 /// stop of four, as the engine counts it.
-fn tab_cells(column: usize) -> u16 {
+const fn tab_cells(column: usize) -> u16 {
     match column % 4 {
         0 => 4,
         1 => 3,

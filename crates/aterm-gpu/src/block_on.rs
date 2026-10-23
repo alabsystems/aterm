@@ -20,7 +20,7 @@ struct Signal {
 }
 
 impl Signal {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             woken: Mutex::new(false),
             cv: Condvar::new(),

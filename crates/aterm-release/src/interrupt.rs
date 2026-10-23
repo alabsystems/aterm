@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE INTERRUPT: SIGINT (Ctrl-C), SIGTERM (`kill <pid>`) and SIGHUP (a closed
-//! terminal) are caught, never fatal — each one this process did not inherit IGNORED:
-//! under `nohup` (or a background `&` of a shell without job control) the release keeps
-//! SIG_IGN, as every program that respects it does (`if (signal(sig, SIG_IGN) !=
-//! SIG_IGN) signal(sig, handler)`), and its children inherit it.
-//!
-//! The handler only records (atomics: async-signal-safe). While a step's child runs, a
-//! forwarder thread ([`Running`]) hands the first signal to every process of the
-//! child's group and a second one SIGKILL to them — every process but a Trust `trustd`
-//! and what it runs ([`group_members`]). A trustd shares no group with its launcher
-//! from trust `41f912aa5f4` (2026-09-22) on, but the store seal of 2026-10 (321aaeda7)
-//! predates it, so a trustd a step's `targo trust check` starts (`pub stage`'s public
-//! clone gate runs one) lives in that step's group — and a signalled trustd records
-//! DIRTY, after which targo starts none until someone attests no solver survives
-//! (AGENTS.md: never signal a trustd). So no signal goes to a group as a whole. The
-//! release then sees the step end and says its INTERRUPTED line.
-//!
-//! `ship release`'s steps, `ship hook` and the trust lane all read it: one module, its
-//! two arms below.
+//! Signal handling and process-group forwarding for release steps.
 
 #[cfg(unix)]
 mod imp {
@@ -48,8 +30,7 @@ mod imp {
         COUNT.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Catch SIGINT, SIGTERM and SIGHUP for the release's life — except a signal this
-    /// process was started ignoring, which stays ignored.
+    /// Catches `SIGINT`, `SIGTERM`, and `SIGHUP` unless already ignored.
     pub fn install() {
         let handler = on_signal as extern "C" fn(i32) as usize;
         for sig in [SIGHUP, SIGINT, SIGTERM] {
@@ -70,7 +51,7 @@ mod imp {
         (sig != 0).then_some(sig)
     }
 
-    /// `sig` to `pid` (a member of a step's group, never a group as a whole).
+    /// Sends `sig` to `pid`.
     pub fn send(pid: i32, sig: i32) {
         // SAFETY: `kill` takes two integers and touches no memory of ours.
         unsafe {
@@ -78,11 +59,7 @@ mod imp {
         }
     }
 
-    /// The running step's child, for as long as this value lives: a forwarder thread
-    /// polls the signals caught (every 50 ms) and hands them on — so a signal that
-    /// arrived between the spawn and this is handed on at its first look — and a
-    /// git credential helper of the child's that waits for a person is ended
-    /// ([`crate::credential_wait`]).
+    /// Guard that forwards caught signals to a running step's process group.
     pub struct Running {
         done: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -90,7 +67,7 @@ mod imp {
     }
 
     impl Running {
-        /// `leader` is the child's pid, which leads its own session and group.
+        /// Starts forwarding caught signals for the process group led by `leader`.
         pub fn enter(leader: u32) -> Self {
             let done = Arc::new(AtomicBool::new(false));
             let thread = i32::try_from(leader).ok().map(|group| {
@@ -170,13 +147,9 @@ mod imp {
 
 pub use imp::*;
 
-/// The members of process group `group` in a `ps -A -o pid=,ppid=,pgid=,comm=` listing
-/// that a release's interrupt may signal: every one but a Trust `trustd` (its command's
-/// last path component) and every descendant of one — the solvers it runs. A trustd is
-/// never signalled (the module docs say why); it outlives the step by design.
+/// Returns the signalable members of process group `group` from a `ps` listing, sparing `trustd` and its descendants.
 #[must_use]
 pub fn group_members(listing: &str, group: i32) -> Vec<i32> {
-    // (pid, ppid, pgid, comm), the command being the rest of the line (paths hold spaces)
     let rows: Vec<(i32, i32, i32, &str)> = listing
         .lines()
         .filter_map(|line| {
@@ -234,7 +207,6 @@ mod tests {
           601     1   777 /bin/sh\n\
           garbage line\n";
         assert_eq!(group_members(listing, 500), [500, 501, 505]);
-        // another group's members, and a group holding nothing, are no one's
         assert_eq!(group_members(listing, 777), [601]);
         assert!(group_members(listing, 999).is_empty());
     }

@@ -159,7 +159,7 @@ impl Cell {
         }
     }
 
-    fn continuation(style: Style) -> Self {
+    const fn continuation(style: Style) -> Self {
         Self {
             text: String::new(),
             width: 0,

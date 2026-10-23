@@ -6,21 +6,17 @@
 //! `aterm-effects/tests/conformance_trick_listener.rs`.
 
 use aterm_models_effects::trick_listener_purity_model;
+use aterm_spec::interp;
 use aterm_spec::walk::walk;
-use aterm_spec::{interp, verify};
 
 #[test]
-fn trick_listener_purity_proves_catches_and_has_no_dead_action() {
+fn trick_listener_purity_has_no_dead_action() {
     let model = trick_listener_purity_model();
     let fired = interp::fired_actions(&model);
     assert_eq!(
         fired.len(),
         model.actions.len(),
         "every action fires: {fired:?}"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "kitty listener: only a pure, unpoisoned line speaks, at an edge, and only the name makes it final",
     );
 
     // `sit␣` alone is tentative; after `kitty␣`, or `kitty,`, it is final.

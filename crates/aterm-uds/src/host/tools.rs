@@ -774,16 +774,17 @@ pub const TOOLS: &[Tool] = &[
     clt(
         "otool",
         &["/usr/bin/otool"],
-        "the producer's and abrew's linkage reads, until S12 moves them onto atpkg::macho's \
-         LC_LOAD_DYLIB reader (row 12)",
+        "the producer's relocation reads, and the oracle atpkg::macho's load-command reader is \
+         checked against (abrew reads with atpkg::macho, row 12)",
     ),
     // Not the CLT's: their /usr/bin/xcodebuild is a shim that refuses without full Xcode
     // ("tool 'xcodebuild' requires Xcode", measured 2026-10-20 on a CLT-only developer dir).
     unprovided(
         "xcodebuild",
-        &["/usr/bin/xcodebuild"],
-        "it is full Xcode's, and S12 reads the developer dir's version plist instead (row 13)",
-        "abrew's `-version`, which answers only where full Xcode is installed (row 13)",
+        &["/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild"],
+        "it is full Xcode's; abrew reads the selected Xcode's version plist instead (row 13)",
+        "the oracle abrew's Xcode probe is checked against: the selected Xcode's own `-version`, \
+         never the /usr/bin shim, and only where an Xcode is selected (row 13)",
     ),
     // ---- ALab's default set (§7) ----------------------------------------------------
     toolset(
@@ -893,9 +894,10 @@ pub const TOOLS: &[Tool] = &[
     unprovided(
         "zstd",
         &["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"],
-        "S12's Compressor port removes its tests' need, and S17's encoder the publish hosts' (row 18)",
-        "the producer compresses every pack at -19; its tests leave it with S12's Compressor port, \
-         and publish hosts with S17's encoder (row 18)",
+        "only a rostered publish host packs with it, until S17's encoder (row 18)",
+        "the producer compresses every pack at -19 on a rostered publish host, and one producer \
+         test packs through it, the oracle its other tests' raw-block writer (aterm-zstd) is held \
+         to; S17's encoder retires it (row 18)",
     ),
     unprovided(
         "gitleaks",
@@ -909,11 +911,6 @@ pub const TOOLS: &[Tool] = &[
         "firebase",
         &[],
         "`ship site` deploys through firebase-tools until S17's REST deploy (row 17)",
-    ),
-    release_host(
-        "gh",
-        &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"],
-        "release publishing and atpkg-publish's host lane, until S15's REST (row 22)",
     ),
     release_host(
         "pub",

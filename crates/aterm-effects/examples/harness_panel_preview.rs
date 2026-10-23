@@ -1,44 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `harness_panel_preview`: pictures of Claude Code's agents panel as the
-//! harness wears it (`aterm_effects::harness_panel`,
-//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.6.13) for visual
-//! iteration and the owner's eye — pictures to look at, not checks.
-//!
-//! Each panel is drawn by the real renderer (`aterm_render::Renderer`, the
-//! bundled JetBrains Mono with DejaVu Sans Mono and Noto Sans Symbols 2
-//! behind it) from a real engine (`aterm_core::terminal::Terminal`) fed the
-//! panel as Claude Code 2.1.304 draws it — the mode row, a blank row, `⏺
-//! main` bold in the default ink, each agent's `◯ <name>  <activity>` and
-//! its right-aligned `<elapsed> · ↓ <N> tokens` in Claude's panel grey
-//! (`#999999` dark, `#666666` light), a workflow's `▰▰▱` bar after a slot
-//! row — with the emitter's ink and light laid on the frame as the host
-//! lays them (`aterm-gui`'s `claude_panel::make_look`). One row each:
-//! running hot (1000 tok/s, level 1), running light (4 tok/s, level 0.18),
-//! quiet for 90 s (freshness 0.54), waiting four minutes on its own Bash
-//! call inside that call's timeout (in its tool: fresh, level 0, dimmed
-//! light), stuck for minutes (freshness 0.10, its breath at its peak),
-//! awaiting approval, done (Claude's success green
-//! bullet), failed (its error red), and a workflow running at 116 tok/s
-//! (level 0.66) crested mid-bar. Each row's activity text names its state.
-//! Written to `<out_dir>`:
-//!
-//! * `panel_dark.png`, `panel_light.png`, `panel_linen.png`: Cruise, Land
-//!   and Off on Aterm Night, on Aterm Day, then on Linen.
-//! * `panel_serious.png`: Cruise in serious mode, dark then light (the state
-//!   ink kept, every light dropped).
-//! * `dots_zoom.png` (4×): the dots and names of Cruise dark and Cruise
-//!   light, cropped.
-//! * `breath.png` (4×): the stuck row alone at its breath's floor, halfway
-//!   and at its peak, dark then light.
-//! * `crest.png` (3×): the workflow row alone at six moments two ripple
-//!   steps (256 ms) apart, the crest passing along the filled cells.
-//!
-//! ```text
-//! targo --unverified run -p aterm-effects --example harness_panel_preview -- [out_dir]
-//! (default out_dir: target/harness_panel_preview)
-//! ```
+//! `harness_panel_preview`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -398,7 +361,6 @@ fn panel(rend: &mut Renderer, scene: Scene, label: &str) -> Picture {
     let grey = GREY[li];
     let g = sgr(grey);
     let theme = Theme::from(&builtin(scene.theme).expect("a built-in theme"));
-    // The engine's default ink and ground are the theme's, as a pane's are.
     let mut screen = format!(
         "\x1b]10;#{:06x}\x07\x1b]11;#{:06x}\x07\x1b[?25l\x1b[2J",
         theme.fg, theme.bg
@@ -493,7 +455,6 @@ fn lay(
             );
         }
     };
-    // Main: its name along its stripe at Claude's (bold default) lightness.
     if scene.solo.is_none() {
         name(&mut put, MAIN_ROW, 0, 4, fg, 1.0);
     }

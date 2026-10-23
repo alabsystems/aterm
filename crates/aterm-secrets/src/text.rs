@@ -300,7 +300,7 @@ impl Document {
     }
 
     /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in every machine that asks, with no password, except a key [`Document::code_only`] names.
-    pub fn open(&self) -> bool {
+    pub const fn open(&self) -> bool {
         self.model.open.is_some()
     }
 
@@ -1450,7 +1450,7 @@ pub fn merge_for(host: &str, entries: Vec<Entry>) -> Result<Vec<Entry>, TextErro
 }
 
 /// True when `c` may be in a file name.
-fn name_char(c: u8) -> bool {
+const fn name_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-')
 }
 

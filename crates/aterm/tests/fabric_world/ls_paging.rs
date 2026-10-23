@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm link ls` OVER A SCRIPTED `Last`: what `--attention` keeps, and that
-//! a walk which could not finish is a failure.
-//!
-//! The paging itself is astream's: `ls` walks the face with
-//! `astream_broker::Client::last_walk`, which pages on the resume cursor —
-//! through short and EMPTY pages, ending only on an empty `resume`, and failing
-//! past `LAST_WALK_PAGES_MAX` — and astream's own `tests/last_walk.rs` proves
-//! that contract. A live broker rarely shows an empty page with a live cursor
-//! (its `last_page` hands back a cursor only on a subject the filter covers),
-//! so the stub here answers `Last` in the contract's worst legal shapes, with
-//! the real `aterm link ls` on the other end of the socket, to check the parts
-//! that are aterm's: the filter over the rows and the exit status.
-//!
-//! DETERMINISTIC: no sleeps, no live broker, no clock.
+//! `aterm link ls` over a scripted `Last` response.
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
@@ -144,11 +131,6 @@ fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
         .arg(&path)
         .args(extra);
     let out = harness::output_within(&mut cmd, "aterm link ls");
-    // UNBLOCK THE ACCEPT rather than time it out. If `ls` exited without ever
-    // connecting — a usage error, a parse change — the stub would sit in
-    // `accept()` for ever and the test would HANG instead of failing. One
-    // throwaway connection makes the join total; it is queued and ignored when
-    // `ls` did connect.
     let _ = UnixStream::connect(&path);
     server.join().expect("the stub broker thread");
     (
@@ -190,12 +172,6 @@ fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
 }
 
 /// A WALK THAT COULD NOT FINISH IS AN ERROR, NOT AN EMPTY FLEET.
-///
-/// The stub never surrenders an empty `resume`, so the walk is unbounded and
-/// astream's walker gives up at its page bound. `ls` must hand that error on —
-/// with a non-zero exit — rather than swallow it: a caller that cannot tell
-/// "no rows" from "I stopped looking" is the caller that reports a quiet fleet
-/// while a node is escalating.
 #[test]
 fn a_last_walk_that_never_ends_is_an_error_rather_than_a_short_roster() {
     let (stdout, stderr, ok) = ls("bnd", vec![Page::empty("/f/f1/pub/n-a/s-1/presence")], &[]);

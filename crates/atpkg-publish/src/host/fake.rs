@@ -182,7 +182,7 @@ impl FakeHost {
             .or_default() += 1;
     }
 
-    /// A keyless builder: no token and no `gh` login, so every authenticated read
+    /// A keyless builder: no token, so every authenticated read
     /// (`releases`, `release`, `download`) is unreachable and only the anonymous download
     /// host answers ([`ReleaseHost::reads_anonymously`]).
     pub fn set_anonymous_reads(&self, anonymous: bool) {
@@ -230,7 +230,7 @@ impl FakeHost {
         }
         if self.state().anonymous {
             return Err(HostError::Unreachable(
-                "gh has no login and there is no token file on this keyless builder".into(),
+                "there is no token file on this keyless builder".into(),
             ));
         }
         if self.state().unreachable_owners.contains(&slug.owner) {
@@ -447,7 +447,7 @@ impl ReleaseHost for FakeHost {
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
         self.log(format!("fetch {slug} {tag} {asset}"));
         let answer = self.fetch_public_into(slug, tag, asset, dest, cap);
-        // As the trait says and GhCli does: `dest` holds a file only when it is present.
+        // As the trait says and RestHost does: `dest` holds a file only when it is present.
         if answer != Probe::Present {
             let _ = std::fs::remove_file(dest);
         }

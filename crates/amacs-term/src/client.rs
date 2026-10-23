@@ -264,7 +264,7 @@ pub enum Ending {
 
 /// Maps an [`EditErr`] to its [`Handoff`] classification.
 #[must_use]
-pub fn handoff_of(error: &EditErr) -> Handoff {
+pub const fn handoff_of(error: &EditErr) -> Handoff {
     match error {
         EditErr::Refused(_) => Handoff::Refused,
         EditErr::Unreachable(_) | EditErr::Unsendable(_) => Handoff::Unreachable,

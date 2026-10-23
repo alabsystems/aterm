@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `SCM_RIGHTS` descriptor passing against a real kernel: the transport the
-//! seamless handoff uses when the successor is not a fork child and inherits
-//! no descriptor table.
-//!
-//! Each test checks one fact `aterm_uds::fdpass` relies on:
-//!
-//! * descriptors arrive at different numbers naming the same open file
-//!   descriptions, asserted via `fstat` identity and a shared file offset (a
-//!   fresh `open` of the same path would not share the offset);
-//! * `FD_CLOEXEC` is clear on arrival (Darwin has no `MSG_CMSG_CLOEXEC`), so
-//!   the receiver must set it itself;
-//! * an over-budget receive is refused and leaks nothing.
-//!
-//! Descriptor counts are process-wide and tests run as threads of one
-//! process, so every test takes [`serial`].
+//! `SCM_RIGHTS` descriptor passing against a real kernel.
 #![cfg(any(
     target_vendor = "apple",
     all(
@@ -85,8 +71,8 @@ fn identity(f: &File) -> (u64, u64) {
 /// This process's open-descriptor count.
 fn open_descriptor_count() -> usize {
     (0..PROBE_LIMIT)
-        // SAFETY: `F_GETFD` only reads the descriptor flags; an unopened
-        // number answers -1/EBADF, which is exactly what is being counted.
+        // SAFETY: `F_GETFD` only reads the descriptor flags; an unopened number answers -1/EBADF,
+        // which is exactly what is being counted.
         .filter(|&fd| unsafe { fcntl(fd, F_GETFD) } != -1)
         .count()
 }
@@ -97,9 +83,6 @@ fn descriptors_naming(want: (u64, u64)) -> usize {
     (0..PROBE_LIMIT)
         .filter(|&fd| {
             // SAFETY: the `File` is wrapped in `ManuallyDrop` and never
-            // dropped, so this borrows the descriptor for one `fstat` and
-            // never closes a descriptor it does not own. An invalid number
-            // fails `metadata()` (EBADF) and counts as no match.
             let f = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
             f.metadata().is_ok_and(|m| (m.dev(), m.ino()) == want)
         })
@@ -108,8 +91,7 @@ fn descriptors_naming(want: (u64, u64)) -> usize {
 
 /// Descriptor flags of `fd`, or -1.
 fn descriptor_flags(fd: RawFd) -> i32 {
-    // SAFETY: `F_GETFD` only reads the descriptor flags of a descriptor this
-    // process owns.
+    // SAFETY: `F_GETFD` only reads the descriptor flags of a descriptor this process owns.
     unsafe { fcntl(fd, F_GETFD) }
 }
 
@@ -307,8 +289,6 @@ fn misuse_is_refused_before_the_kernel_is_asked() {
     let over_max = fdpass::recv_with_fds(&b, &mut buf, MAX_FDS + 1).expect_err("over the cap");
     assert_eq!(over_max.kind(), ErrorKind::InvalidInput);
 
-    // Nothing was sent: a non-blocking receive finds an empty socket rather
-    // than a message whose descriptors were quietly consumed.
     b.set_nonblocking(true).expect("non-blocking");
     let idle = fdpass::recv_with_fds(&b, &mut buf, 1).expect_err("nothing queued");
     assert_eq!(

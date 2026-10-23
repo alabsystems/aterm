@@ -9,8 +9,8 @@
 use std::collections::BTreeSet;
 
 use aterm_models_agh::agh_route_wall_model;
+use aterm_spec::interp;
 use aterm_spec::walk::walk;
-use aterm_spec::{interp, verify};
 
 const ROUTER_AND_WORLD: [&str; 9] = [
     "Decide",
@@ -43,32 +43,13 @@ type Values = [(&'static str, i64); 2];
 /// At `Buggy = 0` exactly the nine world and router actions fire, at `Buggy = 1` all
 /// eighteen do, and the model is proved at 0 and caught at 1.
 #[test]
-fn route_wall_proves_catches_and_fires_every_action() {
+fn route_wall_fires_every_action_and_every_mutant() {
     let model = agh_route_wall_model();
     let lawful: BTreeSet<&str> = ROUTER_AND_WORLD.into_iter().collect();
     assert_eq!(interp::fired_actions(&model), lawful);
     let every: BTreeSet<&str> = ROUTER_AND_WORLD.into_iter().chain(MUTANTS).collect();
     assert_eq!(interp::fired_actions(&interp::with_buggy(&model, 1)), every);
     assert_eq!(model.actions.len(), 18);
-    verify::prove_and_catch_scalar(
-        &model,
-        "agh route wall: the release token stays home, writes need the routed writer, refusals send nothing, the hop carries no credential",
-    );
-}
-
-/// The fault sweep finds nothing, and each of the nine mutants is an audited negative
-/// control.
-#[test]
-fn route_wall_has_no_fault_and_nine_audited_controls() {
-    let model = agh_route_wall_model();
-    assert_eq!(
-        verify::sweep_faults(std::slice::from_ref(&model)),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        verify::audit_dead_negative_controls(std::slice::from_ref(&model)),
-        Ok(9)
-    );
 }
 
 /// Each mutant, fired from a lawful state, breaks the laws design §17.1 pairs it with.

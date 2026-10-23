@@ -32,7 +32,7 @@ impl Value {
     /// The string, if this is one.
     #[inline]
     #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
+    pub const fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s.value().as_str()),
             _ => None,

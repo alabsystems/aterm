@@ -3,24 +3,7 @@
 
 use aterm_spec::derive::*;
 
-/// A wrapped Codex row may print its first glyph behind an unchanged visible
-/// caret while a status repaint replaces the last global print anchor. Its
-/// same-caret re-lay requires an exact in-flight key and old hand-owned cell:
-/// the row's blank-to-glyph transition is the witness even after the 250 ms
-/// key hint, but never after the 10 s press patience. A stalled host can
-/// instead observe the first whole a/n/d batch: with no old cell, a prior
-/// blank-row probe plus an exact chronological in-flight key run and fresh
-/// last key authorize only the missing first cell. A glyph replaced under the
-/// unchanged caret is a key's echo only when the hand retyped that column: a
-/// Backspace whose retreat no caret move has shown, and the keys typed since
-/// it spelling the changed cells (the erase and the retyped keys rendered as
-/// one repaint). That change is then the witness, printed or erased to the
-/// line's end for a Space, whether the column held the hand's lit cell or
-/// the late echo of a key the Backspace erased, which no press paid
-/// (`RetypedOverLateEcho`). Tier-1 drives captured Codex frame schedules in
-/// `aterm-effects/tests/codex_particle_replay.rs` and Claude Code's composer
-/// in `aterm-effects/tests/the_owners_composer_gaps.rs` and
-/// `aterm-effects/tests/torn_repaint_hidden_caret.rs`.
+/// Same-caret typed echo admission across wrapped rows, batched keys, and in-place retypes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn same_caret_typed_echo_model() -> Model {
@@ -228,21 +211,7 @@ pub fn same_caret_typed_echo_model() -> Model {
     }
 }
 
-/// A Backspace's echo, in byte order. Bytes are processed in order: a key
-/// typed and erased inside one echo lag (`thes⌫`, `s` unseen at the
-/// Backspace) still prints before the erase's retreat, and a key typed after
-/// the Backspace echoes after it. So the erased key's late echo is paid by no
-/// press (the Backspace retired it), the next key's press included, and it
-/// leaves the erase owed: the retreat, however late, is the erase's echo,
-/// never Ink's park while the next key is in flight. A correction rendered as
-/// one repaint (`MergedCorrection`) is the retreat and the next key's advance
-/// at once. Before the law the late echo spent the Backspace's licence
-/// (`Buggy = 2`): the retreat was held as a park, the next key's echo back to
-/// the park's origin cancelled it, and that key stayed dark (the owner's
-/// `the▯subtrees`, 2026-10-16). Paying the late echo with the next key's
-/// press (`Buggy = 1`) darkens that key too. Tier-1 drives Claude Code's
-/// composer at every echo lag in
-/// `aterm-effects/tests/torn_repaint_hidden_caret.rs`.
+/// Byte-order Backspace echo and late-echo retirement without parking the next key.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn erased_key_echo_order_model() -> Model {
@@ -297,16 +266,7 @@ pub fn erased_key_echo_order_model() -> Model {
     }
 }
 
-/// An unknown-width insert can absorb a queued key into its own hop, so its
-/// dispatch-to-delivery credits leave the generic ring at orphan cleanup.
-/// When one or two known one-cell keys remain, the seam escrows their glyphs
-/// and the insert's row/next column/print generation. Exact later row
-/// transitions spend one key or both when a single frame has two new exact
-/// cells; a different print, a third pending key, expiry, scroll, rewrite, or
-/// reset closes the remainder. The PTY cannot distinguish a delayed key from
-/// program output that exactly mimics its glyphs and transition; the model
-/// rejects every distinguishable program move. Tier-1 drives the genuine
-/// CursorGlow seam in `cursor_glow::tests::unknown_insert`.
+/// Orphan key escrow and exact-print admission after an unknown-width insert.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn unknown_insert_orphan_key_model() -> Model {

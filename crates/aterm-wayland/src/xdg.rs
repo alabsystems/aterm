@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! xdg-shell windows: the `xdg_wm_base` (answering the compositor's pings),
-//! a toplevel over a `wl_surface` (its `xdg_surface` and `xdg_toplevel`), the
-//! configure sequence the compositor drives it with, and the decoration mode
-//! negotiated through xdg-decoration where the compositor offers it. Where it
-//! does not, the window decorates itself (aterm-gui's chrome band is the
-//! header, LW.5).
-//!
-//! A configure is applied in two halves, as the protocol has it: the
-//! toplevel's `configure` (size, states) and the surface's `configure`
-//! (serial) that closes it; [`Toplevel::take_configure`] hands out the
-//! whole, and the caller acks it once it has drawn for it.
+//! `xdg-shell` window, surface configure, and decoration handling ([`Toplevel::take_configure`]).
 
 use std::ffi::CStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -23,13 +13,10 @@ use crate::protocols::xdg_decoration_unstable_v1::{
 use crate::protocols::xdg_shell::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use crate::proxy::{Error, EventArg, Listener, Proxy};
 
-/// The highest `xdg_wm_base` version bound: smithay-client-toolkit 0.19.2's
-/// (the winit fork's shell until LW.7), so a toplevel hears the configure
-/// states it heard (version 7's constrained edges are not sent).
+/// The highest `xdg_wm_base` version bound.
 pub const WM_BASE_VERSION: u32 = 6;
 
-/// The shell: `xdg_wm_base` (answering pings) and, when offered, the
-/// decoration manager.
+/// The shell: `xdg_wm_base` (answering pings) and, when offered, the decoration manager.
 pub struct Shell {
     wm_base: Proxy,
     decorations: Option<Proxy>,
@@ -37,8 +24,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    /// Bind `xdg_wm_base` (at most version [`WM_BASE_VERSION`]) and
-    /// `zxdg_decoration_manager_v1` if the registry lists it.
+    /// Binds `xdg_wm_base` (up to [`WM_BASE_VERSION`]) and optional `zxdg_decoration_manager_v1`.
     pub fn bind(registry: &Registry) -> Result<Shell, Error> {
         let global = registry.find(c"xdg_wm_base").ok_or(Error::NoObject)?;
         let wm_base = registry
@@ -46,17 +32,16 @@ impl Shell {
             .ok_or(Error::NoObject)?;
         let pong = move |base: Proxy, opcode: u32, args: &[EventArg<'_>]| {
             if let (xdg_wm_base::evt::PING, [EventArg::Uint(serial)]) = (opcode, args) {
-                // SAFETY: the live wm_base the event came from.
+                // SAFETY: `wm_base` is the live proxy that delivered the ping event.
                 unsafe { xdg_wm_base::pong(base, *serial) };
             }
         };
-        // SAFETY: the wm_base just bound, without a listener; the listener
-        // lives in the returned Shell and drops after the proxy.
+        // SAFETY: The wm_base just bound, without a listener.
         let ping = unsafe { wm_base.listen(pong) };
         let ping = match ping {
             Ok(l) => l,
             Err(e) => {
-                // SAFETY: the wm_base bound above, not used again.
+                // SAFETY: The wm_base bound above, not used again.
                 unsafe { xdg_wm_base::destroy(wm_base) };
                 return Err(e);
             }
@@ -77,16 +62,13 @@ impl Shell {
         self.decorations.is_some()
     }
 
-    /// The `xdg_wm_base`, for a caller that makes its toplevels' objects
-    /// itself (the winit fork's windows, whose configure it hears in order
-    /// with their scale); live while the shell is.
+    /// Returns the raw `xdg_wm_base` pointer valid for the lifetime of this shell.
     #[inline]
     pub const fn wm_base(&self) -> Proxy {
         self.wm_base
     }
 
-    /// The `zxdg_decoration_manager_v1`, when the compositor offers one; live
-    /// while the shell is.
+    /// Returns the raw `zxdg_decoration_manager_v1` pointer if offered by the compositor.
     #[inline]
     pub const fn decoration_manager(&self) -> Option<Proxy> {
         self.decorations
@@ -95,8 +77,7 @@ impl Shell {
 
 impl Drop for Shell {
     fn drop(&mut self) {
-        // SAFETY: objects this value bound, each destroyed once (every
-        // toplevel made from them is gone: Toplevel borrows the Shell).
+        // SAFETY: Objects this value bound.
         unsafe {
             if let Some(d) = self.decorations {
                 zxdg_decoration_manager_v1::destroy(d);
@@ -119,17 +100,14 @@ pub enum Decorations {
     Pending,
 }
 
-/// One complete configure: the toplevel's suggestion and the surface's
-/// serial.
+/// One complete configure: the toplevel's suggestion and the surface's serial.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Configure {
     pub serial: u32,
-    /// The suggested size in surface-local coordinates; 0 leaves it to the
-    /// client.
+    /// The suggested size in surface-local coordinates; 0 leaves it to the client.
     pub width: i32,
     pub height: i32,
-    /// `xdg_toplevel.state` values (maximized 1, fullscreen 2, resizing 3,
-    /// activated 4, the tiled edges 5-8, suspended 9).
+    /// Active `xdg_toplevel.state` values reported in this configure event.
     pub states: Vec<u32>,
 }
 
@@ -153,9 +131,7 @@ pub struct Toplevel<'s> {
     _listeners: Vec<Listener>,
 }
 
-/// Owns a constructor's objects and installed listeners until a Toplevel
-/// takes them. Later setup failures destroy children before their parents,
-/// while all installed listeners are still alive.
+/// Owns a constructor's objects and installed listeners until a Toplevel takes them.
 struct PendingToplevel {
     xdg_surface: Option<Proxy>,
     toplevel: Option<Proxy>,
@@ -165,8 +141,7 @@ struct PendingToplevel {
 
 impl Drop for PendingToplevel {
     fn drop(&mut self) {
-        // SAFETY: objects made by this constructor and not transferred to a
-        // Toplevel; taken once, children first, before listeners are freed.
+        // SAFETY: Objects made by this constructor and not transferred to a Toplevel.
         unsafe {
             if let Some(d) = self.decoration.take() {
                 zxdg_toplevel_decoration_v1::destroy(d);
@@ -273,20 +248,17 @@ impl State {
     }
 }
 
-/// Listen to one of a toplevel's objects: each event, decoded with the book
-/// unlocked, is applied to it. The book is a leaf of the lock graph: only its
-/// own method runs while it is held.
+/// Listen to one of a toplevel's objects.
 ///
 /// # Safety
-/// `proxy` is a live object of `part`'s kind this module made, without a
-/// listener, destroyed before the listener is freed.
+/// Caller must ensure `proxy` is a live unlistened proxy destroyed before its listener.
 unsafe fn listen_part(
     proxy: Proxy,
     toplevel_book: &Arc<Mutex<State>>,
     part: Part,
 ) -> Result<Listener, Error> {
     let toplevel_book = Arc::clone(toplevel_book);
-    // SAFETY: the caller's contract.
+    // SAFETY: The caller's contract.
     unsafe {
         proxy.listen(move |_, opcode, args| {
             if let Some(h) = heard(part, opcode, args) {
@@ -300,13 +272,10 @@ unsafe fn listen_part(
 }
 
 impl<'s> Toplevel<'s> {
-    /// Give `surface` the toplevel role, titled, and ask for server-side
-    /// decorations where the compositor negotiates them. The first configure
-    /// follows the first commit.
+    /// Give `surface` the toplevel role, titled.
     ///
     /// # Safety
-    /// `surface` is a live `wl_surface` with no role, on the same display
-    /// as the shell, and outlives the toplevel.
+    /// Caller must ensure `surface` is a live role-less `wl_surface` that outlives the toplevel.
     pub unsafe fn new(
         shell: &'s Shell,
         surface: Proxy,
@@ -314,7 +283,7 @@ impl<'s> Toplevel<'s> {
         app_id: &CStr,
     ) -> Result<Toplevel<'s>, Error> {
         let toplevel_book = Arc::new(Mutex::new(State::default()));
-        // SAFETY: the shell's live wm_base and the caller's role-less surface.
+        // SAFETY: The shell's live wm_base and the caller's role-less surface.
         let xdg = unsafe { xdg_wm_base::get_xdg_surface(shell.wm_base, surface) }
             .ok_or(Error::NoObject)?;
         let mut pending = PendingToplevel {
@@ -323,36 +292,35 @@ impl<'s> Toplevel<'s> {
             decoration: None,
             listeners: Vec::new(),
         };
-        // SAFETY: an xdg_surface made here; its pending owner destroys it
-        // before any installed listeners are freed on a later error.
+        // SAFETY: An xdg_surface made here.
         pending
             .listeners
             .push(unsafe { listen_part(xdg, &toplevel_book, Part::Surface) }?);
-        // SAFETY: the live xdg_surface.
+        // SAFETY: The live xdg_surface.
         let toplevel = unsafe { xdg_surface::get_toplevel(xdg) }.ok_or(Error::NoObject)?;
         pending.toplevel = Some(toplevel);
-        // SAFETY: a toplevel made here, held by the pending owner.
+        // SAFETY: A toplevel made here, held by the pending owner.
         pending
             .listeners
             .push(unsafe { listen_part(toplevel, &toplevel_book, Part::Toplevel) }?);
-        // SAFETY: the live toplevel; NUL-terminated strings.
+        // SAFETY: The live toplevel; NUL-terminated strings.
         unsafe {
             xdg_toplevel::set_title(toplevel, title);
             xdg_toplevel::set_app_id(toplevel, app_id);
         }
         let decoration = match shell.decorations {
             Some(manager) => {
-                // SAFETY: the shell's live manager and the toplevel above.
+                // SAFETY: The shell's live manager and the toplevel above.
                 let d = unsafe {
                     zxdg_decoration_manager_v1::get_toplevel_decoration(manager, toplevel)
                 }
                 .ok_or(Error::NoObject)?;
                 pending.decoration = Some(d);
-                // SAFETY: a decoration object made here, held by the pending owner.
+                // SAFETY: A decoration object made here, held by the pending owner.
                 pending
                     .listeners
                     .push(unsafe { listen_part(d, &toplevel_book, Part::Decoration) }?);
-                // SAFETY: the live decoration object.
+                // SAFETY: The live decoration object.
                 unsafe {
                     zxdg_toplevel_decoration_v1::set_mode(
                         d,
@@ -371,7 +339,6 @@ impl<'s> Toplevel<'s> {
             toplevel_book,
             _listeners: std::mem::take(&mut pending.listeners),
         };
-        // The complete owner exists before the pending owner is disarmed.
         pending.decoration = None;
         pending.toplevel = None;
         pending.xdg_surface = None;
@@ -389,7 +356,7 @@ impl<'s> Toplevel<'s> {
 
     /// Acknowledge a configure (after drawing for it, before committing).
     pub fn ack(&self, serial: u32) {
-        // SAFETY: the live xdg_surface this value made.
+        // SAFETY: The live xdg_surface this value made.
         unsafe { xdg_surface::ack_configure(self.xdg_surface, serial) }
     }
 
@@ -439,8 +406,7 @@ impl<'s> Toplevel<'s> {
 
 impl Drop for Toplevel<'_> {
     fn drop(&mut self) {
-        // SAFETY: objects this value made, destroyed once, children first;
-        // the listeners drop after, with the fields.
+        // SAFETY: Objects this value made, destroyed once, children first.
         unsafe {
             if let Some(d) = self.decoration {
                 zxdg_toplevel_decoration_v1::destroy(d);

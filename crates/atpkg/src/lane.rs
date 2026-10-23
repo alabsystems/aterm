@@ -2,26 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `atpkg lane` — the Rust-lane reader over one shell command line.
-//!
-//! [`aterm_types::rust_lane`] finds a stock Rust tool (`cargo`, `cargo +1.97.1`, `rustc`,
-//! `rustfmt`, clippy, rustdoc) at command position in a shell line, through substitutions
-//! and wrappers, and renders the Trust spelling of the same command. The reroute stubs
-//! answer a name looked up on PATH and never see a command line; this verb reads one.
-//!
-//! It installs nothing, reads nothing but its input and knows no vendor: it takes a command
-//! line (argv, stdin, or one string field of a JSON object on stdin,
-//! `--json tool_input.command`) and answers with an exit code and stderr. Whoever wants a
-//! guard wires it themselves.
-//!
-//! - Exit 0 and silence: no stock Rust tool at command position.
-//! - Exit 0 and one stderr line: one stood there, cleared by `ATERM_STOCK_REASON='<why>'` in
-//!   front of it.
-//! - Exit [`crate::reroute::REFUSAL_EXIT`] (2) with [`rust_lane::refusal`] on stderr: the
-//!   Trust spelling of the command, the stock pin in force (`$RUSTUP_TOOLCHAIN`, else the
-//!   directory's toolchain file) unless the command names its own channel or toolchain,
-//!   and the escape.
-//! - Exit 1: the input or the arguments could not be read (not JSON, not UTF-8, over
-//!   [`MAX_INPUT_BYTES`], a usage error), so there is no verdict.
 
 use std::path::{Path, PathBuf};
 
@@ -29,13 +9,10 @@ use aterm_types::rust_lane;
 
 use crate::reroute::Pin;
 
-/// The most input one call reads. An agent's command line can be large (a heredoc
-/// body), but a guard that buffers without bound is its own hazard.
+/// The most input one call reads.
 pub const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
-/// All of `input`, up to [`MAX_INPUT_BYTES`]. Input past the limit is refused, never cut:
-/// a verdict on a prefix would be a false clean (or a false "not JSON").
-///
+/// All of `input`, up to [`MAX_INPUT_BYTES`].
 /// # Errors
 /// The reader failed, or held more than [`MAX_INPUT_BYTES`].
 pub fn read_input(input: impl std::io::Read) -> Result<Vec<u8>, String> {
@@ -74,8 +51,7 @@ pub struct Args {
     pub source: Source,
 }
 
-/// Parse the argv after `lane`. `Err` is the usage error to print.
-///
+/// Parse the argv after `lane`.
 /// # Errors
 /// An unknown option, a missing value, no source, or two sources.
 pub fn parse_args(rest: &[String]) -> Result<Args, String> {
@@ -134,10 +110,7 @@ pub fn parse_args(rest: &[String]) -> Result<Args, String> {
     Ok(Args { cwd, source })
 }
 
-/// The command line `source` names, `input` being stdin's bytes (read only for the
-/// stdin sources). `Ok(None)`: the JSON object has no string at that path — nothing to
-/// read, so nothing to refuse.
-///
+/// The command line `source` names, `input` being stdin's bytes (read only for the stdin sources).
 /// # Errors
 /// Input that is not UTF-8, or not JSON for [`Source::Json`].
 pub fn command_line(source: &Source, input: &[u8]) -> Result<Option<String>, String> {
@@ -174,14 +147,7 @@ pub enum Answer {
     Refused(String),
 }
 
-/// The reader's answer for `command`, a refusal naming the stock pin of `cwd` (or
-/// `$RUSTUP_TOOLCHAIN`, `env_toolchain`, which rustup ranks above a file).
-///
-/// A path-form command word's directory is looked at ([`rust_lane::verdict_in`],
-/// [`rust_lane::file_beside`]): a relative one under `cwd`, a leading `~/` or `$HOME/` under
-/// `home`. So a Trust toolchain's own `rustc` by path (`build/<host>/stage2/bin/rustc -vV`)
-/// is not refused, and its `cargo` is refused with that directory's `targo`. With no `cwd`,
-/// only an absolute or home-relative directory can be looked at.
+/// The reader's answer for `command`, a refusal naming the stock pin of `cwd`.
 #[must_use]
 pub fn answer(
     command: &str,
@@ -316,7 +282,6 @@ mod tests {
             panic!("a stock command is refused");
         };
         assert!(text.contains("targo --unverified test -p x"), "{text}");
-        // The directory's stock pin, and `$RUSTUP_TOOLCHAIN` above it.
         let dir = crate::testdir::dir("atpkg-lane-");
         let sub = dir.join("src");
         std::fs::create_dir_all(&sub).unwrap();

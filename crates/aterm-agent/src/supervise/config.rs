@@ -273,7 +273,7 @@ pub struct SupervisorConfig {
     pub probe_api: bool,
     /// Continue once a session or weekly usage limit has reset.
     pub resume_limits: bool,
-    /// At Claude Code's usage-limit dialog (`What do you want to do?`), choose `Wait here, then continue automatically …` by its label (never a spending row, never `Stop`), arming the vendor's own continue for the reset (`limit-wait@v1`).
+    /// At Claude Code's usage-limit dialog (`What do you want to do?`), choose `Wait here, then continue automatically …` by its label (never a spending row, never `Stop`), arming the vendor's own continue for the reset (`limit-wait@v1`); at Gemini CLI's, wait through the reset it names (or, naming none, the back-off ladder's rung while a person is told), then choose `Keep trying` (`limit-retry@v1`), or on its per-model dialog `Stop` (`limit-stop@v1`, never the switch nor the upgrade) and then the resume. Off: the dialog is a person's.
     pub limit_wait: bool,
     /// At Claude Code's autocompact offer (`We recommend compacting earlier`, 2.1.302), choose `Autocompact at ‹ <size> › tokens` at this size, in kilo-tokens (`autocompact-offer@v1`).
     pub autocompact_offer: Option<u32>,

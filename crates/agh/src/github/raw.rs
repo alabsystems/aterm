@@ -19,13 +19,12 @@ pub struct Raw<'a> {
     gh: &'a Github,
 }
 
-/// One `agh api` request: a read. `Raw::get` refuses a `method` other than GET and HEAD. M2
-/// adds `Raw::send` for writes and leaves `RawGet` as it is.
+/// One `agh api` read request.
 #[derive(Clone, Debug)]
 pub struct RawGet {
     /// The method.
     pub method: Method,
-    /// The path, starting with `/`, as typed (the CLI encodes nothing further).
+    /// The path, starting with `/`, as typed.
     pub path: String,
     /// The query pairs.
     pub query: Vec<(String, String)>,
@@ -89,11 +88,9 @@ fn segments(path: &str) -> Vec<String> {
 /// How a `Content-Type` labels a body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Media {
-    /// `application/json`: what GitHub sends for an object or an array.
+    /// `application/json`.
     Json,
-    /// Another `+json` type. GitHub labels bytes that are not JSON this way too (a raw file
-    /// is `application/vnd.github.raw+json`, an HTML rendering `….html+json`), so such a body
-    /// is JSON only when it parses.
+    /// Another `+json` media type.
     PlusJson,
     /// Anything else, or no `Content-Type`.
     Other,
@@ -108,8 +105,7 @@ fn essence(content_type: Option<&str>) -> String {
 }
 
 impl Media {
-    /// The label of `content_type`, judged on its essence (before any `;`, trimmed, ASCII
-    /// case-insensitive), never on a substring.
+    /// Classify `content_type` by its media essence.
     pub(crate) fn of(content_type: Option<&str>) -> Media {
         Media::of_essence(&essence(content_type))
     }
@@ -170,36 +166,20 @@ impl<'a> Raw<'a> {
         }
     }
 
-    /// Send `req`. Without `all`: one call; `include` → `Included` (a non-empty body that
-    /// parses as JSON under a JSON content type, else its lossy text); an `application/json`
-    /// body → `Json`; a raw or HTML rendering of a contents or readme path → `Bytes`, even
-    /// when it parses; another `+json` body → `Json` when it parses, else `Bytes`; anything
-    /// else (an empty body included) → `Bytes`. With `all`: every page (`page::walk_pages`), scoped
-    /// by the path (`/repos/{o}/{r}/…` → `Repo`, `/orgs/{o}/…` and `/users/{o}/…` → `Owner`,
-    /// with the owner's id read first, else `Exact`); arrays are concatenated into `Json`, any
-    /// other pages are `Pages`. A HEAD has no pages, so it is one call with or without `all`.
+    /// Execute `req`, reading one response or walking all pages when `req.all` is set.
     ///
     /// # Errors
     ///
-    /// A `req.method` other than GET and HEAD → Refused `policy.method_not_read`, before any
-    /// request, `all`'s owner-id lookup included; Usage for a `req.path` holding a `#`, which
-    /// the wire would cut, so the route would be decided for one path and another sent, or a
-    /// `.` or `..` segment (typed or percent-encoded), which a normalising server would
-    /// resolve off the route (`all`'s owner-id lookup included); else its calls' errors.
-    /// The 404 of a `/repos/{o}/{r}/…` path is probed.
+    /// Returns an error if `req.method` is not a read, `req.path` is invalid, or the call fails.
     pub fn get(&self, req: &RawGet) -> Result<RawOutcome> {
         self.get_with_end(req, false).map(|(outcome, _)| outcome)
     }
 
-    /// `get`, with how its walk ended: `End::Complete` for one call; under `all`, the walk's
-    /// own end (`Limited` at `req.opts.limit` pages, `Capped` at the page cap under
-    /// `partial`). `RawOutcome` carries no end, so `agh api` reads it here. Crate-private:
-    /// the public API of `Raw` is plan §4.6.20's `get`. `no_probe` (`--no-probe`) leaves a 404 unprobed
-    /// (NotVisible), which the frozen `RawGet` has no field for.
+    /// Execute `req` and return the outcome paired with how pagination ended.
     ///
     /// # Errors
     ///
-    /// As `get`.
+    /// Returns an error under the same conditions as [`Self::get`].
     pub(crate) fn get_with_end(&self, req: &RawGet, no_probe: bool) -> Result<(RawOutcome, End)> {
         if !req.method.is_read() {
             let repo = match &req.route.target {
@@ -214,8 +194,6 @@ impl<'a> Raw<'a> {
                 req.path
             )));
         }
-        // Judged on the whole decoded path, so a `..` behind an encoded `/` is refused too: a
-        // server that normalised it would leave the route.
         crate::path::refuse_encoded_dot_segment(
             "path",
             req.path.split('?').next().unwrap_or_default(),
@@ -243,7 +221,6 @@ impl<'a> Raw<'a> {
                 body,
             }
         } else if media == Media::Json && !answered.body.is_empty() {
-            // A body labelled `application/json` that does not parse is GitHub's fault.
             RawAnswer::Json(answered.json()?)
         } else {
             match parsed() {

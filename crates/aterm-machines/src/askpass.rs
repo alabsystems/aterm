@@ -1,24 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-machines-askpass`: the `SSH_ASKPASS` program `enroll` points each Mac's `ssh` login
-//! at (design §4.2).
-//!
-//! `enroll` asks the admin's password once and runs `ssh` with it on standard input, a pipe
-//! (`System::run_fed`), `SSH_ASKPASS=<scratch>/aterm-machines-askpass` (a link to this aterm,
-//! the argv0 alias crates/aterm routes here) and `SSH_ASKPASS_REQUIRE=force`. OpenSSH runs the
-//! helper as `[path, prompt]` with `ssh`'s own standard input and error and a pipe for its
-//! output; it closes every other descriptor at start (`closefrom(STDERR_FILENO + 1)`), so
-//! standard input is the one channel left. The helper answers that prompt with the first line
-//! of its standard input. Measured in the macOS 27.0 VM (`OpenSSH_10.3`): the prompt is
-//! `admin@192.168.64.5's password: ` for the password method and `(admin@192.168.64.5)
-//! Password:` for keyboard-interactive, and `ssh -n` still hands the helper the pipe (it
-//! only keeps the session's input off it).
-//!
-//! It answers a password prompt only: never a host-key or agent confirmation (OpenSSH sets
-//! `SSH_ASKPASS_PROMPT` for those), never a key passphrase or a one-time code, and never a
-//! person (standard input a terminal). The input holds one copy of the password, so a second
-//! prompt in the same login reads the end of input and is refused.
+//! `aterm-machines-askpass`: the `SSH_ASKPASS` program `enroll` points each Mac's `ssh` login at
+//! (design §4.2).
 
 use crate::port::Secret;
 use std::ffi::OsString;
@@ -31,7 +15,6 @@ pub const ALIAS: &str = "aterm-machines-askpass";
 /// `aterm-machines-askpass <prompt>`, as OpenSSH runs it.
 #[must_use]
 pub fn main(args: &[OsString]) -> ExitCode {
-    // Before the password is read: no core file of this process holds it.
     crate::port::no_core_dumps();
     let prompt = args
         .first()
@@ -39,8 +22,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         .unwrap_or_default();
     let confirm = std::env::var_os("SSH_ASKPASS_PROMPT").is_some();
     let person = std::io::stdin().is_terminal();
-    // Descriptors 0 and 1 themselves, not std's buffered handles: a buffer would keep a copy
-    // of the password no scrub reaches.
     let code = answer(
         &prompt,
         confirm,
@@ -75,9 +56,9 @@ impl Write for Unbuffered {
     }
 }
 
-/// Answer `prompt` with the first line of `input` on `out`: exit status 0, or 1 with one line
-/// on `err` when it is not a password prompt this helper may answer (`confirm`: OpenSSH asked
-/// a yes/no question; `person`: standard input is a terminal) or `input` has nothing left.
+/// Answer `prompt` with the first line of `input` on `out`: exit status 0, or 1 with one line on
+/// `err` when it is not a password prompt this helper may answer (`confirm`: OpenSSH asked a yes/no
+/// question; `person`: standard input is a terminal) or `input` has nothing left.
 pub fn answer(
     prompt: &str,
     confirm: bool,

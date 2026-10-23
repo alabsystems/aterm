@@ -1,35 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ HARNESS ▸ TAB CONTROL (`/tabs`): the native Tab Control Panel
-//! showing all accessible computers (`this Mac` plus managed LAN/remote Macs),
-//! `aterm` sessions/instances, and their open tabs in a spreadsheet list with
-//! live telemetry and live AI CLI status (`working: thinking`, `waiting on
-//! permission`, `idle at prompt`, Autopilot mode, and last human activity).
-//!
-//! Three cards, in order:
-//! 1. **FLEET & TAB SUMMARY** (`tabs/summary`) and **Actions** (`tabs/actions`:
-//!    `Refresh`, `Harness`, `AI CLIs`).
-//! 2. **ACCESSIBLE COMPUTERS** (`tabs/computers`) — spreadsheet rows for each
-//!    accessible Mac (computer name, reachability, address, macOS version,
-//!    `aterm` instance count, open tab count, and active AI CLI count).
-//! 3. **SESSIONS & TABS SPREADSHEET** (`tabs/spreadsheet`) — spreadsheet rows
-//!    for every open tab across all computers and `aterm` instances, showing
-//!    computer, instance, tab/window place, title, foreground program or AI
-//!    CLI product name, live AI CLI status and duration, Autopilot mode, human
-//!    activity, and a `Show tab` button for local tabs.
+//! SETTINGS ▸ HARNESS ▸ TAB CONTROL (`/tabs`): accessible computers, `aterm`
+//! sessions, and open tabs with live telemetry and AI CLI status.
 
 use super::harness_page::{metadata_cards, row_cards};
 use super::*;
 use crate::harness_screen::{TabComputer, TabControlProjection, TabSpreadsheetRow};
 use crate::native_app::HarnessRequest;
 
-/// Every action the Tab Control page mints starts with this (`tabs/refresh`,
-/// `tabs/show/<local_id>`).
+/// Prefix for actions minted by the Tab Control page.
 pub(crate) const TABS_ACTION_PREFIX: &str = "tabs/";
 
-/// The Refresh button's key and action: scan computers, sibling sockets, and
-/// tabs again off the event loop.
+/// Key and action for the Refresh button.
 pub(crate) const TABS_REFRESH: &str = "tabs/refresh";
 
 /// Prefix for a local tab row's `Show tab` action (`tabs/show/<local_id>`).
@@ -483,19 +466,14 @@ fn session_group_header_row(
     )
 }
 
+// Words are laid out as a column of lines, each beside its branch stem, so rows
+// taller than the viewport split cleanly across screens (`scroll::row_parts`).
 /// One open tab: its place, title, program and state, then its AI CLI's
 /// or its program's status, each wrapped to the words' column, never cut,
 /// under the tree's branch (which runs down beside every line of a row that
 /// another follows); and `Show tab` for a local tab, beside the words where
 /// the card holds both and the list holds the row whole (`room`), else
 /// under them.
-///
-/// A ROW TALLER THAN THE LIST IS LISTED A LINE AT A TIME: its words are a
-/// column of lines, each with its part of the branch beside it, so the
-/// list cuts the row between its lines into parts each screen shows whole
-/// ([`scroll::row_parts`]). Laid out as one block beside one tall stem, the
-/// row (a long title and status at 2× text: 296pt in the 268pt list of an
-/// 80x24 window, 1748pt at 22 columns) was cut on every screen.
 fn spreadsheet_row(
     row: &TabSpreadsheetRow,
     is_last: bool,
@@ -528,8 +506,6 @@ fn spreadsheet_row(
     });
     let button_height = show_button.as_ref().map_or(0.0, fixed_height);
 
-    // The words' column: the row's words beside the branch, as wide as the
-    // branch and the space after it in the title's type.
     let (branch, indent) = if is_last {
         ("   \u{2514}\u{2500}", "      ")
     } else {
@@ -559,9 +535,6 @@ fn spreadsheet_row(
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
     let branch_width =
         crate::tray_raster::ui_text_width_for(face, &format!("{branch} "), px).ceil();
-    // The row's lines in a words column beside the branch, `text_width`
-    // wide with it: the title's, then the status's, each wrapped there,
-    // never cut; and how tall they stand.
     let lines_in = |text_width: f32| {
         let words_width = (text_width - branch_width).max(0.0);
         let wrap = |text: &str, (role, style): (SemanticRole, StyleRef)| {
@@ -577,17 +550,12 @@ fn spreadsheet_row(
             + status.len().max(1) as f32 * detail_line_height();
         (title, status, height, words_width)
     };
-    // Show tab beside the words only where the card holds both and the list
-    // holds the row whole so; else under them, the row a column the list can
-    // list a line at a time.
     let beside_width = (inner - button_width - ROW_GAP).max(0.0);
     let beside = show_button.is_some()
         && !compact
         && lines_in(beside_width).2.max(button_height) <= room + 0.01;
     let text_width = if beside { beside_width } else { inner };
     let (title_lines, status_lines, text_height, words_width) = lines_in(text_width);
-    // Each line beside its part of the branch: the branch at the title's
-    // first line, its stem beside every other line of a row another follows.
     let stem = if is_last { "" } else { "   \u{2502}" };
     let line_row = |index: usize,
                     glyph: &str,
@@ -643,7 +611,6 @@ fn spreadsheet_row(
             title_line_height(),
         ));
     }
-    // The 4pt between the title and the status.
     lines.push(
         UiNode::new(
             format!("{key}/gap"),

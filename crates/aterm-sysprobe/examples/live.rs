@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A live sample of the system-awareness readers on this host, and what each
-//! costs: every reader once (its answer printed, with the capability report
-//! of what this OS can give), then the median, 90th percentile and worst wall
-//! time of `--calls N` back-to-back calls (default 200; the process sweep at
-//! most 20). Dev only; nothing ships it. On Linux and Windows this is the
-//! live check of those arms.
-//!
-//! ```sh
-//! targo --unverified run -q -p aterm-sysprobe --example live
-//! targo --unverified run -q -p aterm-sysprobe --example live -- --qos-check
-//! ```
-//!
-//! The network links are read twice a second apart, and each link that
-//! counts toward the machine's traffic prints what it moved in that second;
-//! the process sweep prints the disk bytes of this example and of the shell
-//! that ran it, up its parent chain. The process counts are the machine's
-//! and this process's user's. `net_links_into` is timed with one buffer
-//! kept across its calls, as the probe thread keeps one.
-//!
-//! `--qos-check` (macOS) checks that the layout's logical ids are the CPU
-//! numbers the kernel runs threads on: threads at each QoS class spin for
-//! two seconds, asking `pthread_cpu_number_np` (public since macOS 11) which
-//! CPU they are on, and the counts are printed by CPU number with the
-//! layout's cluster for it. The scheduler keeps background-QoS threads on
-//! the efficiency cores, so every background count should fall in the
-//! efficiency cluster, under any load. The kernel's CPU number is the
-//! processor index `host_processor_info` answers by and the device tree's
-//! `logical-cpu-id` (xnu builds its processor array from that id).
+//! A live sample of the system-awareness readers on this host, and what each costs.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -262,7 +235,6 @@ fn qos_check(layout: &aterm_sysprobe::CpuLayout) {
             (0..cores).map(move |_| {
                 let stop = Arc::clone(stop);
                 let handle = std::thread::spawn(move || {
-                    // SAFETY: sets this thread's own QoS class; no pointers.
                     unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
                     let mut seen = [0u64; MAX];
                     while !stop.load(Ordering::Relaxed) {

@@ -139,9 +139,13 @@ fn json(text: &str) -> aterm_json::Value {
     aterm_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
 }
 
-/// A broker process, killed on drop.
+/// A broker process, killed on drop. Started by [`harness::spawn_broker`]: it holds its stdio
+/// and nothing else of this process, and ends itself with its lifeline if this process dies
+/// first.
 struct Broker {
     child: aterm_uds::spawnfd::Child,
+    /// Held while it serves ([`harness::BrokerChild`]).
+    _lifeline: aterm_uds::lifeline::Lifeline,
 }
 
 impl Broker {
@@ -161,24 +165,29 @@ impl Broker {
         Self::serve_env(sock, log, extra, &[])
     }
 
-    /// [`Broker::serve`] with extra environment: a dev seam a test arms.
+    /// [`Broker::serve`] with extra environment: a dev seam a test arms. The
+    /// lifeline's FIFO is made, and unlinked at once, in the socket's own
+    /// scratch directory.
     fn serve_env(sock: &str, log: &str, extra: &[&str], env: &[(&str, &str)]) -> Self {
-        let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
-        cmd.args(["link", "broker", sock, log])
-            .args(extra)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(aterm_uds::spawnfd::Stdio::null());
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn().expect("spawn the broker");
-        let lines = line_reader(child.stdout.take().expect("stdout"));
+        let dir = Path::new(sock).parent().expect("the socket's directory");
+        let mut args = vec![sock, log];
+        args.extend_from_slice(extra);
+        let mut broker = harness::spawn_broker(dir, &args, |cmd| {
+            cmd.stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null());
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+        });
+        let lines = line_reader(broker.child.stdout.take().expect("stdout"));
         let first = lines
             .recv_timeout(DEADLINE)
             .expect("the broker prints its readiness line");
         assert_eq!(first, format!("listening {sock}"));
-        Self { child }
+        Self {
+            child: broker.child,
+            _lifeline: broker.lifeline,
+        }
     }
 
     fn pid(&self) -> u32 {
@@ -216,16 +225,20 @@ fn a_broker_whose_stdout_reader_left_keeps_serving() {
     let s = Scratch::new("epipe");
     let (gone, stdout) = std::io::pipe().expect("a pipe");
     drop(gone);
-    let mut child = aterm_uds::spawnfd::command(harness::aterm_to_launch())
-        .args(["link", "broker", &s.sock(), &s.path("b.log")])
-        .args(["--secret-file", &s.path("mint.secret")])
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stdout(stdout)
-        .stderr(aterm_uds::spawnfd::Stdio::piped())
-        .spawn()
-        .expect("spawn the broker");
-    let err = child.stderr.take().expect("stderr");
-    let _broker = Broker { child };
+    let (sock, log, secret) = (s.sock(), s.path("b.log"), s.path("mint.secret"));
+    let mut broker = harness::spawn_broker(
+        s.dir.path(),
+        &[&sock, &log, "--secret-file", &secret],
+        |cmd| {
+            cmd.stdout(stdout)
+                .stderr(aterm_uds::spawnfd::Stdio::piped());
+        },
+    );
+    let err = broker.child.stderr.take().expect("stderr");
+    let _broker = Broker {
+        child: broker.child,
+        _lifeline: broker.lifeline,
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(err).lines() {
@@ -355,6 +368,8 @@ fn the_report_reads_the_brokers_durability_off_its_process() {
         );
     }
     let log = s.path("never.log");
+    // NO LIFELINE on purpose: a refused tier, so the broker exits at its usage check
+    // and never serves.
     let refused = harness::output_within(
         Command::new(harness::aterm_to_launch()).args([
             "link",
@@ -1243,6 +1258,8 @@ fn a_filter_the_broker_would_refuse_is_a_usage_error_before_the_dial() {
 /// `aterm link broker <args>`, run to its exit: code, stdout, stderr.
 fn broker_run(args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(harness::aterm_to_launch());
+    // NO LIFELINE on purpose: every caller's argv ends the broker before it serves (a
+    // repair, a refused log, a usage error), and `output_within` bounds the run.
     cmd.args(["link", "broker"]).args(args);
     let Output {
         status,
@@ -1254,6 +1271,29 @@ fn broker_run(args: &[&str]) -> (i32, String, String) {
         String::from_utf8_lossy(&stdout).into_owned(),
         String::from_utf8_lossy(&stderr).into_owned(),
     )
+}
+
+/// **A LIFELINE THE BROKER CANNOT ADOPT IS A USAGE ERROR, AND NOTHING SERVES**: a
+/// launcher that asked for a lifeline and silently got none would leak the broker it
+/// started. A word that is no number, a descriptor that is not open, and stdin that is
+/// `/dev/null` (a character device, no pipe) each exit 2 naming the flag, before the
+/// socket or the log is made.
+#[test]
+fn a_lifeline_the_broker_cannot_adopt_is_refused_before_it_serves() {
+    let s = Scratch::new("lifeline");
+    let (sock, log) = (s.sock(), s.path("b.log"));
+    let flag = aterm_uds::lifeline::FLAG;
+    // `broker_run`'s stdin is `/dev/null`.
+    for fd in ["nope", "1000000", "0"] {
+        let (code, out, err) = broker_run(&[&sock, &log, flag, fd]);
+        assert_eq!(code, 2, "{flag} {fd}: stdout {out:?}, stderr:\n{err}");
+        assert!(err.contains(flag), "{flag} {fd}: it names the flag:\n{err}");
+        assert!(!out.contains("listening"), "{flag} {fd}: it served: {out}");
+        assert!(
+            !Path::new(&sock).exists() && !Path::new(&log).exists(),
+            "{flag} {fd}: a refused broker makes no socket and no log"
+        );
+    }
 }
 
 /// **A LOG THE BROKER REFUSES AS CORRUPT HAS A REPAIR THIS BINARY SHIPS, AND

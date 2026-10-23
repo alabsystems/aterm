@@ -2,22 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! WHERE A WORD MAY TAKE A HYPHEN: its syllable breaks, as a typesetter
-//! finds them — Liang's algorithm (TeX's `\patterns`) over the American
-//! English patterns and exception list TeX ships (`data/hyph-en-us.tex`,
-//! hyph-utf8's `ushyphmax`, embedded as published), with TeX's English
-//! minimums: two letters before a hyphen and three after it.
-//!
-//! The one answer every wrap of aterm's chrome reads when a word is wider
-//! than its whole box: "Bright-" / "ness", "AUTO-" / "MATIC", "notifica-" /
-//! "tions". Broken wherever the box ended, it read "Brightn-" / "ess",
-//! "AUTOMA-" / "TIC" and "Messag-" / "es.". The same on every platform and
-//! in a headless test: no platform hyphenator is asked.
-//!
-//! Only a word of prose takes one ([`crate::TokenKind::Word`]): a path, a
-//! version, a hash or a name written in mixed case (`macOS`) is an
-//! identifier, every character of which is its own, and a hyphen put in it
-//! would read as one of them.
+//! English syllable hyphenation points using Liang's TeX algorithm.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -116,7 +101,6 @@ fn letter_run_points(letters: &str) -> Vec<usize> {
         return points.iter().copied().filter(allowed).collect();
     }
     let dotted = format!(".{lower}.");
-    // The value before each byte of `dotted`, and one after its end.
     let mut values = vec![0_u8; dotted.len() + 1];
     for start in 0..dotted.len() {
         for end in start + 1..=dotted.len().min(start + table.longest) {
@@ -128,21 +112,13 @@ fn letter_run_points(letters: &str) -> Vec<usize> {
             }
         }
     }
-    // A break after `at` letters of the word is before byte `at + 1` of the
-    // dotted word.
     (1..count)
         .filter(|at| values[at + 1] % 2 == 1)
         .filter(allowed)
         .collect()
 }
 
-/// WHERE A WORD OF PROSE MAY TAKE A HYPHEN: the byte offsets in `word` of
-/// its syllable breaks, in order ([`syllable_points`]), so "built-in" and
-/// "Couldn't" break only inside their letters, and punctuation around a
-/// word is no letter of it: "Messages." breaks as "Mes-" / "sages.". None
-/// for an identifier ([`crate::token_kind`]): a path, a version, a hash, a
-/// name in mixed case, and none for a run of letters TeX's English patterns
-/// do not cover (an accented or another script's letter in it).
+/// Returns the byte offsets of syllable hyphenation points in a prose `word`.
 #[must_use]
 pub fn hyphen_points(word: &str) -> Vec<usize> {
     if crate::token_kind(word) != crate::TokenKind::Word {
@@ -151,11 +127,7 @@ pub fn hyphen_points(word: &str) -> Vec<usize> {
     syllable_points(word)
 }
 
-/// The syllable breaks of every run of letters in `text`
-/// ([`letter_run_points`]), as byte offsets in `text`, in order, whatever
-/// the text around them: an identifier no line holds and that has no joint
-/// left to break at breaks at one of these with no mark rather than
-/// anywhere (`/Applica` / `tions`, not `/Applicati` / `ons`).
+/// Returns the byte offsets of syllable breaks across all letter runs in `text`.
 pub(crate) fn syllable_points(text: &str) -> Vec<usize> {
     let mut points = Vec::new();
     let mut run_start: Option<usize> = None;

@@ -240,7 +240,7 @@ pub fn dl_name(bytes: &[u8]) -> Option<String> {
 
 /// A functional type (`SIOCGIFFUNCTIONALTYPE`) as a [`LinkKind`]: wired, Wi-Fi infrastructure and cellular name theirs; `IFRTYPE_FUNCTIONAL_UNKNOWN` (0) is `unknown`'s; every other type (loopback, AWDL, intcoproc, companion link, management) is other.
 #[must_use]
-pub fn kind_of_functional(functional: u32, unknown: LinkKind) -> LinkKind {
+pub const fn kind_of_functional(functional: u32, unknown: LinkKind) -> LinkKind {
     match functional {
         0 => unknown,
         IFRTYPE_FUNCTIONAL_WIRED => LinkKind::Wired,

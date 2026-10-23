@@ -5,19 +5,6 @@
 // takes the Apache-2.0 arm), modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! The named cursor icons.
-//!
-//! LOCAL PATCH (aterm), 2026-10-15 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 5):
-//! upstream winit re-exports `cursor_icon::CursorIcon`, 35 icons; this crate defines the six aterm
-//! sets, so the package left the macOS and Windows graphs. Linux still links it, through
-//! smithay-client-toolkit: the Wayland backend converts at that boundary
-//! (`platform_impl::linux::wayland::types::cursor::sctk_icon`). The variant docs are aterm's own;
-//! the names are the CSS `cursor` keywords and the fallbacks are cursor-icon's table, as
-//! `tests/recorded_answers.rs` records.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.5): ADDED the eight
-//! edge-resize icons (`n-resize` … `nw-resize`), which aterm's own Wayland frame sets on its
-//! edges and corners where the window had sctk-adwaita's frame; their names and fallbacks were
-//! recorded from cursor-icon 1.2.0 like the six above.
 
 /// A named cursor icon.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
@@ -75,8 +62,8 @@ impl CursorIcon {
         }
     }
 
-    /// Names the icon has in legacy Xcursor themes, to try in order when a theme has no icon
-    /// under [`name`](Self::name).
+    /// Names the icon has in legacy Xcursor themes, to try in order when a theme has no icon under
+    /// [`name`](Self::name).
     #[inline]
     pub const fn alt_names(&self) -> &'static [&'static str] {
         match self {

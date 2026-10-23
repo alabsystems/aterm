@@ -997,7 +997,7 @@ fn secrets(n: usize) -> String {
 }
 
 /// Why the subscriber in `state` keeps nothing in sync, or `None` while it runs.
-fn idle(state: &State) -> Option<&'static str> {
+const fn idle(state: &State) -> Option<&'static str> {
     match state {
         State::Installed { pid: Some(_), .. } => None,
         State::Installed { pid: None, .. } => Some("subscriber installed but not running"),
@@ -1295,7 +1295,7 @@ struct Note {
 }
 
 impl Note {
-    fn new(user: User, probe: Probe) -> Self {
+    const fn new(user: User, probe: Probe) -> Self {
         Self { user, probe }
     }
 

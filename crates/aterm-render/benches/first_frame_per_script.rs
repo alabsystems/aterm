@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE FIRST NON-LATIN FRAME COSTS ON WINDOWS — the other half of the
-//! mapped-font question. A measurement, not a gate:
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-render --bench first_frame_per_script
-//! ```
-//!
-//! Since `font_file::admit_font_file` MAPS the faces under `C:\Windows\Fonts`
-//! (`MAPPABLE_FONT_ROOTS`), a fallback-chain face's pages are not resident until
-//! something reads them, and the first cell drawn from a face reads nearly all
-//! of it (`docs/measured/win-heap-2026-08-29.md` §7). So the trade is measured
-//! rather than argued: this walks the scripts the Windows chain names a face
-//! for, in `FALLBACK_CANDIDATES`' order, and prints each script's FIRST frame
-//! (the one that brings its face in) beside a second frame of the same text
-//! (the glyph cache's steady state).
-//!
-//! Ported from win/font-mmap ede86746e2's `tests/win_first_cjk_frame.rs`, an
-//! `#[ignore]`d test there (2026-08-29); main keeps its measurements as benches.
-//! Public API only. Windows only: elsewhere it says so and exits.
+//! WHAT THE FIRST NON-LATIN FRAME COSTS ON WINDOWS — the other half of the mapped-font question.
 
 #[cfg(windows)]
 use aterm_core::terminal::Terminal;
@@ -69,8 +51,6 @@ fn main() {
     let seal_ms = ms(|| {
         residency = r.seal_admitted_font_sources().discovered_residency();
     });
-    // One ASCII frame first, as a real session starts, so the atlas and the
-    // primary face are warm and the per-script numbers are each FACE's cost.
     let ascii_ms = ms(|| frame_of(&mut r, b"$ cargo build --release\r\n"));
     let (mapped, copied) = residency;
     eprintln!(
@@ -83,8 +63,6 @@ fn main() {
     let mut worst = 0.0_f64;
     for (label, text) in SCRIPT_LINES {
         let first = ms(|| frame_of(&mut r, text.as_bytes()));
-        // A fresh terminal with the same text: the glyph cache's steady state,
-        // against which the first frame's one-off cost reads.
         let second = ms(|| frame_of(&mut r, text.as_bytes()));
         eprintln!("{label:<24} {first:>10.1} {second:>10.1}");
         worst = worst.max(first);

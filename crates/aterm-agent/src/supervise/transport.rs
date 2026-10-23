@@ -431,7 +431,8 @@ pub(super) fn render(
             {
                 stderr.push_str(&format!("aterm-ctl: {note}\n"));
             }
-            if tail.split_whitespace().nth(1) == Some("turn") {
+            let turn = tail.split_whitespace().nth(1) == Some("turn");
+            if turn {
                 let verdict: Vec<&str> = tail.split_whitespace().skip(1).collect();
                 stderr.push_str(&format!("aterm-ctl: {}\n", verdict.join(" ")));
             }
@@ -440,6 +441,9 @@ pub(super) fn render(
                 stderr.push_str(&format!("aterm-ctl: {header}\n"));
             } else if empty {
                 stderr.push_str(&format!("aterm-ctl: {header} ({verb}: no results)\n"));
+            } else if !turn && let Some(note) = aterm_ctl::frame_open_note(tail) {
+                // `text`'s `frame=open`, whose header is not shown: the note `aterm-ctl` prints.
+                stderr.push_str(&format!("aterm-ctl: {note}\n"));
             }
             lossy(body)
         }
@@ -624,6 +628,7 @@ mod tests {
                 Some("OK 1 incomplete capped\n10 0 1\n"),
                 Some("OK title=- attention=-\n"),
                 Some("OK 1 incomplete older\n10 0 1\n"),
+                Some("OK 1 frame=open\nrow\n"),
             ],
         );
         let mut c = RelayCtl::new(Endpoint::Socket(sock), Some("tok".to_string()));
@@ -669,11 +674,21 @@ mod tests {
                  1 incomplete older\n"
             )
         );
+        // A read of a frame the program had not finished: the rows on stdout, `aterm-ctl`'s
+        // note for its `frame=open` on stderr.
+        let text = c.call(&["@s-1", "text"]).expect("text");
+        assert_eq!(
+            (text.stdout.as_str(), text.stderr.as_str()),
+            (
+                "row\n",
+                format!("aterm-ctl: {}\n", aterm_ctl::FRAME_OPEN_NOTE).as_str()
+            )
+        );
         drop(c);
         let seen = h.join().expect("server");
         assert_eq!(seen[0], "AUTH");
         assert_eq!(seen[1], "@s-1 text --json tail=40");
-        assert_eq!(seen.len(), 10, "one connection, one AUTH: {seen:?}");
+        assert_eq!(seen.len(), 11, "one connection, one AUTH: {seen:?}");
     }
 
     /// A connection that closes unanswered is `lost` in `aterm-ctl`'s words,

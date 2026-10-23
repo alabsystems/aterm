@@ -2,34 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! bridge-fx: the fabric bridge reads its clocks through its door.
-//!
-//! `aterm-link`'s deterministic simulation (`src/sim`) runs the REAL bridge
-//! behind its doors (`src/fx.rs`, the supervisor's `Fx` pattern): a virtual
-//! monotonic and wall clock moved only by the bridge's own parks and the
-//! scheduler, a simulated bus, verb lane and state dir. A clock the bridge
-//! reads past that door is the real one inside a simulated world — a seed no
-//! longer replays, and a deadline the scheduler moved is met or missed by
-//! wall time — and nothing else says so: the bridge still compiles, the live
-//! arm still works. So the bridge's own files read `self.fx.now()` and
-//! `self.fx.wall_ms()` (or a `now` a caller took from them), and never
-//! `Instant::now`, `SystemTime::now` or an `Instant`'s `.elapsed()`, which
-//! reads `Instant::now` itself: a span is
-//! `fx.now().saturating_duration_since(started)`. Nor the wall clock as the
-//! bridge read it before its door — `crate::now_ms()`, every one of the dozen
-//! `self.fx.wall_ms()` sites was one — or aterm-time's `unix_millis`; nor a
-//! park past the door: `std::thread::sleep` (the door's is `self.fx.sleep`)
-//! or the mailbox's own `take` (the door's is `self.fx.take`), which wait out
-//! real time where the simulation moves its clock.
-//!
-//! LEXICAL, like every census rule: a clock or a park reached under another
-//! name (an alias, a helper in another file) is not seen.
-//!
-//! Read on the CODE view of shipped lines, so a comment, a string or a test
-//! naming one is no finding. The door itself (`fx.rs`) and the simulation
-//! are outside the scope; so are the bridge's measurement seam
-//! (`wait_tally.rs`, which reads a clock only while its dev seam is set) and
-//! the programs that are not the bridge (`notify`, `enable`, the CLI).
+//! Census guard ensuring the fabric bridge reads its clocks and parks through `Fx`.
 
 use super::{Bound, Finding, Rule, Tree, has};
 

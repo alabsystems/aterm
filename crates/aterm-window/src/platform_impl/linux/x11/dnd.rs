@@ -4,13 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/dnd.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (Percent-decoding
-// through the backend's own helper, `common/percent.rs`, not the `percent-encoding` crate.
-// The requests are aterm-x11's encoders, where upstream used x11rb's. A path is the one the
-// source named, not canonicalized. An entry that names no local file is skipped, not the
-// whole list, and a drag whose list names none is refused. A list too large for one property
-// is read through ICCCM INCR.)
-
 use std::os::raw::*;
 use std::path::PathBuf;
 use std::str::Utf8Error;
@@ -40,8 +33,7 @@ const MAX_INCR_BYTES: usize = 64 * 1024 * 1024;
 pub enum Answer {
     /// The whole list.
     List(Vec<u8>),
-    /// An ICCCM INCR transfer began: the list comes in chunks ([`Dnd::take_chunk`]). GTK
-    /// answers so for a list over 256 KiB (Nautilus's Select All in a large folder).
+    /// An ICCCM INCR transfer began; the list arrives in chunks ([`Dnd::take_chunk`]).
     Incr,
 }
 
@@ -63,29 +55,20 @@ impl From<Utf8Error> for DndDataParseError {
 
 pub struct Dnd {
     xconn: Arc<XConnection>,
-    // Populated by XdndEnter event handler
     pub version: Option<c_long>,
     pub type_list: Option<Vec<xproto::Atom>>,
-    // The source and target named by XdndEnter, retained through the drop.
     pub source_window: Option<xproto::Window>,
     /// The application window the drag entered, independent of its conversion's requestor.
     pub target_window: Option<xproto::Window>,
-    /// The time of the drag's one `ConvertSelection` while its answer is outstanding (an aterm
-    /// addition). A `SelectionNotify` that comes with no request outstanding, or with another
-    /// time, answers an earlier drag's request: GTK 4 sources answer after the drag's next
-    /// message, so a drag that left or dropped can still be answered during the next one.
+    /// Timestamp of the drag's outstanding `ConvertSelection` request.
     pub requested: Option<xproto::Timestamp>,
-    /// The drag dropped before its data came (an aterm addition): the drop is delivered and
-    /// finished when it comes.
+    /// Whether the drag dropped before its data arrived.
     pub dropped: bool,
     /// One conversion owns its requestor until its data completes or the drag ends.
     requestor: Option<Requestor>,
     /// The answer is coming in ICCCM INCR chunks: the bytes so far.
     incoming: Option<Vec<u8>>,
-    /// The drag's local files, once its data came (`selection_notify`, after the request
-    /// `XdndPosition` makes). Empty where the data names no local file, or the source refused
-    /// it: the drag is then refused (an aterm change; upstream kept a parse error here and
-    /// accepted the drag either way).
+    /// The drag's local files once its data arrived, or empty when refused.
     pub result: Option<Vec<PathBuf>>,
 }
 
@@ -99,7 +82,6 @@ struct Requestor {
 impl Requestor {
     fn new(xconn: Arc<XConnection>, target: xproto::Window) -> Result<Self, X11Error> {
         let window = xconn.dnd_requestor_id()?;
-        // Arm cleanup before the fallible create/check: the server may have made the window.
         let requestor = Self { xconn, window };
         requestor
             .xconn
@@ -126,7 +108,6 @@ impl Drop for Requestor {
         if let Ok(cookie) = self.xconn.send_void(xproto::destroy_window(self.window)) {
             cookie.ignore_error();
         }
-        // Best effort, not an acknowledgement of destruction. The identity is never reused.
         let _ = self.xconn.flush_requests();
     }
 }
@@ -205,9 +186,7 @@ impl Dnd {
         self.requestor = None;
     }
 
-    /// Whether a `SelectionNotify` of `time` answers this drag's outstanding request, which it
-    /// then no longer is. A request made at `CurrentTime` (an XDND version 0 source) matches
-    /// any time, still only on its own requestor.
+    /// Whether a `SelectionNotify` of `time` answers this drag's outstanding request.
     pub fn answers(&mut self, window: xproto::Window, time: xproto::Timestamp) -> bool {
         if !self.is_requestor(window) {
             return false;
@@ -295,9 +274,7 @@ impl Dnd {
         Ok(())
     }
 
-    /// Read and delete the answer the source put on `window`: an INCR header or an 8-bit
-    /// `text/uri-list`, `None` where the read fails or has another type. Upstream's typed read
-    /// could not read an INCR header. Deleting one asks the source for the first chunk.
+    /// Reads and deletes the selection property on `window` as an INCR header or `text/uri-list`.
     pub fn take_data(&self, window: xproto::Window) -> Option<Answer> {
         let reply = self.take_property(window)?;
         if reply.type_ == self.xconn.atoms()[Incr] {
@@ -308,16 +285,13 @@ impl Dnd {
         }
     }
 
-    /// Read and delete the INCR chunk the source put on `window`, which asks for the next one;
-    /// `None` where the read fails. An empty chunk ends the transfer.
+    /// Reads and deletes the next INCR chunk from `window` (an empty chunk ends the transfer).
     pub fn take_chunk(&self, window: xproto::Window) -> Option<Vec<u8>> {
         let reply = self.take_property(window)?;
         (reply.type_ == self.xconn.atoms()[TextUriList] && reply.format == 8).then_some(reply.value)
     }
 
-    /// Add `chunk` to the INCR transfer: `None` until it is whole, then the list.
-    /// A transfer over [`MAX_INCR_BYTES`], or a read that failed (`chunk` `None`), brings an
-    /// empty list, which refuses the drag.
+    /// Appends `chunk` to the INCR transfer, returning the completed list when finished.
     pub fn add_chunk(&mut self, chunk: Option<Vec<u8>>) -> Option<Vec<u8>> {
         let data = self.incoming.as_mut()?;
         match chunk {
@@ -350,12 +324,7 @@ impl Dnd {
     }
 }
 
-/// The local files a `text/uri-list` names, in its order. An entry that names none (another
-/// scheme such as `https://`, `trash:///` or `sftp://`, a host, a path that is not UTF-8) is
-/// skipped, and the rest still count; upstream failed the whole list on one. Each path is the
-/// one the source named: no symlink is resolved (a link dropped is the link, not its target)
-/// and nothing reads the filesystem, which this, on the event loop's thread, must not wait on.
-/// Upstream canonicalized each path.
+/// Extracts local file paths from a `text/uri-list` payload, skipping non-local entries.
 pub fn local_paths(data: &[u8]) -> Vec<PathBuf> {
     uri_list_entries(data).filter_map(|uri| file_uri_path(uri).ok()).collect()
 }

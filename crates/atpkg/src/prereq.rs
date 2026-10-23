@@ -45,7 +45,7 @@ pub enum CcVerdict {
 impl CcVerdict {
     /// Whether this verdict means a Trust build cannot compile here (an answer, not an unknown).
     #[must_use]
-    pub fn blocks_builds(&self) -> bool {
+    pub const fn blocks_builds(&self) -> bool {
         matches!(
             self,
             Self::NoDeveloperDir | Self::NoDriver | Self::Broken { .. }
@@ -54,7 +54,7 @@ impl CcVerdict {
 
     /// The one command that fixes this verdict, when there is one.
     #[must_use]
-    pub fn fix(&self) -> Option<&'static str> {
+    pub const fn fix(&self) -> Option<&'static str> {
         match self {
             Self::NoDeveloperDir | Self::NoDriver => Some(act()),
             Self::Broken { .. } if !cfg!(target_os = "macos") => Some(act()),
@@ -109,7 +109,7 @@ impl CcVerdict {
 
 /// The act that installs a C toolchain on this platform.
 #[must_use]
-pub fn act() -> &'static str {
+pub const fn act() -> &'static str {
     if cfg!(target_os = "macos") {
         "aterm init --only base.clt"
     } else if cfg!(windows) {
@@ -254,12 +254,34 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             why: format!("could not write {}: {error}", source.display()),
         };
     }
-    let mut cmd = aterm_uds::spawnfd::command(cc);
-    cmd.arg("-o").arg(&program).arg(&source).current_dir(&dir);
-    if let Some(path) = path_var {
-        cmd.env("PATH", path);
+    let run_cc = |sdkroot: Option<&Path>| {
+        let mut cmd = aterm_uds::spawnfd::command(cc);
+        cmd.arg("-o").arg(&program).arg(&source).current_dir(&dir);
+        if let Some(path) = path_var {
+            cmd.env("PATH", path);
+        }
+        if let Some(sdk) = sdkroot {
+            cmd.env("SDKROOT", sdk);
+        }
+        crate::doctor::output_bounded_capturing(&mut cmd, host.bound)
+    };
+    let mut result = run_cc(None);
+    if matches!(&result, Some(out) if !out.status.success())
+        && std::env::var_os("SDKROOT").is_none()
+        && host
+            .shim_dir
+            .as_deref()
+            .is_some_and(|shim| cc.parent() == Some(shim))
+    {
+        let developer_dir = std::fs::read_link(&host.xcode_select_link)
+            .unwrap_or_else(|_| host.default_developer_dir.clone());
+        let sdk = developer_dir.join("SDKs/MacOSX.sdk");
+        if sdk.is_dir() {
+            let _ = std::fs::remove_file(&program);
+            result = run_cc(Some(&sdk));
+        }
     }
-    match crate::doctor::output_bounded_capturing(&mut cmd, host.bound) {
+    match result {
         None => CcVerdict::Unanswered {
             driver: cc.to_path_buf(),
         },

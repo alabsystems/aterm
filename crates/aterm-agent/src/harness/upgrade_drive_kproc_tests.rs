@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROCESS READS ARE `ps`'s, on the live machine: macOS reads the
-//! kernel's records in-process (`aterm_sysprobe::kproc`), and every reader
-//! the host's job and restart rest on — the table, a process's ids, start and
-//! age, its terminal's owner and opener, what runs under an agent — is held
-//! here to the `ps` read it replaced (kept as the oracle: `ps_table`,
-//! `tty_table`, `ps_opener`, `ps_held_of`, `ps`).
-//!
-//! The machine runs on while a test reads it: a row is compared only where
-//! two kernel reads that sandwich the `ps` read agree, and each test asserts
-//! its fixtures were compared and that most rows were, so none passes having
-//! compared nothing.
+//! THE PROCESS READS ARE `ps`'s, on the live machine.
 
 use std::collections::BTreeMap;
 
@@ -78,8 +68,6 @@ fn the_table_is_the_one_ps_prints() {
         .filter(|r| r.uid == uid)
         .map(|r| r.pid)
         .collect();
-    // Each name is read when first asked for (`Comm`): asked here, so both
-    // reads sandwich the `ps` read.
     let named = || {
         let t = table();
         for (_, _, name) in &t {

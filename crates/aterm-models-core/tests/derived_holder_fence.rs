@@ -6,7 +6,7 @@
 //! guards (the dials follow the knobs' order).
 
 use aterm_models_core::holder_fence_model;
-use aterm_spec::{interp, verify};
+use aterm_spec::interp;
 
 /// The laws the mutant at `dial` breaks.
 fn broken_at(dial: i64) -> Vec<&'static str> {
@@ -18,10 +18,6 @@ fn broken_at(dial: i64) -> Vec<&'static str> {
 #[test]
 fn the_fence_admits_only_the_current_drawers_rows_and_keeps_what_nobody_took() {
     let m = holder_fence_model();
-    assert_eq!(
-        verify::sweep_faults(std::slice::from_ref(&m)),
-        Vec::<String>::new()
-    );
     interp::bmc(&m).unwrap_or_else(|(s, law)| panic!("{law} broken at {s:?}"));
     let own = ["AdmittedIsOwn"];
     for (dial, laws) in [

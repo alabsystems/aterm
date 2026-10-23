@@ -1,19 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `sys jobs` (§13.6): the stuck engine's view ([`crate::jobs::JobsView`],
-//! which the host hangs on every snapshot) for one scope, as text and JSON.
-//!
-//! The row words are the engine's own ([`JobRow::wire`], the findings'
-//! [`Findings::wire_lines`]), so `sys jobs`, the stats bars and the engine's
-//! tests read one spelling. This module picks the rows a scope covers, says
-//! the summary sentence, and builds the JSON shapes (no float, no null:
-//! φ is `phi_m`, φ × 1000).
-//!
-//! PRIVACY: a scope covers only its sessions' rows; findings name a process
-//! of any user, so a finding prints only for a session the scope covers,
-//! except in `scope=global`, which is the owner's (the access arm escalates
-//! it). No command text is printed: the engine keeps none on its rows.
+//! Scoped text and JSON formatting for `sys jobs` ([`crate::jobs::JobsView`]).
+//! Formats rows using [`JobRow::wire`] and [`Findings::wire_lines`].
 
 use super::json::Jv;
 use super::view::Line;
@@ -21,15 +10,13 @@ use crate::jobs::wire::{exe_word, phi_text};
 use crate::jobs::{Class, Findings, JobRow, JobsView, Verdict};
 use crate::model::Snapshot;
 
-/// The rows of `view` in the sessions `keys`: live rows before exited ones,
-/// then by id.
+/// The rows of `view` in the sessions `keys`: live rows before exited ones, then by id.
 #[must_use]
 pub fn rows_in<'a>(view: &'a JobsView, keys: &[u64]) -> Vec<&'a JobRow> {
     sorted(view.rows.iter().filter(|r| keys.contains(&r.tab)).collect())
 }
 
-/// Every row of `view` (`scope=global`, the owner's), ordered as
-/// [`rows_in`].
+/// Every row of `view` (`scope=global`, the owner's), ordered as [`rows_in`].
 #[must_use]
 pub fn rows_all(view: &JobsView) -> Vec<&JobRow> {
     sorted(view.rows.iter().collect())
@@ -44,8 +31,7 @@ fn sorted(mut rows: Vec<&JobRow>) -> Vec<&JobRow> {
     rows
 }
 
-/// Why a snapshot carries no jobs view: the first sample (`warming`), or a
-/// host that read none (`not_sampled`).
+/// Why a snapshot carries no jobs view.
 #[must_use]
 pub fn missing_why(s: &Snapshot) -> &'static str {
     if s.procs_window_ns.is_none() {
@@ -60,8 +46,7 @@ fn running(r: &JobRow) -> bool {
     r.class == Class::Running && r.verdict != Verdict::Exited
 }
 
-/// The verdicts the summary counts, in the closed set's order (`fine` is
-/// counted as jobs, not said).
+/// Ordered verdicts counted in the summary.
 const SAID: [Verdict; 8] = [
     Verdict::WaitingYou,
     Verdict::Parked,
@@ -87,9 +72,7 @@ fn worst<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
         .max_by_key(|r| r.phi_milli.unwrap_or(0))
 }
 
-/// The summary clauses: `3 jobs · 1 running · 1 quiet · 1 stuck · worst:
-/// silent 19m12s, about 19× its usual 60 s gap, φ 8.34`; `no jobs` for none.
-/// Words only: no name any process chose.
+/// The summary clauses.
 #[must_use]
 pub fn summary(rows: &[&JobRow]) -> String {
     if rows.is_empty() {
@@ -120,8 +103,7 @@ pub fn summary(rows: &[&JobRow]) -> String {
     parts.join(" · ")
 }
 
-/// How much a verdict asks for a look, most first: the order `status job=`
-/// picks a session's worst job by. `exited` is not a live job's.
+/// How much a verdict asks for a look, most first.
 fn urgency(v: Verdict) -> Option<u8> {
     Some(match v {
         Verdict::Stuck => 0,
@@ -136,8 +118,7 @@ fn urgency(v: Verdict) -> Option<u8> {
     })
 }
 
-/// The live job of `rows` whose verdict asks most for a look (then the one
-/// quiet longest); `None` when every row has exited or there is none.
+/// The live job of `rows` whose verdict asks most for a look (then the one quiet longest).
 #[must_use]
 pub fn worst_live<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
     rows.iter()
@@ -147,12 +128,7 @@ pub fn worst_live<'a>(rows: &[&'a JobRow]) -> Option<&'a JobRow> {
         .map(|(_, r)| r)
 }
 
-/// `status`'s two additive fields (§11.2): `job=<verdict> job_quiet_ms=<ms>`
-/// of the session's worst live job; `job=none job_quiet_ms=-` when the engine
-/// read the session and found no live job; `job=- job_quiet_ms=-` without a
-/// view to read (none yet, or too old to speak for now). The view is
-/// `age_ms` old: the quiet age is the time since the last progress the engine
-/// saw, so it counts on past the reading.
+/// Additive job status fields for `status`.
 #[must_use]
 pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> String {
     let Some(view) = view else {
@@ -169,9 +145,7 @@ pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> Stri
     }
 }
 
-/// The `brief` jobs line (§19 P2a): `jobs 2 jobs · 1 running · 1 stuck ·
-/// worst: …`, the `sys jobs` summary of the session's rows, when it has a
-/// live job; `None` otherwise (a brief spends no tokens on an idle tab).
+/// Formats the `brief` jobs line.
 #[must_use]
 pub fn brief_line(view: &JobsView, keys: &[u64]) -> Option<String> {
     let rows = rows_in(view, keys);
@@ -187,8 +161,7 @@ fn value_line(key: String, text: String) -> Line {
     }
 }
 
-/// The findings a scope may print: those in its sessions, or every one for
-/// `all` (`scope=global`, the owner's).
+/// The findings a scope may print.
 #[must_use]
 pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
     let mine = |tab: Option<u64>| all || tab.is_some_and(|t| keys.contains(&t));
@@ -207,10 +180,7 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
     }
 }
 
-/// The body lines after the `jobs` sentence: one `job` row per job (with
-/// `tab=<n>` when the scope spans tabs), the findings, the lanes that are
-/// off. At most `top` rows; the caller counts the rest on the reply's one
-/// `more=` line ([`overflow`]).
+/// The body lines after the `jobs` sentence ([`overflow`]).
 pub fn row_lines(
     view: &JobsView,
     rows: &[&JobRow],
@@ -239,9 +209,7 @@ pub fn row_lines(
     out
 }
 
-/// The rows `top` left out, as the `more=` line's first words (`3 jobs ·
-/// top=11`, the `top=` that would print them all, at most 64); `None` when
-/// every row printed.
+/// Formats the `more=` overflow prefix for rows omitted by `top`, or `None` if all printed.
 #[must_use]
 pub fn overflow(rows: usize, top: usize) -> Option<String> {
     (rows > top).then(|| format!("{} jobs · top={}", rows - top, rows.min(64)))
@@ -252,7 +220,7 @@ fn enum_word(w: &str) -> String {
     w.replace('-', "_")
 }
 
-/// One row as JSON (§13.6): integers in base units, φ as `phi_m`.
+/// Formats one job row as JSON with integers in base units and `phi_m`.
 #[must_use]
 pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
     let mut o = Jv::obj([
@@ -337,9 +305,6 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
             ]),
         );
     }
-    // The engine carries CPU only where a class rests on it (unread input,
-    // busy-silent); elsewhere it is no evidence, and the row, like the
-    // text one, leaves it out rather than call it warming.
     if let Some(c) = r.cpu_mc {
         o.set("cpu_mc", Jv::u(c));
     }
@@ -366,8 +331,6 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
         o.set("mu_from", Jv::s(from.word()));
     }
     o.set("verdict", Jv::s(r.verdict.word()));
-    // Beside the verdict, never one: an agent's quiet call whose members
-    // used no CPU over its silence.
     o.set("no_progress", Jv::Bool(r.no_progress));
     o.set("episode", Jv::u(u64::from(r.episode)));
     if let Some(e) = r.exit {
@@ -376,8 +339,7 @@ pub fn row_json(r: &JobRow, tab_number: Option<usize>) -> Jv {
     o
 }
 
-/// The summary as JSON: counts by running and by each verdict said, and the
-/// worst suspect's quiet age and φ.
+/// The summary as JSON.
 #[must_use]
 pub fn summary_json(rows: &[&JobRow]) -> Jv {
     let mut o = Jv::obj([
@@ -579,7 +541,6 @@ mod tests {
         let lines = row_lines(&v, &rows, &Findings::default(), true, 8, &|k| {
             (k == 7).then_some(1)
         });
-        // The row, then the process table the engine always reports.
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1].text, "finding kind=process-table own=0");
         assert!(
@@ -626,7 +587,6 @@ mod tests {
         assert_eq!(findings_in(&f, &[7], true).stopped.len(), 2);
         let j = findings_json(&mine);
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
-        // A name no exe word may carry prints as `-`.
         let odd = Findings {
             stopped: vec![Named {
                 pid: 12,

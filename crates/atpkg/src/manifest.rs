@@ -67,7 +67,7 @@ impl Program {
     /// Whether the signed row names the retired `requires` relation; the install door and the update pass both refuse such a program ([`crate::FlowError::RequiresRetired`]).
     #[inline]
     #[must_use]
-    pub fn names_requires(&self) -> bool {
+    pub const fn names_requires(&self) -> bool {
         !self.requires.is_empty()
     }
 }
@@ -316,7 +316,7 @@ impl std::fmt::Display for DigestAlg {
 /// The one digest a `sha256`/`sha512` pair names (a signed row's, a log entry's, a record's): `(algorithm, value)` when exactly one is non-empty, `None` otherwise.
 #[inline]
 #[must_use]
-pub fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'a str)> {
+pub const fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'a str)> {
     match (sha256.is_empty(), sha512.is_empty()) {
         (false, true) => Some((DigestAlg::Sha256, sha256)),
         (true, false) => Some((DigestAlg::Sha512, sha512)),

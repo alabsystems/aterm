@@ -1,32 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHETHER MACOS'S PROGRAM CHECK STILL ANSWERS: `syspolicyd`, the daemon that
-//! decides whether a program may start, read through its thread pool.
-//!
-//! Each program the check assesses holds one of `syspolicyd`'s constrained
-//! workqueue threads until its Developer Tools question (`tccd`) is answered.
-//! On macOS 27.0.1 that question can need `tccd` to check a stapled app by
-//! path, which calls back into `syspolicyd`. Once every constrained thread is
-//! held, nothing serves the call back: `syspolicyd` and `tccd` wait on each
-//! other for good. No program starts again, and the window server can die at
-//! a privacy check (measured 2026-10-20: 95 pool threads against the limit of
-//! 90, 89 of them behind one queue, for 4.5 days, then the window server's
-//! watchdog; a restart cleared it;
-//! `docs/DESIGN-leftover-processes-2026-10-16.md` I1, M26-M29).
-//!
-//! The kernel's flag that the pool is at its limit is the precondition, and a
-//! healthy pool leaves it within seconds (each question takes milliseconds).
-//! So the judge calls the check [`State::Stuck`] once one `syspolicyd` has
-//! read at its limit at every reading for [`STUCK_AFTER_MS`]. One reading
-//! below the limit, a new `syspolicyd` (launchd started another), or none
-//! running answers it again. A missing reading changes nothing.
-//!
-//! Pure: the host reads the daemon (`aterm_uds::program_check::look`) and
-//! hands the reading here with the time.
+//! Tracks whether macOS `syspolicyd` is stuck at its workqueue thread limit.
 
-/// One `syspolicyd` process: its pid and start time, so a restarted daemon
-/// at a reused pid is a new one.
+/// Identity of a `syspolicyd` process by PID and start timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Daemon {
     /// Its pid.
@@ -37,51 +14,43 @@ pub struct Daemon {
     pub start_us: u32,
 }
 
-/// One reading of `syspolicyd`'s thread pool (`ps -o wq=,wql=`).
+/// Snapshot of `syspolicyd` workqueue thread-pool state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
     /// The daemon read.
     pub daemon: Daemon,
-    /// Its workqueue threads of every kind (`wq`), idle ones included: a
-    /// figure for the words, never the verdict.
+    /// Total workqueue threads of all kinds (`wq`).
     pub workers: u64,
-    /// The kernel flagged it at a workqueue limit (`wql` `C`, constrained, or
-    /// `T`, total).
+    /// Whether the kernel flagged a workqueue limit (`wql` `C` or `T`).
     pub at_limit: bool,
-    /// The constrained limit (`kern.wq_max_constrained_threads`), if read:
-    /// a figure for the words.
+    /// Constrained thread limit (`kern.wq_max_constrained_threads`), if read.
     pub limit: Option<u64>,
 }
 
 impl Reading {
-    /// Whether the pool is full: the kernel's flag alone. The thread count
-    /// counts overcommit and idle threads the constrained limit does not, so
-    /// a count at the limit is no proof (one process measured `100 -`).
+    /// Returns whether the kernel flagged the workqueue pool as at its limit.
     #[must_use]
     pub const fn full(&self) -> bool {
         self.at_limit
     }
 }
 
-/// How long one `syspolicyd` reads full before the check is [`State::Stuck`]:
-/// five minutes, when a healthy pool drains in seconds.
+/// Duration a `syspolicyd` pool must remain full before [`State::Stuck`] is reported.
 pub const STUCK_AFTER_MS: u64 = 5 * 60_000;
 
-/// What the readings say of the program check.
+/// Health state of the macOS program check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Not read yet (or not readable here).
     Unread,
     /// The last reading's pool was below its limit.
     Answering,
-    /// The pool has read full since `since_ms`, for less than
-    /// [`STUCK_AFTER_MS`].
+    /// The pool has read full since `since_ms` for less than [`STUCK_AFTER_MS`].
     Full {
         /// The first full reading of this run.
         since_ms: u64,
     },
-    /// The pool has read full since `since_ms`, for [`STUCK_AFTER_MS`] or
-    /// more: only a restart (of the Mac, or of `syspolicyd`) ends it.
+    /// The pool has read full since `since_ms` for [`STUCK_AFTER_MS`] or more.
     Stuck {
         /// The first full reading of this run.
         since_ms: u64,
@@ -139,8 +108,7 @@ impl Judge {
         self.state
     }
 
-    /// Fold in the reading taken at `at_ms` (`None`: nothing could be read,
-    /// which changes nothing) and answer the state.
+    /// Folds in the reading taken at `at_ms` (`None` leaves the state unchanged).
     pub fn absorb(&mut self, at_ms: u64, reading: Option<&Reading>) -> State {
         let Some(reading) = reading else {
             return self.state;
@@ -164,8 +132,7 @@ impl Judge {
         self.state
     }
 
-    /// No `syspolicyd` runs: whatever held one ended with it, and launchd
-    /// starts a fresh one at the next request. The check answers.
+    /// Records that no `syspolicyd` process is running and returns [`State::Answering`].
     pub fn absorb_none_running(&mut self) -> State {
         self.daemon = None;
         self.state = State::Answering;
@@ -203,7 +170,6 @@ mod tests {
 
     #[test]
     fn a_pool_full_for_five_minutes_is_stuck_and_one_below_it_is_not() {
-        // 2026-10-20's wedge: 95 threads against a limit of 90, flagged.
         let full = Some(reading(D, 95, true));
         let states = run(&[
             (0, Some(reading(D, 6, false))),
@@ -222,7 +188,6 @@ mod tests {
                 State::Stuck { since_ms: MIN },
             ]
         );
-        // Negative control: the same times with the pool below its limit.
         let busy = Some(reading(D, 40, false));
         let states = run(&[(MIN, busy), (2 * MIN, busy), (6 * MIN, busy)]);
         assert!(states.iter().all(|s| *s == State::Answering), "{states:?}");
@@ -271,13 +236,11 @@ mod tests {
                 State::Full { since_ms: 0 },
                 State::Stuck { since_ms: 0 },
                 State::Stuck { since_ms: 0 },
-                // Launchd's next syspolicyd is judged from its own readings.
                 State::Full { since_ms: 7 * MIN },
                 State::Answering,
             ]
         );
         assert_eq!(Judge::new().absorb(0, None), State::Unread);
-        // A stuck daemon that is gone, with none in its place, held nothing.
         let mut judge = Judge::new();
         judge.absorb(0, full.as_ref());
         judge.absorb(5 * MIN, full.as_ref());
@@ -304,8 +267,6 @@ mod tests {
             }
             .full()
         );
-        // Negative control: a count at or past the limit without the flag is
-        // overcommit and idle threads, not a full pool.
         assert!(!reading(D, 90, false).full());
         assert!(!reading(D, 100, false).full());
         assert!(reading(D, 95, true).full());

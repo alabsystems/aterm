@@ -5,18 +5,9 @@
 // Apache-2.0; see LICENSE-MIT and LICENSE-APACHE), renamed by the aterm
 // project in 2026. The rest of this file is aterm's.
 
-//! Where an outline goes: segments in font units ([`OutlineSink`]), the same
-//! segments mapped into a raster's pixel space ([`ScaledSink`]), or the
-//! unscaled points a grid-fitter works on ([`PointSink`]).
+//! Where an outline goes.
 
 /// Receives a glyph outline as segments, in font units, y up.
-///
-/// Every contour starts with `move_to`. TrueType outlines arrive as
-/// quadratic segments, CFF outlines as cubic ones, and each contour ends with
-/// `close` except a CFF2 glyph's last one, which ends when the outline call
-/// returns (CFF2 has no `endchar`; ttf-parser draws it so, and the corpus
-/// pins it). A sink that needs every contour closed closes the open one
-/// itself, as aterm-render's rasterizer sink does.
 pub trait OutlineSink {
     /// Appends a MoveTo segment: the start of a contour.
     fn move_to(&mut self, x: f32, y: f32);
@@ -50,15 +41,8 @@ impl OutlineSink for NullSink {
     fn close(&mut self) {}
 }
 
-/// Forwards an outline to `inner` with every point mapped through
-/// `(x, y) -> (x * sx + dx, y * sy + dy)`: font units to a raster's pixels.
-///
-/// `sx = sy = px / units_per_em` with no offset is the y-up pixel outline;
-/// `sy = -sx`, `dx = -left`, `dy = top` puts it in a y-down ink box whose
-/// top-left corner is `(left, top)`. Each coordinate is one multiply and one
-/// add, in that order, so a caller that wrote `x * s - left` (or
-/// `top - y * s`) gets the same bits back. "No offset" is `-0.0`, the one
-/// value whose addition changes no bits (`-0.0 + 0.0` is `+0.0`).
+/// Forwards an outline to `inner` with every point mapped through `(x, y) -> (x * sx + dx, y * sy +
+/// dy)`: font units to a raster's pixels.
 pub struct ScaledSink<'a, S: OutlineSink + ?Sized> {
     inner: &'a mut S,
     sx: f32,
@@ -139,14 +123,7 @@ pub enum PointKind {
     OffCurveCubic,
 }
 
-/// Receives a glyph outline as points, in font units, y up: each contour's
-/// points in order, then `end_contour`.
-///
-/// For `glyf` these are the points the font stores (two adjacent quadratic
-/// control points keep their implied on-curve midpoint implicit), after the
-/// `gvar` deltas and a composite's component transforms. For CFF they are
-/// each segment's control points and end point, with a contour's last point
-/// dropped when it repeats the contour's start (the implicit close).
+/// Receives a glyph outline as points, in font units, y up.
 pub trait PointSink {
     /// The next point of the current contour.
     fn point(&mut self, x: f32, y: f32, kind: PointKind);

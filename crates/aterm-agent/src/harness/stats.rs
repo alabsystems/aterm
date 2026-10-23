@@ -1146,18 +1146,24 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     let sid = text("sid").unwrap_or_default();
     let rule = text("rule_id").unwrap_or("-");
     let outcome = text("decision").and_then(Outcome::from_word);
+    // A fact line is no act ([`approvals::is_fact_rule`]): it ends no limit wait and counts as
+    // none.
+    let fact = approvals::is_fact_rule(rule);
     match outcome {
         Some(Outcome::Waiting) if rule == RULE_WALL_WAIT => {
             acc.open.limit.entry(sid.to_string()).or_insert(ts);
         }
         Some(Outcome::Waiting) if rule == RULE_WALL_WAIT_END => close_limit(acc, sid, ts),
-        Some(Outcome::Typed) => close_limit(acc, sid, ts),
+        Some(Outcome::Typed) if !fact => close_limit(acc, sid, ts),
         _ => {}
     }
     if ts < acc.since_ms {
         return;
     }
     acc.row_of(sid);
+    if fact {
+        return;
+    }
     let Some(outcome @ (Outcome::Approved | Outcome::Declined | Outcome::Typed)) = outcome else {
         return;
     };

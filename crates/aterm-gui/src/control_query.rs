@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use aterm_control::wire::{VisibleTrim, push_visible};
+use aterm_control::wire::{FRAME_OPEN_WORD, VisibleTrim, frame_open_tail, push_visible};
 use aterm_core::grid::extra::ImageData;
 use aterm_core::grid::{Cell, CellFlags};
 use aterm_core::search::{
@@ -32,8 +32,9 @@ use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::metrics::wire::{
     FieldSink, FlagWords, Form, JsonSink, ReadCtx, Request, Syntax, TextSink,
 };
+use crate::park::Lane;
 use crate::session_waits::{RewrapGauge, RewrapReading};
-use crate::{Wake, term_lock};
+use crate::{ReadOn, Wake, term_lock, term_lock_whole, term_lock_whole_when};
 
 /// The visible, trailing-trimmed text of screen row `r`.
 pub(crate) fn visible_row(t: &Terminal, r: usize) -> String {
@@ -272,45 +273,50 @@ pub(crate) fn screen_text(t: &Terminal) -> String {
 }
 
 /// `text [trim] [tail=<n>|rows=<a>-<b>]` -> `OK <n>[ trimmed=<k>][ first=<row>]\n` then `<n>` visible rows.
+/// Read in a whole frame ([`term_lock_whole`]); one still unfinished at the read's bound is read as it stands, `frame=open` after the count.
 pub(crate) fn cmd_text_opt(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
     args: TextArgs,
 ) -> String {
     let mut look = frame.look_frame();
-    let (first, end, text, display) = {
-        let t = term_lock(term);
+    let (first, end, text, display, open) = {
+        let t = term_lock_whole(term);
         let (first, end) = match args.shape.select(t.rows() as usize) {
             Ok(span) => span,
             Err(err) => return err,
         };
+        let open = crate::frame_unfinished_now(&t);
         if args.display {
             let mut body = String::with_capacity((end - first) * (t.cols() as usize + 1));
             for r in first..end {
                 body.push_str(&row_in_order(&t, r, true).0);
                 body.push('\n');
             }
-            (first, end, None, body)
+            (first, end, None, body, open)
         } else {
-            (first, end, Some(look.text(&t)), String::new())
+            (first, end, Some(look.text(&t)), String::new(), open)
         }
     };
     let body = text
         .as_deref()
         .map_or(display.as_str(), |text| text.span(first, end));
-    frame_rows_reply(body, end - first, "", args.trim, first)
+    let word = if open { FRAME_OPEN_WORD } else { "" };
+    frame_rows_reply(body, end - first, word, args.trim, first)
 }
 
-/// `cursor` -> `OK <row> <col> <visible:0|1> <style>\n` (0-based).
+/// `cursor` -> `OK <row> <col> <visible:0|1> <style>[ frame=open]\n` (0-based), read in a whole frame ([`term_lock_whole`]).
 pub(crate) fn cmd_cursor(term: &Arc<Mutex<Terminal>>) -> String {
-    let t = term_lock(term);
+    let t = term_lock_whole(term);
     let c = t.cursor();
     let vis = u8::from(t.cursor_visible());
     let style = cursor_style_name(t.cursor_style());
-    format!("OK {} {} {} {}\n", c.row, c.col, vis, style)
+    let open = frame_open_tail(crate::frame_unfinished_now(&t));
+    format!("OK {} {} {} {}{open}\n", c.row, c.col, vis, style)
 }
 
-/// `cell <r> <c>` -> `OK <grapheme> <fg> <bg> <attrs>[ link=<url>]\n` or `ERR <msg>\n`.
+/// `cell <r> <c>` -> `OK <grapheme> <fg> <bg> <attrs>[ link=<url>][ frame=open]\n` or `ERR <msg>\n`.
+/// A screen row is read in a whole frame ([`term_lock_whole_when`]), a history row at once with no word; a trailing ` frame=open` is no style evidence to [`aterm_codec::cell::parse_style`].
 pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let mut it = rest.split_whitespace();
     let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
@@ -326,7 +332,8 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let Ok(c) = cs.parse::<usize>() else {
         return "ERR bad args\n".to_string();
     };
-    let t = term_lock(term);
+    let live = |t: &Terminal| abs.is_none_or(|n| n >= screen_first_abs(t));
+    let t = term_lock_whole_when(term, Lane::SERVED, live);
     let out_of_range = || {
         format!(
             "ERR out of range: rows 0-{}, cols 0-{}\n",
@@ -401,8 +408,12 @@ pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
             .unwrap_or_default(),
         CellRow::History(_) => String::new(),
     };
+    let open = match at {
+        CellRow::Screen(_) => frame_open_tail(crate::frame_unfinished_now(&t)),
+        CellRow::History(_) => "",
+    };
     format!(
-        "OK {grapheme_tok} {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {attrs}{link}\n",
+        "OK {grapheme_tok} {:02x}{:02x}{:02x} {:02x}{:02x}{:02x} {attrs}{link}{open}\n",
         fg[0], fg[1], fg[2], bg[0], bg[1], bg[2],
     )
 }
@@ -718,6 +729,7 @@ pub(crate) fn offscreen_args(rest: &str) -> Result<OffscreenArgs, String> {
 }
 
 /// `offscreen [since=<i>|since=<origin>:<i>] [tail=<n>] [max=<n>] [screen=1]` -> the rows an alternate-screen app scrolled off its top.
+/// `screen=1`'s rows are read in a whole frame ([`term_lock_whole`]), with `frame=open` before `screen_rows=` when not.
 pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, frame: &FrameSlot, rest: &str) -> String {
     let args = match offscreen_args(rest) {
         Ok(args) => args,
@@ -725,7 +737,7 @@ pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, frame: &FrameSlot, rest
     };
     let mut look = frame.look_frame();
     let (read, alt, seq, screen) = {
-        let t = term_lock(term);
+        let t = term_lock_whole_when(term, Lane::SERVED, |_| args.screen);
         let archive = t.alt_archive();
         let since = match args.since {
             None => 0,
@@ -744,12 +756,9 @@ pub(crate) fn cmd_offscreen(term: &Arc<Mutex<Terminal>>, frame: &FrameSlot, rest
             None => aterm_core::terminal::AltArchiveQuery::oldest(since, page),
         };
         let read = archive.read(query);
-        let screen = args.screen.then(|| {
-            (
-                look.text(&t),
-                t.frame_unfinished_at(std::time::Instant::now()),
-            )
-        });
+        let screen = args
+            .screen
+            .then(|| (look.text(&t), crate::frame_unfinished_now(&t)));
         (read, t.is_alternate_screen(), t.content_seq(), screen)
     };
     let frame_open = screen.as_ref().is_some_and(|(_, open)| *open);
@@ -802,9 +811,7 @@ fn format_offscreen_reply(
     if read.more {
         out.push_str(" more=1");
     }
-    if frame_open {
-        out.push_str(" frame=open");
-    }
+    out.push_str(frame_open_tail(frame_open));
     if let Some(screen) = screen {
         let _ = write!(out, " screen_rows={}", screen.row_count());
     }
@@ -820,11 +827,13 @@ fn format_offscreen_reply(
 }
 
 /// `line <n>` -> `OK <text>\n` for the line at MONOTONIC ABSOLUTE row `n`, or `ERR out of range\n` / `ERR evicted\n` / `ERR unreadable\n`.
+/// A live row is read in a whole frame ([`term_lock_whole_when`]) with no word for one still unfinished; a history row at once.
 pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let Ok(n) = rest.trim().parse::<u64>() else {
         return "ERR usage: line <abs_row>\n".to_string();
     };
-    let row = term_lock(term).abs_row_text_within(n, usize::MAX);
+    let live = |t: &Terminal| n >= screen_first_abs(t);
+    let row = term_lock_whole_when(term, Lane::SERVED, live).abs_row_text_within(n, usize::MAX);
     let text = match row {
         AbsRowText::Text(s) => s,
         AbsRowText::Evicted => return "ERR evicted\n".to_string(),
@@ -838,7 +847,15 @@ pub(crate) fn cmd_line(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     out
 }
 
+/// The absolute row of the live screen's first row: a row before it is history, no part of a frame.
+fn screen_first_abs(t: &Terminal) -> u64 {
+    let grid = t.grid();
+    grid.oldest_absolute_row()
+        .saturating_add(grid.scrollback_lines() as u64)
+}
+
 /// Execute `aterm ctl search` across scrollback and visible grid rows.
+/// The plan is held in a whole frame ([`term_lock_whole`]); ` frame=open` says a hold found the frame unfinished, which is no ` incomplete` cause.
 pub(crate) fn cmd_search(term: &Arc<Mutex<Terminal>>, rest: &str, rewrap: &RewrapGauge) -> String {
     cmd_search_capped(term, rest, search_max_lines(), || rewrap.reading())
 }
@@ -860,12 +877,9 @@ fn cmd_search_capped(
         pat = head.trim_end();
     }
     if pat.is_empty() {
-        let t = term_lock(term);
-        let screen_first = t
-            .grid()
-            .oldest_absolute_row()
-            .saturating_add(t.grid().scrollback_lines() as u64);
-        return format!("OK 0 screen_first={screen_first}\n");
+        let t = term_lock_whole(term);
+        let open = frame_open_tail(crate::frame_unfinished_now(&t));
+        return format!("OK 0{open} screen_first={}\n", screen_first_abs(&t));
     }
     let before = rewrap();
     let searched = search_full_history_capped(term, pat, case_sensitive, is_regex, depth_cap);
@@ -890,8 +904,9 @@ fn search_reply(
                 moving,
                 search.searched_lines.is_some(),
             );
+            let open = frame_open_tail(search.frame_open);
             let mut out = format!(
-                "OK {}{qualifier} screen_first={}\n",
+                "OK {}{qualifier}{open} screen_first={}\n",
                 search.results.matches.len(),
                 search.base_y,
             );
@@ -948,6 +963,8 @@ pub(crate) struct FullHistorySearch {
     pub(crate) consistent: bool,
     pub(crate) frame_stable: bool,
     pub(crate) searched_lines: Option<usize>,
+    /// A hold of the search found the program's DEC 2026 frame unfinished.
+    pub(crate) frame_open: bool,
 }
 
 /// [`search_full_history_capped`] at the configured depth, as the socket verb runs it.
@@ -977,6 +994,7 @@ fn search_full_history_capped(
         None,
         false,
         depth_cap,
+        ReadOn::Control,
     )
 }
 
@@ -999,12 +1017,14 @@ pub(crate) fn search_full_history_direction(
         anchor,
         strict,
         search_max_lines(),
+        ReadOn::EventLoop,
     )
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the depth cap rides alongside the query's own surface, like the anchor"
+    reason = "the depth cap and the reading thread ride alongside the query's own surface, like \
+              the anchor"
 )]
 fn search_full_history_direction_capped(
     term: &Arc<Mutex<Terminal>>,
@@ -1015,9 +1035,10 @@ fn search_full_history_direction_capped(
     anchor: Option<(usize, usize)>,
     strict: bool,
     depth_cap: usize,
+    on: ReadOn,
 ) -> Result<FullHistorySearch, SearchOptionsError> {
     let request = search_request(depth_cap, anchor);
-    full_history_search(search_terminal(term, &request, |built, _| {
+    full_history_search(search_terminal(term, &request, on, |built, _| {
         built.query(query, case_sensitive, is_regex, direction, strict)
     }))
 }
@@ -1038,6 +1059,7 @@ fn full_history_search(
         consistent: searched.verdict.consistent,
         frame_stable: searched.verdict.frame_stable,
         searched_lines: window.searched_lines(),
+        frame_open: searched.frame_open,
     })
 }
 
@@ -1054,22 +1076,36 @@ struct Searched<T> {
     key: SearchKey,
     wrap: WrapFrame,
     verdict: SearchVerdict,
+    /// A hold found the program's DEC 2026 frame unfinished.
+    frame_open: bool,
 }
 
+/// One search through `term`'s index slot; only a control thread's plan hold waits for a whole frame.
 fn search_terminal<T>(
     term: &Arc<Mutex<Terminal>>,
     request: &SearchRequest,
+    on: ReadOn,
     answer: impl FnOnce(&mut BuiltSearch, bool) -> T,
 ) -> Searched<T> {
-    let mut plan = term_lock(term).search_plan(request);
+    let unfinished = crate::frame_unfinished_now;
+    let (mut plan, mut frame_open) = {
+        let mut t = term_lock_whole_when(term, on.lane(), |_| on.waits());
+        (t.search_plan(request), unfinished(&t))
+    };
     let hit = plan.is_hit();
     while plan.rows_to_read() > 0 {
-        term_lock(term).read_search_chunk(&mut plan, SNAPSHOT_CHUNK_LINES);
+        let t = term_lock(term);
+        frame_open |= unfinished(&t);
+        t.read_search_chunk(&mut plan, SNAPSHOT_CHUNK_LINES);
     }
     let mut built = plan.build();
     let answer = answer(&mut built, hit);
     let (key, wrap) = (*built.key(), built.wrap());
-    let (verdict, discard) = term_lock(term).finish_search(built);
+    let (verdict, discard) = {
+        let mut t = term_lock(term);
+        frame_open |= unfinished(&t);
+        t.finish_search(built)
+    };
     drop(discard);
     keep_resident(term);
     Searched {
@@ -1077,6 +1113,7 @@ fn search_terminal<T>(
         key,
         wrap,
         verdict,
+        frame_open,
     }
 }
 
@@ -1101,31 +1138,36 @@ pub(crate) fn search_full_history_point(
     strict: bool,
 ) -> Result<FullHistoryPoint, SearchOptionsError> {
     let request = search_request(search_max_lines(), Some(anchor));
-    full_history_point(search_terminal(term, &request, |built, hit| {
-        let batch = |built: &mut BuiltSearch| {
-            built
-                .query(query, case_sensitive, is_regex, direction, strict)
-                .map(|(_, point_match)| point_match)
-        };
-        if !hit {
-            return batch(built);
-        }
-        let wrap = built.wrap();
-        match built.index().find_direction_opts(
-            query,
-            case_sensitive,
-            is_regex,
-            aterm_search::DirectedFind {
-                anchor: wrap.logical_anchor().unwrap_or(anchor),
-                direction,
-                inclusive: !strict,
-                wrap: true,
-            },
-        ) {
-            Err(SearchOptionsError::ScanCutShort) => batch(built),
-            found => found.map(|found| found.map(|found| wrap.to_physical(&found))),
-        }
-    }))
+    full_history_point(search_terminal(
+        term,
+        &request,
+        ReadOn::EventLoop,
+        |built, hit| {
+            let batch = |built: &mut BuiltSearch| {
+                built
+                    .query(query, case_sensitive, is_regex, direction, strict)
+                    .map(|(_, point_match)| point_match)
+            };
+            if !hit {
+                return batch(built);
+            }
+            let wrap = built.wrap();
+            match built.index().find_direction_opts(
+                query,
+                case_sensitive,
+                is_regex,
+                aterm_search::DirectedFind {
+                    anchor: wrap.logical_anchor().unwrap_or(anchor),
+                    direction,
+                    inclusive: !strict,
+                    wrap: true,
+                },
+            ) {
+                Err(SearchOptionsError::ScanCutShort) => batch(built),
+                found => found.map(|found| found.map(|found| wrap.to_physical(&found))),
+            }
+        },
+    ))
 }
 
 fn full_history_point(
@@ -1468,7 +1510,14 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"dims":{...},"seq":N,"gen":"E.S", "human_ms":N|null}`.
 #[cfg(test)]
 pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
-    cmd_text_json_read(term, &FrameSlot::default(), args, None, None, 0, None, None)
+    cmd_text_json_read(
+        term,
+        &FrameSlot::default(),
+        args,
+        || (None, None, 0),
+        None,
+        None,
+    )
 }
 
 /// [`cmd_text_json_opt`] as the dispatch answers it.
@@ -1477,19 +1526,27 @@ pub(crate) fn cmd_text_json_looked(
     ctx: &crate::SessionCtx,
     args: TextArgs,
 ) -> String {
-    let now_us = crate::metrics::now_us();
-    let human_seq = ctx.human_input.seq();
+    let person = || {
+        let human_seq = ctx.human_input.seq();
+        let now_us = crate::metrics::now_us();
+        (
+            ctx.human_input.ms_since(now_us),
+            ctx.human_input.unkeyed_ms(now_us),
+            human_seq,
+        )
+    };
     cmd_text_json_read(
         term,
         &ctx.frame,
         args,
-        ctx.human_input.ms_since(now_us),
-        ctx.human_input.unkeyed_ms(now_us),
-        human_seq,
+        person,
         Some(&ctx.launch),
         Some((&ctx.output_echo, &ctx.sink)),
     )
 }
+
+/// The person's stamps a `text --json` read carries: `human_ms`, `unkeyed_ms` and `human_seq`.
+pub(crate) type PersonStamps = (Option<u64>, Option<u64>, u64);
 
 #[cfg(test)]
 thread_local! {
@@ -1497,23 +1554,18 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the session's facts read beside one screen, each from its own leaf; a struct \
-              would only rename them at the one dispatch that passes them"
-)]
+/// `person` and the first `inputs` count are taken under the rows' hold once its wait is over, so neither is older
+/// than the frame read; before the rows, so a gesture they miss moves `human_seq` past an `if-human=` fence.
 pub(crate) fn cmd_text_json_read(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
     args: TextArgs,
-    human_ms: Option<u64>,
-    unkeyed_ms: Option<u64>,
-    human_seq: u64,
+    person: impl FnOnce() -> PersonStamps,
     launch: Option<&crate::launch_witness::LaunchWitness>,
     input: Option<(&crate::app_input::OutputEchoTracker, &SinkWriter)>,
 ) -> String {
-    let inputs_before = input.map(|(tracker, sink)| tracker.input_settled(sink));
     let mut look = frame.look_frame();
+    let ((human_ms, unkeyed_ms, human_seq), inputs_before);
     let (
         text,
         display_rows,
@@ -1530,7 +1582,9 @@ pub(crate) fn cmd_text_json_read(
         launch,
         frame_open,
     ) = {
-        let t = term_lock(term);
+        let t = term_lock_whole(term);
+        (human_ms, unkeyed_ms, human_seq) = person();
+        inputs_before = input.map(|(tracker, sink)| tracker.input_settled(sink));
         #[cfg(test)]
         WHILE_ROWS_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -1648,17 +1702,27 @@ pub(crate) fn cmd_text_json_read(
     out
 }
 
-/// `cursor --json` -> `{"row":R,"col":C,"visible":bool,"style":"<name>"}`.
+/// `cursor --json` -> `{"row":R,"col":C,"visible":bool,"style":"<name>"[,"frame":"open"]}`, read as `cursor` is.
 pub(crate) fn cmd_cursor_json(term: &Arc<Mutex<Terminal>>) -> String {
-    let t = term_lock(term);
+    let t = term_lock_whole(term);
     let c = t.cursor();
     json_ok(&format!(
-        "{{\"row\":{},\"col\":{},\"visible\":{},{}}}",
+        "{{\"row\":{},\"col\":{},\"visible\":{},{}{}}}",
         c.row,
         c.col,
         t.cursor_visible(),
         json_str_field("style", cursor_style_name(t.cursor_style())),
+        frame_open_field(&t),
     ))
+}
+
+/// `,"frame":"open"` when `t`'s frame is unfinished, else nothing: a JSON reply's last key.
+fn frame_open_field(t: &Terminal) -> &'static str {
+    if crate::frame_unfinished_now(t) {
+        ",\"frame\":\"open\""
+    } else {
+        ""
+    }
 }
 
 fn underline_style_name(u: UnderlineStyle) -> &'static str {
@@ -2252,6 +2316,7 @@ fn _styled_cell_snap_is_fully_serialized(snap: &StyledCellSnap) {
 }
 
 /// `screen` -> the lossless engine-styled grid as a single-line JSON frame in the `OK 1\n<json>\n` read framing.
+/// Read in a whole frame ([`term_lock_whole`]); a reply read on one still unfinished closes with `"frame":"open"`.
 pub(crate) fn cmd_screen_styled_json(
     term: &Arc<Mutex<Terminal>>,
     frame: &FrameSlot,
@@ -2262,24 +2327,29 @@ pub(crate) fn cmd_screen_styled_json(
         Err(usage) => return usage,
     };
     let mut look = frame.look_frame();
-    let (styled, key, etag) = {
-        let t = term_lock(term);
+    let (styled, key, tail) = {
+        let t = term_lock_whole(term);
         let key = FrameKey::read(&t);
         let etag = key.etag();
         if since == Some(etag) {
             return json_ok(&format!(
-                "{{\"unchanged\":true,\"seq\":{},\"gen\":\"{}\",\"etag\":\"{etag:016x}\"}}",
+                "{{\"unchanged\":true,\"seq\":{},\"gen\":\"{}\",\"etag\":\"{etag:016x}\"{}}}",
                 key.seq(),
                 key.generation(),
+                frame_open_field(&t),
             ));
         }
-        (look.styled(&t, &key), key, etag)
+        let tail = ScreenTail {
+            etag,
+            open: crate::frame_unfinished_now(&t),
+        };
+        (look.styled(&t, &key), key, tail)
     };
     let reply = |frame: &str| {
         let mut out = String::with_capacity(32 + frame.len());
         out.push_str("OK 1\n");
         out.push_str(frame);
-        close_with_etag(out, etag)
+        close_with_etag(out, tail)
     };
     let (out, lighter) = match styled {
         Styled::Hit(published) => (
@@ -2290,7 +2360,7 @@ pub(crate) fn cmd_screen_styled_json(
             let out = if look.keeps_styled() {
                 reply(look.publish_styled(key, &snap).body())
             } else {
-                screen_frame_reply(&snap, etag)
+                screen_frame_reply(&snap, tail)
             };
             (out, Lighter::Gathered(snap))
         }
@@ -2303,15 +2373,19 @@ pub(crate) fn cmd_screen_styled_json(
     let out = match lighter {
         Lighter::Gathered(mut snap) if snap.carries_image_payloads() => {
             snap.image_payloads = false;
-            screen_frame_reply(&snap, etag)
+            screen_frame_reply(&snap, tail)
         }
         Lighter::Published(true) => {
-            let (mut snap, etag) = {
-                let t = term_lock(term);
-                (gather_styled_frame(&t), FrameKey::read(&t).etag())
+            let (mut snap, tail) = {
+                let t = term_lock_whole(term);
+                let tail = ScreenTail {
+                    etag: FrameKey::read(&t).etag(),
+                    open: crate::frame_unfinished_now(&t),
+                };
+                (gather_styled_frame(&t), tail)
             };
             snap.image_payloads = false;
-            screen_frame_reply(&snap, etag)
+            screen_frame_reply(&snap, tail)
         }
         Lighter::Gathered(_) | Lighter::Published(false) => out,
     };
@@ -2329,19 +2403,29 @@ enum Lighter {
     Published(bool),
 }
 
-fn screen_frame_reply(snap: &StyledFrameSnapshot, etag: u64) -> String {
+fn screen_frame_reply(snap: &StyledFrameSnapshot, tail: ScreenTail) -> String {
     let payloads = styled_frame_payloads(snap);
     let mut out = String::with_capacity(32 + styled_frame_estimate(snap, &payloads));
     out.push_str("OK 1\n");
     write_styled_frame(&mut out, snap, &payloads);
-    close_with_etag(out, etag)
+    close_with_etag(out, tail)
 }
 
-fn close_with_etag(mut out: String, etag: u64) -> String {
+/// The keys a full `screen` reply closes with, read in its frame's hold; neither is in the published frame.
+#[derive(Clone, Copy)]
+struct ScreenTail {
+    etag: u64,
+    open: bool,
+}
+
+fn close_with_etag(mut out: String, tail: ScreenTail) -> String {
     debug_assert!(out.ends_with('}'), "the styled frame is one JSON object");
     out.pop();
-    let _ = std::fmt::Write::write_fmt(&mut out, format_args!(",\"etag\":\"{etag:016x}\"}}"));
-    out.push('\n');
+    let _ = std::fmt::Write::write_fmt(&mut out, format_args!(",\"etag\":\"{:016x}\"", tail.etag));
+    if tail.open {
+        out.push_str(",\"frame\":\"open\"");
+    }
+    out.push_str("}\n");
     out
 }
 
@@ -3953,25 +4037,31 @@ mod tests {
                     usize::from(planned.cols),
                 );
                 let request = super::search_request(depth, Some((0, 0)));
-                let searched = super::search_terminal(&term, &request, |built, hit| {
-                    assert_eq!(hit, warm, "{case}: precondition");
-                    if let Some(race) = race {
-                        race(&mut term_lock(&term));
-                    }
-                    built.query(
-                        "needle",
-                        false,
-                        false,
-                        super::EngineSearchDirection::Forward,
-                        false,
-                    )
-                });
+                let searched = super::search_terminal(
+                    &term,
+                    &request,
+                    crate::ReadOn::Control,
+                    |built, hit| {
+                        assert_eq!(hit, warm, "{case}: precondition");
+                        if let Some(race) = race {
+                            race(&mut term_lock(&term));
+                        }
+                        built.query(
+                            "needle",
+                            false,
+                            false,
+                            super::EngineSearchDirection::Forward,
+                            false,
+                        )
+                    },
+                );
                 if point {
                     let found = super::full_history_point(super::Searched {
                         answer: searched.answer.map(|(_, point_match)| point_match),
                         key: searched.key,
                         wrap: searched.wrap,
                         verdict: searched.verdict,
+                        frame_open: searched.frame_open,
                     })
                     .expect(&case);
                     assert_eq!(found.consistent, race.is_none(), "{case}");
@@ -4050,20 +4140,21 @@ mod tests {
         assert_eq!(hit, built);
 
         let request = super::search_request(super::search_max_lines(), Some((0, 0)));
-        let walked = super::search_terminal(&term, &request, |built, hit| {
-            assert!(hit, "precondition: a hit");
-            built.index().find_direction_opts(
-                costly,
-                true,
-                true,
-                aterm_search::DirectedFind {
-                    anchor: built.wrap().logical_anchor().unwrap_or((0, 0)),
-                    direction: super::EngineSearchDirection::Forward,
-                    inclusive: false,
-                    wrap: true,
-                },
-            )
-        });
+        let walked =
+            super::search_terminal(&term, &request, crate::ReadOn::Control, |built, hit| {
+                assert!(hit, "precondition: a hit");
+                built.index().find_direction_opts(
+                    costly,
+                    true,
+                    true,
+                    aterm_search::DirectedFind {
+                        anchor: built.wrap().logical_anchor().unwrap_or((0, 0)),
+                        direction: super::EngineSearchDirection::Forward,
+                        inclusive: false,
+                        wrap: true,
+                    },
+                )
+            });
         assert_eq!(walked.answer, Err(super::SearchOptionsError::ScanCutShort));
     }
 
@@ -4639,9 +4730,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             TextArgs::default(),
-            None,
-            None,
-            0,
+            || (None, None, 0),
             None,
             None,
         );
@@ -4653,9 +4742,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             TextArgs::default(),
-            Some(12_345),
-            None,
-            3,
+            || (Some(12_345), None, 3),
             None,
             None,
         );
@@ -4668,9 +4755,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             args("tail=5 trim"),
-            Some(7),
-            None,
-            9,
+            || (Some(7), None, 9),
             None,
             None,
         );
@@ -4685,9 +4770,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             args("tail=5 trim"),
-            None,
-            Some(5_000),
-            0,
+            || (None, Some(5_000), 0),
             None,
             None,
         );
@@ -4702,9 +4785,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             TextArgs::default(),
-            Some(7),
-            Some(5_000),
-            0,
+            || (Some(7), Some(5_000), 0),
             None,
             None,
         );
@@ -4726,9 +4807,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             args("tail=5 trim"),
-            Some(7),
-            None,
-            9,
+            || (Some(7), None, 9),
             Some(&w),
             None,
         );
@@ -4743,9 +4822,7 @@ mod trim_tests {
             &term,
             &crate::frame_memo::FrameSlot::default(),
             TextArgs::default(),
-            Some(7),
-            None,
-            10,
+            || (Some(7), None, 10),
             Some(&w),
             None,
         );
@@ -4775,9 +4852,7 @@ mod trim_tests {
                 &term,
                 &crate::frame_memo::FrameSlot::default(),
                 args,
-                None,
-                Some(5_000),
-                0,
+                || (None, Some(5_000), 0),
                 None,
                 Some((&*tracker, &sink)),
             )
@@ -6140,9 +6215,7 @@ mod screen_conditional {
                 &term,
                 &crate::frame_memo::FrameSlot::default(),
                 super::TextArgs::default(),
-                None,
-                None,
-                0,
+                || (None, None, 0),
                 None,
                 None,
             )

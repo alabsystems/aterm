@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Cursors on Wayland: the six pointer shapes aterm shows, as
-//! cursor-shape-v1 shapes (the compositor draws them) and, where a
-//! compositor lacks that protocol, as images from the user's cursor theme
-//! through libwayland-cursor (`libwayland-cursor.so.0`, opened at run time).
-//!
-//! An [`Icon`]'s theme names are its CSS name first, then the legacy X
-//! cursor names a theme may use instead, as cursor-icon 1.2.0 lists them
-//! (the crate the winit fork names cursors through until LW.7).
-//!
-//! `struct wl_cursor` and `struct wl_cursor_image` are transcribed from
-//! `wayland-cursor.h`; `tests/cursor_layout.rs` holds them to that header on
-//! each Linux architecture.
+//! Cursors on Wayland: the six pointer shapes aterm shows, as cursor-shape-v1 shapes (the
+//! compositor draws them) and, where a compositor lacks that protocol, as images from the user's
+//! cursor theme through libwayland-cursor (`libwayland-cursor.so.0`, opened at run time).
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr::NonNull;
@@ -134,8 +125,7 @@ pub fn cursor_lib() -> Result<&'static CursorLib, aterm_dl::Error> {
     .map_err(Clone::clone)
 }
 
-/// One frame of a themed cursor: its buffer (owned by the theme) and
-/// geometry.
+/// One frame of a themed cursor: its buffer (owned by the theme) and geometry.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     pub buffer: Proxy,
@@ -151,15 +141,13 @@ pub struct Theme {
     raw: NonNull<c_void>,
 }
 
-// SAFETY: the theme is used from one thread at a time by its owner; its
-// buffers are libwayland proxies, which are thread-safe.
+// SAFETY: the theme is used from one thread at a time by its owner; its buffers are libwayland
+// proxies, which are thread-safe.
 unsafe impl Send for Theme {}
 
 impl Theme {
-    /// Load `name` (the user's theme when `None`, libwayland-cursor's
-    /// built-in cursors when it has none) at `size` pixels, its buffers made
-    /// from `shm` (and on `shm`'s queue).
-    ///
+    /// Load `name` (the user's theme when `None`, libwayland-cursor's built-in cursors when it has
+    /// none) at `size` pixels, its buffers made from `shm` (and on `shm`'s queue).
     /// # Safety
     /// `shm` is a live `wl_shm` that outlives the theme.
     pub unsafe fn load(name: Option<&CStr>, size: u32, shm: Proxy) -> Result<Theme, Error> {
@@ -184,12 +172,12 @@ impl Theme {
         self.frame_named(icon.names())
     }
 
-    /// The first frame of the cursor under the first of `names` the theme
-    /// has (a caller with icons of its own names them, CSS name first).
+    /// The first frame of the cursor under the first of `names` the theme has (a caller with icons
+    /// of its own names them, CSS name first).
     pub fn frame_named(&self, names: &[&CStr]) -> Option<Frame> {
         names.iter().find_map(|name| {
-            // SAFETY: a live theme and a NUL-terminated name; the cursor and
-            // its images live as long as the theme.
+            // SAFETY: a live theme and a NUL-terminated name; the cursor and its images live as
+            // long as the theme.
             unsafe {
                 let cursor =
                     (self.lib.theme_get_cursor)(self.raw.as_ptr(), name.as_ptr()).as_ref()?;

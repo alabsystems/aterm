@@ -604,6 +604,84 @@ fn a_live_bash_takes_a_newer_body_at_its_next_prompt() {
     }
 }
 
+/// A running bash whose PS0 holds the hook as a loader of v0.107.0-v0.108.0 wrote it,
+/// `${ __aterm_ps0; }` (a substitution whose output bash 5.3 keeps in a file, so a Git Bash
+/// whose `/tmp` went away dropped every line typed: ATERM-KI-1020-3), takes `${| __aterm_ps0; }`
+/// both ways a running shell takes a newer build: the body a pointer names, read at its next
+/// prompt, where `__aterm_fresh_load` still reads the 1 of the shell's own start, and the
+/// whole script sourced in place (as [`typed_rekey_with_loader`] sources it), where it reads
+/// 0. The rewrite is text, made on every bash, so macOS's bash 3.2 checks it too.
+/// NEGATIVE CONTROLS (2026-10-22, bash 3.2.57 and 5.3.20): the rewrite gated on
+/// `__aterm_fresh_load` left the in-place shell's PS0 `${ __aterm_ps0; }`; the rewrite moved
+/// above the body's BEGIN marker left the pointed shell's.
+#[cfg(unix)]
+#[test]
+fn a_running_bash_takes_the_fileless_ps0_hook_from_a_newer_body_and_in_place() {
+    const OLD_HOOK: &str = "${ __aterm_ps0; }";
+    let probe = |n: u32| {
+        (
+            format!(
+                "printf 'PS0=%s\\n' \"$PS0\"; printf 'FRESH=%s\\n' \"$__aterm_fresh_load\"; \
+                 printf 'REV=%s\\n' \"${{__aterm_body_rev-}}\"; echo PZ$((400 + {n}))"
+            ),
+            format!("PZ{}", 400 + n),
+        )
+    };
+    for in_place in [false, true] {
+        let how = if in_place { "in place" } else { "pointer" };
+        let bf = BodyFixture::new();
+        let pointer = bf.pointer.to_str().unwrap().to_string();
+        let mut sh = spawn_live_bash_from(
+            &bf.fx,
+            &bf.ours,
+            &[
+                ("ATERM_SHELL_NONCE", REKEY_OLD),
+                (BODY_POINTER_VAR, pointer.as_str()),
+            ],
+        );
+        sh.send(&format!("PS0='{OLD_HOOK}'"));
+        let (line, marker) = probe(1);
+        sh.send(&line);
+        let at = sh.wait_for_after(&marker, 0);
+        assert_eq!(
+            sh.value_before("PS0=", at),
+            OLD_HOOK,
+            "{how}: the running shell holds the older loaders' hook\n{}",
+            sh.transcript()
+        );
+        if in_place {
+            let loader = bf.ours.join("aterm_shell_integration.bash");
+            sh.send(&format!(". {}", posix_quoted(&loader)));
+        } else {
+            // Pointed at while the shell idles, after the probe's prompt checked for a body.
+            sh.wait_for_after(&format!("133;A;id={REKEY_OLD}"), at);
+            deliver(&bf.pointer, NEWER_REV);
+            sh.send("true");
+        }
+        let (line, marker) = probe(2);
+        sh.send(&line);
+        let end = sh.wait_for_after(&marker, at);
+        let (fresh, rev) = if in_place {
+            ("0", bf.ours_rev())
+        } else {
+            ("1", NEWER_REV.to_owned())
+        };
+        assert_eq!(
+            (sh.value_before("FRESH=", end), sh.value_before("REV=", end)),
+            (fresh.to_owned(), rev),
+            "{how}: the load it is (`__aterm_fresh_load`, the body's revision)\n{}",
+            sh.transcript()
+        );
+        assert_eq!(
+            sh.value_before("PS0=", end),
+            "${| __aterm_ps0; }",
+            "{how}: PS0's hook after the newer build came\n{}",
+            sh.transcript()
+        );
+        sh.finish();
+    }
+}
+
 /// The pre-loader scripts (fixtures): what a shell spawned before loaders existed runs,
 /// which no body pointer reaches.
 #[cfg(unix)]

@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `doc` verb's grammar: its requests and the rows `doc ls` answers
-//! (design §7c; slice A1, with `apply`, `save` and `log` in A2).
-//!
-//! `doc` reaches the documents a window shows in Editor views: the live
-//! buffers, which can differ from their files on disk. aterm-gui serves it,
-//! and any control client can send it; `amacs --apply` (A3) asks `doc ls
-//! uri=` whether a file is open before it edits the file on disk.
-//!
-//! - `doc ls [uri=<file-uri>]` → `OK <n>`, then one [`DocRow`] per document.
-//! - `doc read <doc-id|file-uri> [lines=<A>-<B>]` → `OK <nbytes> doc=<d>`,
-//!   then [`super::read::format_lines`]'s text of the buffer, capped at
-//!   [`super::read::DOC_READ_CAP`]: the rows `amacs --read` prints of the
-//!   same text.
-//!
-//! A row's positions (`cursor=`, `sel=`) follow the anchor rules
-//! ([`super::anchor`]): a 1-based line, and a 1-based column that counts
-//! characters, the unit `edit line=<L>:<C>` takes. As in [`super::edit`],
-//! every field is one whitespace-free token, and each `parse` takes what its
-//! `format` writes.
+//! The `doc` verb's grammar: its requests and the rows `doc ls` answers.
 
 use std::fmt;
 
@@ -30,8 +12,7 @@ use super::read::LineRange;
 /// The `doc` request's usage line.
 pub const DOC_USAGE: &str = "doc ls [uri=<file-uri>] | doc read <doc-id|file-uri> [lines=<A>-<B>]";
 
-/// Why a line is not one of this module's forms. Its `Display` is the text a
-/// server answers after `ERR `.
+/// Why a line is not one of this module's forms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocError {
     /// The line is not a form at all: no sub-form, or no document named.
@@ -42,8 +23,7 @@ pub enum DocError {
     BadLines(String),
     /// An option the form does not have, or one given twice.
     UnknownOption(String),
-    /// A field to be written holds whitespace (or is empty), so the wire
-    /// would split it.
+    /// A field to be written holds whitespace (or is empty), so the wire would split it.
     Whitespace(&'static str),
 }
 
@@ -61,8 +41,8 @@ impl fmt::Display for DocError {
 
 impl std::error::Error for DocError {}
 
-/// Which document a request names: the `doc=` id a row or `OK edit` gave, or
-/// a `file://` URI in any spelling of the file.
+/// Which document a request names: the `doc=` id a row or `OK edit` gave, or a `file://` URI in any
+/// spelling of the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocRef {
     Id(u64),
@@ -70,8 +50,8 @@ pub enum DocRef {
 }
 
 impl DocRef {
-    /// `<d>`, `doc=<d>`, `<file-uri>` or `uri=<file-uri>`: a field copied
-    /// from a row reads as the bare value.
+    /// `<d>`, `doc=<d>`, `<file-uri>` or `uri=<file-uri>`: a field copied from a row reads as the
+    /// bare value.
     pub fn parse(word: &str) -> Result<Self, DocError> {
         let value = word
             .strip_prefix("doc=")
@@ -99,8 +79,7 @@ impl fmt::Display for DocRef {
     }
 }
 
-/// A sub-form a later slice serves (design §7c): `apply` and `save` write,
-/// `log` reads a document's undo frames.
+/// A sub-form (`apply`, `save`, or `log`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaterForm {
     Apply,
@@ -196,8 +175,7 @@ impl DocRequest {
     }
 }
 
-/// How a document's file stands against the version its buffer was read or
-/// last saved as.
+/// How a document's file stands against the version its buffer was read or last saved as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskState {
     /// The file holds that version's bytes.
@@ -211,12 +189,10 @@ pub enum DiskState {
 }
 
 impl DiskState {
-    /// How a file read now stands against the version a buffer was read or
-    /// last saved as, by content: [`Self::Missing`] when no file is there,
-    /// [`Self::Same`] when that version was a file too and the length and
-    /// the content agree (`disk_same`, contracted), and [`Self::Changed`]
-    /// otherwise. A write of the same bytes, or a `touch`, is not a change.
-    /// A file that could not be read is the caller's [`Self::Unknown`].
+    /// How a file read now stands against the version a buffer was read or last saved as, by
+    /// content: [`Self::Missing`] when no file is there, [`Self::Same`] when that version was a
+    /// file too and the length and the content agree (`disk_same`, contracted), and
+    /// [`Self::Changed`] otherwise.
     #[must_use]
     pub fn by_content(
         now_exists: bool,
@@ -267,10 +243,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `doc-disk-same` (SPECS.md): for every one of the 16 inputs, the
-// compiled body is its closed form, so it never holds of a file that is not
-// there and `DiskState::by_content` reads the same table whichever arm it
-// asks first. Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem disk_same_is_all_four (now base len content : Bool) :
@@ -281,8 +253,8 @@ verify_island! {
     }
 }
 
-/// A position in a text: a 1-based line by the anchor rules and a 1-based
-/// column in characters, written `<L>:<C>`.
+/// A position in a text: a 1-based line by the anchor rules and a 1-based column in characters,
+/// written `<L>:<C>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Point {
     pub line: usize,
@@ -293,13 +265,7 @@ impl Point {
     /// Line 1, column 1.
     pub const START: Self = Self { line: 1, col: 1 };
 
-    /// Where byte `offset` of `text` sits. A byte inside a line or its
-    /// end-of-line is on that line, its column one past the characters before
-    /// it (never past the line's end); the end of a text whose last line ends
-    /// with an end-of-line is column 1 of the line after it, as an editor
-    /// shows that caret. A byte-order mark is before line 1, and an offset
-    /// past the text, or inside a character, counts as the nearest boundary
-    /// before it.
+    /// Where byte `offset` of `text` sits.
     #[must_use]
     pub fn at(text: &str, offset: usize) -> Self {
         let lines = Lines::of(text);
@@ -406,9 +372,8 @@ impl fmt::Display for ViewSpan {
     }
 }
 
-/// One `doc ls` row: `doc=<d> uri=<canonical-uri> seq=<s> dirty=0|1
-/// disk=<state> views=<v,…> ticket=<t,…|-> cursor=<view>:<L>:<C>|-
-/// sel=<view>:<L>:<C>-<L>:<C>|-`.
+/// One `doc ls` row: `doc=<d> uri=<canonical-uri> seq=<s> dirty=0|1 disk=<state> views=<v,…>
+/// ticket=<t,…|-> cursor=<view>:<L>:<C>|- sel=<view>:<L>:<C>-<L>:<C>|-`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocRow {
     /// The document (`doc read <d>`).
@@ -597,7 +562,6 @@ mod tests {
             assert_eq!(DocRequest::parse(line).as_ref(), Ok(&request), "{line}");
             assert_eq!(request.format().as_deref(), Ok(line), "{line}");
         }
-        // A field copied from a row names the same document.
         assert_eq!(
             DocRequest::parse("read doc=3 lines=5"),
             Ok(DocRequest::Read {
@@ -612,7 +576,6 @@ mod tests {
             DocRequest::parse("read uri=file:///x"),
             DocRequest::parse("read file:///x")
         );
-        // The write forms and `log` are recognized, not read.
         assert_eq!(
             DocRequest::parse("apply 3 base=7 len=12"),
             Ok(DocRequest::Later(LaterForm::Apply))
@@ -737,28 +700,20 @@ mod tests {
     fn points_follow_the_anchor_rules() {
         let text = "ab\r\nc\u{e9}d\n\ne";
         let at = |offset| Point::at(text, offset).to_string();
-        // Line 1: `ab`, then its CRLF; a caret on the CR or LF is at the
-        // line's end.
         assert_eq!([at(0), at(1), at(2), at(3)], ["1:1", "1:2", "1:3", "1:3"]);
-        // Line 2: `céd`; the é is two bytes and one column, and a byte inside
-        // it counts as the boundary before it.
         assert_eq!(
             [at(4), at(5), at(6), at(7), at(8)],
             ["2:1", "2:2", "2:2", "2:3", "2:4"]
         );
-        // Line 3 is empty, and the open last line ends the text.
         assert_eq!([at(9), at(10), at(11)], ["3:1", "4:1", "4:2"]);
         assert_eq!(at(99), "4:2", "past the end is the end");
-        // A text that ends with an end-of-line ends on the line after it.
         assert_eq!(Point::at("a\nb\n", 4).to_string(), "3:1");
         assert_eq!(Point::at("", 0), Point::START);
-        // A byte-order mark is before line 1.
         let marked = "\u{feff}x\n";
         assert_eq!(
             [0, 1, 3, 4, 5].map(|offset| Point::at(marked, offset).to_string()),
             ["1:1", "1:1", "1:1", "1:2", "2:1"]
         );
-        // Every point is what an anchor names: the line its read prints.
         let lines = Lines::of(text);
         for offset in 0..text.len() {
             let point = Point::at(text, offset);

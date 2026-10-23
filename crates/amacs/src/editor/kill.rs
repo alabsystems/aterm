@@ -34,7 +34,7 @@ pub(super) struct YankRecord {
 
 impl YankRecord {
     /// The document the yank inserted into.
-    pub(super) fn document(&self) -> DocumentId {
+    pub(super) const fn document(&self) -> DocumentId {
         self.document
     }
 }

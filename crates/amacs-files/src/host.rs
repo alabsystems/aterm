@@ -96,7 +96,7 @@ impl DocumentGrant {
         self.target.logical_path()
     }
 
-    pub fn target(&self) -> &AtomicFileTarget {
+    pub const fn target(&self) -> &AtomicFileTarget {
         &self.target
     }
 
@@ -300,12 +300,12 @@ pub struct AdmittedDocument {
 
 impl AdmittedDocument {
     /// Whether no file exists yet: admitted with [`AdmitOptions::allow_missing`] as an empty text, which the first save creates.
-    pub fn is_missing(&self) -> bool {
+    pub const fn is_missing(&self) -> bool {
         !self.observed.exists
     }
 
     /// How the admitted text maps back to the file's bytes.
-    pub fn encoding(&self) -> DiskEncoding {
+    pub const fn encoding(&self) -> DiskEncoding {
         self.observed.encoding()
     }
 }
@@ -504,7 +504,7 @@ impl DocumentHostError {
     }
 
     /// The kind of the I/O error behind a refused read, where one was.
-    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+    pub const fn io_kind(&self) -> Option<std::io::ErrorKind> {
         match self {
             Self::Io { kind, .. } => *kind,
             _ => None,
@@ -853,7 +853,7 @@ impl DocumentPersistenceStore {
 }
 
 impl DocumentGrantStore {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             next_id: 1,
             grants: BTreeMap::new(),
@@ -1426,7 +1426,7 @@ fn root_stat_is_tolerable(error: &std::io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-fn root_stat_is_tolerable(_error: &std::io::Error) -> bool {
+const fn root_stat_is_tolerable(_error: &std::io::Error) -> bool {
     false
 }
 
@@ -1912,7 +1912,7 @@ impl HeldAdvisoryLock {
     }
 
     /// Underlying locked file accessed under the lock.
-    pub fn file(&self) -> &File {
+    pub const fn file(&self) -> &File {
         &self.0
     }
 }

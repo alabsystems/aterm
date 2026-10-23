@@ -185,7 +185,7 @@ impl PgpError {
     /// reported, so one naming another issuer (refused by stage 4) never masks the time or
     /// crypto refusal of one naming the pinned key. The report is unauthenticated: an added
     /// packet that merely claims the pinned issuer outranks a genuine one's time refusal.
-    fn stage(self) -> u8 {
+    const fn stage(self) -> u8 {
         match self {
             Self::TooLarge
             | Self::Armor
@@ -298,7 +298,7 @@ pub fn verify_detached(
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 

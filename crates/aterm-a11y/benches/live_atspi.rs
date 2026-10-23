@@ -1,27 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Explicit publisher acceptance against Linux at-spi2-core. This changes the
-//! session's accessibility enablement temporarily and kills/rejoins its accessibility
-//! bus; run in the Linux lane's scratch VM, never an owner's desktop session.
+//! Explicit publisher acceptance against Linux `at-spi2-core` in the scratch VM.
 //! STOCK EXCEPTION: the scratch guest uses the pinned stock compiler in
 //! `aterm-lab/src/linux_guest.rs`; the lane documents the unavailable Linux Trust build.
-//! The host still invokes Trust tooling:
-//! `targo --unverified lab linux exec -- cargo bench -p aterm-a11y --bench live_atspi --profile test`
-//! A missing session bus/at-spi2-core is COULD NOT RUN, never a successful row.
-//!
-//! Three rows, in turn on the session's one accessibility bus. The first is
-//! an assistive technology's view of one window (listed by the registry, its
-//! window and terminal read, an event heard, an action delivered), then the
-//! bus's daemon killed: the window is told, and the publisher rejoins the
-//! bus at-spi2-core starts again. The second freezes the same daemon
-//! (SIGSTOP) while the window's text keeps changing: the publisher's writes
-//! fill the socket the daemon no longer reads, one waits out
-//! [`aterm_a11y::atspi::WRITE`], and the publisher must leave the bus, tell
-//! the window, and rejoin once the daemon is thawed (SIGCONT), although
-//! nothing on the session bus says it was ever gone. The third is its
-//! negative control: a publisher whose writes have no deadline is held for
-//! as long as the daemon stays frozen, and its window is never told.
 
 #[path = "../../aterm-conformance/benches/support/mod.rs"]
 #[cfg_attr(
@@ -493,8 +475,6 @@ mod live {
         while changes.is_none_or(|n| i < n) && started.elapsed() < HANG {
             adapter.update_if_active(|| tree(&format!("line {i}\n")));
             i += 1;
-            // Until the window is told, a change a millisecond; with a count,
-            // every change at once.
             if changes.is_none()
                 && window_heard.recv_timeout(Duration::from_millis(1)) == Ok(Heard::Deactivated)
             {
@@ -511,14 +491,9 @@ mod live {
         );
         drop(frozen);
         if told {
-            // Thawed, the daemon answers the publisher's join: the window is
-            // asked for its tree on the bus again.
             assert_eq!(heard(&window_heard), Heard::Activated);
         }
         adapter.update_if_active(|| tree("thawed\n"));
-        // The publisher may still be writing out what the frozen daemon left
-        // unread, and the registry and the publisher answer once they are
-        // through: the text reads `thawed` then, a hang detector.
         let thawed = vec![Value::from("live$ echo hi\nthawed\n")];
         let started = Instant::now();
         let mut first = None;
@@ -547,8 +522,7 @@ mod live {
         })
     }
 
-    /// The publisher leaves a frozen bus on its write deadline, tells the
-    /// window, and rejoins the bus thawed.
+    /// Leaves a frozen bus on its write deadline, tells the window, and rejoins when thawed.
     pub(super) fn frozen() -> Result<String, String> {
         let row = frozen_under_changes(Some(WRITE), None, HANG)?;
         assert!(
@@ -563,11 +537,7 @@ mod live {
         ))
     }
 
-    /// The negative control of [`frozen`]: writes that wait for as long as
-    /// the daemon does. Far more changes than the socket holds, three times
-    /// the deadline, and the window is still not told; thawed, the publisher
-    /// goes on where it stopped on the same bus, and its window was never
-    /// let go.
+    /// Negative control of [`frozen`]: writes with no deadline block until the daemon thaws.
     pub(super) fn frozen_control() -> Result<String, String> {
         let row = frozen_under_changes(None, Some(20_000), WRITE * 3)?;
         assert!(!row.told, "a publisher with no deadline let its window go");
@@ -602,7 +572,6 @@ mod live {
         while owner(session, "org.a11y.Bus") == was {
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(!left.is_zero(), "the launcher {was} outlived its bus");
-            // Its exit is a NameOwnerChanged, which this connection's rule hears.
             let _ = session.recv(Some(left));
         }
     }
@@ -653,7 +622,6 @@ mod live {
         adapter.update_window_focus_state(true);
         adapter.update_if_active(|| tree("hi\n"));
 
-        // The registry lists the application; its window and terminal read.
         let app = find(&mut reader, &name);
         let windows =
             refs(&call(&mut reader, &app, ROOT, ACCESSIBLE, "GetChildren", vec![]).unwrap());
@@ -695,7 +663,6 @@ mod live {
             "{attributes:?}"
         );
 
-        // An event crosses the bus, and an action comes back.
         adapter.update_if_active(|| tree("hi there\n"));
         let changed = signal(&mut reader, &app, "TextChanged");
         assert_eq!(changed.path.as_ref().unwrap().as_str(), terminal);
@@ -710,7 +677,6 @@ mod live {
         assert_eq!(grabbed.unwrap(), vec![Value::Bool(true)]);
         assert_eq!(heard(&window_heard), Heard::Action(Action::Focus));
 
-        // The accessibility bus dies. The window is told, and nothing panics.
         let launcher = owner(&mut session, "org.a11y.Bus");
         session
             .add_match(
@@ -729,8 +695,6 @@ mod live {
         drop(reader);
         assert_eq!(heard(&window_heard), Heard::Deactivated);
 
-        // The launcher goes with its bus; the publisher, told it changed hands,
-        // asks for it again, rejoins the new bus, and the window publishes there.
         launcher_gone(&mut session, &launcher);
         assert_eq!(heard(&window_heard), Heard::Activated);
         let mut reader = at(&mut session);

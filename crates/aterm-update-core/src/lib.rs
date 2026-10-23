@@ -8,7 +8,9 @@
 //! advisory [`FileLock`] and [`same_volume`]; `curl` plumbing for GitHub's web host ([`cdn`]
 //! derives a tag's download URL, [`pointer`] learns the newest tag from one redirect-refusing
 //! HEAD, [`download_bytes`]/[`download_to`] never attach a credential) and for vendor-direct
-//! hosts ([`vendor_get`]); [`ensure_private_dir`]; [`sha256_file`]; the release-tag grammar
+//! hosts ([`vendor_get`]); the publishers' credentialed GitHub REST lane over the same curl
+//! ([`github_rest`], with [`github_pages`]' listing reader), which no updater path calls;
+//! [`ensure_private_dir`]; [`sha256_file`]; the release-tag grammar
 //! ([`tag`]) the publisher and the updater both classify with; the trust anchors ([`pins`]);
 //! the master-signed machine [`roster`]; and the Developer ID requirement with its bounded
 //! `/usr/bin/codesign` check ([`codesign`]).
@@ -27,6 +29,8 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 pub mod cdn;
 pub mod codesign;
+pub mod github_pages;
+pub mod github_rest;
 /// The successor's signed handoff policy: the release cutter seals it into
 /// the bundle, the outgoing build reads it from the verified candidate.
 pub mod handoff_policy;

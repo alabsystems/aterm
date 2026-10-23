@@ -225,7 +225,7 @@ impl Failed {
     /// unlinked since its exec (a rebuilt binary, a replaced app).
     const ENOENT: i32 = 2;
 
-    fn of(errno: i32) -> Self {
+    const fn of(errno: i32) -> Self {
         match errno {
             Self::ESRCH => Self::Exited,
             Self::EBADF => Self::Closed,

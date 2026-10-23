@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-libc-oracle` — checks `crates/aterm-libc` against the pinned
-//! reference `libc = "=0.2.186"` on this host's native ABI cell, and
-//! regenerates cell modules across all four cells.
-//!
-//! `libc-oracle/` is a standalone workspace without `[patch]` so the reference
-//! resolves from the registry while `under-test/` compiles the shim's sources.
-//! Under the pinned Trust toolchain, the gate runs five phases:
-//! 1. `inputs` — `Cargo.lock` current, locked deps offline, `union.json`;
-//! 2. `siblings` — same-OS hand-written cell bodies identical ([`siblings`]);
-//! 3. `conformance` — generated layout/const assertions compile and pass (`targo test -p libc-conformance`);
-//! 4. `shape` & `symbols` — rustdoc public shape and extern linker symbols match reference ([`shape`], [`symbols`]);
-//! 5. `controls` — planted defects are caught ([`controls`]).
-//!
-//! Authoring verbs share the same cell table and declaration closure:
-//! `regen` ([`regen`]) rewrites the shim and conformance cell modules, and
-//! `harvest` ([`harvest`]) widens `libc-oracle/union.json` from a check log.
+//! `aterm-libc-oracle` gate ([`siblings`], [`shape`], [`symbols`], [`controls`]) and authoring
+//! verbs ([`regen`], [`harvest`]).
 
 mod cargo;
 mod cells;

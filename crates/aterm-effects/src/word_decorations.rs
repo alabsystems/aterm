@@ -6279,6 +6279,48 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
     amp * carrier * (1.0 - p)
 }
 
+/// The share of its own contrast with the page a self-glowing word keeps on a
+/// light ground ([`paper_glow_scale`]). A trail body under the word is solved so the
+/// theme's text keeps `cursor_glow::BODY_CONTRAST_BAR` (5.25:1) over it and
+/// lands near 5:1 once its rounding and dither composite, so a word that keeps
+/// 4.5 / 5.0 of its contrast still reads at 4.5:1 over such a body.
+const PAPER_GLOW_KEEP: f32 = 0.9;
+
+/// The share of its envelope a self-glow `mix(fg, lit, glow)` lifts by on the
+/// word's ground `bg`, for an envelope that peaks under `amp`. On a dark
+/// ground the lift raises the word's contrast, and the glow stands as asked
+/// (`1`). On a light one a lift toward white is a fade: the whole pulse is
+/// scaled down until even `amp` leaves the lit ink [`PAPER_GLOW_KEEP`] of the
+/// word's own contrast, so it keeps its shape (no plateau at a clamp, no dip
+/// back to the word's ink), and a word that glows as a Return commits it, with
+/// a trail's band still lit beneath it, never drops under 4.5:1.
+fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
+    let (lum_fg, lum_bg) = (relative_luminance(fg), relative_luminance(bg));
+    if lum_bg <= lum_fg || amp <= 0.0 {
+        return 1.0;
+    }
+    let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
+    let reads = |g: f32| {
+        let lum = relative_luminance(mix_rgb(fg, lit, g)).min(lum_bg);
+        (lum_bg + 0.05) / (lum + 0.05) >= floor
+    };
+    if reads(amp) {
+        return 1.0;
+    }
+    let (mut lo, mut hi) = (0.0_f32, amp);
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        if reads(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo / amp
+}
+
+/// §4.2 specular lobe at gradient position `u` for sweep center `center`:
+/// `smoothstep(1 − min(1, |u − center|/0.28))²` — 28% wide, 0 outside.
 #[inline]
 const fn spec_lobe(u: f32, center: f32) -> f32 {
     let d = (u - center).abs() / 0.28;
@@ -6336,13 +6378,14 @@ fn emit_ink(
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
+            let bg = rgb3_to_u32(occ.ink_bg);
             for (&col, &fg_rgb) in cols.iter().zip(fgs) {
                 let fg = rgb3_to_u32(fg_rgb);
                 let lit = mix_rgb(fg, 0x00FF_FFFF, lift);
                 let cell = InkCell {
                     row: occ.row,
                     col,
-                    color: u32_to_rgb3(mix_rgb(fg, lit, glow)),
+                    color: u32_to_rgb3(mix_rgb(fg, lit, glow * paper_glow_scale(fg, lit, bg, amp))),
                 };
                 *fp = fold_ink(*fp, &cell);
                 *fp ^= frame_term;
@@ -16998,6 +17041,79 @@ mod trick_flash_hook_tests {
         wd.rescan(term, 4, 40, &lex, &c, 2, t0);
     }
 
+    /// ON PAPER A GLOWING WORD KEEPS ITS LETTERS OVER A TRAIL'S BAND: `kitty`
+    /// in GitHub Light's text on its page, ticked across its whole glow: every
+    /// lit cell keeps 4.5:1 over a grey ground where the theme's text reads
+    /// 5:1 (a trail body at its bar, as it composites), the word still lifts,
+    /// and the lift follows the envelope (a scaled pulse, not one cut flat at
+    /// a clamp). Negative control: the unbounded lift on the same word, at
+    /// the envelope's peak, falls under 4.5:1 over that ground. On a dark
+    /// ground the glow stands as asked.
+    #[test]
+    fn on_paper_a_glowing_word_keeps_its_letters_over_a_trails_band() {
+        use crate::color_math::contrast_ratio;
+        let (fg, page) = (0x001F_2328_u32, 0x00FF_FFFF_u32);
+        let band = (0u32..=255)
+            .map(|v| v * 0x0001_0101)
+            .find(|&g| contrast_ratio(fg, g) >= 5.0)
+            .expect("a grey reads the text at 5:1");
+        let t0 = Instant::now();
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        let mut term = Terminal::new(4, 40);
+        term.process(b"\x1b[38;2;31;35;40;48;2;255;255;255m$ kitty \x1b[0m");
+        let mut wd = WordDecorations::default();
+        wd.rescan(&term, 4, 40, &lex, &c, 1, t0);
+        let env = |ms: u64| feline_glow_env(ms, FELINE_GLOW_MS, FELINE_GLOW_AMP);
+        let lift_of = |rgb: u32| -> f32 {
+            [16, 8, 0]
+                .map(|sh| ((rgb >> sh) & 0xff) as f32 - ((fg >> sh) & 0xff) as f32)
+                .iter()
+                .sum()
+        };
+        let mut lifts = Vec::new();
+        let mut ink = Vec::new();
+        for ms in (0..FELINE_GLOW_MS).step_by(10) {
+            tick(&mut wd, t0 + Duration::from_millis(ms), &mut ink);
+            for cell in ink.iter().filter(|cell| (2..=6).contains(&cell.col)) {
+                let rgb = rgb3_to_u32(cell.color);
+                let over = contrast_ratio(rgb, band);
+                assert!(
+                    over >= 4.5,
+                    "{ms} ms col {}: {over:.2}:1 over the band",
+                    cell.col
+                );
+                if cell.col == 2 {
+                    lifts.push((env(ms), lift_of(rgb)));
+                }
+            }
+        }
+        let peak = (0..FELINE_GLOW_MS).map(env).fold(0.0_f32, f32::max);
+        let top = lifts.iter().map(|&(_, l)| l).fold(0.0_f32, f32::max);
+        assert!(top >= 15.0, "the word still lifts on paper: {top}");
+        for &(e, l) in &lifts {
+            assert!(
+                (l / top - e / peak).abs() <= 0.15,
+                "the lift follows the envelope: {:.2} of its top at {:.2} of the peak",
+                l / top,
+                e / peak
+            );
+        }
+        let unbound = mix_rgb(fg, mix_rgb(fg, page, FELINE_GLOW_LIFT), peak);
+        assert!(
+            contrast_ratio(unbound, band) < 4.5,
+            "control: the unbounded lift reads {:.2}:1 over the band",
+            contrast_ratio(unbound, band)
+        );
+        let (dark_fg, dark_bg) = (0x00E6_EDF3_u32, 0x000D_1117_u32);
+        let lit = mix_rgb(dark_fg, page, FELINE_GLOW_LIFT);
+        assert_eq!(
+            paper_glow_scale(dark_fg, lit, dark_bg, FELINE_GLOW_AMP).to_bits(),
+            1.0_f32.to_bits()
+        );
+    }
+
+    /// With no live flash (even a pending one), a wordless tick returns empty
+    /// ink, fp 0 and a `None` deadline.
     #[test]
     fn a_wordless_screen_with_no_flash_still_returns_fp_zero_and_disarms() {
         let t0 = Instant::now();

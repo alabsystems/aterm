@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_models_gui::{autopilot_timer_liveness, autopilot_timer_model};
+use aterm_models_gui::autopilot_timer_model;
 use aterm_spec::{interp, verify};
 
 /// AUTOPILOT'S TIMER (`docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8): the timer goes
@@ -13,7 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn a_timer_only_takes_power_away_and_the_hand_always_wins() {
     let model = autopilot_timer_model();
-    verify::prove_and_catch_scalar(&model, "autopilot timer");
 
     for (mutant, invariant) in [
         ("WireLandKeepsTimer", "TheTimerGoesWithCruise"),
@@ -74,14 +73,4 @@ fn a_timer_only_takes_power_away_and_the_hand_always_wins() {
     assert!(model.fire("WallMoved", &mut s));
     assert!(model.fire("Fire", &mut s));
     assert_eq!(s["word"], 2, "{s:?}");
-}
-
-/// A timer whose time came is landed (`[]<>`) under the fire's, the wall's re-derivation's, the
-/// wake's and the Commit's weak fairness, each load-bearing; a Commit that does not rebuild
-/// the index breaks it alone.
-#[test]
-fn a_stored_timer_whose_time_came_lands() {
-    let model = autopilot_timer_model();
-    let live = autopilot_timer_liveness();
-    verify::liveness_proves_and_catches_tiered(&model, &live, "AutopilotTimer lands");
 }

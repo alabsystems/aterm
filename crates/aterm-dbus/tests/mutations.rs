@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The decoder on damaged input: every recording, mutated many times from a
-//! fixed seed (overwritten, truncated, spliced, its length words stomped).
-//! Nothing panics, and what is accepted is accepted for what it is:
-//!
-//! * a value is accepted only as its own canonical encoding (it re-encodes to
-//!   exactly the bytes read);
-//! * a message decodes and re-encodes, and that encoding decodes and
-//!   re-encodes to the same bytes (bytes, not `==`: a NaN double is never
-//!   equal to itself, so value equality would fail a message that is fine);
-//! * `frame_len` answers every prefix.
-//!
-//! The cargo-fuzz target under `fuzz/` holds the same properties without the
-//! seed (a STOCK EXCEPTION lane; see its header).
+//! Seeded mutation tests for D-Bus message/value decoding (fuzz target is a STOCK EXCEPTION lane).
 
 use crate::support::*;
 use aterm_dbus::message::{self, Message};
@@ -39,8 +27,6 @@ fn mutate(rng: &mut XorShift, bytes: &[u8]) -> Vec<u8> {
                 out.splice(i..i, junk);
             }
             3 if out.len() >= 4 => {
-                // A length word set to an edge: zero, one, the array and
-                // message limits and past them, all ones.
                 let at = rng.index(out.len() / 4) * 4;
                 let edges = [
                     0u32,
@@ -89,8 +75,6 @@ fn a_nan_double_round_trips_by_its_bits() {
     let m = Message::decode(&bytes).expect("the fuzzer's input decodes");
     let nan = m.body.first().and_then(aterm_dbus::Value::as_f64);
     assert!(nan.is_some_and(f64::is_nan), "{:?}", m.body.first());
-    // The control: value equality cannot judge this message, even against
-    // itself, which is why the round trip compares bytes.
     assert_ne!(m, m.clone());
     assert_round_trip(&m, &bytes);
     let bits = nan.map(f64::to_bits);
@@ -138,8 +122,6 @@ fn a_damaged_message_decodes_to_itself_or_is_refused() {
             assert_round_trip(&m, &bytes);
         }
     }
-    // Some damage lands where the message survives it (a flag bit, a byte of
-    // a string): the round trip above is exercised, not vacuous.
     assert!(
         accepted > 100 && accepted < tries,
         "{accepted} of {tries} accepted"

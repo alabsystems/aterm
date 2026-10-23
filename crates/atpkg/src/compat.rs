@@ -111,7 +111,7 @@ impl Blocked {
 
     /// The one fix: the manual step no verb takes, then the verb that lays the root.
     #[must_use]
-    pub fn fix(&self) -> &'static str {
+    pub const fn fix(&self) -> &'static str {
         if self.symlink {
             "remove that link (only the link: whatever it names is left as it is), then \
              `aterm pkg repair` lays the exec root"

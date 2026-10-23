@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The jq evaluator: each expression is a stream of values, written into an output vector in
-//! order. An error stops the stream, and what was written before it stays written, so `?` and
-//! `//` keep the outputs that came before an error, as jq does.
+//! The jq evaluator: each expression is a stream of values, written into an output vector in order.
 
 use std::cmp::Ordering;
 
@@ -169,8 +167,6 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
             None => return Err(runtime(&format!("${name} is not defined"))),
         },
         Ast::Index(target, key, opt) => {
-            // jq runs the key outermost and the target innermost: `([1,2],[3,4])[0,1]` is
-            // 1, 3, 2, 4, and a failing target ends the stream after the first key's results.
             let (keys, status) = stream(key, input, env);
             let mut targets = Inner::new(Some(target));
             for k in &keys {
@@ -182,7 +178,6 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
             status?;
         }
         Ast::Slice(target, lo, hi, opt) => {
-            // As jq: the start outermost, then the end, then the target.
             let mut los = Inner::new(lo.as_deref());
             let mut his = Inner::new(hi.as_deref());
             let mut targets = Inner::new(Some(target));
@@ -233,8 +228,6 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
                 out.extend(kept);
             }
         }
-        // `a or b` and `a and b`: the left side outermost, the right side run for each left
-        // output that does not decide the answer.
         Ast::Or(lhs, rhs) | Ast::And(lhs, rhs) => {
             let decides = matches!(ast, Ast::Or(..));
             let (lefts, status) = stream(lhs, input, env);
@@ -293,12 +286,6 @@ fn eval(ast: &Ast, input: &Value, env: Option<&Env<'_>>, out: &mut Vec<Value>) -
 
 /// A string's every rendering: the cartesian product of its interpolations' outputs, written
 /// before the error that stopped it.
-///
-/// jq builds `"a\(x)b\(y)"` as `(("a" + x) + "b") + y`, so each piece is the right side of a
-/// `+` whose left side is the text so far: a later interpolation varies slowest (`"\(1,2)
-/// \(3,4)"` is "1 3", "2 3", "1 4", "2 4"), and the text so far stops the stream once the
-/// first output of the piece after it is used, as `binop` does. This runs left to right, with
-/// no recursion, so the number of pieces is unbounded.
 fn interpolate(
     pieces: &[StrPiece],
     input: &Value,
@@ -379,7 +366,6 @@ fn object(
         return Ok(());
     };
     let mut ran = vec![object_entry(key, value, input, env)];
-    // The pair each entry stands at.
     let mut at = vec![0usize];
     while let Some(&i) = at.last() {
         let depth = at.len() - 1;
@@ -508,8 +494,7 @@ fn from_integer(v: i128) -> Value {
     }
 }
 
-/// A double as a JSON number: a whole value within 2^53 becomes an integer, as jq prints it, and
-/// an infinity the largest double of its sign, as jq prints one. NaN is null.
+/// Converts a double into a JSON number or null.
 pub(super) fn from_double(v: f64) -> Value {
     const EXACT: f64 = 9_007_199_254_740_992.0;
     if v.is_finite() && v.fract() == 0.0 && v.abs() <= EXACT {
@@ -743,8 +728,6 @@ fn call(
     env: Option<&Env<'_>>,
     out: &mut Vec<Value>,
 ) -> Result<()> {
-    // An argument's outputs and how they ended: jq runs the function once for each, so the
-    // results made before the argument's error stay written.
     let arg = |i: usize| -> (Vec<Value>, Result<()>) {
         match args.get(i) {
             Some(ast) => stream(ast, input, env),
@@ -794,11 +777,9 @@ fn call(
                 out.push(Value::Bool(match (input, k) {
                     (Value::Object(map), Value::String(k)) => map.contains_key(k),
                     (Value::Array(items), Value::Number(n)) => {
-                        // jq's (int) cast truncates toward zero: -0.5 reads as 0, 1.5 as 1.
                         let i = n.as_f64().map_or(-1.0, f64::trunc);
                         i >= 0.0 && i < items.len() as f64
                     }
-                    // jq 1.7.1's jv_has answers false for a null input, whatever the key.
                     (Value::Null, _) => false,
                     _ => {
                         return Err(runtime(&format!(
@@ -816,9 +797,6 @@ fn call(
             Value::Number(_) => input.clone(),
             Value::String(text) => match aterm_json::from_str::<Value>(text) {
                 Ok(n @ Value::Number(_)) => n,
-                // An infinity, spelled as jq reads one (`inf`, `-Infinity`) or as an exponent
-                // past a double's range (`1e1000`), is the largest double of its sign, as a
-                // number literal is.
                 _ => match text.trim_ascii().parse::<f64>() {
                     Ok(v) if v.is_infinite() => from_double(v),
                     _ => {
@@ -845,9 +823,6 @@ fn call(
             } else {
                 "endswith"
             };
-            // As every function below that takes an argument: the argument runs first, and
-            // the input is checked once for each of its outputs, so `1 | startswith(empty)`
-            // is empty, as jq's.
             let (prefixes, status) = arg(0);
             for s in &prefixes {
                 let text = string_of(input, name)?;
@@ -943,7 +918,6 @@ fn call(
         },
         Func::Last => match args.first() {
             None => out.push(index(input, &Value::from(-1i64))?),
-            // jq 1.7.1: `def last(f): reduce f as $x (null; $x)`, so null when f yields nothing.
             Some(f) => out.push(collect(f, input, env)?.pop().unwrap_or(Value::Null)),
         },
         Func::Sort => {
@@ -1011,8 +985,6 @@ fn call(
                     })
                     .collect(),
             )),
-            // jq 1.7.1: `[keys_unsorted[] as $k | {key: $k, value: .[$k]}]`, so an array's
-            // keys are its indices.
             Value::Array(items) => out.push(Value::Array(
                 items
                     .iter()
@@ -1106,14 +1078,11 @@ fn format(name: &str, input: &Value) -> Result<String> {
                 .chars()
                 .filter(|c| !c.is_ascii_whitespace())
                 .collect();
-            // jq 1.7.1 decodes up to the first `=`, so padding alone is "" and what follows
-            // the padding is not read.
             let data = text.split('=').next().unwrap_or_default();
             let bytes = aterm_codec::base64::decode(data)
                 .map_err(|_| runtime(&format!("{} is not valid base64 data", shown(input))))?;
             Ok(String::from_utf8_lossy(&bytes).into_owned())
         }
-        // `text`, the one format left: the lexer admits only `FORMATS`.
         _ => Ok(tostring(input)),
     }
 }

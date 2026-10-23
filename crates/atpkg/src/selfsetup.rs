@@ -396,7 +396,7 @@ struct Sweep<'w> {
 }
 
 impl Sweep<'_> {
-    fn act(&self) -> &'static str {
+    const fn act(&self) -> &'static str {
         if self.dry { "would remove" } else { "remove" }
     }
 
@@ -533,6 +533,22 @@ const CAFFEINE_LABEL_PREFIX: &str = "com.aterm.aterm.caffeine";
 /// still holds the old one. Returns what holds each helper whose step failed (its bundle, or
 /// the store's `aterm`): each is kept, as its `aterm caffeine` is what that step needs again.
 fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    sweep_caffeine_with(
+        s,
+        p,
+        app_dirs,
+        || caffeine_account(aterm_uds::peer::our_uid(), &p.home),
+        run_quietly,
+    )
+}
+
+fn sweep_caffeine_with(
+    s: &mut Sweep<'_>,
+    p: &Places,
+    app_dirs: &[PathBuf],
+    account: impl FnOnce() -> Option<(u32, u32)>,
+    mut run: impl FnMut(&Path, &[OsString]) -> i32,
+) -> Vec<PathBuf> {
     let support = p.support();
     let listed = || -> Vec<PathBuf> {
         CAFFEINE_FILES
@@ -549,7 +565,7 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
     if files.is_empty() && !login_plist {
         return Vec::new();
     }
-    let account = caffeine_account(aterm_uds::peer::our_uid(), &p.home);
+    let account = account();
     let own_quit: &[&str] = &["caffeine", "quit", "own"];
     let steps: &[&[&str]] = if s.outsider.is_some() {
         &[&["caffeine", "startup", "off"], own_quit]
@@ -578,7 +594,7 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
         && !s.dry
         && !helpers.is_empty()
     {
-        let rc = run_quietly(Path::new(SUDO), &as_account_argv(uid, Path::new(TRUE), &[]));
+        let rc = run(Path::new(SUDO), &as_account_argv(uid, Path::new(TRUE), &[]));
         if rc != 0 {
             for (app, aterm) in std::mem::take(&mut helpers) {
                 s.skip(
@@ -603,13 +619,24 @@ fn sweep_caffeine(s: &mut Sweep<'_>, p: &Places, app_dirs: &[PathBuf]) -> Vec<Pa
             }
             continue;
         }
-        if run_helper(&aterm, &["help", "caffeine"], account) != 0 {
+        let rc = run_helper(&aterm, &["help", "caffeine"], account, &mut run);
+        if rc != 0 {
+            if account.is_some() {
+                s.skip(
+                    &helper_line(&aterm, &["help", "caffeine"], account),
+                    &format!(
+                        "could not confirm the helper ran as its account (exit {rc}); {} is kept for it",
+                        app.display()
+                    ),
+                );
+                failed.push(app);
+            }
             continue;
         }
         supported = true;
         for args in steps {
             let line = helper_line(&aterm, args, account);
-            match run_helper(&aterm, args, account) {
+            match run_helper(&aterm, args, account, &mut run) {
                 0 => s.say(&format!("ran {line}")),
                 2 if *args == own_quit => s.say(&format!(
                     "{line}: this build cannot quit only its own mug; one it runs keeps running"
@@ -910,10 +937,15 @@ fn as_account_argv(uid: u32, aterm: &Path, args: &[&str]) -> Vec<OsString> {
 
 /// Run the Caffeine helper `aterm args` quietly, as `account` when one is named
 /// ([`caffeine_account`]).
-fn run_helper(aterm: &Path, args: &[&str], account: Option<(u32, u32)>) -> i32 {
+fn run_helper(
+    aterm: &Path,
+    args: &[&str],
+    account: Option<(u32, u32)>,
+    run: &mut impl FnMut(&Path, &[OsString]) -> i32,
+) -> i32 {
     match account {
-        None => run_quietly(aterm, args),
-        Some((uid, _)) => run_quietly(Path::new(SUDO), &as_account_argv(uid, aterm, args)),
+        None => run(aterm, &args.iter().map(OsString::from).collect::<Vec<_>>()),
+        Some((uid, _)) => run(Path::new(SUDO), &as_account_argv(uid, aterm, args)),
     }
 }
 
@@ -951,6 +983,17 @@ pub fn self_uninstall(
     dry: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
+) -> bool {
+    self_uninstall_with_caffeine(p, man_src, dry, out, err, sweep_caffeine)
+}
+
+fn self_uninstall_with_caffeine(
+    p: &Places,
+    man_src: Option<&Path>,
+    dry: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    mut caffeine: impl FnMut(&mut Sweep<'_>, &Places, &[PathBuf]) -> Vec<PathBuf>,
 ) -> bool {
     let outsider = p.install_dir.as_ref().and_then(|_| scope_outsider(p));
     let mut s = Sweep {
@@ -1046,7 +1089,7 @@ pub fn self_uninstall(
 
     // 0b. THE CAFFEINE MUG, BEFORE THE BUNDLE IT RUNS FROM: see `sweep_caffeine`. A bundle
     //     whose step failed is kept: its `aterm caffeine` is the remedy.
-    let caffeine_kept = sweep_caffeine(&mut s, p, &app_dirs);
+    let caffeine_kept = caffeine(&mut s, p, &app_dirs);
 
     // 1. App bundles — every candidate dir (the scope alone, when set), aterm's only. The
     //    updater's apply leaves the outgoing bundle at `aterm.app.rollback`.

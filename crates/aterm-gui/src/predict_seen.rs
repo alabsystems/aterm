@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The cells predictive echo reads, projected to [`Seen`]: at a keypress, the
-//! cursor row the press hands `Predictor::predict_glyph` ([`seen_row`]), and at
-//! a frame, the cell the reconcile's observe answers ([`seen_at`]).
-//!
-//! The predictor's TAIL GUARD compares the two: the row right of a guess as the
-//! press saw it, with the same row once the guess's echo landed. An echo that
-//! left the row as it was (a right prompt, a suggestion the typed glyph matched)
-//! proves the line; one that moved it (a mid-line insert) proves nothing. So the
-//! two projections must agree about every cell that did not change, or an
-//! unchanged right prompt reads as a change and the line stays dark. Both come
-//! from the same extraction (`Terminal::logical_row_into` is the frame's own row
-//! extraction, before BiDi reordering) and both go through [`seen_of`].
-//!
-//! They agree on every cell but a bracket at a right-to-left level: the frame
-//! draws it with its mirroring glyph (UAX #9 L4, `aterm-core`'s
-//! `apply_bidi_reorder`), and the key row, read before the reordering, does not.
-//! Both cells are opaque, and the disagreement reads as a change, so a line with
-//! such a bracket right of the cursor fails closed: it never proves.
-//!
-//! A cell is OPAQUE ([`Seen::Opaque`]) when its glyph and column do not describe
-//! it: either half of a wide glyph, a grapheme cluster or combining marks, and
-//! every cell of a row the frame draws in another order (BiDi) or at another
-//! size (DEC double width or height). Opaque cells are compared only for
-//! equality; the glyph lane reads them as the plain glyph they carry.
+//! The cells predictive echo reads, projected to [`Seen`].
 
 use aterm_core::grid::LineSize;
 use aterm_core::render::RenderInput;
@@ -62,12 +39,9 @@ fn has_marks(
     clusters.iter().any(|(at, _)| *at == col) || combining.iter().any(|(at, _)| *at == col)
 }
 
-/// What the reconcile's observe answers at LOGICAL column `col` of frame row
-/// `row` of an extracted frame (the single-pane `input_scratch`, or the focused
-/// pane's `pane_scratch` before the composed blit). The column is found through
-/// `visual_col`, as the ghost painter finds it, and the glyph it carries is what
-/// the plain observe answered before, so the glyph lane reads the frame as it
-/// always did.
+/// What the reconcile's observe answers at LOGICAL column `col` of frame row `row` of an extracted
+/// frame (the single-pane `input_scratch`, or the focused pane's `pane_scratch` before the composed
+/// blit).
 pub(crate) fn seen_at(input: &RenderInput, row: u16, col: u16) -> Seen {
     let r = usize::from(row);
     let frame_col = input.visual_col(r, usize::from(col));
@@ -94,9 +68,7 @@ pub(crate) fn seen_at(input: &RenderInput, row: u16, col: u16) -> Seen {
     )
 }
 
-/// The cursor row as a keypress hands it to the predictor, with the buffers its
-/// extraction fills. Resident per window, so a run's first press refills it in
-/// place; type-ahead never reads it (`Predictor::wants_key_row`).
+/// The cursor row as a keypress hands it to the predictor, with the buffers its extraction fills.
 #[derive(Default)]
 pub(crate) struct KeyRow {
     cells: Vec<RenderCell>,
@@ -114,21 +86,14 @@ impl KeyRow {
         &self.seen
     }
 
-    /// The row under it, as [`seen_row`] read it (`KeySample::below`, THE
-    /// FLOOR a run's proof stands on); `None` when that was the last row.
+    /// The row under it, as [`seen_row`] read it; `None` when that was the last row.
     pub(crate) fn below(&self) -> Option<&[Seen]> {
         (!self.below.is_empty()).then_some(self.below.as_slice())
     }
 }
 
-/// Read visible row `row` of `t` into `out` as the predictor's key-time sample:
-/// one [`Seen`] per column of the grid, projected exactly as [`seen_at`] projects
-/// the same row of a frame. The row under it too, read the same way, unless
-/// `row` is the last. Call under the press's terminal hold, beside the
-/// cursor read.
+/// Read visible row `row` of `t` into `out` as the predictor's key-time sample.
 pub(crate) fn seen_row(t: &Terminal, row: u16, out: &mut KeyRow) {
-    // The row under it first, read into `seen` and swapped into `below`: both
-    // buffers stay resident.
     out.below.clear();
     if row.saturating_add(1) < t.rows() {
         read_row(t, row.saturating_add(1), out);
@@ -196,9 +161,6 @@ mod tests {
                 "wide glyph" => 2,
                 "combining" => 1,
                 "emoji cluster" => 2,
-                // Every written cell (`$ אב ab`, the Hebrew pair wide or not): no
-                // cell of the row is at its logical column. Past the written
-                // prefix both orders hold the implicit blank.
                 _ => 7,
             };
             assert_eq!(opaque, expected_opaque, "{label}: {:?}", key.cells());

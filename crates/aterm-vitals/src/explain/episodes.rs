@@ -1,24 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! EPISODES AND THE DECK'S CLAUSE (RD §5.5): what the causes of successive
-//! split ticks add up to, on the host's monotonic clock (`Sample::mono_ms`,
-//! which stops while the Mac sleeps).
-//!
-//! * [`Episodes`]: a covering cause opens once it holds on two consecutive
-//!   split ticks and closes once it has failed for [`CLOSE_MS`]; a context
-//!   keeps no episode. Ticks more than [`GAP_MS`] apart are not consecutive:
-//!   a gap in the readings ends every episode, so a pull after one starts
-//!   cold and prints no `opened=`. On a tick whose sweep stopped at its cap,
-//!   a tab's work neither opens nor closes.
-//! * [`ClauseHold`]: the Deck's `∵ <activity>` clause shows once the largest
-//!   open covering cause has been a named activity covering at least
-//!   [`CLAUSE_MC`] and [`CLAUSE_PM`] of the busy CPU outside aterm for
-//!   [`CLAUSE_IN_MS`], and goes once that has failed for [`CLAUSE_OUT_MS`]
-//!   or the facts are older than [`CLAUSE_STALE_MS`]. Its words change only
-//!   at those edges, so it never flickers. It reads open episodes only, so
-//!   at 5 s split ticks it shows 15 s after its cause first held: one tick
-//!   for the episode to open, then the hold.
+//! EPISODES AND THE DECK'S CLAUSE (RD §5.5): what the causes of successive split ticks add up to,
+//! on the host's monotonic clock (`Sample::mono_ms`, which stops while the Mac sleeps).
 
 use std::collections::HashMap;
 
@@ -28,8 +12,8 @@ use crate::model::Snapshot;
 
 /// An open episode closes once its cause has failed this long, ms.
 pub const CLOSE_MS: u64 = 30_000;
-/// Split ticks further apart than this are not consecutive, ms (a split
-/// window's own limit, [`super::WINDOW_MAX_NS`]).
+/// Split ticks further apart than this are not consecutive, ms (a split window's own limit,
+/// [`super::WINDOW_MAX_NS`]).
 pub const GAP_MS: u64 = super::WINDOW_MAX_NS / 1_000_000;
 /// The clause needs its activity to cover this much, millicores.
 pub const CLAUSE_MC: i64 = 1000;
@@ -49,11 +33,9 @@ pub struct OpenCause {
     pub id: CauseId,
     /// When it opened, unix ms (the second split tick it held on).
     pub opened_unix_ms: i64,
-    /// When its work began, by the evidence, unix ms: the earliest over the
-    /// episode.
+    /// When its work began, by the evidence, unix ms: the earliest over the episode.
     pub since_ms: Option<i64>,
-    /// Whether it holds on this tick (an open one that fails stays open for
-    /// [`CLOSE_MS`]).
+    /// Whether it holds on this tick (an open one that fails stays open for [`CLOSE_MS`]).
     pub holds: bool,
     /// What it covered when it last held, millicores.
     pub covers_mc: i64,
@@ -82,10 +64,9 @@ pub struct Episodes {
 }
 
 impl Episodes {
-    /// One split tick at `mono_ms` (wall `unix_ms`) on which `held` hold
-    /// (`cut`: its sweep stopped at its cap, so each tab's work episode stays
-    /// as it was): every episode open after it, ranked as
-    /// [`super::detect()`] ranks causes.
+    /// One split tick at `mono_ms` (wall `unix_ms`) on which `held` hold (`cut`: its sweep stopped
+    /// at its cap, so each tab's work episode stays as it was): every episode open after it, ranked
+    /// as [`super::detect()`] ranks causes.
     pub fn step(
         &mut self,
         mono_ms: u64,
@@ -155,13 +136,11 @@ pub struct DeckCause {
     pub activity: ActivityId,
     /// Its people's word: `Spotlight`.
     pub word: &'static str,
-    /// Its context, where it names a time: [`Context::Startup`] or
-    /// [`Context::Wake`].
+    /// Its context, where it names a time: [`Context::Startup`] or [`Context::Wake`].
     pub context: Option<Context>,
 }
 
-/// The clause's hold (RD §5.5): in after [`CLAUSE_IN_MS`], out after
-/// [`CLAUSE_OUT_MS`].
+/// The clause's hold (RD §5.5): in after [`CLAUSE_IN_MS`], out after [`CLAUSE_OUT_MS`].
 #[derive(Clone, Debug, Default)]
 pub struct ClauseHold {
     shown: Option<DeckCause>,
@@ -176,8 +155,8 @@ pub struct ClauseHold {
 }
 
 impl ClauseHold {
-    /// One split tick at `mono_ms`, with the episodes `open` after it over
-    /// the window `split`: the clause to show.
+    /// One split tick at `mono_ms`, with the episodes `open` after it over the window `split`: the
+    /// clause to show.
     pub fn step(
         &mut self,
         mono_ms: u64,
@@ -231,8 +210,6 @@ impl ClauseHold {
 /// The clause's candidate: the largest open covering cause that holds, when
 /// it is a named activity covering at least [`CLAUSE_MC`] and [`CLAUSE_PM`]
 /// of the busy CPU outside aterm (others, services and a positive residual).
-/// "Largest" keeps the clause to one cause, and an activity beside a larger
-/// cause of another kind is never it.
 fn candidate(open: &[OpenCause], split: &CoalSplit) -> Option<DeckCause> {
     let o = open.iter().filter(|o| o.holds && o.id.covering()).fold(
         None,
@@ -256,8 +233,7 @@ fn candidate(open: &[OpenCause], split: &CoalSplit) -> Option<DeckCause> {
     })
 }
 
-/// The clause snapshot `snap` shows: its facts', unless they are older than
-/// [`CLAUSE_STALE_MS`].
+/// The clause snapshot `snap` shows: its facts', unless they are older than [`CLAUSE_STALE_MS`].
 #[must_use]
 pub fn deck_cause(snap: &Snapshot) -> Option<DeckCause> {
     let facts: &WhyFacts = snap.why.as_deref()?;

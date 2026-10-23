@@ -339,7 +339,7 @@ struct Brackets {
 }
 
 impl Brackets {
-    fn new(state: LexState) -> Self {
+    const fn new(state: LexState) -> Self {
         Self {
             depth: state.depth,
             levels: state.levels,
@@ -347,7 +347,7 @@ impl Brackets {
         }
     }
 
-    fn open(&mut self) {
+    const fn open(&mut self) {
         self.depth = self.depth.saturating_add(1);
     }
 
@@ -359,7 +359,7 @@ impl Brackets {
         }
     }
 
-    fn finish(self) -> (u16, u32) {
+    const fn finish(self) -> (u16, u32) {
         let mut levels = self.levels;
         if self.depth > self.shallowest {
             levels |= level_bit(self.shallowest);
@@ -369,12 +369,12 @@ impl Brackets {
 }
 
 /// The bit of `levels` for the bracket at `depth`; none past 31.
-fn level_bit(depth: u16) -> u32 {
+const fn level_bit(depth: u16) -> u32 {
     if depth < 32 { 1u32 << depth } else { 0 }
 }
 
 /// How many indent levels the brackets below `depth` add.
-fn levels_below(levels: u32, depth: u16) -> usize {
+const fn levels_below(levels: u32, depth: u16) -> usize {
     let mask = if depth < 32 {
         (1u32 << depth) - 1
     } else {

@@ -173,7 +173,7 @@ pub struct Census {
 pub const CENSUSES: &[Census] = &[
     Census {
         name: "mainloop",
-        about: "main-thread reach to unbounded work (OB-1..OB-6, OB-22)",
+        about: "main-thread reach to unbounded work or a frame wait (OB-1..OB-6, OB-22, OB-23)",
         run: run_mainloop_census,
     },
     Census {
@@ -379,6 +379,94 @@ const OFFLOAD_ALLOWLIST: &[OffloadBoundary] = &[
             not a suppression.",
     },
 ];
+
+/// The whole-frame reads: aterm-gui's `term_lock_whole` and `term_lock_whole_when`, a control
+/// thread's hold that parks, holding nothing, until the program's DEC 2026 frame closes or the
+/// read's bound passes (OB-23). Their own definitions are the wait, not a caller of it.
+const WHOLE_FRAME_WAITS: &[&str] = &["term_lock_whole", "term_lock_whole_when"];
+
+/// The `ReadOn` arms a gate waits on: a fn naming one hands its read a control thread's wait (OB-23).
+const WAITING_READ_ON: &[&str] = &["ReadOn::Control", "ReadOn::Committed"];
+
+/// A fn the event loop reaches that calls a whole-frame read which never waits there: its
+/// `needs` is false on the event loop's `ReadOn::EventLoop` arm. Each entry (OB-23) carries a
+/// written justification and must still be defined at `def_file`.
+struct WholeFrameGate {
+    /// The fn name at its `fn <symbol>` definition.
+    symbol: &'static str,
+    /// Repo-relative file holding the definition (existence-checked).
+    def_file: &'static str,
+    /// Why the event loop's call through it never waits for a frame.
+    justification: &'static str,
+}
+
+/// The audited whole-frame callers the event loop shares with a control thread.
+const WHOLE_FRAME_GATES: &[WholeFrameGate] = &[
+    WholeFrameGate {
+        symbol: "input_if_fenced_observed",
+        def_file: "crates/aterm-gui/src/control_input.rs",
+        justification: "Its `needs` is `on.waits() && fence.reads_rows()`. The event loop's \
+            fenced presses (the footer's slash press, a worker's launch line) pass \
+            ReadOn::EventLoop, whose waits() is false, so the hold is taken as the screen stands \
+            and a row fence on an unfinished frame is refused (frame_unfinished_now); only a \
+            control thread waits, and an event-loop fn naming a waiting arm is itself red.",
+    },
+    WholeFrameGate {
+        symbol: "search_terminal",
+        def_file: "crates/aterm-gui/src/control_query.rs",
+        justification: "Its `needs` is `on.waits()`. The find bar searches with \
+            ReadOn::EventLoop, whose waits() is false, so its plan hold is taken as the screen \
+            stands; only the `search` verb's control thread waits.",
+    },
+];
+
+/// A fn only a control lane's thread runs, where OB-23's walk stops: the name-merged graph would
+/// otherwise carry an event-loop `step` or `drive` into every control verb. Each entry carries a
+/// written justification and must still be defined at `def_file`.
+const CONTROL_LANE_ENTRIES: &[WholeFrameGate] = &[WholeFrameGate {
+    symbol: "serve_here",
+    def_file: "crates/aterm-gui/src/control_lanes.rs",
+    justification: "A control connection is served here, by `Lanes::drive` on the lane thread \
+        `spawn_lane_thread` started for it (or the wait lane it was handed to); the event loop \
+        never serves a connection, it only posts to the lanes.",
+}];
+
+/// The first line of `body` naming one of `names` as a whole token whose text before and after
+/// `fits` accepts.
+fn first_naming<'a>(
+    body: &'a [String],
+    names: &[&str],
+    fits: impl Fn(&str, &str) -> bool,
+) -> Option<&'a str> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    body.iter()
+        .find(|line| {
+            names.iter().any(|name| {
+                line.match_indices(name).any(|(at, _)| {
+                    line[..at].chars().next_back().is_none_or(|c| !ident(c))
+                        && fits(&line[..at], &line[at + name.len()..])
+                })
+            })
+        })
+        .map(|line| line.trim())
+}
+
+/// The first whole-frame read `body` calls, as its line.
+fn whole_frame_wait(body: &[String]) -> Option<&str> {
+    first_naming(body, WHOLE_FRAME_WAITS, |_, rest| rest.starts_with('('))
+}
+
+/// The first line of `body` handing a read a waiting [`WAITING_READ_ON`] arm as an argument or a
+/// binding, never as a pattern (`=>`, `|`) or a comparison (`==`, `!=`).
+fn waiting_read_on(body: &[String]) -> Option<&str> {
+    first_naming(body, WAITING_READ_ON, |before, rest| {
+        let path = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
+        let before = before.trim_end_matches(path).trim_end();
+        rest.trim_start().starts_with([',', ')', ';'])
+            && !before.ends_with("==")
+            && !before.ends_with("!=")
+    })
+}
 
 /// Returns `true` if `path` is a test-only source file excluded from implementation scans.
 pub fn is_test_file(path: &Path) -> bool {
@@ -689,8 +777,9 @@ fn ident_ending_at(s: &str, end: usize) -> Option<&str> {
 }
 
 /// Term-lock guard variables bound in `body` via `let [mut] <ident> =
-/// term_lock(` or the UI thread's registering `[crate::]term_lock_ui(`, which
-/// returns the same guard.
+/// term_lock(`, the UI thread's registering `[crate::]term_lock_ui(` or a control
+/// read's `[crate::]term_lock_whole(` / `[crate::]term_lock_whole_when(`, which
+/// return the same guard.
 fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
     let mut guards = std::collections::BTreeSet::new();
     for line in body {
@@ -698,6 +787,10 @@ fn guard_vars(body: &[String]) -> std::collections::BTreeSet<String> {
             .find("= term_lock(")
             .or_else(|| line.find("= crate::term_lock_ui("))
             .or_else(|| line.find("= term_lock_ui("))
+            .or_else(|| line.find("= crate::term_lock_whole("))
+            .or_else(|| line.find("= term_lock_whole("))
+            .or_else(|| line.find("= crate::term_lock_whole_when("))
+            .or_else(|| line.find("= term_lock_whole_when("))
         else {
             continue;
         };
@@ -742,8 +835,12 @@ fn term_hop_calls(body: &[String]) -> (Vec<TermHopHazard>, usize) {
         }
     };
     for line in body {
-        // (or `term_lock_ui(..).m(` — the `_ui` infix breaks the plain needle).
-        if line.contains("term_lock(") || line.contains("term_lock_ui(") {
+        // A call chained on the lock guard; the `_ui`/`_whole`/`_whole_when` infixes break the plain needle.
+        if line.contains("term_lock(")
+            || line.contains("term_lock_ui(")
+            || line.contains("term_lock_whole(")
+            || line.contains("term_lock_whole_when(")
+        {
             let mut search = line.as_str();
             while let Some(rel) = search.find(").") {
                 let after = &search[rel + 2..];
@@ -1092,15 +1189,16 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             }
         }
     }
-    let reconstruct = |mut idx: usize| -> String {
+    let path_in = |parents: &std::collections::BTreeMap<usize, Option<usize>>, mut idx: usize| {
         let mut path = vec![fns[idx].name.clone()];
-        while let Some(Some(p)) = parent.get(&idx) {
+        while let Some(Some(p)) = parents.get(&idx) {
             path.push(fns[*p].name.clone());
             idx = *p;
         }
         path.reverse();
         path.join(" -> ")
     };
+    let reconstruct = |idx: usize| path_in(&parent, idx);
 
     let mut hazard_hits = 0usize;
     for idx in 0..fns.len() {
@@ -1166,6 +1264,102 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         }
     }
 
+    // [OB-23] The event loop never parks for a program's frame: no reachable fn takes a
+    // whole-frame read but an audited gate, and every gate is justified and still defined.
+    for g in WHOLE_FRAME_GATES {
+        if g.justification.trim().is_empty() {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-23] whole-frame gate `{}` has an EMPTY justification; every gate \
+                 says why the event loop's call never waits.",
+                g.symbol
+            );
+            failures += 1;
+        }
+        if !fn_defined_in(root, g.def_file, g.symbol) {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-23] whole-frame gate `{}` is allowlisted but `fn {}` is no longer \
+                 defined in {}: update def_file if it moved, or remove the entry.",
+                g.symbol, g.symbol, g.def_file
+            );
+            failures += 1;
+        } else if !by_name.get(g.symbol).is_some_and(|defs| {
+            defs.iter()
+                .any(|&i| whole_frame_wait(&fns[i].body).is_some())
+        }) {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-23] whole-frame gate `{}` no longer takes a whole-frame read: \
+                 remove the entry, or teach `whole_frame_wait` the read's new spelling.",
+                g.symbol
+            );
+            failures += 1;
+        }
+    }
+    for e in CONTROL_LANE_ENTRIES {
+        if e.justification.trim().is_empty() || !fn_defined_in(root, e.def_file, e.symbol) {
+            let _ = writeln!(
+                log,
+                "  ✗ FAIL [OB-23] control-lane entry `{}` is unjustified or no longer defined in \
+                 {}: update def_file if it moved, or remove the entry.",
+                e.symbol, e.def_file
+            );
+            failures += 1;
+        }
+    }
+    let mut on_loop: std::collections::BTreeMap<usize, Option<usize>> = Default::default();
+    let mut queue: std::collections::VecDeque<usize> = MAIN_THREAD_ROOTS
+        .iter()
+        .filter_map(|r| by_name.get(*r))
+        .flatten()
+        .copied()
+        .filter(|&idx| on_loop.insert(idx, None).is_none())
+        .collect();
+    while let Some(cur) = queue.pop_front() {
+        for callee in &edges[cur] {
+            if CONTROL_LANE_ENTRIES.iter().any(|e| e.symbol == callee) {
+                continue;
+            }
+            for &cidx in by_name.get(callee).map(Vec::as_slice).unwrap_or(&[]) {
+                if let std::collections::btree_map::Entry::Vacant(slot) = on_loop.entry(cidx) {
+                    slot.insert(Some(cur));
+                    queue.push_back(cidx);
+                }
+            }
+        }
+    }
+    let mut frame_waits = 0usize;
+    for (idx, f) in fns.iter().enumerate() {
+        let name = f.name.as_str();
+        if !on_loop.contains_key(&idx)
+            || WHOLE_FRAME_WAITS.contains(&name)
+            || WHOLE_FRAME_GATES.iter().any(|g| g.symbol == name)
+        {
+            continue;
+        }
+        let Some(line) = whole_frame_wait(&f.body).or_else(|| waiting_read_on(&f.body)) else {
+            continue;
+        };
+        let _ = writeln!(
+            log,
+            "  ✗ FAIL [OB-23] the event loop reaches a whole-frame read, which parks until the \
+             program's DEC 2026 frame closes.\n\
+             \x20   PATH:  {}\n\
+             \x20   SITE:  {} (fn `{}`)\n\
+             \x20   LINE:  {line}\n\
+             \x20   REPAIR: read with `term_lock` and ask `frame_unfinished_now` (refuse or wait \
+             for the next poll on an unfinished frame), or pass a `ReadOn` whose event-loop arm \
+             gives `term_lock_whole_when` a false `needs` and register the fn in \
+             WHOLE_FRAME_GATES (crates/aterm-census/src/lib.rs) with its justification.",
+            path_in(&on_loop, idx),
+            f.span,
+            f.name,
+        );
+        failures += 1;
+        frame_waits += 1;
+    }
+
     let held = match held_guard::scan_tree(root) {
         Ok(scan) => {
             if scan.acquires == 0 {
@@ -1218,13 +1412,16 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
     }
 
     if failures > 0 {
-        if hazard_hits > 0 {
+        if hazard_hits > 0 || frame_waits > 0 {
             let _ = write!(log, "{PRECISION_NOTE}");
         }
         return CensusOutcome::red(
             MAINLOOP,
             log,
-            format!("{failures} obligation violation(s) ({hazard_hits} unbounded-work site(s))."),
+            format!(
+                "{failures} obligation violation(s) ({hazard_hits} unbounded-work site(s), \
+                 {frame_waits} frame wait(s))."
+            ),
         );
     }
     let (held_files, held_acquires) = held.unwrap_or_default();
@@ -1246,11 +1443,13 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
         "{} fn(s) walked from {roots_found} main-thread root(s), none reaching an UNBOUNDED \
          sink synchronously; {offload_sites} offload-boundary call(s); {} sink(s) marked and \
          registered; {} boundaries defined and justified; {} out-of-closure marker(s) \
-         reported; {held_acquires} `term` acquire(s), none holding unbounded work.",
+         reported; {held_acquires} `term` acquire(s), none holding unbounded work; no \
+         whole-frame read reached but through {} gate(s) defined and justified.",
         parent.len(),
         UNBOUNDED_REGISTRY.len(),
         OFFLOAD_ALLOWLIST.len(),
         out_markers.len(),
+        WHOLE_FRAME_GATES.len(),
     );
     CensusOutcome::green(MAINLOOP, log, summary).with_floors(vec![Floor::at_least(
         "`term` acquires the held-guard walk read",
@@ -1557,6 +1756,45 @@ fn table() -> [f32; 256] {
         assert!(g.contains("term"));
     }
 
+    /// A control read's `term_lock_whole` and `term_lock_whole_when` bind the same guard:
+    /// path-qualified and bare spellings, and the chained idiom.
+    #[test]
+    fn guard_vars_captures_the_term_lock_whole_binding() {
+        let g = guard_vars(&body("        let t = crate::term_lock_whole(term);"));
+        assert!(
+            g.contains("t"),
+            "crate::term_lock_whole( binding yields `t`"
+        );
+        let g = guard_vars(&body("        let mut t = term_lock_whole(term);"));
+        assert!(g.contains("t"), "bare term_lock_whole( binding yields `t`");
+        let (hz, _) = term_hop_calls(&body(
+            "    let p = crate::term_lock_whole(term).resize(rows, cols);",
+        ));
+        assert_eq!(hz.len(), 1, "chained term_lock_whole(..).resize( must flag");
+        let g = guard_vars(&body(
+            "        let t = crate::term_lock_whole_when(term, |_| on == ReadOn::Control);",
+        ));
+        assert!(
+            g.contains("t"),
+            "crate::term_lock_whole_when( binding yields `t`"
+        );
+        let g = guard_vars(&body(
+            "        let mut t = term_lock_whole_when(term, waits);",
+        ));
+        assert!(
+            g.contains("t"),
+            "bare term_lock_whole_when( binding yields `t`"
+        );
+        let (hz, _) = term_hop_calls(&body(
+            "    let p = crate::term_lock_whole_when(term, |_| true).resize(rows, cols);",
+        ));
+        assert_eq!(
+            hz.len(),
+            1,
+            "chained term_lock_whole_when(..).resize( must flag"
+        );
+    }
+
     /// The registering `term_lock_ui` binds the same guard, so `term.resize(`
     /// under it is a hazard.
     #[test]
@@ -1623,6 +1861,25 @@ fn table() -> [f32; 256] {
                     "{m}(entries)\npub fn diskwalk_slice() {{}}\n\
                      {m}(entries)\npub fn diskwalk_size_full() {{}}\n"
                 ),
+            ),
+            // OB-23's gates, whose event-loop arm never waits, and the lane serve it stops at.
+            (
+                "crates/aterm-gui/src/control_input.rs".to_string(),
+                "fn input_if_fenced_observed() {\n    \
+                 let terminal = term_lock_whole_when(term, Lane::SERVED, |_| waits);\n}\n"
+                    .to_string(),
+            ),
+            (
+                "crates/aterm-gui/src/control_query.rs".to_string(),
+                "fn search_terminal() {\n    \
+                 let t = term_lock_whole_when(term, Lane::SERVED, |_| on == ReadOn::Control);\n}\n"
+                    .to_string(),
+            ),
+            (
+                "crates/aterm-gui/src/control_lanes.rs".to_string(),
+                "fn serve_here() {\n    cmd_text(term);\n}\n\
+                 fn cmd_text() {\n    let t = crate::term_lock_whole(term);\n}\n"
+                    .to_string(),
             ),
         ]
     }
@@ -1734,6 +1991,125 @@ fn table() -> [f32; 256] {
         );
     }
 
+    /// OB-23: a whole-frame read the event loop reaches is red with its path; one behind a gate
+    /// or a control lane's serve is not. Negative control: the same read by `term_lock` is green.
+    #[test]
+    fn a_whole_frame_read_the_event_loop_reaches_is_red_ob23() {
+        let tree = |name: &str, read: &str| {
+            let mut files = synth_base();
+            let gui = synth_gui(&format!(
+                "fn resize_helper() {{\n    \
+                 let pending = term_lock(&s.term).resize_offloading_scrollback(r, c);\n    \
+                 claude_rows_now();\n    \
+                 input_if_fenced_observed();\n    \
+                 search_terminal();\n    \
+                 serve_here();\n}}\n\
+                 fn claude_rows_now() {{\n    let t = {read}(&entry.term);\n}}\n"
+            ));
+            files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
+            run_mainloop_census(&synth_tree("aterm-census", name, &files))
+        };
+        let out = tree("red-ob23", "crate::term_lock_whole");
+        assert!(!out.ok, "expected RED, got:\n{}", out.log);
+        assert!(
+            out.log
+                .contains("PATH:  window_event -> resize_helper -> claude_rows_now"),
+            "log:\n{}",
+            out.log
+        );
+        assert!(
+            out.verdict
+                .contains("(0 unbounded-work site(s), 1 frame wait(s))"),
+            "{}",
+            out.log
+        );
+        let out = tree("green-ob23", "crate::term_lock");
+        assert!(out.ok, "expected GREEN, got:\n{}", out.log);
+    }
+
+    /// OB-23: an event-loop fn handing a gate a waiting `ReadOn` arm is red, since the gate then
+    /// waits; `ReadOn::EventLoop` is green.
+    #[test]
+    fn a_waiting_read_on_the_event_loop_hands_a_gate_is_red_ob23() {
+        let tree = |name: &str, on: &str| {
+            let mut files = synth_base();
+            let gui = synth_gui(&format!(
+                "fn resize_helper() {{\n    \
+                 let pending = term_lock(&s.term).resize_offloading_scrollback(r, c);\n    \
+                 claude_rows_now();\n}}\n\
+                 fn claude_rows_now() {{\n    \
+                 input_if_fenced_observed(term, ctx, ev, &fence, crate::{on}, None);\n}}\n"
+            ));
+            files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
+            run_mainloop_census(&synth_tree("aterm-census", name, &files))
+        };
+        for (name, on) in [
+            ("red-ob23-control", "ReadOn::Control"),
+            ("red-ob23-committed", "ReadOn::Committed"),
+        ] {
+            let out = tree(name, on);
+            assert!(!out.ok, "expected RED for {on}, got:\n{}", out.log);
+            assert!(
+                out.log
+                    .contains("PATH:  window_event -> resize_helper -> claude_rows_now"),
+                "log:\n{}",
+                out.log
+            );
+        }
+        let out = tree("green-ob23-loop", "ReadOn::EventLoop");
+        assert!(out.ok, "expected GREEN, got:\n{}", out.log);
+        let gui = synth_gui(
+            "fn resize_helper() {\n    \
+             let pending = term_lock(&s.term).resize_offloading_scrollback(r, c);\n    \
+             lane(on);\n}\n\
+             fn lane(on: ReadOn) -> bool {\n    \
+             let waits = on == ReadOn::Control;\n    \
+             match on {\n        \
+             ReadOn::Committed => waits,\n        \
+             ReadOn::Control | ReadOn::EventLoop => !waits,\n    }\n}\n",
+        );
+        let mut files = synth_base();
+        files.push(("crates/aterm-gui/src/main.rs".to_string(), gui));
+        let out = run_mainloop_census(&synth_tree("aterm-census", "green-ob23-arms", &files));
+        assert!(
+            out.ok,
+            "a pattern or a comparison hands no read: {}",
+            out.log
+        );
+    }
+
+    /// OB-23 fails a gate that no longer takes a whole-frame read: the allowlist stays honest.
+    #[test]
+    fn a_gate_that_no_longer_waits_is_red_ob23() {
+        let files: Vec<(String, String)> = synth_base()
+            .into_iter()
+            .map(|(rel, text)| {
+                if rel.ends_with("control_query.rs") {
+                    (
+                        rel,
+                        "fn search_terminal() {\n    let t = term_lock(term);\n}\n".into(),
+                    )
+                } else {
+                    (rel, text)
+                }
+            })
+            .chain([(
+                "crates/aterm-gui/src/main.rs".to_string(),
+                synth_gui(
+                    "fn resize_helper() {\n    \
+                     let pending = term_lock(&s.term).resize_offloading_scrollback(r, c);\n}\n",
+                ),
+            )])
+            .collect();
+        let out = run_mainloop_census(&synth_tree("aterm-census", "red-ob23-gate", &files));
+        assert!(!out.ok, "expected RED, got:\n{}", out.log);
+        assert!(
+            out.log
+                .contains("whole-frame gate `search_terminal` no longer takes a whole-frame read"),
+            "log:\n{}",
+            out.log
+        );
+    }
     #[test]
     fn cfg_predicate_entails_unshipped_only_when_it_really_does() {
         for yes in [

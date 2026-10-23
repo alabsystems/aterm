@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CONNECTION LAYER'S ONE ROW PER AI CLI (docs/DESIGN-ai-connections-2026-10-16.md §5).
-//!
-//! A row is keyed by the program word of atpkg's [`atpkg::vendor_direct::VENDORS`], the
-//! package roster every other layer derives from. Every fact is compiled (harness-plugins
-//! owner rule R1): where the vendor keeps its home, which files show a login exists (their
-//! existence and write time only, never their content), the sign-in flow, the one-shot
-//! one-shot mode a review runs (and its flags for each permission level), and the wording a failed one-shot run uses for a lost login
-//! or a reached limit.
-//!
-//! [`connections`] walks `VENDORS` and keeps the programs that have a row, so a package with
-//! no row is not a connection in this build and nothing polices the pairing.
-//!
-//! A row whose commands have not run on a real install is `measured: false`: it never reads
-//! FAIL in the doctor. It reviews like any other.
+//! Compiled connector rows per AI CLI, keyed by [`atpkg::vendor_direct::VENDORS`] program name.
 
 /// One AI CLI aterm can keep a connection to.
 #[derive(Debug)]
@@ -25,26 +12,21 @@ pub struct Connector {
     pub product: &'static str,
     /// Where the CLI keeps its state.
     pub home: Home,
-    /// Files under the home whose existence shows a login was stored (stat()ed, never
-    /// opened). Any one present is a login.
+    /// Files under the home whose existence indicates a stored login (`stat`ed, never opened).
     pub stores: &'static [&'static str],
-    /// Variables the CLI reads ahead of its stored login: a sign-in and a review run
-    /// without them, and the doctor names any it finds set.
+    /// Environment variables the CLI reads ahead of its stored login.
     pub credential_env: &'static [&'static str],
     /// The sign-in flow.
     pub login: Login,
     /// The one-shot mode a review runs.
     pub review: Review,
-    /// How the CLI starts a line that reports its own failure (lowercase), where it marks
-    /// one: only such lines are read for a lost login or a limit, so its talk of the change
-    /// under review never decides a verdict. `None`: its last lines are read.
+    /// Lowercase prefix for lines reporting the CLI's own failure, or `None` to inspect trailing lines.
     pub error_lead: Option<&'static str>,
     /// Lowercase phrases in a failed run's error output meaning the login has ended.
     pub auth_words: &'static [&'static str],
     /// Lowercase phrases in a failed run's error output meaning the usage limit is reached.
     pub limit_words: &'static [&'static str],
-    /// Whether a lab pass has run this row's commands on a real install.
-    /// Evidence metadata, not an install or sign-in admission gate.
+    /// Whether a lab pass has verified this row's commands against a real install.
     pub measured: bool,
 }
 
@@ -62,17 +44,14 @@ pub struct Home {
 pub struct Status {
     /// Arguments after the program.
     pub args: &'static [&'static str],
-    /// Line prefixes and what each means: `Some(method word)` signed in that way, `None`
-    /// signed out. Anything after a prefix (an API key's masked fragment) is dropped where
-    /// it is read; a line outside the set says nothing.
+    /// Line prefixes and their meaning: `Some(method)` when signed in, `None` when signed out.
     pub lines: &'static [(&'static str, Option<&'static str>)],
 }
 
 /// The sign-in flow.
 #[derive(Debug)]
 pub enum Login {
-    /// Claude Code: only accounts v2's renewal (accounts v2 §5), which owns the machine's
-    /// Claude login, its staging home, its email hint and its one check after a sign-in.
+    /// Claude Code login managed by accounts v2.
     Accounts,
     /// Run the CLI in this terminal and wait for it.
     Run {
@@ -82,8 +61,7 @@ pub enum Login {
         remote: Option<&'static [&'static str]>,
         /// What the person is told before it starts.
         tell: &'static str,
-        /// Whether the flow signs out the current login before it starts (Codex revokes
-        /// it), so it is run only when the CLI is already signed out.
+        /// Whether the flow revokes the current login before starting.
         signs_out_first: bool,
         /// The status read run after the flow, on the login it just made.
         after: Option<Status>,
@@ -100,8 +78,7 @@ pub enum PromptVia {
     },
     /// In `request.txt` in the run directory, named by this flag.
     File(&'static str),
-    /// In `request.txt` in the run directory, which a short request after this flag tells
-    /// the CLI to read (a request in argv would be visible to `ps` and capped in size).
+    /// In `request.txt` in the run directory, read via a short prompt passed after this flag.
     Pointer(&'static str),
 }
 
@@ -141,16 +118,14 @@ impl Levels {
     }
 }
 
-/// The one-shot mode a review runs: the CLI with every capability it has, in the repository,
-/// at the asking agent's permission level.
+/// One-shot review configuration for a CLI.
 #[derive(Debug)]
 pub struct Review {
     /// Arguments after the program, before the answer's and the request's.
     pub args: &'static [&'static str],
     /// The flags for each permission level.
     pub levels: Levels,
-    /// Whether the level's flags go before `args` (Muse Code's are global flags, before its
-    /// `exec`); otherwise after.
+    /// Whether permission-level flags precede `args`.
     pub levels_first: bool,
     /// How the request goes in.
     pub prompt: PromptVia,
@@ -166,8 +141,7 @@ pub const CLAUDE: Connector = Connector {
         var: Some("CLAUDE_CONFIG_DIR"),
         default: ".claude",
     },
-    // On macOS the login is a keychain item, which aterm never reads: the profile's
-    // `oauthAccount` and accounts v2's bound login show it instead (`facts`).
+    // On macOS the login is a keychain item; profile `oauthAccount` and accounts v2 state report it instead.
     stores: &[".credentials.json"],
     credential_env: &[
         "ANTHROPIC_API_KEY",
@@ -195,7 +169,6 @@ pub const CLAUDE: Connector = Connector {
         answer: AnswerVia::Stdout,
     },
     error_lead: None,
-    // `-p`'s non-interactive wording (2.1.301 bundle), and the TUI's.
     auth_words: &[
         "failed to authenticate",
         "oauth session expired",
@@ -229,9 +202,7 @@ pub const CODEX: Connector = Connector {
         remote: None,
         tell: "Codex's own sign-in opens in your browser. It signs out (revokes) Codex's \
                current login before it starts: if you cancel, Codex stays signed out.",
-        // 0.163.0 `cli/src/login.rs`: `clear_existing_auth_before_login` revokes first.
         signs_out_first: true,
-        // MEASURED on 0.163.0: one line on stderr, read from local storage only.
         after: Some(Status {
             args: &["login", "status"],
             lines: &[
@@ -278,10 +249,7 @@ pub const CODEX: Connector = Connector {
     measured: true,
 };
 
-/// Antigravity CLI (Google). Its sign-in, store and one-shot behaviour are unmeasured; its
-/// help was read on 1.4.0 (2026-10-16): no login verb (it signs in on its first interactive
-/// run, from the OS keyring or a browser), `--print` takes the request as an argument, and
-/// `models` lists models (it reaches Google; atpkg's row: exit 1 when signed out).
+/// Antigravity CLI (Google).
 pub const AGY: Connector = Connector {
     id: "agy",
     product: "Antigravity CLI",
@@ -313,7 +281,6 @@ pub const AGY: Connector = Connector {
         answer: AnswerVia::Stdout,
     },
     error_lead: None,
-    // `You are currently not signed in.` is agy 1.4.0's signed-out wall (aterm-phase `agy`).
     auth_words: &[
         "authentication required",
         "you are currently not signed in",
@@ -324,11 +291,7 @@ pub const AGY: Connector = Connector {
     measured: false,
 };
 
-/// Muse Code (Meta); served on macOS only. Its help was read on 1.4.10-R6427.1 (2026-10-16):
-/// `muse login` approves a code in the browser (so it works over SSH too), its login is
-/// `~/.config/muse/.auth.json`, and `META_API_KEY` takes priority over it. Its safety flags
-/// (`--yolo`, `--disable-approval`, `--disable-write`, `--disable-shell`) are global, before
-/// `exec`. Its one-shot behaviour is unmeasured until someone signs in.
+/// Muse Code (Meta), served on macOS only.
 pub const MUSE: Connector = Connector {
     id: "muse",
     product: "Muse Code",
@@ -358,7 +321,6 @@ pub const MUSE: Connector = Connector {
         answer: AnswerVia::Stdout,
     },
     error_lead: None,
-    // `Log in with browser` heads Muse Code's signed-out menu (aterm-phase `muse`).
     auth_words: &[
         "log in with browser",
         "not logged in",
@@ -370,11 +332,10 @@ pub const MUSE: Connector = Connector {
     measured: false,
 };
 
-/// Every row, in no particular order: [`connections`] gives `VENDORS`' order.
+/// All connector rows; [`connections`] yields them in `VENDORS` order.
 pub const ROWS: &[&Connector] = &[&CLAUDE, &CODEX, &AGY, &MUSE];
 
-/// Every row's id, in [`ROWS`]' order, for a list a constant must name (the window's
-/// choice of a preferred CLI); [`ids`] is the connections' own, in `VENDORS`' order.
+/// Connector IDs in [`ROWS`] order.
 pub const IDS: [&str; ROWS.len()] = {
     let mut ids = [""; ROWS.len()];
     let mut i = 0;
@@ -391,7 +352,7 @@ pub fn connector(id: &str) -> Option<&'static Connector> {
     ROWS.iter().copied().find(|c| c.id == id)
 }
 
-/// THE CONNECTIONS: every program in atpkg's `VENDORS` that has a row, in `VENDORS` order.
+/// Every program in `VENDORS` that has a connector row, in `VENDORS` order.
 pub fn connections() -> impl Iterator<Item = &'static Connector> {
     atpkg::vendor_direct::VENDORS
         .iter()
@@ -405,7 +366,7 @@ pub fn ids() -> Vec<&'static str> {
 }
 
 impl Connector {
-    /// Whether this is Claude Code, whose login accounts v2 owns.
+    /// Whether this connector uses accounts v2 login management.
     #[must_use]
     pub fn is_claude(&self) -> bool {
         matches!(self.login, Login::Accounts)

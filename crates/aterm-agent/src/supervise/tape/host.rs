@@ -21,7 +21,7 @@ use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
-use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
+use crate::supervise::occupancy::{OccupancyReading, PaceGrant, RuleId, SlotsSeen};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
@@ -167,6 +167,8 @@ tape_arg_debug!(
     ResetAsk,
     ResetEnd,
     UsageWindow,
+    // `occupancy_pace`'s rule: a closed enum, printed as its variant.
+    RuleId,
 );
 
 /// A call's request as a tape holds it: `name=<Debug>` for each argument, a line each, in the signature's order; nothing for a call with none.
@@ -522,14 +524,20 @@ fn turn_word(turn: HostTurn) -> &'static str {
         HostTurn::Notice => "notice",
         HostTurn::CarryOn => "carry-on",
         HostTurn::Check => "check",
+        HostTurn::Fact => "fact",
     }
 }
 
 fn turn_of(word: &str) -> Result<HostTurn, CodecError> {
-    [HostTurn::Notice, HostTurn::CarryOn, HostTurn::Check]
-        .into_iter()
-        .find(|t| turn_word(*t) == word)
-        .ok_or(bad("a host turn this build does not know"))
+    [
+        HostTurn::Notice,
+        HostTurn::CarryOn,
+        HostTurn::Check,
+        HostTurn::Fact,
+    ]
+    .into_iter()
+    .find(|t| turn_word(*t) == word)
+    .ok_or(bad("a host turn this build does not know"))
 }
 
 /// [`HostStep`] as a tape holds it.
@@ -753,6 +761,21 @@ impl TapeValue for OccupancyReading {
 
     fn absent() -> Option<Self> {
         Some(OccupancyReading::default())
+    }
+}
+
+/// `occupancy_pace`'s answer on a tape: its word ([`PaceGrant::word`]), as a
+/// JSON string. A word this build does not know is refused. No absent form:
+/// a build without the door typed no fact line, so a replay that reaches the
+/// door diverges there.
+impl TapeValue for PaceGrant {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.word())
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        PaceGrant::of_word(&of_json::<String>(bytes)?)
+            .ok_or(bad("a pace answer this build does not know"))
     }
 }
 

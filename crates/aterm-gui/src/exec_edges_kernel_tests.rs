@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`ProcWatch`] on a real interactive `zsh -f -i`, started through
-//! aterm-pty's confined spawn on a real pseudo-terminal (`spawnfd::command`
-//! gives no controlling tty), heard as the gather hears it: each `exec` with
-//! `tcgetpgrp(master)` read at the drain and judged by
-//! [`FgCutter::proc_kind`].
-//!
-//! The chain is the managed launch's shape (card engine §3.13): a reroute
-//! stub that `exec`s a twin that `exec`s the program, here `/bin/sleep`, each
-//! link held at a fifo until the test has heard the one before, so each
-//! `exec` is its own event. Controls: a subshell that never `exec`s is a fork
-//! and no `exec`, and a command substitution's `exec` at the prompt is no
-//! Group edge. Every process a test judges is held alive on a fifo while it
-//! is judged: nothing here waits on a clock.
+//! Kernel `ProcWatch` tests over an interactive `zsh` pseudo-terminal.
 
 use std::time::{Duration, Instant};
 
@@ -60,7 +48,6 @@ impl Zsh {
             shell,
             out: Vec::new(),
         };
-        // The echo shows `RE""ADY`; only the shell's output reads `READY`.
         zsh.run_until("print RE\"\"ADY", "READY");
         zsh
     }
@@ -277,7 +264,6 @@ fn a_reroute_chain_is_a_fork_then_one_exec_per_link() {
     let mut watch = ProcWatch::new(zsh.pid()).expect("watch the shell");
     zsh.type_line(&reroute.display().to_string());
 
-    // The stub, at its first gate.
     let gate = open_writer(&mut zsh, &gates[0]);
     let heard = hear_until(&mut zsh, &mut watch, "the stub's exec", |heard| {
         forks(heard).iter().any(|c| first_exec(heard, *c).is_some())
@@ -315,7 +301,6 @@ fn a_reroute_chain_is_a_fork_then_one_exec_per_link() {
     assert_eq!(execs_of(&heard, child), [true], "the stub: one exec, late");
     assert_eq!(quiet(&mut watch), [], "nothing more while the stub waits");
 
-    // The twin, at its gate.
     release(gate);
     let gate = open_writer(&mut zsh, &gates[1]);
     let heard = hear_until(&mut zsh, &mut watch, "the twin's exec", |heard| {
@@ -324,7 +309,6 @@ fn a_reroute_chain_is_a_fork_then_one_exec_per_link() {
     assert_eq!(execs_of(&heard, child), [true], "the twin: one exec, late");
     assert_eq!(quiet(&mut watch), [], "nothing more while the twin waits");
 
-    // The program.
     release(gate);
     let heard = hear_until(&mut zsh, &mut watch, "sleep's exec", |heard| {
         !execs_of(heard, child).is_empty()
@@ -347,8 +331,6 @@ fn a_subshell_that_never_execs_is_no_exec() {
     let mut zsh = Zsh::start();
     let mut watch = ProcWatch::new(zsh.pid()).expect("watch the shell");
     zsh.type_line(&format!("( read x < {} )", fifo.display()));
-    // The subshell has opened the gate: it is inside `read`, past any `exec`
-    // it would have made.
     let gate = open_writer(&mut zsh, &fifo);
     let heard = hear_until(&mut zsh, &mut watch, "the subshell's fork", |heard| {
         !forks(heard).is_empty()

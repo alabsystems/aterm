@@ -215,7 +215,7 @@ enum Container {
 impl Container {
     /// Transcript/ledger wording — these strings reach the user through status
     /// lines and the health ledger.
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::Zip => "zip",
             Self::Dmg => "DMG",
@@ -1503,7 +1503,7 @@ fn stamp_receipt(
 
 /// Whether the check that just ended owes the shared check receipt a stamp: only one that
 /// reached the channel.
-fn check_leaves_a_receipt(
+const fn check_leaves_a_receipt(
     result: &Result<Option<String>, String>,
     recorded_a_deferral: bool,
 ) -> bool {

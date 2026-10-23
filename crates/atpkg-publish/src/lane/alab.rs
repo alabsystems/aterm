@@ -820,7 +820,7 @@ fn locked(
 }
 
 /// A signing run needs the machine key, its record and both token files (the lanes never
-/// use gh's own login), and a packer that can pack ([`Packer::can_pack`]: the zstd CLI
+/// read or write anonymously), and a packer that can pack ([`Packer::can_pack`]: the zstd CLI
 /// every pack is compressed by), so a missing tool refuses the run before any build
 /// rather than failing every pack until each program latches.
 fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
@@ -843,8 +843,8 @@ fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
     ] {
         if std::fs::metadata(path).map_or(true, |m| m.len() == 0) {
             return Err(Error::cannot_run(format!(
-                "{what} token file missing/empty: {} — the unattended lane never uses gh's own \
-                 login",
+                "{what} token file missing/empty: {} — the unattended lane speaks only as its \
+                 owners' tokens",
                 ctx.shown(path)
             )));
         }

@@ -4584,6 +4584,146 @@ fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
     }
 }
 
+/// GEMINI CLI'S BUCKET DIALOG IS TRIED BY ITS `Stop` AT THE SAME DUE
+/// ([`RULE_LIMIT_STOP`], [`LimitTry::StopThenResume`]; X2 of the walls-3
+/// stage): a terminal quota of the session's model's own bucket (`Usage
+/// limit reached for all Pro models.`, hand-built from the bundle's
+/// `ProQuotaDialog`) offers `Switch to <fallback>` over `Stop` — `Upgrade for
+/// higher limits` between them under the Google login — and no `Keep
+/// trying`. At every level, once the loop's clock says the reset and its
+/// grace have passed, its `Stop` is pressed by digit (`2`, or `3` past the
+/// upgrade), guarded on the reset's own row, so the turn-end policy types the
+/// resume at the error it leaves; before then it is not pressed, the reason
+/// naming the reset and the try. Measured before: `only Keep trying over
+/// Stop is pressed`, a person's for good. NEGATIVE CONTROLS: never the
+/// switch nor the upgrade; the retryable quota's three options (`Keep
+/// trying`, a switch, `Stop`), a switch naming no model, and the options in
+/// another order are a person's; with `limit_wait` off it is a person's.
+#[test]
+fn gemini_clis_bucket_dialog_is_tried_by_its_stop_at_the_same_due() {
+    use aterm_phase::gemini::fixtures as g;
+    for (fixture, digit) in [
+        (g::LIMIT_DIALOG_BUCKET, 2),
+        (g::LIMIT_DIALOG_BUCKET_UPGRADE, 3),
+    ] {
+        let rows = phase_fixtures::screen(fixture);
+        let reset_row = rows
+            .iter()
+            .find(|r| r.contains("Access resets at 5:06 AM PDT."))
+            .expect("the reset row")
+            .clone();
+        for level in [full(), ctx(), none(full())] {
+            let due = ApprovalCtx {
+                limit_retry: true,
+                ..level.clone()
+            };
+            let d = decide_screen(Some("node"), &rows, &due).expect("a box");
+            let Decision::Approve {
+                rule_id,
+                choice,
+                guard,
+                subject,
+                unproven,
+            } = &d
+            else {
+                panic!("{:?}: expected a press, got {d:?}", level.approve);
+            };
+            assert_eq!(
+                (*rule_id, choice, unproven),
+                (RULE_LIMIT_STOP, &Choice::Digit(digit), &None),
+                "the Stop, never the switch nor the upgrade"
+            );
+            assert_eq!(subject, "Stop (reset 5:06 AM PDT)");
+            let m = aterm_observe::row_matcher(guard).expect("compiles");
+            let hits: Vec<&String> = rows.iter().filter(|r| m.matches(r)).collect();
+            assert_eq!(hits, [&reset_row], "the reset's own row");
+
+            let early = decide_screen(Some("node"), &rows, &level).expect("a box");
+            assert_eq!(approved(&early), None, "{early:?}");
+            let why = reason(&early);
+            assert_eq!(
+                why,
+                "Gemini CLI's usage limit resets at 5:06 AM PDT: Stop is pressed and the turn \
+                 resumed past it"
+            );
+            assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
+
+            let off = ApprovalCtx {
+                limit_wait: false,
+                ..due.clone()
+            };
+            let d = decide_screen(Some("node"), &rows, &off).expect("a box");
+            assert!(reason(&d).contains("limit_wait is off"), "{d:?}");
+        }
+    }
+    // The options as the policy reads them: only the measured shapes.
+    let switch = "Switch to gemini-3.5-flash";
+    let upgrade = "Upgrade for higher limits";
+    assert_eq!(
+        LimitTry::of(&["Keep trying", "Stop"]),
+        Some(LimitTry::KeepTrying)
+    );
+    assert_eq!(
+        LimitTry::of(&[switch, "Stop"]),
+        Some(LimitTry::StopThenResume { stop: 1 })
+    );
+    assert_eq!(
+        LimitTry::of(&[switch, upgrade, "Stop"]),
+        Some(LimitTry::StopThenResume { stop: 2 })
+    );
+    for other in [
+        &["Keep trying", switch, "Stop"][..],
+        &["Switch to ", "Stop"],
+        &["Stop", switch],
+        &[upgrade, switch, "Stop"],
+        &[switch, upgrade],
+        &[switch, "Keep trying", "Stop"],
+    ] {
+        assert_eq!(LimitTry::of(other), None, "{other:?}");
+    }
+    // The retryable quota's dialog drawn as the bundle draws it: a person's.
+    let rows = phase_fixtures::screen(g::LIMIT_DIALOG_BUCKET);
+    let first = rows
+        .iter()
+        .position(|r| r.contains("1. Switch to gemini-3.5-flash"))
+        .expect("the switch");
+    let width = rows[first].chars().count();
+    let row = |text: &str| format!("{:<w$}│", format!("│ {text}"), w = width - 1);
+    let mut three = rows.clone();
+    three.splice(
+        first..=first + 1,
+        [
+            row("● 1. Keep trying"),
+            row(&format!("  2. {switch}")),
+            row("  3. Stop"),
+        ],
+    );
+    let reading = aterm_phase::read(Some("node"), &three, None);
+    let p = reading.prompt.as_ref().expect("the dialog");
+    assert_eq!(
+        p.options
+            .iter()
+            .map(|o| o.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Keep trying", switch, "Stop"],
+        "PRECONDITION: {three:#?}"
+    );
+    let d = decide_screen(
+        Some("node"),
+        &three,
+        &ApprovalCtx {
+            limit_retry: true,
+            ..full()
+        },
+    )
+    .expect("a box");
+    assert_eq!(approved(&d), None, "{d:?}");
+    assert!(
+        reason(&d).contains("Keep trying | Switch to gemini-3.5-flash | Stop"),
+        "{d:?}"
+    );
+}
+
 #[test]
 fn full_power_leaves_an_unmeasured_gemini_cli_box_to_a_person() {
     let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::BOX_SHELL);

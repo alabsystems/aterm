@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The consumer catalog: named presets over verified `defaults` rows (design §5.2).
-//!
-//! Each row is one key, with where it was verified. Every row was written, read back and
-//! restored in the macOS 27.0 VM (26A428) by the path the agent takes: a user key as
-//! that user from root (`sudo -n -u <u> -H -- env -i …`), read back through the same
-//! path and through the user's login session (`launchctl asuser`); a system key as
-//! root. A row that could not be verified on 26 or 27 is not here; the owner can add it
-//! as a `[[defaults]]` row. Universal Control has no row: atpkg's `[machine]
-//! universal_control` owns that key on every Mac that runs aterm (design §5.1).
-//!
-//! In the `[consumer]` table `false` turns a feature off; `true` writes the value its
-//! System Settings switch writes when on, or deletes the key where the OS default is
-//! the feature on (or asking).
+//! Consumer catalog presets over verified `defaults` rows.
 
 use super::defaults::{Pref, Scope, Target, Want};
 use super::{Ctx, Item};
@@ -36,8 +24,7 @@ pub struct Table {
     pub airdrop: Option<bool>,
     /// `false` hides desktop and Stage Manager widgets.
     pub widgets: Option<bool>,
-    /// Refused: Universal Control is atpkg's (`[machine] universal_control` in
-    /// aterm.toml), so one key never has two owners (design §5.1).
+    /// Refused: Universal Control is atpkg's (`[machine] universal_control` in aterm.toml).
     pub universal_control: Option<bool>,
     /// `false` stops the keyboard/mouse setup assistant on desktops with none attached.
     pub bluetooth_setup_assistant: Option<bool>,
@@ -94,8 +81,7 @@ pub struct CatalogRow {
     pub id: &'static str,
     /// What it controls, for the title.
     pub what: &'static str,
-    /// The domain (a name for a user row; a name under `/Library/Preferences` or an
-    /// absolute path for a system row).
+    /// The domain (a name for a user row; a name or absolute path for a system row).
     pub domain: &'static str,
     /// The key.
     pub key: &'static str,
@@ -239,8 +225,6 @@ pub const CATALOG: &[CatalogRow] = &[
         domain: "com.apple.Bluetooth",
         key: "BluetoothAutoSeekKeyboard",
         scope: Scope::System,
-        // 27.0.1 stores the key as <true/>; a false of the same type is what readers
-        // that check the type expect, and an integer 0 written by hand still probes Ok.
         off: Lit::Bool(false),
         on: None,
         restart: None,
@@ -288,9 +272,7 @@ pub const CATALOG: &[CatalogRow] = &[
     },
 ];
 
-/// The items `table` asks for: each catalog row of each preset it names, per user for a
-/// user row and once for a system row.
-///
+/// The items `table` asks for.
 /// # Errors
 /// One line naming what cannot be expanded (`universal_control`, which is atpkg's).
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -401,7 +383,6 @@ mod tests {
             items[0].title(),
             "Siri off for alice (com.apple.assistant.support Assistant Enabled)"
         );
-        // One system row (the consent version) joined the analytics preset.
         assert_eq!(items[9].effect(), Effect::Relaunch);
         assert_eq!(items[15].effect(), Effect::Restart);
     }
@@ -489,7 +470,6 @@ mod tests {
     fn personalized_ads_already_off_in_the_vm_probes_ok() {
         let admin = user("admin", 501);
         let sys = Fake::root();
-        // `defaults export com.apple.AdLib -` for the 27.0 VM's admin.
         sys.on(
             "admin$ /usr/bin/defaults export com.apple.AdLib -",
             export("<dict>\n\t<key>CKDPIDSyncState</key>\n\t<integer>1</integer>\n\t<key>CKSubscribedAccountsScrubbed</key>\n\t<true/>\n\t<key>allowApplePersonalizedAdvertising</key>\n\t<false/>\n\t<key>allowIdentifierForAdvertising</key>\n\t<true/>\n\t<key>personalizedAdsMigrated</key>\n\t<true/>\n</dict>"),
@@ -513,7 +493,6 @@ mod tests {
     #[test]
     fn the_bluetooth_assistant_row_turns_the_true_macos_stores_into_false() {
         let sys = Fake::root();
-        // 27.0.1's /Library/Preferences/com.apple.Bluetooth holds the key as <true/>.
         let key = "/usr/bin/defaults export /Library/Preferences/com.apple.Bluetooth -";
         sys.on(
             key,

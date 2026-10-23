@@ -60,7 +60,7 @@ pub enum Identity {
 impl Identity {
     /// Trust by its own `-vV`: a `trust:` line.
     #[must_use]
-    pub fn is_trust(&self) -> bool {
+    pub const fn is_trust(&self) -> bool {
         matches!(self, Self::Known(vv) if vv.trust.is_some())
     }
 
@@ -140,7 +140,7 @@ pub struct Resolved {
 impl Resolved {
     /// Trust by its own `-vV`.
     #[must_use]
-    pub fn is_trust(&self) -> bool {
+    pub const fn is_trust(&self) -> bool {
         self.identity.is_trust()
     }
 

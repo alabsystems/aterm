@@ -47,13 +47,17 @@ const FLEET: &str = "lab";
 /// so the Autopilot Off step holds the screen and the ledger to its absence.
 const NUDGE: &str = "Inbox: task @";
 
-/// The proof's own bus (the Autopilot Off step's mail): a guarded broker the
-/// lab starts outside the jail on a Unix socket in the scratch, under a mint
-/// secret only the scratch holds, and the node ring the instance's bridge
-/// attaches with (THE ring `aterm fabric on` mints,
-/// `aterm_link::enable::node_grants`).
+/// The proof's own bus (the Autopilot Off step's mail): a guarded broker the lab starts outside
+/// the jail on a Unix socket in the scratch, under a mint secret only the scratch holds, and the
+/// node ring the instance's bridge attaches with (THE ring `aterm fabric on` mints,
+/// `aterm_link::enable::node_grants`). The broker ends with the proof (its pid, the lab's own
+/// child) and with this process however it ends (its lifeline).
 struct Fabric {
     broker: Option<aterm_uds::spawnfd::Child>,
+    /// The broker's lifeline (`aterm_uds::lifeline`): it ends itself once this is
+    /// dropped or the lab dies, a SIGKILL included, instead of serving on under
+    /// launchd.
+    _lifeline: aterm_uds::lifeline::Lifeline,
     /// The `[fabric]` table the instance's `aterm.toml` gets.
     table: String,
 }
@@ -118,19 +122,25 @@ impl Fabric {
         let log = std::fs::File::create(dir.join("broker.out"))
             .map_err(|e| format!("broker.out: {e}"))?;
         let err = log.try_clone().map_err(|e| format!("broker.out: {e}"))?;
-        let broker = aterm_uds::spawnfd::command(&program)
+        let mut broker = aterm_uds::spawnfd::command(&program);
+        broker
             .args(["link", "broker"])
             .arg(&sock)
             .arg(dir.join("b.log"))
             .arg("--secret-file")
             .arg(&secret)
-            .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err))
+            .stderr(Stdio::from(err));
+        // Its stdin is the lifeline, whose FIFO lives in this private scratch only
+        // until both ends are open.
+        let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut broker, dir)
+            .map_err(|e| format!("the broker's lifeline in {}: {e}", dir.display()))?;
+        let broker = broker
             .spawn()
             .map_err(|e| format!("aterm link broker: {e}"))?;
         let mut fabric = Fabric {
             broker: Some(broker),
+            _lifeline: lifeline,
             table: format!(
                 "[fabric]\ncommand = \"{program} link serve --fleet {FLEET} --broker {sock} \
                  --cap-file {cap} --state {state} --accept-from {node}\"\n",

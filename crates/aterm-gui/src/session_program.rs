@@ -735,12 +735,13 @@ fn publish_if_current(
     }
     let mut timeline = job.timeline.lock().unwrap_or_else(|p| p.into_inner());
     let was_claude = crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
-    let changed = timeline.set_program(job.pgid, facts.program);
+    let program_changed = timeline.set_program(job.pgid, facts.program);
     timeline.set_leader(job.pgid, facts.copy, facts.path);
-    timeline.set_leader_no_harness(job.pgid, facts.no_harness);
+    let no_harness_changed = timeline.set_leader_no_harness(job.pgid, facts.no_harness);
+    let changed = program_changed || no_harness_changed;
     let became_claude =
-        changed && crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
-    (changed, became_claude, changed && was_claude)
+        program_changed && crate::claude_footer::drawn_for(timeline.agent().program.as_deref());
+    (changed, became_claude, program_changed && was_claude)
 }
 
 #[cfg(test)]
@@ -1754,5 +1755,20 @@ mod tests {
         assert!(!make(&["agy", "--", "--no-harness"], &[]));
         assert!(!make(&["agy"], &["ATERM_NO_HARNESS=0"]));
         assert!(!make(&["agy"], &[]));
+
+        let mut tl = crate::session_timeline::SessionTimeline::default();
+        assert!(tl.note_foreground_group(4100));
+        assert!(tl.set_leader_no_harness(4100, true));
+        assert!(tl.leader_no_harness());
+        assert!(tl.unapplied_leader_no_harness());
+        assert!(tl.take_leader_no_harness());
+        assert!(!tl.unapplied_leader_no_harness());
+        assert!(!tl.take_leader_no_harness());
+
+        assert!(tl.note_foreground_group(4200));
+        assert!(!tl.leader_no_harness());
+        assert!(tl.set_leader_no_harness(4200, true));
+        assert!(tl.unapplied_leader_no_harness());
+        assert!(tl.take_leader_no_harness());
     }
 }

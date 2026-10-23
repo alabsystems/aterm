@@ -24,7 +24,7 @@ pub enum SurveyKind {
 impl SurveyKind {
     /// The word the journal prints (`kind=<word>`).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             SurveyKind::Session => "session",
             SurveyKind::LongContext => "long-context",
@@ -52,7 +52,7 @@ pub struct SurveyBlock {
 impl SurveyBlock {
     /// Why a loop must not press this card's `0`, or `None` when it may: an unknown kind without the `(optional)` mark, or a question row no guard can fence, is said and left to a person or a manager.
     #[must_use]
-    pub fn withheld(&self) -> Option<&'static str> {
+    pub const fn withheld(&self) -> Option<&'static str> {
         if !self.dismissable {
             Some("an unrecognised card without the vendor's (optional) mark")
         } else if self.guard.is_empty() {

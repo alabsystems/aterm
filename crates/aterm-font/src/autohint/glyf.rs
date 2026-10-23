@@ -11,14 +11,7 @@
 // metrics it does not reach, every read checked.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
-//! TrueType outlines as FreeType loads them unscaled: integer font units,
-//! `gvar` deltas computed in 16.16 and rounded to a unit, composite
-//! components transformed in fixed point, and the outline shifted so the
-//! left phantom point sits at x = 0.
-//!
-//! aterm-font's own `glyf` reader (`tables/glyf.rs`) answers ttf-parser's
-//! `f32` outlines; the autohinter is held to skrifa's grid fit, which starts
-//! from these points.
+//! Unscaled TrueType `glyf` outline loader for the autohinter.
 
 use super::DrawError;
 use super::deltas;
@@ -29,14 +22,12 @@ use super::tuple::{Gvar, ReadError};
 const GLYF_COMPOSITE_RECURSION_LIMIT: usize = 32;
 /// Most points a glyph may have (skrifa's `MAX_GLYF_POINTS`).
 const MAX_GLYF_POINTS: usize = u16::MAX as usize;
-/// Most component edges a composite graph may have (skrifa's
-/// `MAX_GRAPH_EDGES`).
+/// Most component edges a composite graph may have (skrifa's `MAX_GRAPH_EDGES`).
 const MAX_GRAPH_EDGES: usize = 2048;
 
 /// Number of phantom points generated at the end of an outline.
 pub(crate) const PHANTOM_POINT_COUNT: usize = 4;
 
-// SimpleGlyphFlags
 const ON_CURVE_POINT: u8 = 0x01;
 const X_SHORT_VECTOR: u8 = 0x02;
 const Y_SHORT_VECTOR: u8 = 0x04;
@@ -44,7 +35,6 @@ const REPEAT_FLAG: u8 = 0x08;
 const X_IS_SAME_OR_POSITIVE_X_SHORT_VECTOR: u8 = 0x10;
 const Y_IS_SAME_OR_POSITIVE_Y_SHORT_VECTOR: u8 = 0x20;
 
-// CompositeGlyphFlags
 const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
 const ARGS_ARE_XY_VALUES: u16 = 0x0002;
 const WE_HAVE_A_SCALE: u16 = 0x0008;
@@ -55,8 +45,7 @@ pub(crate) const USE_MY_METRICS: u16 = 0x0200;
 const SCALED_COMPONENT_OFFSET: u16 = 0x0800;
 const UNSCALED_COMPONENT_OFFSET: u16 = 0x1000;
 
-/// Marker bits for point flags set during variation delta processing and
-/// hinting.
+/// Marker bits for point flags set during variation delta processing and hinting.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 pub(crate) struct PointMarker(u8);
 
@@ -85,15 +74,12 @@ impl PointMarker {
     pub const TOUCHED_Y: Self = Self(0x20);
 }
 
-/// Flags describing a point: whether it is on the curve (else a quadratic
-/// or cubic control point), plus the markers above.
+/// Flags describing a point.
 #[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
 #[repr(transparent)]
 pub(crate) struct PointFlags(u8);
 
 impl PointFlags {
-    // Note: OFF_CURVE_QUAD is signified by the absence of both ON_CURVE
-    // and OFF_CURVE_CUBIC bits, per FreeType and TrueType convention.
     const ON_CURVE: u8 = ON_CURVE_POINT;
     const OFF_CURVE_CUBIC: u8 = 0x80;
     const CURVE_MASK: u8 = Self::ON_CURVE | Self::OFF_CURVE_CUBIC;
@@ -178,8 +164,7 @@ pub(crate) struct Glyf<'a> {
 }
 
 impl<'a> Glyf<'a> {
-    /// `loca` must hold whole offsets (2 bytes each, 4 when long), as
-    /// read-fonts requires.
+    /// `loca` must hold whole offsets (2 bytes each, 4 when long), as read-fonts requires.
     fn new(loca: &'a [u8], long: bool, glyf: &'a [u8]) -> Option<Self> {
         let size = if long { 4 } else { 2 };
         (loca.len() % size == 0).then_some(Self { loca, long, glyf })
@@ -228,7 +213,6 @@ impl<'a> Glyph<'a> {
             }
             Ok(Self::Simple(SimpleGlyph { data }))
         } else {
-            // numberOfContours and the box.
             if data.len() < 10 {
                 return Err(ReadError);
             }
@@ -307,8 +291,7 @@ impl<'a> SimpleGlyph<'a> {
         self.data.get(start..).unwrap_or_default()
     }
 
-    /// Reads the points and their on-curve flags (every other flag bit is
-    /// dropped). Both buffers must hold [`Self::num_points`].
+    /// Reads the points and their on-curve flags (every other flag bit is dropped).
     fn read_points_fast(
         &self,
         points: &mut [Point<i32>],
@@ -322,9 +305,6 @@ impl<'a> SimpleGlyph<'a> {
             return Ok(());
         }
         let data = self.glyph_data();
-        // The flag run can use two bytes per point (a flag plus its repeat
-        // count), so the encoded flags may be longer than n_points; read
-        // over all the available data and stop once every point has a flag.
         let mut flags_iter = data.iter().copied();
         let mut read_flags_bytes = 0;
         let mut i = 0;
@@ -382,8 +362,6 @@ impl<'a> SimpleGlyph<'a> {
             }
             y = y.wrapping_add(delta);
             point.y = y;
-            // The cubic bit is the unreleased `spec_next` extension, which
-            // skrifa's default build drops.
             point_flags.0 &= PointFlags::ON_CURVE;
         }
         Ok(())
@@ -437,8 +415,7 @@ impl<'a> CompositeGlyph<'a> {
         self.data.get(10..).unwrap_or_default()
     }
 
-    /// Every component, fully read; stops at the first that runs past the
-    /// data.
+    /// Every component, fully read; stops at the first that runs past the data.
     fn components(&self) -> impl Iterator<Item = Component> + 'a {
         let data = self.component_data();
         let mut pos = 0usize;
@@ -505,8 +482,7 @@ impl<'a> CompositeGlyph<'a> {
         })
     }
 
-    /// Each component's glyph id and flags, skipping the arguments unread
-    /// (so a truncated component still counts, as in read-fonts).
+    /// Each component's glyph id and flags.
     pub(crate) fn component_glyphs_and_flags(&self) -> impl Iterator<Item = (u16, u16)> + 'a {
         let data = self.component_data();
         let mut pos = 0usize;
@@ -546,7 +522,6 @@ struct HMetrics<'a> {
 
 impl<'a> HMetrics<'a> {
     fn new(hhea: &'a [u8], hmtx: &'a [u8]) -> Option<Self> {
-        // hhea's fixed fields, numberOfHMetrics last.
         if hhea.len() < 36 {
             return None;
         }
@@ -611,17 +586,14 @@ pub(crate) struct Tables<'a> {
 }
 
 impl<'a> Outlines<'a> {
-    /// `None` without `head`, `loca`, `glyf`, `hhea` or `hmtx` (or with a
-    /// `loca` of partial offsets), as skrifa's.
+    /// `None` without `head`.
     pub(crate) fn new(tables: &Tables<'a>) -> Option<Self> {
-        // head's fixed fields, indexToLocFormat at 50.
         if tables.head.len() < 54 {
             return None;
         }
         let long = read_i16(tables.head, 50).ok()? == 1;
         let glyf = Glyf::new(tables.loca?, long, tables.glyf?)?;
         let metrics = HMetrics::new(tables.hhea?, tables.hmtx?)?;
-        // OS/2 version 0's 78 bytes, or [0, 0].
         let os2_vmetrics = tables
             .os2
             .filter(|os2| os2.len() >= 78)
@@ -640,8 +612,7 @@ impl<'a> Outlines<'a> {
         })
     }
 
-    /// The glyph's outline description: point and contour totals and the
-    /// buffer sizes loading it takes.
+    /// The glyph's outline description.
     pub(crate) fn outline(&self, glyph_id: u16) -> Result<Outline<'a>, DrawError> {
         let mut outline = Outline {
             glyph_id,
@@ -710,8 +681,7 @@ impl<'a> Outlines<'a> {
     }
 }
 
-/// What loading one glyph takes (skrifa's `glyf::Outline`, the unhinted
-/// fields).
+/// What loading one glyph takes (skrifa's `glyf::Outline`, the unhinted fields).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Outline<'a> {
     pub glyph_id: u16,
@@ -731,8 +701,7 @@ pub(crate) struct Outline<'a> {
     pub has_variations: bool,
 }
 
-/// The loader's buffers (skrifa's `FreeTypeOutlineMemory`, unhinted),
-/// zeroed per glyph as skrifa's are.
+/// The loader's unhinted buffers (skrifa's `FreeTypeOutlineMemory`), zeroed per glyph.
 struct Memory {
     unscaled: Vec<Point<i32>>,
     scaled: Vec<Point<F26Dot6>>,
@@ -766,17 +735,14 @@ impl Memory {
     }
 }
 
-/// An outline as FreeType loads it unscaled: points (26.6 holding whole
-/// units), flags and contour end points, shifted by the left phantom point.
+/// An outline as FreeType loads it unscaled.
 pub(crate) struct UnscaledOutline {
     pub points: Vec<Point<F26Dot6>>,
     pub flags: Vec<PointFlags>,
     pub contours: Vec<u16>,
 }
 
-/// FreeType's loader at no scale: 26.6 coordinates holding whole font
-/// units, 16.16 deltas rounded to a unit (skrifa's `FreeTypeScaler` with
-/// `ppem = None`).
+/// FreeType's loader at no scale.
 pub(crate) struct UnscaledScaler<'a> {
     outlines: &'a Outlines<'a>,
     memory: Memory,
@@ -784,8 +750,7 @@ pub(crate) struct UnscaledScaler<'a> {
     point_count: usize,
     contour_count: usize,
     component_delta_count: usize,
-    /// The four phantom points: the side bearing and advance points that
-    /// carry the glyph's metrics through variation and transformation.
+    /// The four phantom points.
     phantom: [Point<F26Dot6>; PHANTOM_POINT_COUNT],
 }
 
@@ -871,13 +836,10 @@ impl<'a> UnscaledScaler<'a> {
         tsb: i32,
         vadvance: i32,
     ) {
-        // The four phantom points as FreeType computes them (ttgload.c).
-        // horizontal:
         self.phantom[0].x = F26Dot6::from_bits(i32::from(bounds[0]) - lsb);
         self.phantom[0].y = F26Dot6::ZERO;
         self.phantom[1].x = self.phantom[0].x + F26Dot6::from_bits(advance);
         self.phantom[1].y = F26Dot6::ZERO;
-        // vertical:
         self.phantom[2].x = F26Dot6::ZERO;
         self.phantom[2].y = F26Dot6::from_bits(i32::from(bounds[3]) + tsb);
         self.phantom[3].x = F26Dot6::ZERO;
@@ -931,7 +893,6 @@ impl<'a> UnscaledScaler<'a> {
         let contours = contours
             .get_mut(contours_start..contours_end)
             .ok_or(InsufficientMemory)?;
-        // The contour end points, which must not decrease.
         let mut last_end_pt = 0;
         for (i, contour) in contours.iter_mut().enumerate() {
             let end_pt = glyph.end_pt(i);
@@ -943,7 +904,6 @@ impl<'a> UnscaledScaler<'a> {
         }
         self.point_count += point_count;
         self.contour_count += contour_count;
-        // Append the phantom points.
         for (i, phantom) in self.phantom.iter().enumerate() {
             unscaled[phantom_start + i] = phantom.map(|x| x.to_bits());
             flags[phantom_start + i] = Default::default();
@@ -967,19 +927,15 @@ impl<'a> UnscaledScaler<'a> {
             }
         }
         if have_deltas {
-            // Round off deltas for unscaled outlines.
             for (unscaled, delta) in unscaled.iter_mut().zip(deltas.iter()) {
                 *unscaled += delta.map(Fixed::to_i32);
             }
         }
-        // Unscaled outlines are stored in 26.6 too.
         for (point, unscaled) in scaled.iter_mut().zip(unscaled.iter()) {
             *point = unscaled.map(F26Dot6::from_i32);
         }
-        // Commit the potentially modified phantom points.
         self.phantom.copy_from_slice(&scaled[phantom_start..]);
         if points_start != 0 {
-            // Not the first component: shift the contour end points.
             for contour_end in contours.iter_mut() {
                 *contour_end += points_start as u16;
             }
@@ -994,9 +950,7 @@ impl<'a> UnscaledScaler<'a> {
         recurse_depth: usize,
     ) -> Result<(), DrawError> {
         use DrawError::InsufficientMemory;
-        // The base index of the points for the current glyph.
         let point_base = self.point_count;
-        // Per component deltas; composites nest, so they are a stack.
         let mut have_deltas = false;
         let delta_base = self.component_delta_count;
         if let (Some(gvar), false) = (self.outlines.gvar.as_ref(), self.coords.is_empty()) {
@@ -1007,7 +961,6 @@ impl<'a> UnscaledScaler<'a> {
                 .get_mut(delta_base..delta_base + count)
                 .ok_or(InsufficientMemory)?;
             if deltas::composite_glyph(gvar, glyph_id, self.coords, &mut deltas[..]).is_ok() {
-                // Apply deltas to phantom points.
                 for (phantom, delta) in self
                     .phantom
                     .iter_mut()
@@ -1023,8 +976,6 @@ impl<'a> UnscaledScaler<'a> {
             *point = point.map(|x| F26Dot6::from_i32(x.to_bits()));
         }
         for (i, component) in glyph.components().enumerate() {
-            // Loading a component overrides the phantom points; restore them
-            // unless the component carries USE_MY_METRICS.
             let phantom = self.phantom;
             let start_point = self.point_count;
             let component_glyph = self.outlines.glyf.get(component.glyph)?;
@@ -1051,8 +1002,6 @@ impl<'a> UnscaledScaler<'a> {
                     .get_mut(start_point..end_point)
                     .ok_or(InsufficientMemory)?;
                 for point in scaled {
-                    // Unscaled points are whole units in 26.6, so take the
-                    // unit as the 16.16 bits FreeType multiplies.
                     let unscaled = point.map(|c| Fixed::from_bits(c.to_i32()));
                     let x = unscaled.x * xx + unscaled.y * xy;
                     let y = unscaled.x * yx + unscaled.y * yy;
@@ -1066,8 +1015,6 @@ impl<'a> UnscaledScaler<'a> {
                         && component.flags & (SCALED_COMPONENT_OFFSET | UNSCALED_COMPONENT_OFFSET)
                             == SCALED_COMPONENT_OFFSET
                     {
-                        // FreeType's "guess", which works better than the
-                        // algorithm Apple documents (ttgload.c).
                         fn hypot(a: Fixed, b: Fixed) -> Fixed {
                             let a = a.to_bits().abs();
                             let b = b.to_bits().abs();
@@ -1087,8 +1034,6 @@ impl<'a> UnscaledScaler<'a> {
                             .get(delta_base + i)
                             .copied()
                             .unwrap_or_default();
-                        // FreeType rounds off the fractional parts of a
-                        // composite's deltas.
                         x += delta.x.to_i32();
                         y += delta.y.to_i32();
                     }

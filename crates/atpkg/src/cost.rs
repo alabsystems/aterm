@@ -6,7 +6,7 @@
 //! full volume. The free-space query is the OS edge.
 
 /// The largest unit `n` fills at least once, as its size and name; `(1, "B")` below a KiB.
-fn unit_of(n: u64) -> (u64, &'static str) {
+const fn unit_of(n: u64) -> (u64, &'static str) {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -53,7 +53,7 @@ pub fn human_bytes_apart(a: u64, b: u64) -> (String, String) {
 /// Saturating, so a colossal `required` never wraps to "fits". An install passes its unit's
 /// archives and trees together (`flow::LandingBytes::need`).
 #[must_use]
-pub fn disk_ok(required: u64, available: u64, free_floor: u64) -> bool {
+pub const fn disk_ok(required: u64, available: u64, free_floor: u64) -> bool {
     available >= required.saturating_add(free_floor)
 }
 

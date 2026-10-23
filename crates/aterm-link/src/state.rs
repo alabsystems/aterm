@@ -854,7 +854,7 @@ pub(crate) struct Flushed {
 }
 
 impl Flushed {
-    fn note(&mut self, flush: Option<aterm_durable::Flush>, full: u64) {
+    const fn note(&mut self, flush: Option<aterm_durable::Flush>, full: u64) {
         match flush {
             Some(aterm_durable::Flush::Ordered) => self.ordered += 1,
             Some(aterm_durable::Flush::Durable) => self.full += full,

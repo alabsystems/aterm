@@ -1,45 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The browser lane's third engine: WebKit, the engine under Safari. Its
-//! WebGL2 is its own implementation of the API (on ANGLE's Metal back end,
-//! in WebKit's GPU process), and its pages and worker are WebKit's.
-//!
-//! The lane pins Playwright's build of WebKit for macOS, a zip it unpacks
-//! into a user cache as it does the other two (Safari itself is driven only
-//! through `safaridriver`, which an administrator must enable first). The
-//! build's `Playwright.app` loads the WebKit frameworks beside it, so it
-//! runs with `DYLD_FRAMEWORK_PATH` and `DYLD_LIBRARY_PATH` naming that
-//! directory, as Playwright's own `pw_run.sh` launches it. Nothing drives
-//! it over a protocol: as with Firefox, it opens the cpu page with
-//! `?post=1&next=gpu,worker` on its command line, and each page POSTs its
-//! answer to the lane's server and opens the next.
-//!
-//! `--headless` is not windowless here: the app keeps each headless page in
-//! a window of its own (`-[BrowserAppDelegate createHeadlessPage:withURL:]`,
-//! `_headlessWindows`), ordered in at (-10000, -10000), off every display.
-//! On the desk it took no activation and showed nothing (2026-10-20), but it
-//! is a window on the desktop all the same: the WebKit row opens one, and
-//! under `--no-windows` it is a named skip ([`no_windows_skip`]).
-//!
-//! In order, the lane takes `ATERM_WEBKIT` (a Playwright WebKit
-//! executable), then the pinned build in this machine's cache (`verify
-//! provision` puts it there). Neither is a COULD NOT RUN naming the
-//! fetch.
+//! Playwright WebKit browser verification runner ([`no_windows_skip`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Playwright's WebKit build the lane pins (WebKit 26.6, built 2026-09-01;
-/// Playwright 1.63.0 installs it on macOS 26 and later).
+/// Pinned Playwright WebKit build revision.
 pub(crate) const BUILD: &str = "2359";
 
-/// The WebKit version that build is (Playwright's `browserVersion`; the
-/// build's own user agent names no version, below).
+/// Pinned WebKit browser version string.
 pub(crate) const VERSION: &str = "26.6";
 
-/// One platform's pinned archive: its file name on Playwright's CDN, sha256
-/// and size measured on the download, and the executable inside it.
+/// One platform's pinned archive.
 pub(crate) struct Pinned {
     pub platform: &'static str,
     pub archive: &'static str,
@@ -48,9 +21,7 @@ pub(crate) struct Pinned {
     pub binary: &'static str,
 }
 
-/// The pinned archives, one per platform the lane has run WebKit on.
-/// Playwright builds WebKit per macOS release; the `mac-26` build is the
-/// one it installs on macOS 26 and later (this lane ran it on macOS 27).
+/// Pinned WebKit archives indexed by host platform.
 pub(crate) const PINNED: [Pinned; 1] = [Pinned {
     platform: "mac-arm64",
     archive: "webkit-mac-26-arm64.zip",
@@ -62,9 +33,7 @@ pub(crate) const PINNED: [Pinned; 1] = [Pinned {
 /// The environment variable naming a WebKit to run instead.
 pub(crate) const WEBKIT_ENV: &str = "ATERM_WEBKIT";
 
-/// What `--no-windows` answers for the WebKit row, with its fix: running
-/// without the flag, after `missing` (the fix [`find`]'s refusal names) where
-/// this host has no WebKit to run.
+/// What `--no-windows` answers for the WebKit row, with its fix ([`find`]).
 pub(crate) fn no_windows_skip(missing: Option<&str>) -> String {
     let free = "run without --no-windows when the desktop is free";
     let fix = missing.map_or_else(|| free.to_string(), |fix| format!("{fix}, then {free}"));
@@ -74,8 +43,7 @@ pub(crate) fn no_windows_skip(missing: Option<&str>) -> String {
     )
 }
 
-/// The fix a run without a WebKit names, where `pinned` (this host has a pin
-/// `verify provision` can fetch).
+/// Remediation command suggested when WebKit is not installed.
 pub(crate) fn fix_for(pinned: bool) -> &'static str {
     if pinned {
         "targo --unverified verify provision, or set ATERM_WEBKIT to a Playwright WebKit \
@@ -161,8 +129,7 @@ pub(crate) fn find() -> Result<WebKit, String> {
     }
 }
 
-/// The directory holding the WebKit frameworks `binary` loads: the one
-/// around its `.app` (the build's layout), else the binary's own.
+/// The directory holding the WebKit frameworks `binary` loads.
 pub(crate) fn frameworks_dir(binary: &Path) -> PathBuf {
     binary
         .ancestors()
@@ -172,9 +139,7 @@ pub(crate) fn frameworks_dir(binary: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-/// A fresh profile at `profile`: emptied, then holding the empty home
-/// [`launch_env`] gives WebKit ([`home_of`]) and its website data
-/// ([`data_of`]).
+/// A fresh profile at `profile` ([`launch_env`], [`home_of`], [`data_of`]).
 pub(crate) fn make_profile(profile: &Path) -> Result<(), String> {
     super::firefox::remove_home(&home_of(profile));
     let _ = std::fs::remove_dir_all(profile);
@@ -195,12 +160,7 @@ pub(crate) fn data_of(profile: &Path) -> PathBuf {
     profile.join("data")
 }
 
-/// WebKit's environment: `vars` (this process's) with its home moved to
-/// `home` and its frameworks found in `frameworks`. Foundation reads
-/// `CFFIXED_USER_HOME`, not `HOME`: with the real home the build leaves
-/// `org.webkit.Playwright` folders in the owner's ~/Library (its caches,
-/// website data and preferences), as Firefox does
-/// ([`super::firefox::launch_env`]).
+/// WebKit's environment ([`super::firefox::launch_env`]).
 pub(crate) fn launch_env(
     vars: impl IntoIterator<Item = (OsString, OsString)>,
     home: &Path,
@@ -225,8 +185,7 @@ pub(crate) fn launch_env(
     env
 }
 
-/// WebKit's arguments: headless, its website data in the private
-/// `profile`, opening `url`.
+/// WebKit's arguments: headless, its website data in the private `profile`, opening `url`.
 pub(crate) fn launch_args(profile: &Path, url: &str) -> Vec<OsString> {
     let mut data = OsString::from("--user-data-dir=");
     data.push(data_of(profile));
@@ -234,19 +193,13 @@ pub(crate) fn launch_args(profile: &Path, url: &str) -> Vec<OsString> {
 }
 
 /// Whether `user_agent`, what the lane's pages report, is WebKit's.
-/// Playwright's build, run without Playwright (which sets a Safari-shaped
-/// one over its protocol), answers WebKit's bare user agent, which ends at
-/// `AppleWebKit/605.1.15 (KHTML, like Gecko)`; Safari's adds `Version/<v>
-/// Safari/<v>`. Chromium's also says `AppleWebKit/` (and `Safari/`), and
-/// is not a WebKit session.
 pub(crate) fn is_webkit(user_agent: &str) -> bool {
     user_agent.contains("AppleWebKit/")
         && !user_agent.contains("Chrome/")
         && !user_agent.contains("Firefox/")
 }
 
-/// The session's product: `WebKit`, with Safari's `Version/<v>` where
-/// `user_agent` has one; another browser's user agent as it is.
+/// The session's product: `WebKit`, with Safari's `Version/<v>` where `user_agent` has one.
 pub(crate) fn product(user_agent: &str) -> String {
     if !is_webkit(user_agent) {
         return user_agent.to_string();

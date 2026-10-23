@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-gui`'s AppKit constants (`appkit.rs`'s `consts`), `_Static_assert`ed against Apple's
-//! SDK headers on both arches: compiling the assertion for an arch is the measurement, so no
-//! x86_64 binary runs. Coverage runs both ways: every constant in `consts` has a row and every
-//! row names a constant that is there. No run-time test sees a wrong value here.
-//!
-//! * **The authority is Apple's header**, not a third-party transcription.
-//! * **`x86_64` is covered.** Every row is a compile-time value, so compiling
-//!   the assertion for an arch is the measurement; no binary for that arch has
-//!   to run (this box cannot execute the compat slice). `NS_TEXT_ALIGNMENT_CENTER`'s
-//!   two `#[cfg]` arms are BOTH checked, each under the matching `#if`, and the
-//!   arm the gate selects is read out of the SOURCE.
-//! * **Coverage comes from the SOURCE.** The probe walks every constant the
-//!   parser finds in `consts`, and one with no SDK row fails the probe by name.
-//!
-//! Why it matters: `NS_TEXT_ALIGNMENT_CENTER` once shipped as RIGHT alignment,
-//! caught only by a pixel capture, and `NS_COLOR_RENDERING_INTENT_PERCEPTUAL`
-//! was first written `1` (it is `3`) — wrong values no run-time test sees.
-//!
-//! [`winit_seam_constants.rs`](../winit_seam_constants.rs) is the twin over
-//! `crates/aterm-window`'s seam: same parser grammar, same probe. Two
-//! differences:
-//!
-//! 1. **The literal is PARENTHESISED in the assertion.** `|` binds LOOSER than
-//!    `==` in C, so `_Static_assert(SDK == 0x01 | 0x80, "")` is
-//!    `(SDK == 0x01) | 0x80` and a wrong value compiles (clang only warns
-//!    `-Wparentheses`). `NS_TRACKING_HOVER_IN_VISIBLE_RECT` and
-//!    `NS_VIEW_MIN_X_MARGIN_MAX_Y_MARGIN` are `|`-composed. The seam's probe is
-//!    parenthesised too, so it stays non-vacuous if one is added there.
-//! 2. **`#[cfg(target_arch)]` is part of the grammar.** Its gate is read from
-//!    the attribute above the declaration and turned into the matching `#if`,
-//!    so swapping the two arms fails here.
-//!
-//! It lives in `aterm-objc` beside its twin: it reads its subject as TEXT and
-//! shells out to `clang`, so it need not link the `aterm-gui` library.
+//! Verify `aterm-gui`'s AppKit constants (`appkit.rs`) against Apple's SDK headers on both architectures.
 
 #![cfg(target_os = "macos")]
 
@@ -47,17 +14,13 @@ use crate::sdk_consts::{as_c_literal, green_verdict, inverted_verdict, parse_con
 /// derived: some (`NS_MODAL_RESPONSE_OK`, `CG_NULL_WINDOW_ID`, the `|`-composed masks) are not
 /// the camel-case of their Rust spelling, and the masks make the parenthesisation in [`probe`]
 /// load-bearing.
-//
-// `rustfmt::skip` keeps the table's column alignment, checkable by eye against `consts`.
 #[rustfmt::skip]
 const ROWS: &[(&str, &str)] = &[
-    // ---- status item, modifiers, modal ----
     ("NS_VARIABLE_STATUS_ITEM_LENGTH",        "NSVariableStatusItemLength"),
     ("NS_EVENT_MODIFIER_FLAG_SHIFT",          "NSEventModifierFlagShift"),
     ("NS_EVENT_MODIFIER_FLAG_CONTROL",        "NSEventModifierFlagControl"),
     ("NS_EVENT_MODIFIER_FLAG_COMMAND",        "NSEventModifierFlagCommand"),
     ("NS_MODAL_RESPONSE_OK",                  "NSModalResponseOK"),
-    // ---- the tab strip ----
     ("NS_LINE_CAP_STYLE_ROUND",               "NSLineCapStyleRound"),
     ("NS_TEXT_ALIGNMENT_LEFT",                "NSTextAlignmentLeft"),
     ("NS_TEXT_ALIGNMENT_CENTER",              "NSTextAlignmentCenter"),
@@ -82,11 +45,9 @@ const ROWS: &[(&str, &str)] = &[
     ),
     ("NS_WINDOW_TITLE_HIDDEN",                "NSWindowTitleHidden"),
     ("NS_LINE_BREAK_BY_TRUNCATING_TAIL",      "NSLineBreakByTruncatingTail"),
-    // ---- the modal-alert subsystem ----
     ("NS_EVENT_MASK_KEY_DOWN",                "NSEventMaskKeyDown"),
     ("NS_ALERT_FIRST_BUTTON_RETURN",          "NSAlertFirstButtonReturn"),
     ("NS_ALERT_SECOND_BUTTON_RETURN",         "NSAlertSecondButtonReturn"),
-    // ---- the `chrome` introspection reader ----
     ("NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC",     "NSWindowToolbarStyleAutomatic"),
     ("NS_WINDOW_TOOLBAR_STYLE_EXPANDED",      "NSWindowToolbarStyleExpanded"),
     ("NS_WINDOW_TOOLBAR_STYLE_PREFERENCE",    "NSWindowToolbarStylePreference"),
@@ -94,15 +55,12 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_TOOLBAR_DISPLAY_MODE_DEFAULT",       "NSToolbarDisplayModeDefault"),
     ("NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL","NSToolbarDisplayModeIconAndLabel"),
     ("NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY",    "NSToolbarDisplayModeLabelOnly"),
-    // ---- the titlebar snapshot ----
     ("NS_BITMAP_IMAGE_FILE_TYPE_PNG",         "NSBitmapImageFileTypePNG"),
     ("NS_COLOR_RENDERING_INTENT_PERCEPTUAL",  "NSColorRenderingIntentPerceptual"),
-    // ---- the App Nap opt-out (Foundation's, reached through Cocoa.h) ----
     (
         "NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP",
         "NSActivityUserInitiatedAllowingIdleSystemSleep",
     ),
-    // ---- the Developer Tools helper panel ----
     (
         "NS_WINDOW_STYLE_MASK_UTILITY_PANEL",
         "(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow | NSWindowStyleMaskNonactivatingPanel)",
@@ -187,8 +145,6 @@ fn gui_constants() -> Vec<(String, Gate, String)> {
             depth = 0;
         }
         if inside {
-            // Counted before parsing, so the module's own braces take the depth to 1 and
-            // back to 0.
             let opens = trimmed.matches('{').count() as i32;
             let closes = trimmed.matches('}').count() as i32;
             if let Some(g) = arch_gate(line) {
@@ -197,8 +153,6 @@ fn gui_constants() -> Vec<(String, Gate, String)> {
                 out.push((name, gate, value));
                 gate = Gate::Always;
             } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
-                // Any other non-comment line ends a pending gate: an attribute applies to the
-                // item that follows it.
                 gate = Gate::Always;
             }
             depth += opens - closes;
@@ -222,7 +176,6 @@ fn probe(invert: Option<&str>) -> String {
     let mut s = String::from("#import <Cocoa/Cocoa.h>\n#include <TargetConditionals.h>\n");
     let sdk_of: std::collections::HashMap<&str, &str> = ROWS.iter().copied().collect();
     for (rust, gate, value) in gui_constants() {
-        // A constant with no row is the coverage finding, named.
         let sdk = *sdk_of.get(rust.as_str()).unwrap_or_else(|| {
             panic!(
                 "`consts` declares {rust} and ROWS has no SDK spelling for it, so \
@@ -231,8 +184,6 @@ fn probe(invert: Option<&str>) -> String {
         });
         let lit = as_c_literal(&value);
         let lit = if invert == Some(rust.as_str()) {
-            // `+ 1` is arithmetic the compiler must evaluate, and it works for
-            // the one `double` row as well as every integer one.
             format!("(({lit}) + 1)")
         } else {
             format!("({lit})")

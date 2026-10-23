@@ -10,7 +10,6 @@
 
 mod agh_read_contract;
 mod conformance_index_publish;
-mod gh;
 mod group;
 mod identity;
 mod index_plan;
@@ -18,6 +17,7 @@ mod index_publish;
 mod index_render;
 mod mirror;
 mod producer_to_client;
+mod rest;
 mod scratch;
 mod seed;
 mod status;

@@ -737,19 +737,19 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn new(line: &'a str) -> Self {
+    const fn new(line: &'a str) -> Self {
         Self { line, pos: 0 }
     }
 
-    fn pos(&self) -> usize {
+    const fn pos(&self) -> usize {
         self.pos
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.line.len()
     }
 
-    fn done(&self) -> bool {
+    const fn done(&self) -> bool {
         self.pos >= self.line.len()
     }
 
@@ -767,7 +767,7 @@ impl<'a> Cursor<'a> {
         self.nth(0)
     }
 
-    fn bump(&mut self) {
+    const fn bump(&mut self) {
         if self.pos < self.line.len() {
             self.pos += 1;
         }
@@ -813,7 +813,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Jump to the end of the line.
-    fn finish(&mut self) {
+    const fn finish(&mut self) {
         self.pos = self.line.len();
     }
 
@@ -865,12 +865,12 @@ impl LexCache {
         cache
     }
 
-    pub fn language(&self) -> Language {
+    pub const fn language(&self) -> Language {
         self.language
     }
 
     /// How many lines the cache holds.
-    pub fn line_count(&self) -> usize {
+    pub const fn line_count(&self) -> usize {
         self.lines.len()
     }
 

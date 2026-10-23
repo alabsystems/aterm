@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BOUNDED CHILD (`docs/DESIGN-owner-surfaces-2026-10-16.md` §1, §3, §4):
-//! every `aterm …` command the window reads runs as a CHILD — never in this
-//! process, whose descriptor budget the fleet client would spend
-//! (`control.rs`'s `control_connections_cap`) — through [`run_bounded`]:
-//! stdin null, stdout and stderr prefixes read on threads prepared before
-//! the child starts, each capped at [`OUTPUT_CAP`], and a kill requested at
-//! its cap. A bounded read
-//! also refuses streams that have not answered by then; it never joins a
-//! reader still blocked on a descendant's pipe. The Agents rows' and
-//! the menu bar's document tabs (`App::run_cli_plan`), the fleet glance's
-//! reader (`fleet_glance::ChildRunner`) and the Overview's read of the
-//! fabric's log (`overview_fabric::ChildRunner`) are its callers.
-
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -23,8 +10,7 @@ use aterm_uds::spawnfd::Stdio;
 
 /// The most bytes of a child's stdout, and of its stderr, a read keeps.
 pub(crate) const OUTPUT_CAP: u64 = 8 << 20;
-/// A document read's child/output hang detector. `survey` ends itself first
-/// (3 s a fleet peer, `--timeout`); killed-child cleanup has its own reserve.
+/// Timeout for bounded document reads.
 pub(crate) const READ_CAP: Duration = Duration::from_secs(30);
 /// How often [`run_bounded`] looks whether its child has exited.
 const POLL: Duration = Duration::from_millis(20);
@@ -141,13 +127,7 @@ impl Drop for RunningChild {
     }
 }
 
-/// Run `program args` (stdin null, stdout and stderr read), requesting a kill at
-/// `cap` (`None`: a command that must never be cut off midway, such as the
-/// message bus's install, waits for its own end). `Err` says why there is no
-/// answer: a reader or the child did not start, it could not be waited for,
-/// reached the cap, or a stream had not answered by it. Reader setup failure
-/// starts no child. Refusal never joins a blocked reader; an uncut command
-/// still waits for its own end on a post-spawn error or unwind.
+/// Run `program args` with stdin null and stdout/stderr captured, requesting a kill at `cap`.
 pub(crate) fn run_bounded(
     program: &Path,
     args: &[String],
@@ -183,9 +163,6 @@ fn run_with_readers(
         bounded: cap.is_some(),
         running: true,
     };
-    // Hand both pipes over before inspecting either result. Even a reader
-    // that unexpectedly ended must not leave the other live reader waiting
-    // for a pipe while an uncut child's cleanup waits for its natural exit.
     let stdout = stdout.hand_off(owned.child.stdout.take(), "stdout");
     let stderr = stderr.hand_off(owned.child.stderr.take(), "stderr");
     let (stdout, stderr) = (stdout?, stderr?);
@@ -217,8 +194,7 @@ fn run_with_readers(
     })
 }
 
-/// A fence for `text`: one backtick more than its longest run, at least three,
-/// so a command's output that holds a fence of its own stays inside the block.
+/// Return a backtick fence longer than any backtick run in `text` (at least three).
 pub(crate) fn fence(text: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
@@ -239,10 +215,6 @@ mod tests {
     /// the answering child is not killed.
     #[test]
     fn a_bounded_child_is_read_or_killed_at_its_cap() {
-        // Reader capacity is admitted before attempting even the command.
-        // A missing program would fail at spawn instead if setup came late.
-        // The second refusal starts one real idle reader; dropping its input
-        // cancels it, and the scope joins it before any assertion can unwind.
         let scratch = aterm_tempfile::TempDir::new().expect("owned reader setup scratch");
         let absent = scratch.path().join("not-a-program");
         for cap in [Some(Duration::from_secs(60)), None] {
@@ -274,9 +246,6 @@ mod tests {
                 );
             }
         }
-        // An already-reached deadline is a state, not a latency budget.
-        // Ready output is still consumed; an open but unanswered stream is
-        // refused without waiting for its sender to disappear.
         let past = Instant::now();
         let (finished, output) = sync_channel(1);
         finished.send(b"ready".to_vec()).unwrap();

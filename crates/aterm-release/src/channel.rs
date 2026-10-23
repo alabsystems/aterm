@@ -367,7 +367,7 @@ pub fn withdrawable_assets(
     }
 }
 
-/// One field of the head PATCH, typed the way `gh api` sends it.
+/// One field of the head PATCH, typed as its JSON body carries it: a boolean, or a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadPatchValue {
     Bool(bool),
@@ -381,22 +381,18 @@ pub const HEAD_PATCH: [(&str, HeadPatchValue); 3] = [
     ("make_latest", HeadPatchValue::Str("true")),
 ];
 
-/// The `gh` argv that sends [`HEAD_PATCH`] to `endpoint` (`repos/{slug}/releases/{id}`).
+/// The JSON body that sends [`HEAD_PATCH`].
 #[must_use]
-pub fn head_patch_argv(endpoint: &str) -> Vec<String> {
-    let mut argv: Vec<String> = ["api", "--method", "PATCH", endpoint]
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect();
+pub fn head_patch_body() -> aterm_json::Value {
+    let mut body = aterm_json::Map::new();
     for (name, value) in HEAD_PATCH {
-        let (flag, value) = match value {
-            HeadPatchValue::Bool(value) => ("-F", value.to_string()),
-            HeadPatchValue::Str(value) => ("-f", value.to_string()),
+        let value = match value {
+            HeadPatchValue::Bool(value) => aterm_json::Value::Bool(value),
+            HeadPatchValue::Str(value) => aterm_json::Value::String(value.to_string()),
         };
-        argv.push(flag.to_string());
-        argv.push(format!("{name}={value}"));
+        body.insert(name.to_string(), value);
     }
-    argv
+    aterm_json::Value::Object(body)
 }
 
 /// Both halves of putting one cut onto its channel release.

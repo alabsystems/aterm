@@ -7,24 +7,6 @@ mod pins;
 mod quad;
 mod triple;
 
-/// The pack's compressor, the `zstd` CLI on `PATH` as the producer runs it
-/// (`tarwrite::compressor_on_path`), or the calling test ends COULD NOT RUN saying what
-/// removes the need (its `TOOLS` row's remedy): a host without zstd did not run the test,
-/// which is no verdict on the producer (docs/DESIGN-init-system-2026-10-20.md §8, rule 5).
-///
-/// # Panics
-///
-/// Without it: that is the COULD NOT RUN.
-#[track_caller]
-pub fn need_compressor() {
-    if let Err(why) = atpkg_publish::artifact::tarwrite::compressor_on_path() {
-        aterm_uds::host::could_not_run(format!(
-            "{why}: {}",
-            aterm_uds::host::tool("zstd").remedy()
-        ));
-    }
-}
-
 /// A scratch directory removed on drop.
 pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
     aterm_tempfile::Builder::new()
@@ -39,13 +21,7 @@ enum Node {
     File { bytes: Vec<u8>, mode: u32 },
 }
 
-/// A directory tree held in memory — each directory, and each file's bytes and mode, by its
-/// path under the root — so a fixture whose making costs processes (a git repository) is
-/// made once per process and laid down per test.
-///
-/// It remembers the root it was read from: a made tree can name it (git writes a clone's
-/// source path into the clone's config, reflogs and `FETCH_HEAD`), and [`Tree::lay`] moves
-/// that name to the root it lays the tree at.
+/// An in-memory directory tree snapshot that rewrites its source root path when laid down.
 pub struct Tree {
     root: Vec<u8>,
     nodes: Vec<(std::path::PathBuf, Node)>,
@@ -65,9 +41,6 @@ impl Tree {
                 let e = e.expect("a fixture entry");
                 let rel = rel.join(e.file_name());
                 let meta = e.metadata().expect("stat a fixture entry");
-                // `metadata` here does not follow a link. Read as a file, a link would be laid
-                // down as a copy of what it names (a world unlike the one made), and a fifo
-                // would hang the read.
                 assert!(
                     meta.is_dir() || meta.is_file(),
                     "{} is neither a file nor a directory: a made fixture holds only those",
@@ -92,8 +65,7 @@ impl Tree {
         tree
     }
 
-    /// The tree under `root`, each file's mention of the root it was read from moved to
-    /// `root`.
+    /// Writes the tree under `root`, rewriting mentions of the source root path to `root`.
     ///
     /// # Panics
     ///
@@ -138,9 +110,7 @@ fn moved<'a>(bytes: &'a [u8], from: &[u8], to: &[u8]) -> std::borrow::Cow<'a, [u
 pub type Made<K, T> =
     std::sync::Mutex<std::collections::BTreeMap<K, std::sync::Arc<std::sync::OnceLock<(Tree, T)>>>>;
 
-/// What `make` leaves in `dir` (which must hold nothing yet), made once per process for each
-/// `key` — by the first caller, in its own `dir` — and laid down at `dir` for every caller
-/// after; with what `make` returned.
+/// Runs `make` once per process for `key` and lays the resulting tree into `dir`.
 ///
 /// # Panics
 ///

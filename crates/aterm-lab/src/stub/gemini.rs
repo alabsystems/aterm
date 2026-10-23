@@ -410,7 +410,46 @@ pub const DAY_QUOTA_RETRY: i64 = 3600;
 /// The claim of `limit:CLAIM:RESET` whose Gemini API answer is a Google ACCOUNT's spent usage.
 pub const ACCOUNT_CLAIM: &str = "code_assist";
 
-/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server (`cloudcode-pa.googleapis.com`.
+/// The claim of `limit:CLAIM:RESET` that walls a Google ACCOUNT's PRO
+/// bucket under Gemini CLI's Auto model: the turn answered as
+/// [`ACCOUNT_CLAIM`]'s ([`exhausted_error`]), and while it stands each
+/// structured side request routed to the Pro model ([`route_pro`]), so the
+/// turn meets the wall on a Pro model with a flash model to fall back to and
+/// Gemini CLI 0.46.0 draws the per-model bucket's dialog (`Switch to
+/// <fallback>` over `Stop`). On a model a `--model` named, or on the flash
+/// model, the failed model is its own fallback and the CLI draws the
+/// account's `Keep trying` instead.
+pub const BUCKET_CLAIM: &str = "code_assist_pro";
+
+/// A structured side request's answer `filled` ([`schema_fill`]) routed to
+/// the Pro model: Gemini CLI's numerical router reads `complexity_score`
+/// against its threshold (at most 100), its classifier `model_choice`
+/// (`pro`, the bundle's `PRO_MODEL`); any other answer is left as it is.
+#[must_use]
+pub fn route_pro(filled: J) -> J {
+    match filled {
+        J::Obj(props) => J::Obj(
+            props
+                .into_iter()
+                .map(|(k, v)| match k.as_str() {
+                    "complexity_score" => (k, J::Int(100)),
+                    "model_choice" => (k, J::s("pro")),
+                    _ => (k, v),
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Whether stub mode `mode` routes the side requests to the Pro model now
+/// (`now_s`): a [`BUCKET_CLAIM`] wall not yet reset.
+#[must_use]
+pub fn routes_pro(mode: &str, now_s: i64) -> bool {
+    limit_params(mode).is_some_and(|(claim, reset, _)| claim == BUCKET_CLAIM && now_s < reset)
+}
+
+/// The 429 `RESOURCE_EXHAUSTED` Google's Code Assist server answers once the ACCOUNT's usage limit on `model` is spent.
 #[must_use]
 pub fn exhausted_error(model: &str, retry_secs: i64, reset_s: i64) -> J {
     let secs = retry_secs.max(0);
@@ -749,7 +788,13 @@ impl Stub {
         let t = (method, path, blen, mode, model, verb, in_tok);
         if kind != "gemini" {
             let answer = if kind == "gemini-json" {
-                schema_fill(info.schema.as_ref().unwrap_or(&J::Obj(Vec::new())), None).dump(COMPACT)
+                let filled = schema_fill(info.schema.as_ref().unwrap_or(&J::Obj(Vec::new())), None);
+                if routes_pro(mode, crate::util::now_secs()) {
+                    summary.push_str(" routed:pro");
+                    route_pro(filled).dump(COMPACT)
+                } else {
+                    filled.dump(COMPACT)
+                }
             } else {
                 "Lab stub session".to_string()
             };
@@ -853,7 +898,7 @@ impl Stub {
             };
             let now_s = crate::util::now_secs();
             if now_s < reset {
-                let body = if claim == ACCOUNT_CLAIM {
+                let body = if claim == ACCOUNT_CLAIM || claim == BUCKET_CLAIM {
                     exhausted_error(model, reset - now_s, reset)
                 } else {
                     quota_error(model, reset - now_s)

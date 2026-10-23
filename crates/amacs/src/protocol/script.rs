@@ -180,7 +180,7 @@ pub struct LineMap {
 impl LineMap {
     /// The map at `base` with nothing changed since.
     #[must_use]
-    pub fn new(base: u64) -> Self {
+    pub const fn new(base: u64) -> Self {
         Self {
             base,
             reaches: true,
@@ -190,7 +190,7 @@ impl LineMap {
 
     /// The map of a `base` the history no longer reaches.
     #[must_use]
-    pub fn unreachable(base: u64) -> Self {
+    pub const fn unreachable(base: u64) -> Self {
         Self {
             base,
             reaches: false,
@@ -205,13 +205,13 @@ impl LineMap {
 
     /// The sequence the script's anchors were read at.
     #[must_use]
-    pub fn base(&self) -> u64 {
+    pub const fn base(&self) -> u64 {
         self.base
     }
 
     /// Whether the history still reaches `base`.
     #[must_use]
-    pub fn reaches_base(&self) -> bool {
+    pub const fn reaches_base(&self) -> bool {
         self.reaches
     }
 
@@ -237,7 +237,7 @@ impl LineMap {
 }
 
 /// Where line `line` lands after `change`, when the change left it alone.
-fn shift_line(line: usize, change: &LineChange) -> usize {
+const fn shift_line(line: usize, change: &LineChange) -> usize {
     if line < change.at {
         line
     } else {

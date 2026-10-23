@@ -3,8 +3,8 @@
 // Author: Andrew Yates
 
 //! [`AghHost`]: the release host over agh (docs/DESIGN-agh-2026-10-19.md §10.3). M1 is the
-//! read half, used by tests only; production keeps `GhCli` until M2 swaps both halves in
-//! one commit.
+//! read half, used by tests only; production runs `RestHost` (init-system S15) until M2
+//! swaps both halves in one commit.
 //!
 //! Three rules hold for every operation:
 //! * a host serves one owner: a slug of another owner is refused before anything is sent,
@@ -38,14 +38,14 @@ pub struct AghHost {
 }
 
 impl AghHost {
-    /// A host over `github` for `home`, pausing `super::gh::RETRY_PAUSE` (5 s) between
-    /// unanswered attempts, as `GhCli` does.
+    /// A host over `github` for `home`, pausing `super::RETRY_PAUSE` (5 s) between
+    /// unanswered attempts, as `RestHost` does.
     #[must_use]
     pub fn new(github: agh::Github, home: agh::Slug) -> AghHost {
         AghHost {
             github,
             home,
-            retry_pause: super::gh::RETRY_PAUSE,
+            retry_pause: super::RETRY_PAUSE,
             #[cfg(any(test, debug_assertions))]
             warned: std::sync::Mutex::new(Vec::new()),
         }
@@ -333,7 +333,7 @@ impl ReleaseHost for AghHost {
             Ok(s) => self.fetch_public_own(&s, tag, asset, dest, cap),
             Err(why) => Probe::Unknown(why),
         };
-        // As the trait says and GhCli does: `dest` holds a file only when it is present (a
+        // As the trait says and RestHost does: `dest` holds a file only when it is present (a
         // file an earlier call left, or one renamed into place before a later step failed),
         // whichever answer it is, another owner's refusal among them.
         if answer != Probe::Present {

@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The quit the system asked for: a logout, a restart or a shutdown, after which the agents
-//! aterm hosted relaunch at the next start. A crash leaves the crash journal, which carries
-//! the agents ([`crate::crash_journal`]); a system quit takes the ordinary path, whose
-//! manifest carries no agent — right for a person's own ⌘Q, wrong here. macOS names the
-//! reason in its quit Apple Event's `kAEQuitReason`, read where AppKit asks
-//! `applicationShouldTerminate:` (`menu::terminate_is_the_systems`) and noted here; the
-//! graceful exit then fills the agents in ([`crate::restore::RestoreManifest::fill_agents`]).
-//!
-//! The mark is the generation of the `terminate:` it came with (`menu`'s arbiter mints it),
-//! and every cancel of that generation forgets it (`menu::cancel_native_termination`,
-//! `menu::cancel_current_native_termination`), so a cancelled system quit never marks a
-//! later quit as the system's.
-//!
-//! THE WINDOW SYSTEM GOING AWAY IS ONE TOO (COMPOSITOR-GONE, the Linux lane,
-//! 2026-10-16). When the display connection fails under a running window (a
-//! Wayland compositor or an X server that crashed or restarted), the event
-//! loop ends with [`EventLoopError::DisplayLost`], and the run ends the way a
-//! logout ends it: the ordinary quit, its manifest keeping the agents
-//! ([`note_event_loop_failed`]), then exit status
-//! [`EXIT_WINDOW_SYSTEM_GONE`]. Nothing cancels it: there is no window left to
-//! answer a Cancel in.
-//!
-//! ONLY THAT IS A LOGOUT (GONE-2, 2026-10-17). Any other error the event loop
-//! ends with (a protocol error, a connection the client library closed, a
-//! failed `poll`) is said as itself and exits [`EXIT_EVENT_LOOP_FAILED`]
-//! ([`failed_loop_end`]); the person did not choose it either, so its quit
-//! keeps the agents too. A person's own quit ends the loop without an error
-//! and exits 0.
+//! System-requested quit tracking (logout, restart, shutdown, or lost window system).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -179,8 +152,6 @@ mod tests {
         assert_ne!(person, logout);
         assert!(!asked(), "the person's quit reads as the system's");
 
-        // The system asks again while the person's quit is pending: the pending
-        // quit is now the system's too, and its cancel forgets that.
         assert_eq!(
             admit_native_terminate(true),
             NativeTerminateDecision::DeferExisting(person)
@@ -192,7 +163,6 @@ mod tests {
         assert!(crate::menu::cancel_current_native_termination());
         assert!(!asked());
 
-        // A cancel of some other generation leaves a live mark alone.
         note(person + 100);
         forget(person);
         assert!(asked_for(person + 100));
@@ -240,7 +210,6 @@ mod tests {
         );
         for other in [
             EventLoopError::ExitFailure(1),
-            // Linux's `EPROTO`, a protocol error's errno.
             EventLoopError::ExitFailure(71),
             EventLoopError::RecreationAttempt,
         ] {

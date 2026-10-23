@@ -2,32 +2,28 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The routes: one function per GitHub route, and the rules every answer of an origin keeps
-//! (the credential, the rate headers, ETags, the request id, the faults and the violations).
+//! Fake GitHub route handlers, credential and rate headers, ETags, and fault injection.
 
 use std::time::Duration;
 
 use aterm_json::{Value, json};
 
 use crate::state::{File, Latest, Release, Repo, State};
-use crate::{CompareSpec, DigestSpec, FakeOrigin, Fault, Seen};
+use crate::{CompareSpec, DigestSpec, FakeOrigin, Fault, ReleaseSpec, Seen};
 
 /// GitHub's documentation link, on every error body.
 const DOCS: &str = "https://docs.github.com/rest";
 /// The reset every rate header names.
 const RESET: u64 = 1_760_003_600;
-/// The JSON media type the fake answers with.
+/// JSON media type used in fake responses.
 const JSON: &str = "application/json; charset=utf-8";
 /// The bytes media type.
 const OCTET: &str = "application/octet-stream";
-/// What GitHub labels a file's bytes under `Accept` raw, whatever the bytes are (measured on
-/// the live api: the fixture tape `cat-readme`).
+/// Media type returned by GitHub for raw file contents.
 const RAW_FILE: &str = "application/vnd.github.raw+json; charset=utf-8";
 /// GitHub's page size when a request names none.
 const DEFAULT_PER_PAGE: usize = 30;
-/// The releases listing's result cap: a page starting past item 1000 answers 422, though the
-/// page before it carries a next link (measured on the live api, a repository of 1527
-/// releases at `per_page=1&page=1001`).
+/// The releases listing's result cap.
 const RELEASES_RESULT_CAP: usize = 1000;
 
 /// One answer: status, headers and body.
@@ -84,8 +80,7 @@ impl Answer {
         crate::header_in(&self.headers, name)
     }
 
-    /// Header `name` set to `value`, unless the answer already names it (a fault's own
-    /// header wins over the fake's).
+    /// Sets header `name` to `value` unless already present.
     fn or_header(&mut self, name: &str, value: String) {
         if self.header(name).is_none() {
             self.headers.push((name.into(), value));
@@ -115,10 +110,12 @@ pub(crate) struct Request {
     pub(crate) target: String,
     /// Every header, the credential included.
     pub(crate) headers: Vec<(String, String)>,
+    /// The body as read (`Content-Length` of it, at most the server's bound; empty when
+    /// chunked or after a malformed head).
+    pub(crate) body: Vec<u8>,
     /// Whether the body was chunked.
     pub(crate) chunked: bool,
-    /// Whether the head could not be parsed (no target, a header line without `:`, cut
-    /// short, or too long).
+    /// Whether the request head was malformed.
     pub(crate) malformed: bool,
 }
 
@@ -163,9 +160,7 @@ impl Request {
         self.method == "GET"
     }
 
-    /// The credential's token: the header split once at a space, under the scheme `Bearer`
-    /// or `token`, spelled exactly so, and the rest taken as sent. `None` with no header;
-    /// `Some("")` under any other scheme.
+    /// The credential's token.
     fn token(&self) -> Option<String> {
         let value = self.header(CREDENTIAL)?;
         let (scheme, token) = value.split_once(' ').unwrap_or((value, ""));
@@ -181,10 +176,7 @@ impl Request {
 /// The credential header's name.
 pub(crate) const CREDENTIAL: &str = "authorization";
 
-/// Whether header `name: value` carries a credential at `origin`. The credential header does
-/// everywhere. At the web and CDN origins, where the hop carries no credential of any kind
-/// (design §11.4), so do `Proxy-Authorization`, `Cookie` and any header whose value holds a
-/// token `add_token` registered.
+/// Whether header `name: value` carries a credential at `origin`.
 fn is_credential(state: &State, origin: FakeOrigin, name: &str, value: &str) -> bool {
     if name.eq_ignore_ascii_case(CREDENTIAL) {
         return true;
@@ -208,8 +200,7 @@ fn credentials(state: &State, req: &Request) -> usize {
         .count()
 }
 
-/// Whether the request target (path or query) holds a token `add_token` registered. No
-/// origin takes a credential in its URL, so this is a breach at every one.
+/// Whether the request target (path or query) holds a token `add_token` registered.
 fn target_credential(state: &State, req: &Request) -> bool {
     state
         .tokens
@@ -217,8 +208,7 @@ fn target_credential(state: &State, req: &Request) -> bool {
         .any(|(t, _)| !t.is_empty() && req.target.contains(t.as_str()))
 }
 
-/// Whether the request carries more than one credential header (only the first would be
-/// read, so a second token would pass unseen).
+/// Whether the request carries more than one credential header.
 fn doubled_credential(req: &Request) -> bool {
     req.headers
         .iter()
@@ -230,8 +220,7 @@ fn doubled_credential(req: &Request) -> bool {
 /// What stands in for a registered token in a logged target or a violation text.
 const TOKEN_SHOWN: &str = "<token>";
 
-/// The request target with every registered token replaced by `TOKEN_SHOWN`, longest first,
-/// so neither `seen()` nor `violations()` repeats a credential.
+/// The request target with every registered token replaced by `TOKEN_SHOWN`, longest first.
 fn shown_target(state: &State, req: &Request) -> String {
     let mut tokens: Vec<&str> = state
         .tokens
@@ -260,8 +249,7 @@ fn origin_name(origin: FakeOrigin) -> &'static str {
     }
 }
 
-/// Record every wire rule this request breaks. Each text names the target with every
-/// registered token in it replaced (`shown_target`).
+/// Record every wire rule this request breaks.
 fn violations(state: &mut State, req: &Request) {
     let m = &req.method;
     let path = shown_target(state, req);
@@ -269,8 +257,6 @@ fn violations(state: &mut State, req: &Request) {
     let o = origin_name(req.origin);
     let mut found = Vec::new();
     if req.malformed {
-        // Its headers were read only as far as the head could be, so the rules about headers
-        // would judge a head nobody sent whole: the one line is the malformed head's.
         state
             .violations
             .push(format!("malformed request head: {m} {path}"));
@@ -318,8 +304,7 @@ fn violations(state: &mut State, req: &Request) {
     state.violations.extend(found);
 }
 
-/// Log, judge and answer one request. The answer is decided, and every change it triggers
-/// applied, under the one lock; the server writes it after.
+/// Log, judge and answer one request.
 pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
     state.requests += 1;
     let n = state.requests;
@@ -332,7 +317,6 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
         .cloned()
         .collect();
     let foreign = matches!(req.origin, FakeOrigin::Web | FakeOrigin::Cdn);
-    // At the web and CDN origins any credential counts, a token in the target among them.
     let credentialed =
         headers.len() < req.headers.len() || (foreign && target_credential(state, req));
     state.seen.push(Seen {
@@ -377,15 +361,13 @@ pub(crate) fn handle(state: &mut State, req: &Request) -> Outcome {
     } else {
         Outcome::Answer(answer(state, req, &ctx))
     };
-    // A request a `Close` or a `Hang` meets gets no answer, so it does not count for `after`
-    // (its rate is charged all the same, in `faulted`).
     if matches!(outcome, Outcome::Answer(_) | Outcome::Truncate(..)) {
         state.count_answered(req.origin, &req.method, &req.target);
     }
     outcome
 }
 
-/// Who asks, and which request this is.
+/// Caller identity and request metadata.
 struct Ctx {
     /// The token, when it is a known one.
     token: Option<String>,
@@ -420,7 +402,6 @@ fn faulted(state: &mut State, req: &Request, ctx: &Ctx, fault: Fault) -> Outcome
             }
             Outcome::Answer(finish(state, req, ctx, a))
         }
-        // No answer goes back, but the request reached the api origin and uses up rate.
         Fault::Close => {
             charge(state, req, ctx, None);
             Outcome::Close
@@ -456,8 +437,6 @@ fn faulted(state: &mut State, req: &Request, ctx: &Ctx, fault: Fault) -> Outcome
             Outcome::Answer(a)
         }
         Fault::SecondHop => {
-            // `finish` adds nothing on the CDN, where the fault is meant to fire; off-label on
-            // the api origin, the 302 keeps that origin's request id and rate like any answer.
             let cdn = state.ports.cdn;
             let a = Answer::redirect(302, format!("http://127.0.0.1:{cdn}{}", req.target));
             Outcome::Answer(finish(state, req, ctx, a))
@@ -467,7 +446,6 @@ fn faulted(state: &mut State, req: &Request, ctx: &Ctx, fault: Fault) -> Outcome
 
 /// The repository a path names, by `/repos/{o}/{r}` or `/repositories/{id}`.
 fn repo_of_path(state: &State, path: &str) -> Option<usize> {
-    // The segments the router matches (empty ones dropped), decoded as `api` decodes them.
     match segments(path).as_slice() {
         ["repos", o, r, ..] => state.repo_index(&format!(
             "{}/{}",
@@ -479,19 +457,19 @@ fn repo_of_path(state: &State, path: &str) -> Option<usize> {
     }
 }
 
-/// The answer the origin gives with no fault, its origin's rules applied. An api request
-/// the rate charges, made once its limit is used up, is refused as GitHub refuses it: 403
-/// `API rate limit exceeded.` with the exhausted rate's headers.
+/// The answer the origin gives with no fault, its origin's rules applied.
 fn answer(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     match req.origin {
         FakeOrigin::Api | FakeOrigin::Uploads => {
             let a = if req.header(CREDENTIAL).is_some() && ctx.login.is_none() {
                 Answer::error(401, "Bad credentials")
             } else {
-                let a = if req.origin == FakeOrigin::Uploads || !req.is_read() {
-                    Answer::not_found()
-                } else {
+                let a = if req.origin == FakeOrigin::Uploads {
+                    upload(state, req, ctx)
+                } else if req.is_read() {
                     etag(req, api(state, req, ctx))
+                } else {
+                    write(state, req, ctx)
                 };
                 if over_limit(state, req, ctx, a.status) {
                     let refused = Answer::error(403, "API rate limit exceeded.");
@@ -506,8 +484,7 @@ fn answer(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     }
 }
 
-/// Whether `req`, answered `status`, goes past its rate's limit: an api request the rate
-/// charges, when the count it draws on has reached the limit already.
+/// Whether `req`, answered `status`, goes past its rate's limit.
 fn over_limit(state: &State, req: &Request, ctx: &Ctx, status: u16) -> bool {
     if req.origin != FakeOrigin::Api || is_free(req, ctx, Some(status)) {
         return false;
@@ -553,10 +530,7 @@ fn finish(state: &mut State, req: &Request, ctx: &Ctx, a: Answer) -> Answer {
     finish_with(state, req, ctx, a, None)
 }
 
-/// As `finish`, with the rate exhausted until `exhausted` when given. An exhausted rate's
-/// headers go on an answer of any origin, since they are what `Fault::PrimaryExhausted` is;
-/// only the api origin counts the request. A header the answer already names (a fault's own)
-/// is kept, and the fake's of that name left out.
+/// As `finish`, with the rate exhausted until `exhausted` when given.
 fn finish_with(
     state: &mut State,
     req: &Request,
@@ -587,8 +561,7 @@ fn finish_with(
     a
 }
 
-/// The rate resource a request draws on: `search` for `/search/…`, `core` otherwise, read
-/// from the segments the router matches.
+/// Rate-limit resource bucket for a request.
 fn resource_of(req: &Request) -> &'static str {
     if segments(req.path()).first() == Some(&"search") {
         "search"
@@ -597,15 +570,12 @@ fn resource_of(req: &Request) -> &'static str {
     }
 }
 
-/// Whether the rate leaves `req` uncharged: `/rate_limit` (as the router matches it), and an
-/// authenticated 304.
+/// Whether the rate leaves `req` uncharged.
 fn is_free(req: &Request, ctx: &Ctx, status: Option<u16>) -> bool {
     segments(req.path()) == ["rate_limit"] || (ctx.token.is_some() && status == Some(304))
 }
 
-/// Use up one of the rate's requests for `req` on the api origin, and answer the count used
-/// since (`None` off the api origin). `/rate_limit` and an authenticated 304 are free; an
-/// unanswered request (`status` `None`, a `Close` or a `Hang`) is charged like any other.
+/// Use up one of the rate's requests for `req` on the api origin.
 fn charge(state: &mut State, req: &Request, ctx: &Ctx, status: Option<u16>) -> Option<u64> {
     if req.origin != FakeOrigin::Api {
         return None;
@@ -645,9 +615,7 @@ fn joined(segs: &[&str]) -> String {
         .join("/")
 }
 
-/// `text` as one RFC 3986 path segment, as GitHub writes a tag or an asset name into a URL:
-/// every byte outside the unreserved set (`A-Z a-z 0-9 - . _ ~`) as uppercase `%XX`, so a
-/// tag's `/` is `%2F`.
+/// `text` as one RFC 3986 path segment, as GitHub writes a tag or an asset name into a URL.
 fn segment(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
@@ -722,9 +690,7 @@ fn owner_by_id(state: &State, id: &str) -> Option<u64> {
     state.owners.iter().any(|o| o.id == id).then_some(id)
 }
 
-/// The 301 a renamed repository's old name answers, or a 404. The `Location` keeps the rest
-/// of the target: the sub-path `rest` the router matched (its empty segments dropped, as
-/// the route was taken) and the query as sent.
+/// The 301 a renamed repository's old name answers, or a 404.
 fn moved(state: &State, req: &Request, ctx: &Ctx, slug: &str, rest: &[&str]) -> Answer {
     let Some(id) = state
         .renames
@@ -819,8 +785,7 @@ fn repo_json(state: &State, repo: &Repo, login: Option<&str>) -> Value {
     value
 }
 
-/// One page of a list of `total` items, as the request's `per_page` (default 30, at most
-/// 100) and `page` (from 1) name it.
+/// Computes the slice bounds for one page of `total` items.
 struct Paging {
     /// Items per page.
     per_page: usize,
@@ -859,8 +824,7 @@ impl Paging {
             .collect()
     }
 
-    /// The `Link` header's value pointing at `base` (an absolute URL without a query),
-    /// carrying the request's other parameters as sent; `None` on a list of one page.
+    /// Formats the pagination `Link` header for `base`, or `None` for a single page.
     fn link(&self, req: &Request, base: &str) -> Option<String> {
         let (per_page, number, last) = (self.per_page, self.number, self.last);
         let kept: String = req
@@ -887,8 +851,7 @@ impl Paging {
     }
 }
 
-/// A list's page: the items of `page` and the `Link` header pointing at `base` (an absolute
-/// URL without a query), carrying the request's other parameters as sent.
+/// Returns the items for `page` and the optional pagination `Link` header.
 fn page(req: &Request, items: Vec<Value>, base: &str) -> Answer {
     let paging = Paging::of(req, items.len());
     let mut a = Answer::json(200, &Value::Array(paging.take(items)));
@@ -937,7 +900,6 @@ fn user_repos(state: &State, req: &Request, ctx: &Ctx) -> Answer {
             (owner && r.owner.eq_ignore_ascii_case(login))
                 || (collaborator && r.is_member(Some(login)))
         })
-        // The one visibility rule the repository routes keep (`Hide` included).
         .filter(|r| r.visible_to(Some(login)))
         .filter(|r| match visibility.as_str() {
             "public" => !r.spec.private,
@@ -950,8 +912,7 @@ fn user_repos(state: &State, req: &Request, ctx: &Ctx) -> Answer {
     page(req, items, &format!("http://127.0.0.1:{api}/user/repos"))
 }
 
-/// `/orgs/{o}/repos` (an Organization's, every one the caller sees, by `type`) and
-/// `/users/{u}/repos` (an owner's public ones), with GitHub's numeric next links.
+/// Handles `/orgs/{o}/repos` and `/users/{u}/repos` with pagination links.
 fn owner_repos(state: &State, req: &Request, ctx: &Ctx, id: u64, org: bool) -> Answer {
     let Some(owner) = state.owners.iter().find(|o| o.id == id) else {
         return Answer::not_found();
@@ -1087,8 +1048,7 @@ fn tags(state: &State, req: &Request, repo: &Repo) -> Answer {
     )
 }
 
-/// A page of ref entries, which `entry` builds from each name and its `{sha, url}` commit,
-/// with the `/repos/{o}/{r}/{kind}` next link.
+/// A page of ref entries.
 fn ref_page<'r>(
     state: &State,
     req: &Request,
@@ -1122,8 +1082,7 @@ fn published<'s>(state: &'s State, repo: &Repo) -> Vec<&'s Release> {
         .collect()
 }
 
-/// `/releases`: newest first by `(created_at, id)`, drafts only to a push login, with the
-/// numeric next link; a page past [`RELEASES_RESULT_CAP`] is GitHub's 422.
+/// Handles `/releases` ordered newest first up to [`RELEASES_RESULT_CAP`].
 fn releases(state: &State, req: &Request, ctx: &Ctx, repo: &Repo) -> Answer {
     let push = repo.is_push(ctx.login());
     let mut list: Vec<&Release> = state
@@ -1258,8 +1217,7 @@ fn release_json(state: &State, repo: &Repo, release: &Release) -> Value {
     })
 }
 
-/// `/releases/assets/{id}`: the object under JSON, a 302 to the CDN under
-/// `application/octet-stream`.
+/// `/releases/assets/{id}`.
 fn asset(state: &State, req: &Request, ctx: &Ctx, repo: &Repo, id: &str) -> Answer {
     let Ok(id) = id.parse::<u64>() else {
         return Answer::not_found();
@@ -1303,7 +1261,7 @@ fn dir_sha(reference: &str, path: &str) -> String {
     hex
 }
 
-/// Base64 broken every 60 characters with `\n`, as GitHub's contents answers are.
+/// Encodes `bytes` as base64 wrapped every 60 characters with newlines.
 fn wrapped_base64(bytes: &[u8]) -> String {
     let flat = aterm_codec::base64::encode(bytes).unwrap_or_default();
     let mut out = String::with_capacity(flat.len() + flat.len() / 60 + 1);
@@ -1328,8 +1286,6 @@ fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
     let full = repo.full_name();
     let path = path.trim_matches('/');
     let raw = req.header("accept").is_some_and(|a| a.contains(".raw"));
-    // Each `/`-separated part of the path, and the ref, as one encoded segment, so a space,
-    // a `#`, a `?` or a `%` in either keeps the URL naming this entry.
     let encoded = |p: &str| p.split('/').map(segment).collect::<Vec<_>>().join("/");
     let (query_ref, path_ref) = (segment(&reference), encoded(&reference));
     let entry_url = |p: &str| {
@@ -1338,8 +1294,6 @@ fn contents(state: &State, req: &Request, repo: &Repo, path: &str) -> Answer {
             encoded(p)
         )
     };
-    // GitHub's raw form, on the web origin. The fake does not serve it (the web origin serves
-    // release downloads only): agh reads a file's bytes through `Accept` raw on the api.
     let download = |p: &str| {
         format!(
             "http://127.0.0.1:{web}/{full}/raw/{path_ref}/{}",
@@ -1415,12 +1369,9 @@ fn tree(state: &State, req: &Request, repo: &Repo, reference: &str) -> Answer {
     if !repo.knows(reference) {
         return Answer::not_found();
     }
-    // As GitHub's: any value, `0` and `false` included, recurses; only leaving the parameter
-    // out does not.
     let recursive = req.query("recursive").is_some();
     let api = state.ports.api;
     let full = repo.full_name();
-    // Every sha is the commit's, whichever name the ref was read by.
     let resolved = repo.resolve(reference);
     let mut entries: Vec<(String, Option<&File>)> = Vec::new();
     for file in repo.files_at(reference) {
@@ -1525,11 +1476,7 @@ const COMPARE_COMMITS: usize = 250;
 /// GitHub's cap on a comparison's files.
 const COMPARE_FILES: usize = 300;
 
-/// `/compare/{base}...{head}`: what `set_compare` said, with the commits after the merge base
-/// up to head (oldest first) where the history holds them. As GitHub's: with neither `page`
-/// nor `per_page`, the last 250 commits, so the list ends at head; with either, that page of
-/// them and a `Link` to `/repos/{o}/{r}/compare/{range as sent}`. `files` (at most 300) is
-/// the whole comparison's, on page 1 only.
+/// `/compare/{base}...{head}`.
 fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer {
     let range = aterm_codec::pct::decode(raw_range);
     let Some((base, head)) = range.split_once("...") else {
@@ -1604,13 +1551,10 @@ fn compare(state: &State, req: &Request, repo: &Repo, raw_range: &str) -> Answer
     a
 }
 
-/// The web origin: `/{o}/{r}/releases/download/{tag}/{name}` → 302 to the CDN for a published
-/// release of a public repository.
+/// The web origin.
 fn web(state: &State, req: &Request) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);
-    // The tag may come encoded as one segment (`pkg%2Fv1`) or spread over several, as
-    // `/releases/tags/` reads it.
     let ["releases", "download", tag @ .., name] = segs.get(2..).unwrap_or(&[]) else {
         return Answer::text(404, "Not Found");
     };
@@ -1666,5 +1610,360 @@ fn cdn(state: &mut State, req: &Request) -> Answer {
             }
         }
         None => Answer::text(404, "Not Found"),
+    }
+}
+
+// --- writes ------------------------------------------------------------------------------
+
+/// GitHub's 422 for one field: `Validation Failed` and the one error naming it.
+fn invalid(resource: &str, field: &str, code: &str) -> Answer {
+    Answer::json(
+        422,
+        &json!({
+            "message": "Validation Failed",
+            "errors": [{"resource": resource, "code": code, "field": field}],
+            "documentation_url": DOCS,
+            "status": "422",
+        }),
+    )
+}
+
+/// Why `login` may not write to `repo`, if it may not: anonymous is 401, a repository it
+/// cannot see is the 404 everything hidden answers, and one it sees without push is 403.
+fn unwritable(repo: &Repo, ctx: &Ctx) -> Option<Answer> {
+    if ctx.login().is_none() {
+        Some(Answer::error(401, "Requires authentication"))
+    } else if !repo.visible_to(ctx.login()) {
+        Some(Answer::not_found())
+    } else if !repo.is_push(ctx.login()) {
+        Some(Answer::error(
+            403,
+            "Resource not accessible by personal access token",
+        ))
+    } else {
+        None
+    }
+}
+
+/// A boolean field of a JSON request: absent is `None`; a value of another type is `Err`.
+fn flag(body: &Value, name: &str) -> Result<Option<bool>, ()> {
+    match body.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(()),
+    }
+}
+
+/// A string field of a JSON request: absent is `None`; a value of another type is `Err`.
+fn text_field(body: &Value, name: &str) -> Result<Option<String>, ()> {
+    match body.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(()),
+    }
+}
+
+/// The api origin's writes: create (`POST /repos/{o}/{r}/releases`), edit (`PATCH
+/// …/releases/{id}`) and delete (`DELETE …/releases/{id}`) a release, and rename (`PATCH
+/// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset. Each needs
+/// a push login on a repository it can see (`unwritable`).
+fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
+    let path = req.path().to_string();
+    let segs = segments(&path);
+    let ["repos", o, r, rest @ ..] = segs.as_slice() else {
+        return Answer::not_found();
+    };
+    let slug = format!(
+        "{}/{}",
+        aterm_codec::pct::decode(o),
+        aterm_codec::pct::decode(r)
+    );
+    let Some(index) = state.repo_index(&slug) else {
+        return Answer::not_found();
+    };
+    if let Some(refused) = unwritable(&state.repos[index], ctx) {
+        return refused;
+    }
+    match (req.method.as_str(), rest) {
+        ("POST", ["releases"]) => create_release(state, req, index),
+        ("PATCH", ["releases", id]) => match release_of(state, index, id) {
+            Some(at) => edit_release(state, req, index, at),
+            None => Answer::not_found(),
+        },
+        ("PATCH", ["releases", "assets", id]) => edit_asset(state, req, index, id),
+        ("DELETE", ["releases", "assets", id]) => delete_asset(state, index, id),
+        ("DELETE", ["releases", id]) => match release_of(state, index, id) {
+            Some(at) => {
+                state.releases.remove(at);
+                Answer {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }
+            }
+            None => Answer::not_found(),
+        },
+        _ => Answer::not_found(),
+    }
+}
+
+/// The index in `state.releases` of release `id` of repository `index`.
+fn release_of(state: &State, index: usize, id: &str) -> Option<usize> {
+    let repo = state.repos[index].id;
+    let id = id.parse::<u64>().ok()?;
+    state
+        .releases
+        .iter()
+        .position(|r| r.id == id && r.repo == repo)
+}
+
+/// Whether repository `repo` holds a published release of `tag` other than `except`.
+fn published_tag(state: &State, repo: u64, tag: &str, except: Option<u64>) -> bool {
+    state
+        .releases
+        .iter()
+        .any(|r| r.repo == repo && r.spec.tag == tag && !r.spec.draft && Some(r.id) != except)
+}
+
+/// What `make_latest` does once release `id` of repository `index` is written: `"true"` makes
+/// a published non-prerelease the latest; `"false"` keeps the latest where it is (an
+/// automatic one is pinned to what it names now, so this release cannot take it).
+fn apply_make_latest(state: &mut State, index: usize, id: u64, make_latest: Option<&str>) {
+    let repo = &state.repos[index];
+    let is_candidate = state
+        .releases
+        .iter()
+        .find(|r| r.id == id)
+        .is_some_and(|r| !r.spec.draft && !r.spec.prerelease);
+    match make_latest {
+        Some("true") if is_candidate => state.repos[index].latest = Latest::Set(id),
+        Some("false") if repo.latest == Latest::Auto => {
+            let current = published(state, repo)
+                .into_iter()
+                .filter(|r| r.id != id && !r.spec.prerelease)
+                .max_by(|a, b| (&a.spec.created_at, a.id).cmp(&(&b.spec.created_at, b.id)))
+                .map(|r| r.id);
+            state.repos[index].latest = current.map_or(Latest::None, Latest::Set);
+        }
+        _ => {}
+    }
+}
+
+/// `POST /repos/{o}/{r}/releases`: a release of `tag_name` (a draft or published, a
+/// prerelease or not). A tag that already has a published release is GitHub's 422
+/// `already_exists`; several drafts may share one.
+fn create_release(state: &mut State, req: &Request, index: usize) -> Answer {
+    let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(tag), Ok(name), Ok(notes), Ok(target), Ok(make_latest)) = (
+        text_field(&body, "tag_name"),
+        text_field(&body, "name"),
+        text_field(&body, "body"),
+        text_field(&body, "target_commitish"),
+        text_field(&body, "make_latest"),
+    ) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(draft), Ok(prerelease)) = (flag(&body, "draft"), flag(&body, "prerelease")) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let Some(tag) = tag.filter(|t| !t.is_empty()) else {
+        return invalid("Release", "tag_name", "missing_field");
+    };
+    let repo = &state.repos[index];
+    let repo_id = repo.id;
+    if published_tag(state, repo_id, &tag, None) {
+        return invalid("Release", "tag_name", "already_exists");
+    }
+    let draft = draft.unwrap_or(false);
+    let created_at = "2026-11-01T00:00:00Z".to_string();
+    let spec = ReleaseSpec {
+        tag,
+        name,
+        draft,
+        prerelease: prerelease.unwrap_or(false),
+        immutable: false,
+        target_commitish: target.unwrap_or_else(|| repo.spec.default_branch.clone()),
+        published_at: (!draft).then(|| created_at.clone()),
+        created_at,
+        body: notes,
+    };
+    let full = repo.full_name();
+    let id = state.add_release(&full, spec);
+    apply_make_latest(state, index, id, make_latest.as_deref());
+    let repo = &state.repos[index];
+    match state.releases.iter().find(|r| r.id == id) {
+        Some(release) => Answer::json(201, &release_json(state, repo, release)),
+        None => Answer::not_found(),
+    }
+}
+
+/// `PATCH …/releases/{id}`: the fields the body names. Publishing a draft whose tag already
+/// has a published release is GitHub's 422 `already_exists`.
+fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> Answer {
+    let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(tag), Ok(name), Ok(notes), Ok(make_latest)) = (
+        text_field(&body, "tag_name"),
+        text_field(&body, "name"),
+        text_field(&body, "body"),
+        text_field(&body, "make_latest"),
+    ) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let (Ok(draft), Ok(prerelease)) = (flag(&body, "draft"), flag(&body, "prerelease")) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let id = state.releases[at].id;
+    let repo_id = state.repos[index].id;
+    let final_tag = tag
+        .clone()
+        .unwrap_or_else(|| state.releases[at].spec.tag.clone());
+    let final_draft = draft.unwrap_or(state.releases[at].spec.draft);
+    if !final_draft && published_tag(state, repo_id, &final_tag, Some(id)) {
+        return invalid("Release", "tag_name", "already_exists");
+    }
+    let spec = &mut state.releases[at].spec;
+    if let Some(tag) = tag {
+        spec.tag = tag;
+    }
+    if name.is_some() {
+        spec.name = name;
+    }
+    if notes.is_some() {
+        spec.body = notes;
+    }
+    if let Some(prerelease) = prerelease {
+        spec.prerelease = prerelease;
+    }
+    if let Some(draft) = draft {
+        spec.draft = draft;
+        spec.published_at = if draft {
+            None
+        } else {
+            spec.published_at
+                .clone()
+                .or_else(|| Some(spec.created_at.clone()))
+        };
+    }
+    apply_make_latest(state, index, id, make_latest.as_deref());
+    let repo = &state.repos[index];
+    Answer::json(200, &release_json(state, repo, &state.releases[at]))
+}
+
+/// `PATCH …/releases/assets/{id}`: the asset's `name`, as the body names it, on whichever
+/// release of the repository holds it. A name another asset of that release holds is GitHub's
+/// 422 `already_exists`.
+fn edit_asset(state: &mut State, req: &Request, index: usize, id: &str) -> Answer {
+    let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let Ok(name) = text_field(&body, "name") else {
+        return Answer::error(400, "Problems parsing JSON");
+    };
+    let repo = state.repos[index].id;
+    let Ok(id) = id.parse::<u64>() else {
+        return Answer::not_found();
+    };
+    let Some(at) = state
+        .releases
+        .iter()
+        .position(|r| r.repo == repo && r.assets.iter().any(|a| a.id == id))
+    else {
+        return Answer::not_found();
+    };
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        let release = &mut state.releases[at];
+        if release
+            .assets
+            .iter()
+            .any(|a| a.id != id && a.spec.name == name)
+        {
+            return invalid("ReleaseAsset", "name", "already_exists");
+        }
+        if let Some(asset) = release.assets.iter_mut().find(|a| a.id == id) {
+            asset.spec.name = name;
+        }
+    }
+    let repo = &state.repos[index];
+    let release = &state.releases[at];
+    match release.assets.iter().find(|a| a.id == id) {
+        Some(asset) => Answer::json(200, &asset_json(state, repo, release, asset)),
+        None => Answer::not_found(),
+    }
+}
+
+/// `DELETE …/releases/assets/{id}`: the asset, from whichever release of the repository holds
+/// it.
+fn delete_asset(state: &mut State, index: usize, id: &str) -> Answer {
+    let repo = state.repos[index].id;
+    let Ok(id) = id.parse::<u64>() else {
+        return Answer::not_found();
+    };
+    for release in state.releases.iter_mut().filter(|r| r.repo == repo) {
+        if let Some(at) = release.assets.iter().position(|a| a.id == id) {
+            release.assets.remove(at);
+            return Answer {
+                status: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+        }
+    }
+    Answer::not_found()
+}
+
+/// The uploads origin: `POST /repos/{o}/{r}/releases/{id}/assets?name=…`, the request's body
+/// as a new asset of that name under the request's `Content-Type`. A name the release already
+/// holds is GitHub's 422 `already_exists`; a missing name or media type is a 422 too.
+fn upload(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
+    let path = req.path().to_string();
+    let segs = segments(&path);
+    let ["repos", o, r, "releases", id, "assets"] = segs.as_slice() else {
+        return Answer::not_found();
+    };
+    if req.method != "POST" {
+        return Answer::not_found();
+    }
+    let slug = format!(
+        "{}/{}",
+        aterm_codec::pct::decode(o),
+        aterm_codec::pct::decode(r)
+    );
+    let Some(index) = state.repo_index(&slug) else {
+        return Answer::not_found();
+    };
+    if let Some(refused) = unwritable(&state.repos[index], ctx) {
+        return refused;
+    }
+    let Some(at) = release_of(state, index, id) else {
+        return Answer::not_found();
+    };
+    let Some(name) = req.query("name").filter(|n| !n.is_empty()) else {
+        return invalid("ReleaseAsset", "name", "missing_field");
+    };
+    let Some(content_type) = req.header("content-type").filter(|t| !t.is_empty()) else {
+        return invalid("ReleaseAsset", "content_type", "missing_field");
+    };
+    if state.releases[at]
+        .assets
+        .iter()
+        .any(|a| a.spec.name == name)
+    {
+        return invalid("ReleaseAsset", "name", "already_exists");
+    }
+    let release_id = state.releases[at].id;
+    let spec = crate::AssetSpec {
+        content_type: content_type.to_string(),
+        ..crate::AssetSpec::uploaded(&name, &req.body)
+    };
+    let asset_id = state.add_asset(release_id, spec);
+    let repo = &state.repos[index];
+    let release = &state.releases[at];
+    match release.assets.iter().find(|a| a.id == asset_id) {
+        Some(asset) => Answer::json(201, &asset_json(state, repo, release, asset)),
+        None => Answer::not_found(),
     }
 }

@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHY A SAVE OF A FILE DID NOT LAND, IN A PERSON'S WORDS: the one set of
-//! them, said by every save the atomic writer makes, whichever face asked
-//! for it.
-//!
-//! The writer reports the step that stopped ([`AtomicSaveStage`]) and the
-//! I/O error behind it with what the step was doing ([`SaveCause`]);
-//! [`words`] turns them into what the person can read and act on
-//! ("~/.config/aterm isn't writable \u{b7} check its permissions",
-//! "notes.md isn't readable \u{b7} check its permissions"), never a step's
-//! name, a reducer's state or the system's error text. Every reader of a
-//! failed save takes these words after its own lead: aterm's Settings
-//! status line ("Cursor blink was not saved: …"), a Messages entry's detail,
-//! `aterm ctl settings set`'s reply ("save failed: …"), Manual's ("Save
-//! failed: …") and amacs's terminal face ("Could not save notes.md: …").
+//! Human-readable descriptions for why an atomic file save or open failed.
 
 use std::io::ErrorKind;
 use std::path::Path;
@@ -22,9 +9,7 @@ use std::path::Path;
 use crate::host::{DocumentHostError, PersistenceError, save_lock_of};
 use crate::io::{AtomicSaveStage, SaveCause, SaveError, SaveTouch};
 
-/// The program saying the words, named where a sentence needs a subject
-/// ("aterm couldn't write in ~/notes"): the person reads the name of the
-/// program they are using.
+/// The program reporting the failure, used where a sentence needs a subject.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Speaker {
     /// aterm's own saves: aterm.toml from Settings, Manual's documents.
@@ -51,32 +36,23 @@ pub enum Failure<'a> {
     NoPath,
     /// Reading the file before writing it was refused.
     Read(&'a DocumentHostError),
-    /// Reading the file to open it, or to load it from disk again, was
-    /// refused: said as a save's refused read is, but a folder that is not
-    /// there is one that does not exist, not one that went missing while
-    /// saving.
+    /// Reading the file to open or reload it was refused.
     Open(&'a DocumentHostError),
-    /// The document's save record refused to start the save: it is not
-    /// open any more, or a save of it is still on its way.
+    /// The document's save record refused to start the save.
     Begin(&'a PersistenceError),
-    /// A step of the write failed before the file was replaced: it is as it
-    /// was.
+    /// A write step failed before the target file was replaced.
     Write {
         stage: AtomicSaveStage,
         cause: Option<SaveCause>,
     },
-    /// The file was (or may have been) replaced, but a step after could not
-    /// confirm what it holds.
+    /// The target file was (or may have been) replaced, but a post-replace check failed.
     Unconfirmed {
         stage: AtomicSaveStage,
         cause: Option<SaveCause>,
     },
 }
 
-/// THE WORDS FOR A SAVE OF `path` THAT DID NOT LAND (or may not have), as
-/// `speaker` says them: what went wrong, in terms of the file, its folder,
-/// its save lock or the disk, and what to do where the person can do
-/// anything. A clause, lower case, for a lead to come before it.
+/// Formats a lower-case clause describing why saving or opening `path` failed.
 #[must_use]
 pub fn words(speaker: Speaker, path: &Path, failure: &Failure<'_>) -> String {
     let who = speaker.name();
@@ -184,8 +160,7 @@ fn caused_words(
         (SaveTouch::Read, ErrorKind::PermissionDenied) => {
             format!("{file} isn\u{2019}t readable \u{b7} check its permissions")
         }
-        // An entry beside the file this user cannot open (another user's,
-        // left by a save under `sudo`): it stops every save until it goes.
+        // A lock file left by another user (e.g. `sudo`) blocks every save until removed.
         (SaveTouch::Lock, ErrorKind::PermissionDenied) => {
             let lock =
                 save_lock_of(path).map_or_else(|| "it".to_string(), |lock| home_abbreviated(&lock));
@@ -260,11 +235,9 @@ fn read_words(
     opening: bool,
 ) -> String {
     match error {
-        // A link to nothing: no retry finds a file there.
         DocumentHostError::SymlinkComponent { dangling: true, .. } => {
             return format!("{file} is a link to a file that isn\u{2019}t there");
         }
-        // A path whose name is not UTF-8 has no `file:` URI to open by.
         DocumentHostError::InvalidEncoding => {
             return format!("{who} can\u{2019}t open a file whose name isn\u{2019}t UTF-8");
         }
@@ -454,12 +427,10 @@ mod tests {
             folder.starts_with("/Volumes/Shared/aterm isn\u{2019}t writable"),
             "{folder}"
         );
-        // Making the lock is the first thing a save does in the folder.
         assert_eq!(
             denied(AtomicSaveStage::Preflight, SaveTouch::Folder),
             folder
         );
-        // The same step and kind read by what the step was doing.
         let mut seen = std::collections::BTreeSet::new();
         for touch in TOUCHES {
             assert!(
@@ -504,7 +475,6 @@ mod tests {
             )
             .contains("try again in a moment")
         );
-        // Distinct kinds at one step read differently.
         let mut seen = std::collections::BTreeSet::new();
         for kind in [
             ErrorKind::PermissionDenied,
@@ -528,7 +498,6 @@ mod tests {
                 "{kind:?} reads as another kind"
             );
         }
-        // A step up to the rename changed nothing; one after may have.
         let path = path();
         for stage in &STAGES[..5] {
             let stage = *stage;
@@ -691,7 +660,6 @@ mod tests {
             );
             seen.insert(said);
         }
-        // Not open any more reads one way, whichever record said it.
         assert_eq!(seen.len(), refusals.len() - 2, "{seen:?}");
         assert!(
             words(
@@ -716,7 +684,6 @@ mod tests {
                     Failure::Write { stage, cause },
                     Failure::Unconfirmed { stage, cause },
                 ] {
-                    // The save lock's own name carries the writer's mark.
                     let unlocked =
                         |said: String| said.replace(".notes.md.aterm-write.lock", "LOCK");
                     let aterm = unlocked(words(Speaker::Aterm, &path, &failure));

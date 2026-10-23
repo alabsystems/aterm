@@ -46,6 +46,10 @@ struct Ring {
     col: u16,
     born: Instant,
     life: f32,
+    /// The caret's cell the paper landing veil lies on, which does not ride
+    /// the scroll: its landing, then each on-grid caret the ring has seen
+    /// since ([`ClassicWake::emit_light_ring`]).
+    caret: (u16, u16),
 }
 
 /// The classic wake's animation state; no other style touches it.
@@ -96,6 +100,11 @@ pub struct ClassicWake {
     /// Test-only: lay the light-ground stroke and crown in their unsolved vivid ink (`LightGround::unsolved`), the legibility tests' negative control.
     #[cfg(test)]
     pub(crate) light_unsolved: bool,
+    /// Test-only: lay the light-ground landing veil as it was, centred on
+    /// the landing and spreading with the ring's age, unbounded by the
+    /// caret's cell and row, the negative control of its bound test.
+    #[cfg(test)]
+    pub(crate) veil_unbound: bool,
 }
 
 /// What the mono face's dark bed reads of the frame ([`ClassicWake::tick`]): the probed text, which says where the tracer may be light, and the over-ink account its bed, crown and ring spend.
@@ -338,7 +347,13 @@ impl ClassicWake {
             self.emit_light_crown(now, cfg, geom, cur, under);
             self.emit_light_comet(now, cfg, geom, cur, under);
             under.truncate(Self::MAX_QUADS);
-            self.emit_light_ring(now, cfg, geom, halos);
+            if let Some(ring) = &mut self.ring
+                && let Some(at) =
+                    cur.filter(|&(r, c)| usize::from(r) < geom.rows && usize::from(c) < geom.cols)
+            {
+                ring.caret = at;
+            }
+            self.emit_light_ring(now, cfg, geom, cur, halos);
             halos.truncate(CursorGlow::MAX_HALOS);
         }
 
@@ -456,6 +471,7 @@ impl ClassicWake {
                 col: cc,
                 born: now,
                 life: 0.18,
+                caret: (cr, cc),
             });
         }
     }
@@ -656,6 +672,7 @@ impl ClassicWake {
             geom,
             &text,
             caret,
+            None,
             &mut self.air_runs,
         );
         let chf = geom.ch as f32;
@@ -992,12 +1009,19 @@ impl ClassicWake {
     /// The light-ground landing ring: the modern ring's light arm (an
     /// expanding source-over veil of the ring colour mixed 28% toward black,
     /// its centre alpha fading with the ring and capped at 120), as
-    /// `CursorGlow::emit_ring` draws it for the other styles.
+    /// `CursorGlow::emit_ring` draws it for the other styles, and bound as
+    /// it is: THE VEIL STAYS IN THE CARET'S CELL AND ROW, its reach along the
+    /// row [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] and half a row up and
+    /// down, its centre held to what leaves the theme's text
+    /// [`CursorGlow::LIGHT_VEIL_BAR`] over it (an Enter at the bottom row
+    /// carried the landing up with the scrolled text, and the veil stood as
+    /// a cloud over the line just printed, most of a row above the caret).
     fn emit_light_ring(
         &self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
+        cur: Option<(u16, u16)>,
         halos: &mut Vec<RainHalo>,
     ) {
         let Some((ring, t, cov)) = self.ring_now(now, cfg) else {
@@ -1006,14 +1030,36 @@ impl ClassicWake {
         let grow = (0.7 + 1.0 * t) * chf_of(geom);
         let veil = lerp_rgb(cfg.accent, 0x0000_0000, 0.28);
         let cap = (u32::from(cov) / 2).clamp(1, 120) as u8;
-        push_soft_veil(
-            halos,
-            geom,
-            geom.cell_center(ring.row, ring.col),
-            (grow, grow * 0.85),
-            veil,
-            cap,
-        );
+        #[cfg(not(test))]
+        let unbound = false;
+        #[cfg(test)]
+        let unbound = self.veil_unbound;
+        // A frame whose caret the host withholds (`cur` is `None`) keeps the
+        // veil on the last caret the ring saw ([`Ring::caret`]), never the
+        // cloud over the scrolled landing.
+        let on = |&(r, c): &(u16, u16)| usize::from(r) < geom.rows && usize::from(c) < geom.cols;
+        let on_grid = cur.filter(on).or(Some(ring.caret).filter(on));
+        let (centre, radii, cap) = match on_grid {
+            Some((r, c)) if !unbound => {
+                let (cw, ch) = (geom.cw as f32, chf_of(geom));
+                (
+                    geom.cell_center(r, c),
+                    (
+                        grow.min(CursorGlow::LIGHT_VEIL_REACH_CELLS * cw),
+                        (grow * 0.85).min(0.5 * ch),
+                    ),
+                    cap.min(CursorGlow::light_veil_cap(veil, cfg.theme_fg, cfg.theme_bg)),
+                )
+            }
+            _ if unbound => (
+                geom.cell_center(ring.row, ring.col),
+                (grow, grow * 0.85),
+                cap,
+            ),
+            _ => return,
+        };
+        // Falling off from its centre, never a flat disc of ink (a stain).
+        push_soft_veil(halos, geom, centre, radii, veil, cap);
     }
 
     /// The comet colour at path position `pos` (0 tail ..
@@ -1732,6 +1778,111 @@ mod tests {
                 == (ring.0.round() as u16, ring.1.round() as u16)
                 && halo_over_cap(h.color) <= 120),
             "the landing ring is a capped veil on the landing cell"
+        );
+    }
+
+    /// THE PAPER LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, AT THE
+    /// TEXT BAR (round 2: after an Enter at the bottom row the landing,
+    /// carried up with the scrolled text, laid its veil as a cloud over the
+    /// line just printed, most of a row above the caret, on GitHub Light and
+    /// Default Light, in the spectrum face and a pinned pink alike). With the
+    /// landing a row above the caret, at 30 ms and 120 ms: every veil lies in
+    /// the caret's row, centred on the caret's cell and reaching no further
+    /// than [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] along it, and the theme's
+    /// text over its centre keeps 4.5:1. So on a frame whose caret the host
+    /// withholds (`cur: None`): the veil stays on the caret the ring last
+    /// saw. NEGATIVE CONTROLS: the veil as it was
+    /// ([`ClassicWake::veil_unbound`]) leaves the row; and (as run on
+    /// 2026-10-22, the bound held only while `cur` was there) the
+    /// hidden-caret frame laid the old cloud over the landing.
+    #[test]
+    fn the_paper_landing_veil_stays_in_the_caret_row_at_the_text_bar() {
+        let g = geom();
+        let caret = (4u16, 12u16);
+        let (ccx, _) = g.cell_center(caret.0, caret.1);
+        let reach = CursorGlow::LIGHT_VEIL_REACH_CELLS * g.cw as f32 + 1.0;
+        let (row_top, row_bot) = (
+            i32::from(caret.0) * g.ch as i32,
+            i32::from(caret.0 + 1) * g.ch as i32,
+        );
+        let (mut escapes, mut drawn) = (0usize, 0usize);
+        for (fg, bg) in [(INK, PAPER), (0x0033_3333, 0x00FA_F8F5)] {
+            for accent in [light_cfg().accent, 0x00D0_3A8C] {
+                let c = GlowConfig {
+                    theme_fg: fg,
+                    theme_bg: bg,
+                    accent,
+                    color: accent,
+                    ..light_cfg()
+                };
+                for unbound in [false, true] {
+                    let born = Instant::now();
+                    let w = ClassicWake {
+                        ring: Some(Ring {
+                            row: caret.0 - 1,
+                            col: caret.1,
+                            born,
+                            life: 0.4,
+                            caret,
+                        }),
+                        veil_unbound: unbound,
+                        ..ClassicWake::default()
+                    };
+                    for (at, cur) in [(30u64, Some(caret)), (120, Some(caret)), (60, None)] {
+                        let mut halos = Vec::new();
+                        w.emit_light_ring(ms(born, at), &c, g, cur, &mut halos);
+                        for h in &halos {
+                            let inside = i32::from(h.y) >= row_top
+                                && i32::from(h.y) + i32::from(h.h) <= row_bot
+                                && (f32::from(h.cx) - ccx).abs() <= 1.0
+                                && f32::from(h.rx) <= reach;
+                            if unbound {
+                                escapes += usize::from(!inside);
+                                continue;
+                            }
+                            drawn += 1;
+                            assert!(
+                                inside,
+                                "{accent:06x} on {bg:06x}, {at} ms, caret {cur:?}: the veil \
+                                 {h:?} leaves the caret's cell and row"
+                            );
+                        }
+                        if unbound {
+                            continue;
+                        }
+                        // The stacked veil at its centre, where every layer
+                        // stands at its whole opacity.
+                        let (cx, cy) = (halos[0].cx, halos[0].cy);
+                        let under = halos
+                            .iter()
+                            .filter(|h| {
+                                (h.x..h.x + h.w).contains(&cx) && (h.y..h.y + h.h).contains(&cy)
+                            })
+                            .fold(bg, |px, h| {
+                                let a = u32::from(halo_over_cap(h.color));
+                                let veil = h.color & 0x00FF_FFFF;
+                                let mix = |sh: u32| {
+                                    (((veil >> sh) & 0xff) * a
+                                        + ((px >> sh) & 0xff) * (255 - a)
+                                        + 127)
+                                        / 255
+                                };
+                                (mix(16) << 16) | (mix(8) << 8) | mix(0)
+                            });
+                        let k = crate::color_math::contrast_ratio(fg, under);
+                        assert!(
+                            k >= 4.5,
+                            "{accent:06x} on {bg:06x}, {at} ms: the text over the veil's centre \
+                             reads {k:.2}:1"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(drawn > 0, "the paper landing lays no veil");
+        assert!(
+            escapes > 0,
+            "control: the unbound veil stays in the caret's row"
         );
     }
 

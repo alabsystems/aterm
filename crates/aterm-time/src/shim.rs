@@ -3,12 +3,6 @@
 
 //! The `wasm32` clock: a monotonic [`Instant`] over `performance.now()` and a
 //! wall-clock [`SystemTime`] over `Date.now()`.
-//!
-//! The wasm cells only type-check this module, so it is also compiled into the
-//! native test build: everything except the two clock symbols and the `now()`
-//! calls that read them is target-independent, and the `tests` below drive the
-//! same arithmetic the browser runs. `verify wasm-smoke` reads both clocks
-//! through a real wasm module under node.
 
 use core::ops::{Add, AddAssign, Sub, SubAssign};
 use core::time::Duration;
@@ -19,28 +13,18 @@ use core::time::Duration;
 /// in that macro and here, and nowhere else.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod js {
-    // Plain `f64` returns: no pointer, no invariant for the caller to uphold.
     unsafe extern "C" {
-        /// `performance.now()`: milliseconds since the document's time origin,
-        /// monotonic, sub-millisecond where the embedder allows it.
+        /// `performance.now()` in milliseconds since the time origin.
         #[link_name = "aterm_wasm_performance_now"]
         pub safe fn performance_now() -> f64;
 
-        /// `Date.now()`: integer milliseconds since the Unix epoch, wall clock,
-        /// free to jump when the host's clock is corrected.
+        /// `Date.now()` in milliseconds since the Unix epoch.
         #[link_name = "aterm_wasm_date_now"]
         pub safe fn date_now() -> f64;
     }
 }
 
 /// Convert JS milliseconds to a [`Duration`], totally.
-///
-/// `Duration::from_secs_f64` panics on a negative or non-finite input, and a
-/// browser clock may return either (clamping, tab suspension, `NaN`).
-/// Everything unusable floors to zero.
-///
-/// Whole milliseconds are split from the fraction before scaling, so precision
-/// does not decay as the time origin ages.
 #[inline]
 fn duration_from_millis_f64(ms: f64) -> Duration {
     if !ms.is_finite() || ms <= 0.0 {
@@ -48,8 +32,6 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
     }
     let whole = ms.trunc();
     let frac = ms - whole;
-    // `whole` is finite and positive here; beyond `u64::MAX` milliseconds
-    // (585 million years) it saturates rather than wrapping.
     let millis = if whole >= u64::MAX as f64 {
         u64::MAX
     } else {
@@ -62,8 +44,6 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
             whole as u64
         }
     };
-    // `frac` is in `[0, 1)`, so the nanosecond part is in `[0, 1e6)`, inside
-    // `Duration`'s subsec range, so the sum below never carries.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -73,9 +53,7 @@ fn duration_from_millis_f64(ms: f64) -> Duration {
     Duration::from_millis(millis).saturating_add(Duration::from_nanos(u64::from(nanos)))
 }
 
-/// A measurement of the browser's monotonic clock: the `wasm32` stand-in for
-/// `std::time::Instant`, with the same contract. Only differences between two
-/// instants have meaning.
+/// Monotonic clock measurement (`wasm32` stand-in for `std::time::Instant`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Instant(Duration);
 
@@ -94,8 +72,7 @@ impl Instant {
         Self(duration_from_millis_f64(ms))
     }
 
-    /// Time elapsed from `earlier` to `self`, saturating to zero when `earlier`
-    /// is the later of the two, as `std` does.
+    /// Time elapsed from `earlier` to `self`, saturating to zero.
     #[must_use]
     #[inline]
     pub const fn duration_since(&self, earlier: Self) -> Duration {
@@ -193,12 +170,7 @@ impl Sub<Instant> for Instant {
 /// The anchor of [`SystemTime`]: 1970-01-01 00:00:00 UTC.
 pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::ZERO);
 
-/// A measurement of the browser's wall clock: the `wasm32` stand-in for
-/// `std::time::SystemTime`.
-///
-/// Not monotonic: the value can move backwards when the host's clock is
-/// corrected, which is why [`duration_since`](SystemTime::duration_since)
-/// returns a `Result`.
+/// Wall-clock measurement (`wasm32` stand-in for `std::time::SystemTime`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SystemTime(Duration);
 
@@ -223,8 +195,7 @@ impl SystemTime {
     /// Time elapsed from `earlier` to `self`.
     ///
     /// # Errors
-    /// When `earlier` is later than `self` (the clock moved backwards, or the
-    /// arguments are swapped). The error carries the magnitude, as in `std`.
+    /// Returns an error when `earlier` is later than `self`.
     #[inline]
     pub const fn duration_since(&self, earlier: Self) -> Result<Duration, SystemTimeError> {
         match self.0.checked_sub(earlier.0) {
@@ -236,7 +207,7 @@ impl SystemTime {
     /// Time elapsed since this measurement.
     ///
     /// # Errors
-    /// When the wall clock has moved backwards since `self` was taken.
+    /// Returns an error when the wall clock has moved backwards since `self` was taken.
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[inline]
     pub fn elapsed(&self) -> Result<Duration, SystemTimeError> {
@@ -300,8 +271,7 @@ impl SubAssign<Duration> for SystemTime {
     }
 }
 
-/// The error [`SystemTime::duration_since`] returns when the wall clock ran
-/// backwards. Carries how far back, so a caller can log the magnitude.
+/// Error returned by [`SystemTime::duration_since`] when the wall clock ran backwards.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SystemTimeError(Duration);
 
@@ -350,8 +320,6 @@ mod tests {
         assert_eq!(duration_from_millis_f64(f64::INFINITY), Duration::ZERO);
         assert_eq!(duration_from_millis_f64(-1.0), Duration::ZERO);
         assert_eq!(duration_from_millis_f64(0.0), Duration::ZERO);
-        // A reading beyond `u64::MAX` milliseconds saturates instead of
-        // wrapping into a time in the past.
         assert_eq!(
             duration_from_millis_f64(f64::MAX),
             Duration::from_millis(u64::MAX)
@@ -443,7 +411,6 @@ mod tests {
         let err: SystemTimeError = t0.duration_since(t1).expect_err("backwards");
         assert_eq!(err.duration(), Duration::from_secs(1));
         assert_eq!(err.to_string(), "second time provided was later than self");
-        // The trait object form the `?` operator produces must still work.
         let boxed: Box<dyn std::error::Error> = Box::new(err);
         assert!(!boxed.to_string().is_empty());
     }

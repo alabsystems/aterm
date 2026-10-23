@@ -65,6 +65,11 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
 /// Gemini CLI's usage-limit dialog ([`limit_retry`]).
 pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
+/// Gemini CLI's usage-limit dialog of a model's own bucket ([`limit_retry`],
+/// [`LimitTry::StopThenResume`]): its `Stop`, at the due `Keep trying` would
+/// have been pressed at, so the turn-end policy types the resume at the error
+/// it leaves. Never its switch nor its upgrade.
+pub const RULE_LIMIT_STOP: &str = "limit-stop@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]).
 pub const RULE_LIMIT_RESET: &str = "limit-reset@v1";
 /// Claude Code's autocompact offer ([`autocompact_offer`]).
@@ -3314,19 +3319,99 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
 
 /// Format the escalation reason when Gemini CLI's usage-limit dialog names no reset time.
 #[must_use]
-pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>) -> String {
-    let retry = anchor("gemini.usage.retry");
+pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>, how: LimitTry) -> String {
+    let tried = how.tried();
     match unplaced {
         None => format!(
-            "Gemini CLI's usage limit names no reset: {retry} is tried on a back-off ladder; \
-             /stats model says which limit"
+            "Gemini CLI's usage limit names no reset: {tried} on a back-off ladder; /stats \
+             model says which limit"
         ),
         Some(drawn) => format!(
-            "Gemini CLI's usage limit names a reset the loop cannot place ({}): {retry} is \
-             tried on a back-off ladder",
+            "Gemini CLI's usage limit names a reset the loop cannot place ({}): {tried} on a \
+             back-off ladder",
             crate::harness::one_line(drawn, 24)
         ),
     }
+}
+
+/// HOW GEMINI CLI'S USAGE-LIMIT DIALOG IS TRIED past its due
+/// ([`limit_retry`]), by the options it offers (bundle 0.46.0's
+/// `ProQuotaDialog`). `None`: a dialog no rule here answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitTry {
+    /// `1. Keep trying` over `2. Stop` (the account's quota, or a model with
+    /// no other to fall back to): `Keep trying` sends the turn again
+    /// ([`RULE_LIMIT_RETRY`]).
+    KeepTrying,
+    /// `Switch to <fallback>` over `Stop`, `Upgrade for higher limits`
+    /// between them under the Google login (a terminal quota of the model's
+    /// own bucket, `Usage limit reached for all Pro models.`): no `Keep
+    /// trying` on offer, so the try is its `Stop` ([`RULE_LIMIT_STOP`], the
+    /// option at `stop`) and the resume the turn-end policy types at the
+    /// error it leaves (`usage-resume@v1`), on the same due and ladder. The
+    /// bucket stays the session's model's: the switch is never pressed, nor
+    /// the upgrade.
+    StopThenResume { stop: usize },
+}
+
+impl LimitTry {
+    /// The try `labels` (the dialog's options, top down) offer.
+    #[must_use]
+    pub(crate) fn of(labels: &[&str]) -> Option<Self> {
+        let switch = |l: &str| {
+            l.strip_prefix(anchor("gemini.usage.switch"))
+                .is_some_and(|m| !m.trim().is_empty())
+        };
+        match labels {
+            [retry, "Stop"] if *retry == anchor("gemini.usage.retry") => Some(Self::KeepTrying),
+            [first, "Stop"] if switch(first) => Some(Self::StopThenResume { stop: 1 }),
+            [first, upgrade, "Stop"]
+                if switch(first) && *upgrade == anchor("gemini.usage.upgrade") =>
+            {
+                Some(Self::StopThenResume { stop: 2 })
+            }
+            _ => None,
+        }
+    }
+
+    /// The try as a WAITING line or a badge says it is made (`Keep trying
+    /// is tried`).
+    #[must_use]
+    pub(crate) fn tried(self) -> String {
+        match self {
+            Self::KeepTrying => format!("{} is tried", anchor("gemini.usage.retry")),
+            Self::StopThenResume { .. } => "Stop and resume are tried".to_string(),
+        }
+    }
+
+    /// The try as a WAITING line says it is pressed (`Keep trying is
+    /// pressed`).
+    #[must_use]
+    pub(crate) fn pressed(self) -> String {
+        match self {
+            Self::KeepTrying => format!("{} is pressed", anchor("gemini.usage.retry")),
+            Self::StopThenResume { .. } => "Stop is pressed and the turn resumed".to_string(),
+        }
+    }
+}
+
+/// [`limit_no_reset_reason`] for that dialog answered `Stop`: the badge the
+/// loop raises at the error the `Stop` left, where no badge of the dialog's
+/// stands there, while the resume (`usage-resume@v1`) is typed on the same
+/// ladder (FOREVER: NEEDS YOU is loud and never blocks). `unplaced` as
+/// there. One line, short of an attention's 120-cell reason.
+#[must_use]
+pub(crate) fn limit_stopped_reason(unplaced: Option<&str>) -> String {
+    let what = match unplaced {
+        None => "names no reset".to_string(),
+        Some(drawn) => format!(
+            "names a reset the loop cannot place ({})",
+            crate::harness::one_line(drawn, 24)
+        ),
+    };
+    format!(
+        "Gemini CLI's usage limit {what}; after Stop, resumed on a back-off ladder; /stats model"
+    )
 }
 
 fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
@@ -3335,22 +3420,30 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     }
     let labels: Vec<&str> = prompt.options.iter().map(|o| o.label.as_str()).collect();
     let retry = anchor("gemini.usage.retry");
-    if labels != [retry, "Stop"] {
+    let Some(how) = LimitTry::of(&labels) else {
         return Decision::escalate(format!(
-            "Gemini CLI's usage limit offers {}: only `{retry}` over `Stop` is pressed",
+            "Gemini CLI's usage limit offers {}: only `{retry}` over `Stop`, or a switch's `Stop`, \
+             is pressed",
             labels.join(" | ")
         ));
-    }
+    };
     let reset = aterm_phase::gemini::limit_reset(rows);
     if !ctx.limit_retry {
         return Decision::escalate(match &reset {
             Some(reset) if crate::supervise::limit::parse_reset(&reset.clock).is_some() => {
-                format!("Gemini CLI's usage limit resets at {reset}: {retry} is pressed past it")
+                format!(
+                    "Gemini CLI's usage limit resets at {reset}: {} past it",
+                    how.pressed()
+                )
             }
-            Some(reset) => limit_no_reset_reason(Some(&reset.to_string())),
-            None => limit_no_reset_reason(None),
+            Some(reset) => limit_no_reset_reason(Some(&reset.to_string()), how),
+            None => limit_no_reset_reason(None, how),
         });
     }
+    let (rule_id, at, label) = match how {
+        LimitTry::KeepTrying => (RULE_LIMIT_RETRY, 0, retry),
+        LimitTry::StopThenResume { stop } => (RULE_LIMIT_STOP, stop, "Stop"),
+    };
     let (head, from, missing) = match &reset {
         Some(_) => (
             anchor("gemini.usage.resets"),
@@ -3374,15 +3467,15 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
     else {
         return Decision::escalate(missing);
     };
-    let choice = match (prompt.select, prompt.options[0].n) {
+    let choice = match (prompt.select, prompt.options[at].n) {
         (Select::Digits, Some(n)) => Choice::Digit(n),
         (Select::ArrowsEnter, _) => {
-            let Some(at) = prompt.options.iter().position(|o| o.focused) else {
+            let Some(focused) = prompt.options.iter().position(|o| o.focused) else {
                 return Decision::escalate("a usage-limit dialog with no focused option");
             };
             Choice::Focus {
-                steps: focus_steps(at, 0),
-                label: retry.to_string(),
+                steps: focus_steps(focused, at),
+                label: label.to_string(),
             }
         }
         (Select::Digits, None) => {
@@ -3390,12 +3483,12 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
         }
     };
     Decision::Approve {
-        rule_id: RULE_LIMIT_RETRY,
+        rule_id,
         choice,
         guard: row_guard(&rows[reset_row]),
         subject: match &reset {
-            Some(reset) => format!("{retry} (reset {reset})"),
-            None => format!("{retry} (no reset named)"),
+            Some(reset) => format!("{label} (reset {reset})"),
+            None => format!("{label} (no reset named)"),
         },
         unproven: None,
     }

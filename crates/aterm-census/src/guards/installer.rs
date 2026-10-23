@@ -2,20 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! installer-network: `tools/install.sh` reaches the network through its one
-//! transport.
-//!
-//! The installer runs as `curl … | sh` on a machine aterm has never seen, before
-//! anything can verify it, so every fetch goes through `web_curl` (`curl --proto
-//! =https …`: no downgrade, no redirect off https). It never asks the GitHub API,
-//! whose anonymous budget every install shares, and never runs `gh`, which a fresh
-//! machine lacks or which holds someone's login. Read as plain lines: a bare `curl`
-//! is a line whose command (after an optional `if` and `!`) is `curl` without
-//! `--proto`; `api.github.com` and `gh api|auth|release` are refused anywhere.
-//!
-//! The installer is also the script walk's anchor: a guard run that reads no
-//! `tools/install.sh` lost the scripts (a moved `tools/`, a narrowed
-//! [`Script`] test), and every rule over them held vacuously.
+//! `installer-network` guard over `tools/install.sh` ([`Script`]).
 
 use super::{Finding, Rule, Script, Tree};
 
@@ -28,8 +15,7 @@ pub(super) const INSTALLER_NETWORK: Rule = Rule {
     check: installer_network,
 };
 
-/// The one installer, and the one script every guard run must read: an
-/// anchor, not a count, so a script deleted on purpose moves no number.
+/// The one installer, and the one script every guard run must read.
 const INSTALLER: &str = "tools/install.sh";
 
 fn installer_network(tree: &Tree<'_>, out: &mut Vec<Finding>) {
@@ -84,8 +70,7 @@ fn command_of(line: &str) -> &str {
     }
 }
 
-/// The `gh` verb a line runs, when it is `api`, `auth` or `release`: `gh ` at the
-/// start or after a blank, `;`, `(` or `|`.
+/// The `gh` verb a line runs, when it is `api`, `auth` or `release`.
 fn gh_call(line: &str) -> Option<&'static str> {
     line.match_indices("gh ").find_map(|(at, _)| {
         let edge = line[..at]

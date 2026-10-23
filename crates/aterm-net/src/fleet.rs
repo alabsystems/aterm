@@ -777,7 +777,7 @@ pub(crate) const PREAUTH_GRACE: Duration = Duration::from_secs(1);
 
 /// Return `true` if `ip` (after canonicalising IPv4-mapped IPv6) is loopback, private, or link-local.
 #[must_use]
-pub fn is_fleet_source(ip: IpAddr) -> bool {
+pub const fn is_fleet_source(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
         IpAddr::V6(v6) => {
@@ -1333,7 +1333,7 @@ fn accept_tls(
 
 /// Whether a connection that negotiated `alpn` speaks [`ALPN_NODES`]; `None`
 /// when it negotiated no fleet protocol.
-fn speaks_nodes(alpn: Option<&[u8]>) -> Option<bool> {
+const fn speaks_nodes(alpn: Option<&[u8]>) -> Option<bool> {
     match alpn {
         Some(ALPN_NODES) => Some(true),
         Some(ALPN) => Some(false),
@@ -1515,7 +1515,7 @@ fn dialer_proves<S: Read + Write>(
 
 /// The tag a role's `key` makes for `word` on the channel whose exporter is
 /// `exporter`.
-fn tag(key: &[u8; 32], exporter: &[u8], word: &str) -> [u8; TAG_LEN] {
+const fn tag(key: &[u8; 32], exporter: &[u8], word: &str) -> [u8; TAG_LEN] {
     hmac_sha256_parts(key, &[exporter, word.as_bytes()])
 }
 

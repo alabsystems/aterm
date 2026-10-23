@@ -6721,8 +6721,9 @@ fn an_acts_answer_no_loop_read_run_stopped_by_an_esc_ends_the_carry_for_a_loop_t
 
 fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
     use crate::supervise::approvals::{
-        FALLBACK_ASKED, LIMIT_ENDED, RULE_LAND_OVER, RULE_OFF_STOOD, RULE_POINT, RULE_TASK_DONE,
-        RULE_TRY_OVER, RULE_TURN_RAN, RULE_WALL_WAIT, RULE_WALL_WAIT_END, WALL_TAKEN,
+        FALLBACK_ASKED, LIMIT_ENDED, LIMIT_ENDED_ELSEWHERE, RULE_LAND_OVER, RULE_OFF_STOOD,
+        RULE_POINT, RULE_TASK_DONE, RULE_TRY_OVER, RULE_TURN_RAN, RULE_WALL_WAIT,
+        RULE_WALL_WAIT_END, WALL_TAKEN,
     };
     use crate::supervise::policy::turn_end::{RULE_LEFT, RULE_MODEL_FALLBACK};
     const WALL_LEFT: &str = "the wall left the screen or the worker worked";
@@ -6786,7 +6787,11 @@ fn books_of_0_106(rows: &[(i64, String)]) -> Vec<(i64, String)> {
                     }
                     _ => row.clone(),
                 },
-                (_, RULE_WALL_WAIT_END) if reason == LIMIT_ENDED || reason == WALL_TAKEN => {
+                (_, RULE_WALL_WAIT_END)
+                    if reason == LIMIT_ENDED
+                        || reason == LIMIT_ENDED_ELSEWHERE
+                        || reason == WALL_TAKEN =>
+                {
                     with_reason(row, WALL_LEFT)
                 }
                 _ => row.clone(),

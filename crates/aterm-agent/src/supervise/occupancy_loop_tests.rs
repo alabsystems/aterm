@@ -136,7 +136,8 @@ fn one_hold(
         let cfg = policy.as_ref();
         let mut since = None;
         let mut read = |s: &mut Session<'_, Mock>, seq: u64, review: &mut dyn Review| {
-            s.host_steps_in_background(&screen_at(seq, break_screen()), &mut since, cfg, review);
+            s.host_steps_in_background(&screen_at(seq, break_screen()), &mut since, cfg, review)
+                .expect("the break's step");
         };
         read(&mut s, 1, review);
         clock.skip(settle);
@@ -208,7 +209,8 @@ fn a_point_keeps_the_hold_only_over_the_work() {
     let mut heard = Heard::default();
     let mut since = None;
     let cfg = Some(&opts.policy);
-    s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+    s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+        .expect("the break's step");
     for seq in 2..5 {
         let point = s.turn_of(screen_at(seq, break_screen()));
         s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
@@ -222,7 +224,8 @@ fn a_point_keeps_the_hold_only_over_the_work() {
     let point = s.turn_of(screen_at(5, ended(SAID)));
     s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
         .expect("the point's act");
-    s.host_steps_in_background(&screen_at(6, break_screen()), &mut since, cfg, &mut heard);
+    s.host_steps_in_background(&screen_at(6, break_screen()), &mut since, cfg, &mut heard)
+        .expect("the break's step");
     let point = s.turn_of(screen_at(7, ended(SAID)));
     s.turn_end_execute(&point, wait_a_while(), &opts, &[], &mut heard)
         .expect("the point's act");
@@ -265,7 +268,8 @@ fn kept_at_point(rows: Vec<String>, transcript: bool, action: TurnEndAction) -> 
         &mut since,
         Some(&opts.policy),
         &mut heard,
-    );
+    )
+    .expect("the break's step");
     if transcript {
         s.transcript_wait_seq = Some(2);
     }
@@ -334,11 +338,13 @@ fn the_answer_to_a_harness_line_keeps_the_hold_and_declares_it() {
             let cfg = Some(&opts.policy);
             let mut heard = Heard::default();
             let mut since = None;
-            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             s.took(2, cfg, &mut heard);
             clock.skip(Duration::from_secs(11 * 60));
             clock.set_at_ms(T0 + 11 * MIN);
-            s.host_steps_in_background(&screen_at(3, waiting_break()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(3, waiting_break()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             heard.noted
         };
         let rows = hold_rows(&path);
@@ -396,7 +402,8 @@ fn a_commands_owed_continuation_is_no_turn_the_harness_typed() {
         }
         assert!(s.turn_end.act_untaken(), "the continuation is owed");
         let mut since = None;
-        s.host_steps_in_background(&screen_at(3, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(3, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         s.took(4, cfg, &mut heard);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
@@ -462,9 +469,11 @@ fn the_hosts_step_at_an_idle_point_closes_the_hold() {
             let mut heard = Heard::default();
             let mut since = None;
             let mut at_ms = T0;
-            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             skip(&clock, &mut at_ms, 11 * MIN);
-            s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             let screen = s.screen().expect("the point");
             let point = s.turn_of(screen);
             let _ = s
@@ -509,9 +518,11 @@ fn a_turn_a_limit_resets_end_reads_running_closes_the_hold() {
             let mut heard = Heard::default();
             let mut since = None;
             let mut at_ms = T0;
-            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             skip(&clock, &mut at_ms, 11 * MIN);
-            s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard);
+            s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard)
+                .expect("the break's step");
             if owed {
                 let now = s.fx.mono();
                 s.reset = ResetStep::Owed(Box::new(ResetOwed {
@@ -590,7 +601,8 @@ fn predecessor(tag: &str, declared: bool, ends: bool) -> String {
         let mut heard = Heard::default();
         let mut since = None;
         let mut at_ms = T0;
-        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         if declared {
             s.took(2, cfg, &mut heard);
         }
@@ -600,7 +612,8 @@ fn predecessor(tag: &str, declared: bool, ends: bool) -> String {
         } else {
             break_screen()
         };
-        s.host_steps_in_background(&screen_at(3, last), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(3, last), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         if ends {
             skip(&clock, &mut at_ms, MIN);
             s.hold_left(cfg, &heard);
@@ -635,7 +648,8 @@ fn successor(
         let start = s.fx.mono();
         s.hold_seed_from(body, start, now_ms, lifted_off, &opts.policy, &heard);
         let mut since = None;
-        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         if ends {
             s.hold_left(cfg, &heard);
         } else {
@@ -741,13 +755,16 @@ fn a_loop_that_ends_with_the_hold_open_books_it_for_its_successor() {
         let mut heard = Heard::default();
         let mut since = None;
         let mut at_ms = T0;
-        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         skip(&clock, &mut at_ms, 5 * MIN);
-        s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         s.hold_left(cfg, &heard);
         assert!(hold_rows(&path).is_empty(), "not booked yet");
         skip(&clock, &mut at_ms, 6 * MIN);
-        s.host_steps_in_background(&screen_at(3, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(3, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         s.took(4, cfg, &mut heard);
         s.hold_left(cfg, &heard);
     }
@@ -815,3 +832,6 @@ fn the_hosted_loop_carries_the_hold_across_its_restarts() {
 
 #[path = "occupancy_door_tests.rs"]
 mod door;
+
+#[path = "occupancy_write_tests.rs"]
+mod write;

@@ -741,6 +741,28 @@ fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     let lead = row(&reborn, 307).lead.clone().expect("a lead");
     assert_eq!((lead.exe, lead.voucher), (None, Voucher::Unknown));
 
+    // A current failed identity read replaces a previous successful one,
+    // even when the pid and birth still match (a same-name exec can do so).
+    let mut v = Vitals::new();
+    let [base, sweep, now] = scene.samples();
+    let mut unreadable = now.clone();
+    unreadable.leads = vec![LeadIdentity {
+        pid: 387,
+        birth_ms: 1_792_517_318_000,
+        ..LeadIdentity::default()
+    }];
+    for s in [&base, &sweep] {
+        v.absorb(s);
+    }
+    let unknown = v.absorb(&unreadable).why.expect("a window's facts");
+    let lead = row(&unknown, 307).lead.clone().expect("a lead");
+    assert_eq!(
+        (lead.exe, lead.voucher, lead.signing_id, lead.team),
+        (None, Voucher::Unknown, None, None)
+    );
+    let recovered = later(&now, 5);
+    mds(&v.absorb(&recovered).why.expect("a current identity"));
+
     // Live members none of whose births were read: the part, and no name.
     let unborn = facts_edited(&scene, |base, now| {
         for p in [base, now]

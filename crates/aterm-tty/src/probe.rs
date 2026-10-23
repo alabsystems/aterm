@@ -2,20 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The capability probe (docs/DESIGN-amacs-2026-10-19.md §5.2).
-//!
-//! One write asks the terminal who it is (XTVERSION), for its kitty keyboard flags, and
-//! whether it knows DEC 2026 (synchronized output), 2048 (in-band resize), 1004 (focus)
-//! and 2004 (bracketed paste), then sends DA1, which every terminal since the VT100
-//! answers, as the sentinel: the replies come back in order, so DA1's marks the end. The
-//! replies are read through [`crate::decode`] until DA1 arrives or [`PROBE_TIMEOUT`]
-//! passes; no DA1 means a VT100 subset that answered nothing. The decoder is never
-//! flushed meanwhile, so a reply split across slow reads is never read as typing; keys
-//! typed during the probe come back with the capabilities, and anything the decoder
-//! still holds stays in it for the caller's loop. Signals that arrive meanwhile are
-//! taken (a read reports them until they are) and come back with it too.
-//!
-//! A mode counts as supported when the terminal reports it set, reset or permanently
-//! set; "not recognized" and "permanently reset" mean it cannot be used.
 
 use std::io;
 use std::time::Duration;
@@ -27,11 +13,11 @@ use crate::tty::{Readiness, Tty};
 /// How long the probe waits for the terminal's DA1.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The probe's one write: XTVERSION, kitty's flags, DECRQM for 2026, 2048, 1004 and
-/// 2004, and DA1 last.
+/// The probe's one write: XTVERSION, kitty's flags, DECRQM for 2026, 2048, 1004 and 2004, and DA1
+/// last.
 pub const QUERY: &[u8] = b"\x1b[>0q\x1b[?u\x1b[?2026$p\x1b[?2048$p\x1b[?1004$p\x1b[?2004$p\x1b[c";
 
-/// What the terminal said it can do. The default is a terminal that answered nothing.
+/// What the terminal said it can do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Caps {
     /// It reported kitty keyboard flags, so it takes a kitty push.
@@ -77,18 +63,16 @@ impl Caps {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Probed {
     pub caps: Caps,
-    /// The events read that were not the probe's replies (typeahead, a resize report),
-    /// in order.
+    /// The events read that were not the probe's replies (typeahead, a resize report), in order.
     pub events: Vec<Event>,
     /// The signals taken meanwhile, to be handled as if the loop had taken them: after
-    /// [`Signals::CONT`] the terminal is raw again and wants a repaint; after
-    /// [`Signals::WINCH`], a new size.
+    /// [`Signals::CONT`] the terminal is raw again and wants a repaint; after [`Signals::WINCH`], a
+    /// new size.
     pub signals: Signals,
 }
 
 /// Ask the terminal what it can do, reading its replies through `decoder` until DA1 or
 /// [`PROBE_TIMEOUT`] (on the terminal's clock).
-///
 /// # Errors
 /// The write's or a read's OS error, or setting the terminal raw again after a SIGCONT.
 pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<Probed> {
@@ -100,7 +84,6 @@ pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<
     while !done {
         match tty.read(&mut buf, Some(deadline))? {
             Readiness::Bytes(n) => {
-                // A count past the buffer breaks the Tty contract; read what the buffer holds.
                 let read = buf.get(..n).unwrap_or(&buf);
                 for event in decoder.feed(read, tty.now()) {
                     match event {
@@ -108,10 +91,8 @@ pub fn probe<T: Tty + ?Sized>(tty: &mut T, decoder: &mut Decoder) -> io::Result<
                         other => probed.events.push(other),
                     }
                 }
-                // A terminal that keeps sending (a held key) still ends the probe on time.
                 done |= tty.now() >= deadline;
             }
-            // Taken, or every read until they are would report them.
             Readiness::Signal => probed.signals = probed.signals.union(tty.take_signals()?),
             Readiness::Timeout | Readiness::Closed => done = true,
         }
@@ -151,7 +132,6 @@ mod tests {
 
     #[test]
     fn parses_replies_and_stops_at_da1() {
-        // aterm, with focus reporting on: every query answered, in one read.
         let (mut tty, peer) = MemTty::pair(SIZE);
         let start = tty.now();
         peer.send_after(Duration::from_millis(3), &aterm_replies(b"\x1b[?1004h"));
@@ -180,9 +160,6 @@ mod tests {
             "no wait past DA1"
         );
 
-        // Another terminal's replies, split mid-sequence across reads 300 ms apart (the
-        // decoder is never flushed, so the halves still meet), keys typed before and
-        // after them, and a resize signal in between, which the probe takes and hands on.
         let (mut tty, peer) = MemTty::pair(SIZE);
         let start = tty.now();
         peer.send(b"a\x1bP>|XTe");
@@ -224,8 +201,6 @@ mod tests {
 
     #[test]
     fn times_out_at_500ms_without_da1() {
-        // XTVERSION and one mode answered, DA1 never: the probe ends on its cap, with what
-        // it learned, and leaves the half reply it holds in the decoder.
         let (mut tty, peer) = MemTty::pair(SIZE);
         let start = tty.now();
         peer.send_after(
@@ -250,7 +225,6 @@ mod tests {
             "the held `ESC [` is the loop's"
         );
 
-        // A terminal that answers nothing at all.
         let (mut tty, _peer) = MemTty::pair(SIZE);
         let start = tty.now();
         let probed = probe(&mut tty, &mut Decoder::new()).expect("probed");

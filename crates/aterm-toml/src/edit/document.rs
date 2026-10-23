@@ -40,7 +40,7 @@ impl DocumentMut {
     /// The root table.
     #[inline]
     #[must_use]
-    pub fn as_table(&self) -> &Table {
+    pub const fn as_table(&self) -> &Table {
         self.root
             .as_table()
             .expect("document root is always a table")
@@ -48,7 +48,7 @@ impl DocumentMut {
 
     /// The root table, mutably.
     #[inline]
-    pub fn as_table_mut(&mut self) -> &mut Table {
+    pub const fn as_table_mut(&mut self) -> &mut Table {
         self.root
             .as_table_mut()
             .expect("document root is always a table")

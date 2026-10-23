@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! amacs edits under a REAL terminal (design §5.1, §5.5): the built binary, run as `amacs`
-//! (the argv0 alias every install lays), with a pty as its controlling terminal and stdio,
-//! as over ssh or in Terminal.app. Outside an aterm window, and under tmux inside one, the
-//! terminal face edits in the terminal itself: it probes the terminal, draws, takes keys,
-//! saves through amacs-files, and on exit puts the terminal's settings back exactly.
-//!
-//! The pty pair is aterm-pty's `open_pty_pair`, both ends close-on-exec from the open; the
-//! child makes the slave its controlling terminal (`setsid`, `TIOCSCTTY`), so its
-//! `/dev/tty` is this pty and never the terminal the test runner was started from. The
-//! settings are read through the master: a pair has one termios, and the BSDs revoke every
-//! descriptor of the slave when the session leader the child became exits.
-//!
-//! A SIGTERM mid-edit puts the terminal back too (aterm-tty's guard), and amacs ends as
-//! SIGTERM ends a program; with no draft journal yet (slice T5) the unsaved edit is lost. So
-//! does a panic, which a debug build's development seam injects (`ATERM_AMACS_INJECT_PANIC`,
-//! read only through `aterm_types::dev_seam!`): the terminal is put back before the panic's
-//! message is printed, so the message lands on the shell's screen.
+//! Integration tests for `amacs` running under a real PTY controlling terminal,
+//! verifying terminal mode restoration on normal exit, SIGTERM, and panic.
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt as _;
@@ -114,6 +99,7 @@ struct Session {
     tty: Terminal,
     /// The terminal's settings before amacs ran.
     before: libc::termios,
+    // Held open so the master never sees a hangup and can read termios after child exit.
     /// The slave end, held to the end so the master never reads a hangup.
     _slave: OwnedFd,
     /// Where the first frame's output ends.
@@ -153,8 +139,6 @@ impl Session {
         // async-signal-safe functions (`setsid`, `ioctl`) on its own stdin, the slave.
         unsafe {
             cmd.pre_exec(|| {
-                // `as _`: the request's type is the platform's (`c_uint` on macOS,
-                // `c_ulong` on glibc, `c_int` on musl).
                 if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -162,10 +146,7 @@ impl Session {
             });
         }
         let child = cmd.spawn().expect("run amacs");
-        // The parent's copies go with the `Command`; `slave` stays held until the end.
         drop(cmd);
-        // Own the child before a readiness wait or write can panic, so a
-        // failed startup takes the same kill/reap path as a failed test.
         let mut session = Self {
             root,
             child,
@@ -178,7 +159,7 @@ impl Session {
             at: 0,
         };
 
-        // The probe ends with DA1; answer it as a VT220 does, so the probe ends at once.
+        // Answer the DA1 probe as a VT220 so startup finishes immediately.
         let at = session.tty.wait_for(b"\x1b[c", 0, &mut session.child);
         session.tty.type_bytes(b"\x1b[?62;22c");
         session.at = session.tty.wait_for(b"-UU-:", at, &mut session.child);
@@ -189,6 +170,7 @@ impl Session {
         self.root.path().join("notes.txt")
     }
 
+    // Drain the PTY while waiting so XNU's `ttywait` does not block session-leader exit.
     /// Wait up to [`HANG`] for amacs to exit, reading the terminal meanwhile: a session
     /// leader's exit waits until its terminal's output is read (XNU's `ttywait`), as a
     /// terminal emulator always reads it.
@@ -244,8 +226,6 @@ impl Drop for Session {
 fn amacs_edits_a_file_under_a_real_pty() {
     let aterm = launch_isolation::aterm_executable();
     let aterm = aterm.as_path();
-    // A fresh build's first exec can wait out the system's code-policy check: run it once,
-    // unclocked, before the hang detector starts.
     aterm_spec::wait::first_exec(aterm, &["--help"]);
     for (label, env) in [
         ("outside a window", &[][..]),
@@ -296,7 +276,6 @@ fn sigterm_puts_the_terminal_back() {
     let mut session = Session::start(aterm, &[]);
     let at = session.at;
     session.tty.type_bytes(b"hello");
-    // The modeline's `**` says the keys reached the buffer.
     let at = session.tty.wait_for(b"**", at, &mut session.child);
     let pid = libc::pid_t::try_from(session.child.id()).expect("a pid");
     // SAFETY: `pid` is this test's own child, not yet reaped.

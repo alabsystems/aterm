@@ -1,21 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The toy task every suite test hosts: an accumulator with a "hot" flag that a tick must
-//! clear, an order-sensitive fold of what it was fed, and an effect-emitting input.
-//!
-//! * `Good` clears `hot` on every tick: it passes the contract `toy.tick-clears`.
-//! * `Stranded` is **an intentionally introduced demonstration fault**: its tick leaves `hot`
-//!   as it was, so a tick after an add observes `hot == true` and fails the contract.
-//! * `Strict` is `Good` with an entry invariant (`total >= 0`); `Picky` is `Good` refusing
-//!   `Add(13)`; `Leaky` is `Picky` that folds the refused input into `seen` first, breaking
-//!   the law that a refusal leaves the state untouched (the boundary must catch it, not trust
-//!   it); `OtherSchema` is `Good` declaring another schema digest; the `Shift*`, `Extra*` and
-//!   `Skip*` variants are `Good` with one changed effect.
-//!
-//! The schema can be made `lossy` (its state encoding drops `hot`: the negative control of
-//! the restore-at-every-boundary test) or `sloppy` (its state decoder accepts any non-zero
-//! byte for `hot`: the negative control of the canonical re-encode check).
+//! The toy task every suite test hosts: an accumulator with a "hot" flag that a tick must clear, an
+//! order-sensitive fold of what it was fed, and an effect-emitting input.
 
 use aterm_aos::contract::{Contract, Verdict};
 use aterm_aos::effects::{EffectPort, EffectRequest, NoEffects};
@@ -266,7 +253,6 @@ impl Code<ToySchema> for ToyCode {
         match input {
             ToyInput::Add(n) => {
                 if self.variant == Variant::Leaky && *n == 13 {
-                    // The broken law: the state moves, then the step refuses.
                     state.seen = mix(state.seen, 9, 13);
                     return Err(StepRefusal {
                         law: "toy.no-thirteen",
@@ -352,8 +338,7 @@ pub fn contract() -> TickClears {
     }
 }
 
-/// The same judge under another contract artifact (a relabelled contract, not a swapped
-/// policy).
+/// The same judge under another contract artifact (a relabelled contract, not a swapped policy).
 pub fn other_contract() -> TickClears {
     TickClears {
         id: ArtifactId::new(ArtifactKind::Contract, "toy.anything-goes", 1, b""),
@@ -428,9 +413,8 @@ pub fn attached(variant: Variant, cap: usize) -> ToyBoundary {
     b
 }
 
-/// The host's live path for one input: admit, then (if it runs) the live code's step with
-/// no external effects, then advance or withdraw. Returns the admission and, when the input
-/// ran, what the step returned.
+/// The host's live path for one input: admit, then (if it runs) the live code's step with no
+/// external effects, then advance or withdraw.
 pub fn live(b: &mut ToyBoundary, input: &ToyInput) -> (Admit, Option<Result<ToyObs, StepRefusal>>) {
     live_with(b, input, &mut NoEffects)
 }
@@ -455,8 +439,8 @@ pub fn live_with(
     (admit, Some(r))
 }
 
-/// The host's step of `input` through the live code (no effects), with no `admit` before it
-/// and no `advance` after: what a host does between the two.
+/// The host's step of `input` through the live code (no effects), with no `admit` before it and no
+/// `advance` after: what a host does between the two.
 pub fn apply(b: &mut ToyBoundary, input: &ToyInput) -> Result<ToyObs, StepRefusal> {
     let schema = b.schema().clone();
     let (code, state) = b.pair_mut();

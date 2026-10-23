@@ -1,48 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An unsaved native editor tab rides a self-update: its draft is carried through the
-//! handoff rather than holding the update until the person saves or closes it.
-//!
-//! The carrier is the editor's crash journal (`aterm-gui/src/native_document_journal.rs`).
-//! The successor reopens the file, replays the journal's draft over it, and republishes
-//! the journal under its own sequence numbers. The outgoing process lets the update Commit
-//! only when the image on disk, read back at Commit, replays to exactly its editor's text
-//! and no journal write of its own landed after the successor may have read the image.
+//! Formal model of carrying unsaved native editor drafts across a self-update.
 
 use aterm_spec::derive::Model;
 
-/// One document through one update attempt: the outgoing journal store, the journal image
-/// on disk, and the successor's restore (`App::draft_carry`, the preflight
-/// `App::native_update_close_preflight`, `App::rollback_overlap`).
-///
-/// State: `head` — the outgoing editor's version (0 is the file on disk: a clean
-/// document). `inflight`/`target` — a journal append on the document worker and the
-/// version it writes. `mem` — the version the outgoing store proved durable. `journal` —
-/// the version the image on disk replays to. `owner` — 1 when that image is a successor's
-/// republication (outgoing appends then fail their expected-image preflight). `reseat` —
-/// the outgoing store owes a re-seat of its image. `phase` — 0 no attempt, 1 successor
-/// launched and held, 2 parked, 3 committed. `restored`/`succ` — the successor ran its
-/// restore, and the version its editor holds (`Placeholder`: a Recovery tab, whose Retry
-/// replays the journal). `late` — a journal write landed while parked.
-///
-/// `RestoreIdentical` is a republication byte-for-byte equal to the image already there (a
-/// clean document's restore), so the outgoing store's next append still lands on it.
-///
-/// `NoDraftLost`: after Commit the successor's editor, or its Recovery tab's journal, holds
-/// exactly the outgoing buffer. `JournalOwnedOutsideHandoff`: with no attempt in flight the
-/// image is the outgoing store's own unless a re-seat is owed (else its appends fail and
-/// the draft is no longer crash-safe).
-///
-/// `Buggy = 1` commits a dirty document without the fresh check, and rolls back forgetting
-/// the successor's image. `Buggy = 2` re-seats while parked (over the image the successor
-/// restored from, which Commit then misreads as the successor's copy); `Buggy = 3` drops
-/// the `late` check (an append on the worker at the park lands on an identical
-/// republication after the successor read the older image). Both lose the draft.
-///
-/// Tier-1: `aterm-gui/src/editor_carry_conformance.rs` drives a real outgoing and a real
-/// successor `App` over one journal directory through every schedule, with the `Buggy`
-/// machines as negative controls.
+/// One document through one update attempt.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_editor_carry_model() -> Model {

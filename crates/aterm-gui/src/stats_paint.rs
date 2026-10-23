@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STATS SURFACES' ONE PAINTER: the level-mark grammar of
-//! `docs/DESIGN-system-awareness-2026-10-16.md` §12.1, lowered to
-//! [`DrawPrim`]s for the shared tray rasterizer, so the Deck
-//! (`crate::stats_deck`), the sill (`crate::stats_sill`) and the lens
-//! (`crate::stats_lens`) draw every tile, bar, tank and mark the same way.
-//!
-//! * **Tiles** draw by the resolution ladder, keyed to their drawn size in
-//!   device pixels ([`Rung`]): at 32 px and up all five channels with an
-//!   outside halo; at 10–31 px level, momentum and the glow as a lit top rim;
-//!   under 10 px the level alone. Every band inside a tile (fill, sliver,
-//!   pale band, tide) is clipped to the tile's rounded silhouette, so no
-//!   square corner pokes past the rim.
-//! * **Lanes** (bars) carry the same channels along their length: length and
-//!   ink, the dotted ghost tick, the warm sliver and the notch when rising,
-//!   the pale residual when falling, a glow along the live end clipped to the
-//!   lane's slot, and the end feathered inward for jitter.
-//! * **Marks** (stuck, quiet, waiting, zombies, stopped) are vector shapes,
-//!   never glyphs, so they read the same in every font.
-//!
-//! Positions are whole device pixels, so the same input lays the same pixels
-//! and a fingerprint of the prims decides whether a frame presents.
+//! Shared level-mark painter for the stats Deck, sill, and lens.
 
 use aterm_vitals::Motion;
 use aterm_vitals::ink::{HaloMode, Rgb, VitalsInks};
@@ -63,8 +43,7 @@ pub(crate) fn contains(r: Rect, px: f64, py: f64) -> bool {
     px >= x && px < x + w && py >= y && py < y + h
 }
 
-/// Which instrument a hit region names: the lens opens on its focus well
-/// (Stats Deck v2 §11.4): the deck's seven rows, and How to read.
+/// Which instrument a hit region names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Instrument {
     /// The CPU row, the cores block and the Cores row.
@@ -86,9 +65,7 @@ pub(crate) enum Instrument {
 }
 
 impl Instrument {
-    /// The rows' instruments in the lens's ←/→ order; How to read is
-    /// reached by the header alone (§11.4). Tokens lives in the AI CLI
-    /// harness template rather than the OS Resource Monitor.
+    /// The rows' instruments in the lens's ←/→ order.
     pub(crate) const ALL: [Self; 6] = [
         Self::Cpu,
         Self::Gpu,
@@ -236,8 +213,7 @@ impl Rung {
     }
 }
 
-/// The level, ghost and channels of one bar or tile, as fractions of its
-/// capacity.
+/// The level, ghost, and channels of one bar or tile, as fractions of capacity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Mark {
     /// Fast average, `0..=1` of capacity.
@@ -253,8 +229,7 @@ pub(crate) struct Mark {
 }
 
 impl Mark {
-    /// A mark from a trend in `capacity` units with a motion gate in the same
-    /// units.
+    /// A mark from a trend in `capacity` units with a motion gate in the same units.
     pub(crate) fn of(t: &TrendView, capacity: f32, gate: f32) -> Self {
         let cap = capacity.max(f32::EPSILON);
         let mad = t.mad / cap;
@@ -285,8 +260,7 @@ impl Mark {
     }
 }
 
-/// An attention mark (§12.1's table, Stats Deck v2 §10), drawn as a vector
-/// shape: the chrome faces lack the glyphs.
+/// An attention mark drawn as a vector shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum WellMark {
     /// ⊘: a ring with a 45° slash, frost.
@@ -353,8 +327,7 @@ impl WellMark {
     }
 }
 
-/// One attention mark the bars draw: its kind, how many it counts, and the
-/// quiet mark's arc (the worst quiet job's `(φ − 3) / 5`, design §12.1).
+/// One attention mark the bars draw: its kind, count, and quiet arc.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct StatsMark {
     pub(crate) kind: WellMark,
@@ -369,13 +342,10 @@ impl StatsMark {
     }
 }
 
-/// The ◔ arc the deck's well draws for a quiet row, and the lens for a quiet
-/// job whose φ was not read: a quarter (v2 §10, "a Dot clipped to the
-/// top-right quadrant").
+/// Default `◔` arc for a quiet row or job whose `φ` was not read.
 pub(crate) const QUIET_ARC: f32 = 0.25;
 
-/// How far a quiet job's ◔ arc has filled: 0 at the quiet line (φ = 3), full
-/// at the stuck line (φ = 8), so the arc closes as the verdict nears stuck.
+/// How far a quiet job's `◔` arc has filled (`0.0` at `φ = 3`, `1.0` at `φ = 8`).
 pub(crate) fn quiet_arc(phi_milli: u64) -> f32 {
     use aterm_vitals::jobs::{PHI_QUIET_MILLI, PHI_STUCK_MILLI};
     (phi_milli.saturating_sub(PHI_QUIET_MILLI) as f32
@@ -383,11 +353,7 @@ pub(crate) fn quiet_arc(phi_milli: u64) -> f32 {
         .clamp(0.0, 1.0)
 }
 
-/// The instance's attention marks from the stuck engine's view (§11, the
-/// mark well of §12.2), in the well's priority ⊘ > ☠ > ◔ > ◇ > stopped:
-/// stuck jobs, zombies unreaped by a process in one of aterm's tabs, quiet
-/// jobs (the arc follows the worst φ), jobs waiting for the person, and
-/// parked jobs (stopped by job control, drawn dim). A calm machine has none.
+/// Attention marks from the jobs view in priority order (`⊘ > ☠ > ◔ > ◇ > stopped`).
 pub(crate) fn marks_of(view: &aterm_vitals::jobs::JobsView) -> Vec<StatsMark> {
     use aterm_vitals::jobs::Verdict;
     let count = |v: Verdict| {
@@ -420,10 +386,7 @@ pub(crate) fn marks_of(view: &aterm_vitals::jobs::JobsView) -> Vec<StatsMark> {
     .collect()
 }
 
-/// The type sizes of the stats surfaces, in device px: figures in tabular
-/// type at 11 pt (the design's size; never under 10.5 pt), labels at 9.5–10.5
-/// pt. Below 10 px a word is not legible, so neither size follows a small
-/// terminal font below its floor.
+/// Type sizes for figures and labels on the stats surfaces, in device px.
 pub(crate) fn stats_type(font_px: f32, s: f32) -> (StepPx, StepPx) {
     (
         TypeStep::Body.px_clamped(font_px * 0.92, 10.5 * s, 11.5 * s),
@@ -469,8 +432,7 @@ impl<'a> Painter<'a> {
         (self.s / 2.0).round().max(1.0)
     }
 
-    /// A figure in the terminal's mono face (tabular, so values never
-    /// refold).
+    /// A figure in the terminal's tabular mono face.
     pub(crate) fn figure(&mut self, x: f32, baseline: f32, s: String, color: Rgb, small: bool) {
         let size = if small { self.small_px } else { self.text_px };
         self.prims.push(text_prim(
@@ -505,10 +467,7 @@ impl<'a> Painter<'a> {
         self.prims.push(DrawPrim::ClipPop);
     }
 
-    /// A warm halo round `rect`: rings of the rise ink fading out over
-    /// `reach` px with RainHalo's falloff, clipped to `clip` so it never
-    /// touches a neighbour. Light themes lay a veil (Over), dark themes the
-    /// same rings brighter (the rasterizer has no additive mode).
+    /// A warm halo around `rect` fading out over `reach` px, clipped to `clip`.
     pub(crate) fn halo(&mut self, rect: Rect, radius: f32, reach: f32, step: u8, clip: Rect) {
         if step == 0 || reach < 1.0 {
             return;
@@ -562,14 +521,12 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// One square tile `t` px across at `(x, y)`, by its [`Rung`]; `gutter`
-    /// is the space to its neighbours (the halo reaches half of it).
+    /// One square tile `t` px across at `(x, y)`, by its [`Rung`].
     pub(crate) fn tile(&mut self, x: f32, y: f32, t: f32, m: Mark, gutter: f32) {
         self.tile_rect(x, y, t, t, m, gutter, Some(self.inks.load_at(m.level)));
     }
 
-    /// A tile of any aspect: the GPU tank is one (`fill` `None` takes the
-    /// load ramp at the level).
+    /// A tile of any aspect (`fill = None` uses the load ramp at `m.level`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn tile_rect(
         &mut self,
@@ -604,8 +561,6 @@ impl<'a> Painter<'a> {
         }
         self.prims
             .push(panel(x, y, w, h, r, rgba(inks.track, 0xFF)));
-        // Every band is the tile's own rounded shape clipped to the band's
-        // rows, so the silhouette stays round at the corners.
         let shape = |p: &mut Self, y0: f32, bh: f32, c: Rgba| {
             p.clipped((x, y0, w, bh), |p| p.prims.push(panel(x, y, w, h, r, c)));
         };
@@ -646,8 +601,6 @@ impl<'a> Painter<'a> {
             );
         }
         if rung == Rung::Full && m.edge > 0 {
-            // Variance: the edge feathers inward (soft 3 pt·½, blurred 6), in
-            // the ground, inside the silhouette.
             let feather = if m.edge == 1 {
                 (1.5 * self.s).round()
             } else {
@@ -671,12 +624,10 @@ impl<'a> Painter<'a> {
             });
         }
         if rung == Rung::Mid && m.glow > 0 {
-            // The glow as a lit top rim inside the tile.
             let k = [0.35, 0.60, 0.85][usize::from(m.glow.min(3) - 1)];
             shape(self, y, th, a(inks.rise, k));
         }
         if rung >= Rung::Mid && m.motion == Motion::Rising {
-            // A notch cut into the top edge: rising without colour.
             let nw = (w * 0.22).round().max(2.0);
             let nh = (self.s).round().max(2.0);
             self.prims.push(panel(
@@ -689,7 +640,6 @@ impl<'a> Painter<'a> {
             ));
         }
         if self.dwc && rung >= Rung::Mid && m.motion == Motion::Falling {
-            // Differentiate Without Color: falling gains a bottom notch.
             let nw = (w * 0.22).round().max(2.0);
             let nh = (self.s).round().max(2.0);
             self.prims.push(panel(
@@ -714,8 +664,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// A tile for a core the OS withdrew or nobody measured: a dashed
-    /// outline, never a zero.
+    /// A dashed outline for an unmeasured or withdrawn core.
     pub(crate) fn tile_unmeasured(&mut self, x: f32, y: f32, w: f32, h: f32) {
         let c = a(self.inks.words2, 0.7);
         let th = self.hair();
@@ -725,9 +674,7 @@ impl<'a> Painter<'a> {
         self.dotted(x + w - th, y, x + w - th, y + h, th, c);
     }
 
-    /// The GPU tank: one fill for the whole device, with a hairline per core
-    /// group so it reads as `cores` cores sharing one level, and a rim so an
-    /// idle tank still reads as a vessel.
+    /// The GPU tank: one fill for the device with a hairline per core group.
     pub(crate) fn tank(&mut self, r: Rect, m: Mark, cores: Option<u16>, gutter: f32) {
         let (x, y, w, h) = r;
         self.tile_rect(x, y, w, h, m, gutter, None);
@@ -743,7 +690,6 @@ impl<'a> Painter<'a> {
             }
         }
         if m.edge != 0 || Rung::of(w.min(h)) == Rung::Low {
-            // The tile drew no rim (a jittery or tiny tank): the vessel keeps one.
             self.prims.push(DrawPrim::Stroke {
                 x,
                 y,
@@ -756,8 +702,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// One horizontal lane: all five channels along it. `groove` draws the
-    /// empty part as a thin groove (the sill) instead of a full track.
+    /// One horizontal lane (`groove` draws the empty part as a thin groove).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lane(
         &mut self,
@@ -776,8 +721,6 @@ impl<'a> Painter<'a> {
         let ghost_x = (x + m.ghost * w).round();
         let end = x + len;
         if len > 0.0 && h >= 3.0 {
-            // The glow along the live end (the last three lane-heights),
-            // clipped to the lane's slot: a warm wash round the end, not a dot.
             let reach = (if inks.dark { 2.0 } else { 3.0 } * self.s).round();
             let gw = len.min(3.0 * h);
             self.halo((end - gw, y, gw, h), r, reach, m.glow, slot);
@@ -851,7 +794,6 @@ impl<'a> Painter<'a> {
             );
         }
         if h >= 3.0 && m.motion == Motion::Rising {
-            // A notch cut into the end cap's top corner.
             let nh = (h * 0.35).round().max(1.0);
             let nw = (self.s).round().max(2.0);
             self.prims.push(panel(
@@ -864,7 +806,6 @@ impl<'a> Painter<'a> {
             ));
         }
         if self.dwc && h >= 3.0 && m.motion == Motion::Falling && len >= h {
-            // Differentiate Without Color: a hollow end cap while falling.
             let cap = h.min(len);
             self.prims.push(panel(
                 end - cap + 1.0,
@@ -877,9 +818,7 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// A capacity bracket at a lane's end: a hairline in the track ink, or
-    /// filled in the ramp's hottest stop when the lane is pinned, so a full
-    /// lane never reads as merely long.
+    /// A capacity bracket at a lane's end, highlighted when pinned.
     pub(crate) fn bracket(&mut self, x: f32, y: f32, h: f32, pinned: bool) {
         let w = self.hair().max((self.s * 0.75).round());
         let c = if pinned {
@@ -890,8 +829,7 @@ impl<'a> Painter<'a> {
         self.prims.push(panel(x, y, w, h, 0.0, c));
     }
 
-    /// An attention mark centred at `(cx, cy)` with radius `r`, in its own
-    /// ink; `frac` grows the quiet mark's arc (`0..=1`).
+    /// An attention mark centred at `(cx, cy)` with radius `r`.
     pub(crate) fn mark(&mut self, kind: WellMark, cx: f32, cy: f32, r: f32, frac: f32) {
         let ink = kind.ink(self.inks);
         self.mark_in(kind, (cx, cy, r), frac, ink, (r * 0.28).max(1.0));
@@ -957,7 +895,6 @@ impl<'a> Painter<'a> {
                 }
             }
             WellMark::Zombies => {
-                // A skull reduced to what reads at 16 px: a dome and two eyes.
                 self.prims.push(DrawPrim::Dot {
                     cx,
                     cy: cy - r * 0.1,
@@ -989,8 +926,6 @@ impl<'a> Painter<'a> {
                     .push(panel(cx + r * 0.18, cy - r * 0.7, bw, r * 1.4, 0.0, c));
             }
             WellMark::Low => {
-                // ◢: one whole-pixel panel per scanline, the hypotenuse from
-                // the bottom left to the top right.
                 let (top, bottom, right) = ((cy - r).round(), (cy + r).round(), (cx + r).round());
                 let mut y = top;
                 while y < bottom {
@@ -1003,8 +938,6 @@ impl<'a> Painter<'a> {
                 }
             }
             WellMark::Up | WellMark::Down => {
-                // A shaft 0.72 em tall and two heads 0.24 em: the mark's
-                // radius is 0.36 em.
                 let (top, bottom, head) = (cy - r, cy + r, r * 0.24 / 0.36);
                 self.prims.push(line(cx, top, cx, bottom));
                 let (tip, back) = if kind == WellMark::Down {
@@ -1032,8 +965,7 @@ pub(crate) mod tests {
         Class, Consumer, JobKind, JobRow, JobsView, Tick, Verdict, ZombieParent,
     };
 
-    /// A job of `verdict` in tab 7 (the shared snapshot's tab, `Tab 1`),
-    /// quiet for `quiet_ms` at φ `phi_milli`.
+    /// A job of `verdict` in tab 7, quiet for `quiet_ms` at `phi_milli`.
     pub(crate) fn job_row(
         id: &str,
         verdict: Verdict,
@@ -1178,7 +1110,6 @@ pub(crate) mod tests {
             motion: Motion::Rising,
         };
         p.tile(100.0, 10.0, 48.0, m, 10.0);
-        // Every rounded panel the size of the tile has the tile's radius.
         let tile_panels: Vec<f32> = p
             .prims
             .iter()
@@ -1198,7 +1129,6 @@ pub(crate) mod tests {
                 .iter()
                 .all(|r| *r == tile_panels[0] && *r >= 3.0)
         );
-        // No square panel is wider than the tile's straight edge.
         for prim in &p.prims {
             if let DrawPrim::Panel { w, radius, y, .. } = prim
                 && *radius == 0.0
@@ -1238,7 +1168,6 @@ pub(crate) mod tests {
         );
         let mut low = Painter::new(&inks, 1.0, 12.0, false);
         low.tile(0.0, 0.0, 7.0, m, 3.0);
-        // Track, fill (its clip), nothing else.
         let panels = low
             .prims
             .iter()

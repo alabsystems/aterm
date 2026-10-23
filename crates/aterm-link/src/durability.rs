@@ -65,7 +65,7 @@ impl Durability {
 
     /// Canonical flag value (`strict`, `ordered`, or `relaxed`).
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Durability::Strict => "strict",
             Durability::Ordered => "ordered",
@@ -75,7 +75,7 @@ impl Durability {
 
     /// Corresponding [`astream_broker::Durability`] tier (using [`ORDERED_HORIZON`] for `Ordered`).
     #[must_use]
-    pub fn tier(self) -> astream_broker::Durability {
+    pub const fn tier(self) -> astream_broker::Durability {
         match self {
             Durability::Strict => astream_broker::Durability::Strict,
             Durability::Ordered => astream_broker::Durability::Ordered {
@@ -111,7 +111,7 @@ impl Durability {
 
     /// Map an `astream` wire [`astream_broker::Tier`] to [`Durability`].
     #[must_use]
-    pub fn of_tier(requested: astream_broker::Tier) -> Option<Self> {
+    pub const fn of_tier(requested: astream_broker::Tier) -> Option<Self> {
         match requested {
             astream_broker::Tier::Strict => Some(Durability::Strict),
             astream_broker::Tier::Ordered => Some(Durability::Ordered),
@@ -141,7 +141,7 @@ impl Durability {
 
 /// Default durability for a bare broker argv: `Ordered` when `guarded`, `Strict` when unguarded.
 #[must_use]
-pub fn default_for(guarded: bool) -> Durability {
+pub const fn default_for(guarded: bool) -> Durability {
     if guarded {
         Durability::Ordered
     } else {

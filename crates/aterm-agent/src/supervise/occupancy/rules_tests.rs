@@ -258,7 +258,7 @@ fn each_guard_holds_a_due_line() {
     let at = |g: Guards| verdict(RuleId::WaitNudge, &r, hold(), &b, &g, now);
     // NEGATIVE CONTROL: nothing holds.
     assert!(is_due(&at(cruise()), RuleId::WaitNudge));
-    let cases: [(Guard, SetGuard); 16] = [
+    let cases: [(Guard, SetGuard); 17] = [
         (Guard::Stall, |g| g.brake = Some(Guard::Stall)),
         (Guard::LimitEpisode, |g| g.brake = Some(Guard::LimitEpisode)),
         (Guard::ActUntaken, |g| g.brake = Some(Guard::ActUntaken)),
@@ -269,6 +269,7 @@ fn each_guard_holds_a_due_line() {
         (Guard::Draft, |g| g.draft = true),
         (Guard::Taskless, |g| g.taskless = true),
         (Guard::Exchange, |g| g.exchange = true),
+        (Guard::Managed, |g| g.managed = true),
         (Guard::Memory, |g| g.memory = true),
         (Guard::Reach, |g| g.reach_down = true),
         (Guard::Autopilot, |g| g.mode = Autopilot::Land),
@@ -364,14 +365,13 @@ fn the_reading_is_wanted_only_where_hold_room_could_be_due() {
 }
 
 /// A WOULD ROW READS BACK: its rule, its stamp and its hold's age, for this session only and
-/// under its own rule only; a row this build did not write is passed over.
+/// under its own rule only; a row this build did not write is passed over. A line the door typed
+/// under `prompt` (its `fact-hold@v1` outcome `typed`) is booked as a would-be line is; its
+/// `skipped` outcome and the hold clock's own rows are not.
 #[test]
 fn would_rows_read_back_for_this_session() {
-    let row = |sid: &str, rule: &str, ts: i64, reason: &str| {
-        format!(
-            r#"{{"ts":{ts},"sid":"{sid}","rule_id":"{rule}","outcome":"waiting","reason":"{reason}"}}"#
-        )
-    };
+    let row =
+        |sid: &str, rule: &str, ts: i64, reason: &str| row_said(sid, rule, ts, "waiting", reason);
     let nudge = would_reason(RuleId::WaitNudge, 7, 30 * MIN, false);
     let room_said = would_reason(RuleId::HoldRoom, 9, 2 * HOUR, true);
     let body = [
@@ -380,6 +380,8 @@ fn would_rows_read_back_for_this_session() {
         row("s-1", "fact-hold@v1", T0 + 2, "hold=open held_ms=600000"),
         row("s-1", WOULD_RULE, T0 + 3, "rule=later-rule@v9 held_ms=1"),
         row("s-1", WOULD_RULE, T0 + 4, &room_said),
+        row_said("s-1", "fact-hold@v1", T0 + 5, "skipped", &room_said),
+        row_said("s-1", "fact-hold@v1", T0 + 6, "typed", &room_said),
     ]
     .join("\n");
     assert_eq!(
@@ -395,9 +397,21 @@ fn would_rows_read_back_for_this_session() {
                 row_ms: T0 + 4,
                 held_ms: 2 * HOUR,
             },
+            WouldRow {
+                rule: RuleId::HoldRoom,
+                row_ms: T0 + 6,
+                held_ms: 2 * HOUR,
+            },
         ]
     );
     assert_eq!(would_rows_in(&body, Some("s-3")), []);
+}
+
+/// A ledger row of `sid`'s at `ts`, `decision` under `rule`.
+fn row_said(sid: &str, rule: &str, ts: i64, decision: &str, reason: &str) -> String {
+    format!(
+        r#"{{"ts":{ts},"sid":"{sid}","rule_id":"{rule}","decision":"{decision}","reason":"{reason}"}}"#
+    )
 }
 
 /// An episode's id is the rule's, the hold's and its ordinal's: the same three give the same id

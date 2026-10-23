@@ -13,9 +13,14 @@ use crate::harness;
 use aterm_link::broker_health::{FAULT_SEAM, POISONED_EXIT, POISONED_EXIT_WORDS};
 use harness::{FLEET, SECRET, World, id_at_off, kv, until};
 
-/// A real `aterm link broker` process, killed and reaped on every exit path.
+/// A real `aterm link broker` process, killed and reaped on every exit path, and
+/// ending itself with its lifeline if this process dies first
+/// ([`harness::spawn_broker`]).
 struct BrokerProcess {
     child: aterm_uds::spawnfd::Child,
+    /// Held while it serves ([`harness::BrokerChild`]); taken, the broker ends itself at its
+    /// next wake.
+    lifeline: Option<aterm_uds::lifeline::Lifeline>,
 }
 
 impl Drop for BrokerProcess {
@@ -59,26 +64,32 @@ impl Supervised {
             .append(true)
             .open(&self.err)
             .expect("broker.err");
-        let mut child = aterm_uds::spawnfd::command(harness::aterm_to_launch())
-            .args(["link", "broker", &w.broker_sock, &w.broker_log])
-            .arg("--secret-file")
-            .arg(&self.secret)
-            .args(["--durability", "relaxed"])
-            .env(FAULT_SEAM, &self.fault)
-            .env("XPC_SERVICE_NAME", aterm_link::enable::LABEL)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(err)
-            .spawn()
-            .expect("spawn the broker");
-        let out = child.stdout.take().expect("the broker's stdout");
+        let secret = self.secret.to_string_lossy().into_owned();
+        let args = [
+            w.broker_sock.as_str(),
+            w.broker_log.as_str(),
+            "--secret-file",
+            secret.as_str(),
+            "--durability",
+            "relaxed",
+        ];
+        let mut started = harness::spawn_broker(&w.tmp, &args, |cmd| {
+            cmd.env(FAULT_SEAM, &self.fault)
+                .env("XPC_SERVICE_NAME", aterm_link::enable::LABEL)
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(err);
+        });
+        let out = started.child.stdout.take().expect("the broker's stdout");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut line = String::new();
             let _ = std::io::BufReader::new(out).read_line(&mut line);
             let _ = tx.send(line);
         });
-        let broker = BrokerProcess { child };
+        let broker = BrokerProcess {
+            child: started.child,
+            lifeline: Some(started.lifeline),
+        };
         let first = rx.recv_timeout(harness::DEADLINE).unwrap_or_else(|_| {
             panic!(
                 "the broker printed no readiness line; broker.err:\n{}",
@@ -251,7 +262,9 @@ fn a_poisoned_log_exits_75_and_the_restarted_broker_lands_the_post_once() {
 /// same world under the seam's `stay`: the broker keeps serving its poisoned
 /// log, every post to it stays refused, and the bridge says so —
 /// `fabric=stalled reason=poisoned`, never `connected` — within the
-/// one-minute hang detector.
+/// one-minute hang detector. The seam switches off that exit and no other:
+/// its launcher gone (the lifeline cut), the poisoned broker it kept serving
+/// still ends itself at its next wake, saying why.
 #[test]
 fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     let tag = "poistay";
@@ -285,6 +298,15 @@ fn with_the_exit_switched_off_posts_stay_refused_and_the_link_reads_poisoned() {
     for text in ["refused by the poison", "behind the refused one"] {
         assert_eq!(on_lane(&w, &a, text), 0, "{text} stays refused");
     }
+
+    drop(broker.lifeline.take());
+    let ended = until("the stayed broker to end with its lifeline", || {
+        broker.child.try_wait().ok().flatten()
+    });
+    let said = read(&sup.err);
+    assert!(ended.success(), "a clean stop exits 0: {ended}\n{said}");
+    let why = format!("aterm link broker: {}", aterm_link::cli::LIFELINE_CUT_WORDS);
+    assert!(said.contains(&why), "it said why it ended:\n{said}");
 }
 
 /// How many records on `to`'s `kind` lane from this node carry `needle` in

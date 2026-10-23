@@ -13,19 +13,7 @@
 // gone. See ../../LICENSE-MIT for the upstream license; Apache-2.0 is the
 // workspace's.
 
-//! Writing the glue for an [`Interface`]: the JS (ES module for `web`,
-//! CommonJS for `nodejs`), its `.d.ts`, and the `_bg.wasm.d.ts` of the raw
-//! exports. Each conversion is the inverse of aterm-wasm-abi's lowering
-//! (`crates/aterm-wasm-abi/src/marshal.rs`); the fixed pieces are in
-//! `templates.rs`.
-//!
-//! JS values match wasm-bindgen's for the same Rust types: `u64`/`i64` are
-//! `BigInt`, `None` is `undefined`, buffers are fresh typed arrays, a `char`
-//! is a one-code-point string, and `Err(s)` throws the string `s`.
-//!
-//! Every call into the module is followed by `checkThrown()`: an export that
-//! throws returns normally with the throw in the return slot
-//! (`crates/aterm-wasm-abi/src/mem.rs`), and the glue throws it.
+//! JS, `.d.ts`, and `_bg.wasm.d.ts` glue generation for an [`Interface`].
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -86,7 +74,6 @@ fn elem(ty: &Ty) -> (&'static str, &'static str, usize) {
         Ty::U64 => ("U64", "BigUint64Array", 8),
         Ty::I64 => ("I64", "BigInt64Array", 8),
         Ty::F32 => ("F32", "Float32Array", 4),
-        // The model admits element types only (`Ty::is_element`).
         _ => ("F64", "Float64Array", 8),
     }
 }
@@ -116,6 +103,7 @@ fn ts_param(ty: &Ty, trailing: bool) -> (String, bool) {
     }
 }
 
+// Prefix colliding or reserved parameter names with `_` so they never shadow body identifiers.
 /// The JS names of `f`'s parameters: the Rust names the descriptor records,
 /// which the `.d.ts` and JSDoc show as wasm-bindgen's glue does. A name takes
 /// a leading `_` (wasm-bindgen's `_this`) until it is no reserved word, no
@@ -172,6 +160,7 @@ fn read_names(code: &str) -> BTreeSet<&str> {
     out
 }
 
+// Escape `*/` so the literal is safe inside the self-types header comment.
 /// JSON strings are JS string literals too. Escaping the comment terminator
 /// also makes the same literal safe in the self-types header comment.
 fn literal(text: &str) -> String {
@@ -347,7 +336,6 @@ impl Needs {
                     v
                 }
             },
-            // `()`, `Result<(), _>`; the model refuses any other type.
             _ => vec![],
         }
     }
@@ -714,8 +702,7 @@ fn js_key(name: &str) -> String {
 
 /// The helpers the members asked for, in a fixed order.
 fn helpers(needs: &mut Needs, flavor: Flavor) -> String {
-    // Dependencies between helpers: `checkThrown` reads the slot and the
-    // message.
+    // `checkThrown` unconditionally requires `getStringFromWasm0`, `Uint32Array`, and `Uint8Array`.
     needs.get_string = true;
     needs.view("Uint32Array");
     needs.view("Uint8Array");
@@ -970,9 +957,6 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
             Duration::from_secs(60),
         );
-        // A machine without node cannot run the fixture: that is the machine's
-        // answer, never a finding, so it panics with verify's COULD NOT RUN
-        // sentinel, as `run_bound_node_flavor` does, and the root goes with it.
         let output = match outputs.pop().expect("one owned child") {
             Ok(output) => output,
             Err(aterm_uds::deadline::RunError::Spawn(e)) => panic!(
@@ -986,7 +970,6 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         print!("{stdout}");
         eprint!("{stderr}");
-        // Only a failing run keeps its fixture root for reading.
         let passed = output.status.success()
             && [
                 "GL_LIFETIME_ADMITTED_CONTROLS_REACHED",

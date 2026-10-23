@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE KEPT CHIP BLOCKS ([`WindowLights::lend_block`]): a pane's block is
-//! fitted once per [`FitKey`] and LENT to every frame after it while the key
-//! stands — and the key holds every input the fit reads (the pane's ground,
-//! the accent, the keyboard's and the pointer's chips, the room, Autopilot's
-//! title as its reading built it, and the session's lights: Claude's mode,
-//! a toggle in flight, a refusal (its light and its reason) or a notice
-//! while on show, the Autopilot word, a click in flight and the harness's
-//! glass), so a frame whose inputs moved fits anew and draws what fitting
-//! anew draws. Here input by input on the window's lights, and over a
-//! scripted run of real frames against a window that keeps nothing and
-//! reads every row.
+//! THE KEPT CHIP BLOCKS ([`WindowLights::lend_block`]).
 
 use std::ops::Range;
 use std::os::unix::net::UnixStream;
@@ -310,8 +300,6 @@ fn cases() -> Vec<Case> {
         ("a refusal's show ending", refusing, |w| {
             w.session().refused.as_mut().expect("refused").2 = gone();
         }),
-        // A second click refused for another reason while the first still
-        // shows, on the same light: the title says the new reason.
         ("a refusal's new reason", refusing, |w| {
             w.session().refused = Some((Light::Mode, Refusal::StoppedMidTurn(Mode::Plan), later()));
         }),
@@ -351,9 +339,6 @@ fn cases() -> Vec<Case> {
 /// fitting anew lays; the input moved, the next frame fits anew (the key
 /// missed) and lays what fitting anew lays — not what it laid before (the
 /// input moves the glass) — and the frame after keeps that.
-///
-/// NEGATIVE CONTROL: the first frame of each fits (the counter is wired),
-/// and every moved input is seen by the glass.
 #[test]
 fn a_kept_block_is_lent_while_its_key_stands_and_fitted_anew_where_any_input_moves() {
     for (what, from, moved) in cases() {
@@ -389,8 +374,6 @@ fn a_kept_block_is_lent_while_its_key_stands_and_fitted_anew_where_any_input_mov
 /// its block go to the spares (no allocation) and the pane drawn again
 /// fits anew. A block lent twice in one frame (not yet handed back) is laid
 /// anew the second time, the same cells.
-///
-/// NEGATIVE CONTROL: with nothing kept (`fit_anew_in`) every frame fits.
 #[test]
 fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
     let mut world = World::cruise();
@@ -400,7 +383,6 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
         let (frame, allocations) = crate::work_counts::allocations_in(|| world.frame_of(&[0, 1]));
         assert!(frame.iter().all(|f| f.fits == 0), "frame {i}: {frame:?}");
         assert!(frame.iter().all(|f| f.lent == f.anew), "frame {i}");
-        // The anew fits of the comparison allocate; the lends do not.
         let lends = crate::work_counts::allocations_in(|| {
             world.w.clear_hits();
             for pane in [0, 1] {
@@ -433,7 +415,6 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
         [0, 1],
         "pane 1 fits anew"
     );
-    // Lent twice in one frame.
     world.w.clear_hits();
     let _ = crate::work_counts::take_footer_block_fits();
     let a = world
@@ -468,7 +449,6 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
     assert_eq!(Laid::of(&a), Laid::of(&b), "the same cells");
     world.w.give_back(a);
     world.w.give_back(b);
-    // CONTROL: nothing kept.
     fit_anew_in(|| {
         for i in 0..3 {
             let frame = world.frame_of(&[0, 1]);
@@ -525,8 +505,6 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
             laid: 41,
         }
     };
-    // CONTROL: an ordinary generation change reads the supplied day and
-    // the actual title formatter names the historical stamp's weekday.
     let mut ordinary = make(empty, None);
     let reads = Cell::new(0);
     assert!(ordinary.refresh(
@@ -558,7 +536,6 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
             (&kept.0, &kept.1, kept.2),
         );
     }
-    // CONTROL: a trail without a face clock is still read at its event.
     let mut trail = make(empty, None);
     assert!(trail.refresh(
         1,
@@ -577,9 +554,6 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         |_| panic!("an unchanged trail was read again")
     ));
 
-    // The generation may stand while any part of the built face changes.
-    // A first/restated stamp must not inherit None, or a previous day's
-    // read. Clearing and restating are separate calls through the real seam.
     let moved_clock = built(
         AutopilotView::Land,
         Some(TaskFace::Landed),
@@ -878,10 +852,6 @@ fn script() -> Vec<Step> {
 /// block and reading every row anew — show the same pane, cell for cell,
 /// and the same chips to the pointer, on every step's frame and on the
 /// unchanged frame after it, where the keeping window fits nothing.
-///
-/// NEGATIVE CONTROLS: the keeping window fitted fewer blocks than the other
-/// (it kept some) and the other fitted one every frame; and a hover done to
-/// one twin alone is seen.
 #[test]
 fn the_kept_blocks_and_reads_draw_what_fitting_and_reading_anew_draws() {
     let (mut kept, mut anew) = (Twin::new(false), Twin::new(true));
@@ -918,7 +888,6 @@ fn the_kept_blocks_and_reads_draw_what_fitting_and_reading_anew_draws() {
         kept.fits,
         anew.fits
     );
-    // CONTROL: the comparison sees a difference.
     kept.app
         .hover_claude_chip(kept.wid, Some((kept.session, Chip::Autopilot)));
     let _ = (kept.frame(), anew.frame());

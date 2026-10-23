@@ -7,8 +7,8 @@
 //! `aterm-restore/src/conformance_region.rs`.
 
 use aterm_models_session::crash_restore_journal_model;
+use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
-use aterm_spec::{interp, verify};
 
 /// Every action, so a guard tightened by mistake shows up as a dead action, not a quieter proof.
 const ACTIONS: [&str; 16] = [
@@ -31,7 +31,7 @@ const ACTIONS: [&str; 16] = [
 ];
 
 #[test]
-fn crash_restore_journal_proves_and_catches() {
+fn crash_restore_journal_fires_every_committed_move() {
     let model = crash_restore_journal_model();
     let committed = interp::fired_actions(&model);
     for action in ACTIONS {
@@ -40,11 +40,6 @@ fn crash_restore_journal_proves_and_catches() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "crash restore: never ahead, exact only when true, no torn slot, no overwritten replay, \
-         no resurrected history, a poisoned region costs one full try",
-    );
 }
 
 /// Each defect breaks the invariant written for it, alone: the plan's mutant table.

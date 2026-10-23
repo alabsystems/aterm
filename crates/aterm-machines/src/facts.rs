@@ -149,6 +149,14 @@ pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
     hidutil_keyboards_from(text, false).unwrap_or_default()
 }
 
+/// A service census used to establish every local keyboard obligation. Unlike
+/// the best-effort facts projection, unknown headers or nonempty unparsed rows
+/// cannot establish an empty or partial census. A genuinely empty Services
+/// section is valid, including when it has no table header.
+pub(crate) fn parse_hidutil_keyboards_complete(text: &str) -> Result<Vec<Keyboard>, String> {
+    hidutil_keyboards_from(text, true)
+}
+
 fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, String> {
     let invalid =
         || "hidutil did not return a complete, recognized keyboard service list".to_owned();
@@ -1092,6 +1100,28 @@ UserShell: /bin/zsh
         );
         let malformed_id = VM_HIDUTIL.replacen("0x5ac", "bogus", 1);
         assert_eq!(parse_hidutil_keyboards(&malformed_id).len(), 1);
+        assert_eq!(parse_hidutil_keyboards_complete(VM_HIDUTIL).unwrap(), k);
+        assert_eq!(
+            parse_hidutil_keyboards_complete(LAPTOP_HIDUTIL).unwrap(),
+            parse_hidutil_keyboards(LAPTOP_HIDUTIL)
+        );
+        for empty in ["Services:\n", "Services:\n\nDevices:\n"] {
+            assert!(parse_hidutil_keyboards_complete(empty).unwrap().is_empty());
+        }
+        let partial = VM_HIDUTIL.replacen("Devices:", "unparsed-service-row\nDevices:", 1);
+        for invalid in [
+            "Services:\nUnknownHeader\nnonempty unparsed row\n",
+            "Services:\n\nServices:\n",
+            "Devices:\n",
+            "Services:\nVendorID ProductID Product Built-In\n0x1      0x2       kbd     x\n",
+            malformed_id.as_str(),
+            partial.as_str(),
+        ] {
+            assert!(
+                parse_hidutil_keyboards_complete(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

@@ -41,7 +41,7 @@ enum Tool {
 }
 
 impl Tool {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Tool::Ty => "ty",
             Tool::Ay => "ay",

@@ -8,8 +8,8 @@
 //! `the_incarnation_lease_refines_its_model`.
 
 use aterm_models_session::incarnation_lease_model;
+use aterm_spec::interp;
 use aterm_spec::walk::{only, walk};
-use aterm_spec::{interp, verify};
 
 /// Every action, so a guard tightened by mistake shows up as a dead action, not a quieter proof.
 const ACTIONS: [&str; 12] = [
@@ -28,7 +28,7 @@ const ACTIONS: [&str; 12] = [
 ];
 
 #[test]
-fn incarnation_lease_proves_and_catches() {
+fn incarnation_lease_fires_every_committed_move() {
     let model = incarnation_lease_model();
     let committed = interp::fired_actions(&model);
     for action in ACTIONS {
@@ -37,11 +37,6 @@ fn incarnation_lease_proves_and_catches() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "incarnation lease: a trusted lease names a durable top, every presented incarnation is \
-         covered on the media, and none is ever presented twice, across every kill and power loss",
-    );
 }
 
 /// Each defect breaks the invariant written for it, alone, and every one of them breaks the

@@ -212,7 +212,7 @@ fn own_pgid() -> u32 {
 
 /// A publisher that is provably gone: spawned in a process group of its own and reaped, so
 /// the pid is out of the table and the group is empty. The group is what proof of death is
-/// about, since a publisher's `gh`/`curl` children share it and outlive a killed parent.
+/// about, since a publisher's `curl` children share it and outlive a killed parent.
 /// Returns `(pid, pgid)`, equal for a group leader; the assert guards against immediate pid
 /// reuse.
 fn reaped_pid() -> (u32, u32) {
@@ -378,7 +378,7 @@ fn a_reused_pid_running_another_program_with_an_empty_group_is_dead() {
     );
 }
 
-/// No GitHub mutation runs in the publisher process: each runs in a spawned `gh` or `curl`,
+/// No GitHub mutation runs in the publisher process: each runs in a spawned `curl`,
 /// which a SIGKILL of the parent does not stop. The parent's pid is gone; its upload is not.
 ///
 /// Kills judging liveness on the recorded pid alone, which would let a `--resume` run beside a
@@ -404,7 +404,7 @@ fn a_child_that_outlived_its_publisher_keeps_the_fence_alive() {
                 exe: Some("/bin/zsh".to_string()),
             },
         )
-        .with_group(FENCE_GROUP, &[(4243, "gh")]);
+        .with_group(FENCE_GROUP, &[(4243, "git")]);
     assert!(matches!(
         publish::fence_liveness(&identity, &reused),
         FenceLiveness::Alive(_)
@@ -477,7 +477,7 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
             "fence-format: 2\nfence-pid: 5151\nfence-pgid: 4200\nfence-host: publisher-host\n\
              fence-boot: boot-session-7\n",
         ),
-        // The pid is gone, and a format-1 fence cannot say whether the `gh`/`curl` it spawned
+        // The pid is gone, and a format-1 fence cannot say whether the child it spawned
         // is.
         (
             "no process group recorded (a format-1 fence)",
@@ -560,7 +560,7 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     assert_eq!(
         identity.pgid,
         Some(own_pgid()),
-        "the fence records the group its gh/curl children will share"
+        "the fence records the group its curl children will share"
     );
     assert_eq!(identity.host.as_deref(), Some(local_host().as_str()));
     assert_eq!(identity.boot.as_deref(), Some(local_boot().as_str()));

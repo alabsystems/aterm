@@ -13,7 +13,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
 use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent, Source};
-use crate::{SessionCtx, TabAction, Wake, term_lock};
+use crate::{ReadOn, SessionCtx, TabAction, Wake, term_lock, term_lock_whole_when};
 
 /// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and answer `OK <display_offset> <scrollback_lines>`.
 pub(crate) fn cmd_scroll(
@@ -625,6 +625,7 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
 }
 
 /// The conditions a fenced write is held to, all checked under the same hold of the terminal lock the write is made under.
+/// A row fence (`guard`, `fp`) declines as moved on a DEC 2026 frame still unfinished ([`Terminal::frame_unfinished_at`]).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct InputFence<'a> {
     /// `if=<re>` — some visible row must match.
@@ -644,6 +645,11 @@ pub(crate) struct InputFence<'a> {
 }
 
 impl InputFence<'_> {
+    /// Whether a row condition is armed (`guard`, `fp`), which no unfinished frame decides.
+    fn reads_rows(&self) -> bool {
+        self.guard.is_some() || self.fp.is_some()
+    }
+
     /// Whether any condition is armed; the dispatch routes only an armed write to the fenced arm.
     pub(crate) fn is_armed(&self) -> bool {
         self.guard.is_some()
@@ -705,18 +711,23 @@ pub(crate) enum GuardedInput {
     Pressed(Delivery),
 }
 
-/// Atomic check-and-press.
+/// Atomic check-and-press; a control thread with a row fence takes the lock in a whole frame ([`crate::term_lock_whole_when`]), the event loop as it stands.
 pub(crate) fn input_if_fenced_observed(
     term: &Arc<Mutex<Terminal>>,
     ctx: &SessionCtx,
     ev: InputEvent,
     fence: &InputFence<'_>,
+    on: ReadOn,
     completion: Option<crate::control_input_ack::InputCompletion>,
 ) -> GuardedInput {
     let mut look = ctx.frame.look_frame();
-    let terminal = term_lock(term);
+    let waits = on.waits() && fence.reads_rows();
+    let terminal = term_lock_whole_when(term, on.lane(), |_| waits);
     if fence.human.is_some_and(|n| ctx.human_input.seq() != n) {
         return GuardedInput::Person;
+    }
+    if fence.reads_rows() && crate::frame_unfinished_now(&terminal) {
+        return GuardedInput::Changed;
     }
     if let Some(declined) = fence.check(&terminal, &mut look) {
         return declined;
@@ -830,7 +841,14 @@ pub(crate) fn cmd_key_fenced_observed(
     completion: Option<crate::control_input_ack::InputCompletion>,
 ) -> String {
     match parse_key(rest) {
-        Some(ev) => guarded_input_reply(input_if_fenced_observed(term, ctx, ev, fence, completion)),
+        Some(ev) => guarded_input_reply(input_if_fenced_observed(
+            term,
+            ctx,
+            ev,
+            fence,
+            ReadOn::Control,
+            completion,
+        )),
         None => KEY_USAGE.to_string(),
     }
 }
@@ -873,7 +891,14 @@ pub(crate) fn cmd_send_fenced_observed(
     completion: Option<crate::control_input_ack::InputCompletion>,
 ) -> String {
     let ev = InputEvent::KeySequence(send_bytes(rest));
-    guarded_input_reply(input_if_fenced_observed(term, ctx, ev, fence, completion))
+    guarded_input_reply(input_if_fenced_observed(
+        term,
+        ctx,
+        ev,
+        fence,
+        ReadOn::Control,
+        completion,
+    ))
 }
 
 /// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through the OS event queue instead of the control seam.

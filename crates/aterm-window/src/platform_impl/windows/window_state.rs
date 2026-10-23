@@ -4,11 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/window_state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Use pointer-typed null arguments and checks in Windows window-state operations. Keep a
-// hidden window's maximize for its reveal, which shows it maximized in one step. `ImeState` is
-// `Copy`, for `ime::ime_events`.
-
 use crate::dpi::{PhysicalPosition, PhysicalSize, Size};
 use crate::icon::Icon;
 use crate::keyboard::ModifiersState;
@@ -57,11 +52,9 @@ pub(crate) struct WindowState {
     pub ime_state: ImeState,
     pub ime_allowed: bool,
 
-    // Used by WM_NCACTIVATE, WM_SETFOCUS and WM_KILLFOCUS
     pub is_active: bool,
     pub is_focused: bool,
 
-    // Flag whether redraw was requested.
     pub redraw_requested: bool,
 
     pub dragging: bool,
@@ -218,14 +211,12 @@ impl WindowState {
         self.is_active && self.is_focused
     }
 
-    // Updates is_active and returns whether active-focus state has changed
     pub fn set_active(&mut self, is_active: bool) -> bool {
         let old = self.has_active_focus();
         self.is_active = is_active;
         old != self.has_active_focus()
     }
 
-    // Updates is_focused and returns whether active-focus state has changed
     pub fn set_focused(&mut self, is_focused: bool) -> bool {
         let old = self.has_active_focus();
         self.is_focused = is_focused;
@@ -265,7 +256,6 @@ impl WindowFlags {
     }
 
     pub fn to_window_styles(self) -> (WINDOW_STYLE, WINDOW_EX_STYLE) {
-        // Required styles to properly support common window functionality like aero snap.
         let mut style = WS_CAPTION | WS_BORDER | WS_CLIPSIBLINGS | WS_SYSMENU;
         let mut style_ex = WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES;
 
@@ -291,9 +281,8 @@ impl WindowFlags {
             style_ex |= WS_EX_NOREDIRECTIONBITMAP;
         }
         if self.contains(WindowFlags::CHILD) {
-            style |= WS_CHILD; // This is incompatible with WS_POPUP if that gets added eventually.
+            style |= WS_CHILD;
 
-            // Remove decorations window styles for child
             if !self.contains(WindowFlags::MARKER_DECORATIONS) {
                 style &= !(WS_CAPTION | WS_BORDER);
                 style_ex &= !WS_EX_WINDOWEDGE;
@@ -399,7 +388,6 @@ impl WindowFlags {
             }
         }
 
-        // Minimize operations should execute after maximize for proper window animations
         if diff.contains(WindowFlags::MINIMIZED) {
             unsafe {
                 ShowWindow(window, match new.contains(WindowFlags::MINIMIZED) {
@@ -427,14 +415,12 @@ impl WindowFlags {
         }
 
         if diff != WindowFlags::empty() {
-            // aterm: no `WS_MAXIMIZE` ahead of the reveal (`maximize_waits_for_reveal`).
             let styled = if maximize_hidden { new - WindowFlags::MAXIMIZED } else { new };
             let (style, style_ex) = styled.to_window_styles();
 
             unsafe {
                 SendMessageW(window, event_loop::SET_RETAIN_STATE_ON_SIZE_MSG_ID.get(), 1, 0);
 
-                // This condition is necessary to avoid having an unrestorable window
                 if !new.contains(WindowFlags::MINIMIZED) {
                     SetWindowLongW(window, GWL_STYLE, style as i32);
                     SetWindowLongW(window, GWL_EXSTYLE, style_ex as i32);
@@ -442,16 +428,12 @@ impl WindowFlags {
 
                 let mut flags = SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED;
 
-                // We generally don't want style changes here to affect window
-                // focus, but for fullscreen windows they must be activated
-                // (i.e. focused) so that they appear on top of the taskbar
                 if !new.contains(WindowFlags::MARKER_EXCLUSIVE_FULLSCREEN)
                     && !new.contains(WindowFlags::MARKER_BORDERLESS_FULLSCREEN)
                 {
                     flags |= SWP_NOACTIVATE;
                 }
 
-                // Refresh the window frame
                 SetWindowPos(window, std::ptr::null_mut(), 0, 0, 0, 0, flags);
                 SendMessageW(window, event_loop::SET_RETAIN_STATE_ON_SIZE_MSG_ID.get(), 0, 0);
             }
@@ -463,8 +445,6 @@ impl WindowFlags {
             let mut style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
             let style_ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
-            // Frameless style implemented by manually overriding the non-client area in
-            // `WM_NCCALCSIZE`.
             if !self.contains(WindowFlags::MARKER_DECORATIONS) {
                 style &= !(WS_CAPTION | WS_SIZEBOX);
             }
@@ -528,16 +508,11 @@ impl CursorFlags {
                                 bottom: pos.y + 1,
                             })
                         } else {
-                            // If lock is applied while the cursor is not available, lock it to the
-                            // middle of the window.
                             let cx = (client_rect.left + client_rect.right) / 2;
                             let cy = (client_rect.top + client_rect.bottom) / 2;
                             Some(RECT { left: cx, right: cx + 1, top: cy, bottom: cy + 1 })
                         }
                     } else if self.contains(CursorFlags::HIDDEN) {
-                        // Confine the cursor to the center of the window if the cursor is hidden.
-                        // This avoids problems with the cursor activating
-                        // the taskbar if the window borders or overlaps that.
                         let cx = (client_rect.left + client_rect.right) / 2;
                         let cy = (client_rect.top + client_rect.bottom) / 2;
                         Some(RECT { left: cx, right: cx + 1, top: cy, bottom: cy + 1 })
@@ -557,10 +532,6 @@ impl CursorFlags {
                 false => Some(active_cursor_clip),
             };
 
-            // We do this check because calling `set_cursor_clip` incessantly will flood the event
-            // loop with `WM_MOUSEMOVE` events, and `refresh_os_cursor` is called by
-            // `set_cursor_flags` which at times gets called once every iteration of the
-            // eventloop.
             if active_cursor_clip != cursor_clip.map(rect_to_tuple) {
                 util::set_cursor_clip(cursor_clip)?;
             }
@@ -589,18 +560,15 @@ mod reveal_tests {
         let hidden = WindowFlags::MARKER_ACTIVATE | WindowFlags::RESIZABLE;
         let hidden_max = hidden | WindowFlags::MAXIMIZED;
         let shown = hidden | WindowFlags::VISIBLE;
-        // The maximize of the hidden window waits; a shown window's does not.
         assert!(WindowFlags::maximize_waits_for_reveal(hidden_max));
         assert!(!WindowFlags::maximize_waits_for_reveal(shown | WindowFlags::MAXIMIZED));
         assert!(!WindowFlags::maximize_waits_for_reveal(hidden));
-        // Its reveal shows it maximized; a plain reveal or a shown window shows as before.
         assert_eq!(
             WindowFlags::show_command(hidden_max, hidden_max | WindowFlags::VISIBLE),
             SW_MAXIMIZE
         );
         assert_eq!(WindowFlags::show_command(hidden, shown), SW_SHOW);
         assert_eq!(WindowFlags::show_command(shown, shown | WindowFlags::MAXIMIZED), SW_SHOW);
-        // A window that asked not to be activated is never activated by its reveal.
         let passive = WindowFlags::MAXIMIZED;
         assert_eq!(
             WindowFlags::show_command(passive, passive | WindowFlags::VISIBLE),

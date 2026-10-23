@@ -4,22 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A shown X11 window that another client activates with a startup id asks the window manager
-//! for focus at the user action the id stamps, and ends the launch sequence the id names. GNOME
-//! Shell 46 sends such an id (`ActivationToken`) before it reports a click on a notification,
-//! and made it by starting a launch sequence for the click, for which mutter shows a busy cursor
-//! until the launchee's `remove` message or a timeout. A second client watching the root's
-//! substructure and property changes, as a window manager and a launch monitor do, receives the
-//! window's `_NET_ACTIVE_WINDOW` request with the id's `_TIME` as its timestamp, and the `remove`
-//! message for the id in a `_NET_STARTUP_INFO_BEGIN` chunk and its `_NET_STARTUP_INFO`
-//! continuations. The negative control is the plain raise (`focus_window`), which the watcher
-//! sees at `CURRENT_TIME` and with no `remove`.
-//!
-//! No timing decides it. Each step ends in a round trip on the window's own connection, so the
-//! server has sent the watcher its messages before it answers the watcher's round trip that
-//! follows, and the watcher reads what it was sent up to that answer.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! X11 tests that `focus_window_with_activation_token` stamps `_NET_ACTIVE_WINDOW` and ends launch.
 
 use aterm_x11::proto::event::{ClientMessage, Event};
 use aterm_x11::proto::xproto::{self, cw, event_mask};
@@ -34,8 +19,7 @@ use crate::window::WindowAttributes;
 /// A startup id as GNOME Shell's launch context makes one (libstartup-notification's form).
 const TOKEN: &str = "gnome-shell/aterm/4242-1-host_TIME5678";
 
-/// The client messages the server sent `watcher` from `window`, up to the answer to a round trip
-/// of the watcher's own that follows one of the window's.
+/// The client messages the server sent `watcher` from `window`.
 fn messages_from(watcher: &Connection, window: &Window) -> Vec<ClientMessage> {
     window.xconn.sync_with_server().expect("the window's requests reach the server");
     watcher.send(xproto::get_input_focus()).unwrap().reply().expect("GetInputFocus");
@@ -76,7 +60,6 @@ fn an_activation_token_stamps_the_raise_and_ends_its_launch() {
     else {
         unreachable!()
     };
-    // Each `_NET_ACTIVE_WINDOW` request as its source indication and timestamp.
     let raises = |seen: &[ClientMessage]| -> Vec<[u32; 2]> {
         seen.iter()
             .filter(|m| m.type_ == active)
@@ -86,7 +69,6 @@ fn an_activation_token_stamps_the_raise_and_ends_its_launch() {
             })
             .collect()
     };
-    // The launch message the chunks spell, up to its NUL.
     let launch = |seen: &[ClientMessage]| -> Vec<u8> {
         let mut text = Vec::new();
         for (i, m) in seen.iter().filter(|m| m.type_ == begin || m.type_ == more).enumerate() {
@@ -104,7 +86,6 @@ fn an_activation_token_stamps_the_raise_and_ends_its_launch() {
     };
     let window = Window::new(target, WindowAttributes::default()).expect("an X11 window");
     let _creation = messages_from(&watcher, &window);
-    // Shown, as the loop marks a window when its map is reported; the test pumps no loop.
     window.shared_state_lock().visibility = Visibility::Yes;
 
     window.focus_window();

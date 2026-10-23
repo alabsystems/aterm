@@ -668,6 +668,25 @@ pub(crate) fn fit_glow_in_box(
     ((cx, cy), (rx * k, ry * k))
 }
 
+/// A round glow's radii held inside the effects box around a centre that
+/// stays put: each radius shrinks on its own axis to the room between the
+/// centre and the box's nearer edge (never below 1 px), so the falloff
+/// reaches nothing at the edge instead of being cut there. For a light that
+/// belongs to its cell (the caret's head), where [`fit_glow_in_box`] would
+/// move it a cell inward over the text beside it.
+#[inline]
+pub(crate) fn hold_glow_radii_in_box(
+    geom: Geom,
+    (cx, cy): (f32, f32),
+    (rx, ry): (f32, f32),
+) -> (f32, f32) {
+    let room = |c: f32, lo: i32, hi: i32| (c - lo as f32).min(hi as f32 - c).max(1.0);
+    (
+        rx.min(room(cx, geom.fx_left(), geom.fx_right())),
+        ry.min(room(cy, geom.fx_top(), geom.fx_bot())),
+    )
+}
+
 /// How many nested veils a soft veil stacks ([`push_soft_veil`]).
 pub(crate) const SOFT_VEIL_LAYERS: usize = 10;
 
@@ -1003,7 +1022,14 @@ pub(super) fn push_dust_halo(
     push_halo(out, geom, cx, cy, core, core, premul_rgb(rgb, hot));
 }
 
-/// The water ripple ring (the water landing and the droplet cursor's waterline): a flattened elliptical annulus at `(cx, cy)` with outer radii `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs one pixel row tall, so its curve steps a pixel at a time (slabs half `ry` tall stood its sides in visible stairs).
+/// The water ripple ring (the water landing and the droplet cursor's
+/// waterline): a flattened elliptical annulus at `(cx, cy)` with outer radii
+/// `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs one
+/// pixel row tall, so its curve steps a pixel at a time (slabs half `ry`
+/// tall stood its sides in visible stairs). Near the effects box's edges
+/// each slab fades ([`crate::effect_util::fx_fade_y`]), so a ring round a
+/// caret on the grid's last row melts into the edge instead of ending in a
+/// straight cut along it.
 pub(crate) fn push_ripple_ring(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1030,8 +1056,23 @@ pub(crate) fn push_ripple_ring(
         };
         let (o, i) = (outer as i32, inner as i32);
         if o > i {
-            push_rect(out, geom, cxi - o, cyi + dy, o - i, h, premul);
-            push_rect(out, geom, cxi + i, cyi + dy, o - i, h, premul);
+            let y = cyi + dy;
+            let fade_y = crate::effect_util::fx_fade_y(geom, y as f32 + 0.5 * h as f32);
+            let mid = 0.5 * (o + i) as f32;
+            for (x, xm) in [(cxi - o, cx - mid), (cxi + i, cx + mid)] {
+                let fade = fade_y * crate::effect_util::fx_fade_x(geom, xm);
+                if fade > 0.0 {
+                    push_rect(
+                        out,
+                        geom,
+                        x,
+                        y,
+                        o - i,
+                        h,
+                        crate::effect_util::scale_premul(premul, fade),
+                    );
+                }
+            }
         }
         dy += h;
     }

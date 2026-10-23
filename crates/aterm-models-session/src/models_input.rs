@@ -1,48 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unread-input gate on socket-driven input: a driver's key is never queued behind unread
-//! input of a program established as not reading, and nothing else is refused.
-//!
-//! A screen fence cannot see a program that stopped reading: it never redraws, so every fence
-//! passes, and when it next reads one `read()` returns the old key and the driver's together.
-//! The kernel's input queue can: aterm-session's `SinkWriter::input_backlog` reads it and dates
-//! its oldest byte.
+//! Formal model of the unread-input gate on socket-driven session input.
 
 use aterm_spec::derive::Model;
 
-/// A raw-mode program's input queue (at most `Cap` unread writes, each with an age), its two
-/// writers (the window keyboard, never gated; a socket driver, gated), the reader's states
-/// (reading or frozen, stopped or running, raw or canonical), and the watch that publishes a
-/// stall.
-///
-/// Ages are bands, not ticks: `a1` is the oldest unread write's band (`0` younger than
-/// `WARN_AFTER`, `1` up to `STALL_AFTER`, `2` past it); `Tick` advances it. `a2` is the second
-/// write's band; the queue is FIFO, so consuming one promotes the second's.
-///
-/// The watch publishes (`Publish`) only a program that is not reading (`reading == 0`, standing
-/// for `classify`'s evidence) whose raw input has aged into the stall band, and withdraws it
-/// once the queue is read, turns canonical, or holds only younger input.
-///
-/// The gate restates `input_backlog::gate`: a driver key is refused only when the queue is not
-/// empty and the job is stopped, or a stall is published and the raw oldest write is in the
-/// stall band. Every other key is written; one behind raw input in the warn band or older
-/// carries the warning (`warned`).
-///
-/// One latch per way the gate could be wrong:
-///
-/// * `behind_stalled`: a driver key landed behind input of a stopped job or of a program
-///   published as not reading (`NoDriverKeyBehindStalledInput`);
-/// * `refused_live`: a driver key was refused with neither a stop nor a published stall, as a
-///   static age cap would (`NoRefusalWithoutAnEstablishedStall`);
-/// * `healthy_published`: the watch published a program that was reading, merely slow
-///   (`NoReadingProgramPublished`).
-///
-/// `Buggy = 1` is all three defects (a gate that admits every key, a refusal on the warn age, a
-/// watch that publishes on age alone); each invariant is falsified by its own.
-///
-/// Tier-1: `aterm-session/tests/conformance_input_unread.rs` drives a real pty whose raw slave
-/// never reads and checks the shipped `gate` and `classify` against the model.
+/// Formal model of a session's input queue and socket-driver unread-input gate.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn input_unread_gate_model() -> Model {

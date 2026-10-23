@@ -31,7 +31,7 @@ pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-r
   --no-deploy    commit and push, no deploy, no live check (SITE_NO_DEPLOY=1 too)
   --skip-site    do nothing, say so, exit 0
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
-  --releases FILE plan offline from this release list instead of asking gh (needs
+  --releases FILE plan offline from this release list instead of asking GitHub (needs
                  --dry-run)
 exit: 0 synced (or synced and the live site unreadable, said), deferred or planned · 1 failed · 2 usage or an unreadable publish/site.toml · \
      3 no usable site checkout · 4 the live site does not show the committed site";
@@ -366,11 +366,11 @@ pub fn output(launch: &dyn Launch, cmd: &mut Command) -> std::io::Result<std::pr
 pub trait World {
     /// Returns the [`Launch`] implementation for child processes.
     fn launch(&self) -> Rc<dyn Launch>;
-    /// Queries `gh api PATH` (with `--paginate` when requested).
+    /// The JSON GitHub's REST API answers at `path`; with `paginate`, the whole listing as one array, read through `Link` pagination to its end.
     ///
     /// # Errors
-    /// Returns `gh`'s error message on failure.
-    fn gh_api(&mut self, path: &str, paginate: bool) -> Result<String, String>;
+    /// What GitHub or curl said when it could not answer, or an incomplete listing.
+    fn github(&mut self, path: &str, paginate: bool) -> Result<String, String>;
     /// Downloads up to `limit` bytes from a release asset URL.
     ///
     /// # Errors
@@ -912,9 +912,9 @@ fn steps(
     let commit = match (&env.commit, opts.latest) {
         (Some(c), _) => c.clone(),
         (None, true) => {
-            halt(launch, "asking gh for main's tip")?;
+            halt(launch, "asking GitHub for main's tip")?;
             let sha = world
-                .gh_api(&format!("repos/{slug}/commits/main"), false)
+                .github(&format!("repos/{slug}/commits/main"), false)
                 .ok()
                 .and_then(|j| aterm_json::from_str::<aterm_json::Value>(&j).ok())
                 .and_then(|v| {
@@ -924,10 +924,8 @@ fn steps(
                 })
                 .ok_or_else(|| {
                     child_failed(
-                        "gh",
-                        format!(
-                            "could not read the tip of {slug} main through gh (gh auth status)"
-                        ),
+                        "github",
+                        format!("could not read the tip of {slug} main from GitHub's API"),
                     )
                 })?;
             say(out, &format!("--latest: {slug} main is at {sha}"));
@@ -1024,13 +1022,13 @@ fn steps(
         Some(path) => std::fs::read_to_string(path)
             .map_err(|e| refusal(Refusal::Io, format!("cannot read {}: {e}", path.display())))?,
         None => world
-            .gh_api(&format!("repos/{slug}/releases?per_page=100"), true)
+            .github(&format!("repos/{slug}/releases?per_page=100"), true)
             .map_err(|e| {
                 child_failed(
-                    "gh",
+                    "github",
                     format!(
-                        "could not list releases for {slug} through gh — the complete history, \
-                         every page ({}; gh auth status)",
+                        "could not list releases for {slug} from GitHub's API — the complete \
+                         history, every page ({})",
                         last_line(&e)
                     ),
                 )
@@ -1823,6 +1821,7 @@ pub fn run_cli(args: &[String], repo: &Path) -> i32 {
             .filter(|k| crate::release_steps::launcher_env(k))
             .collect(),
         launch: Rc::new(Plain),
+        github: std::sync::Arc::new(crate::github::Launched(Plain)),
     };
     let mut out = std::io::stdout();
     let ended = sync(&opts, &env, &mut world, &mut out);

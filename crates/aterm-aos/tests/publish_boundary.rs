@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Boundary publication: the repair protocol end to end, the queue during a pause, and every
-//! refusal `pause`, `prepare` and `commit` can return, each leaving the boundary untouched.
+//! End-to-end boundary publication, repair protocol, and refusal tests.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -81,8 +80,6 @@ fn a_repair_replays_from_the_ancestor_and_publishes_one_new_pair_then_delivers_t
     );
     assert_eq!(p.state(), &repaired.state);
     assert_eq!(p.candidate().id(), code(Variant::Good).id());
-    // Prepare replayed on private values: the live pair, the pause and the queue are as they
-    // were.
     assert!(b.is_paused());
     assert_eq!(b.pair().code.id(), code(Variant::Stranded).id());
     assert_eq!(b.queued(), 2);
@@ -110,7 +107,6 @@ fn a_repair_replays_from_the_ancestor_and_publishes_one_new_pair_then_delivers_t
         fold(Variant::Good, ToyState::default(), &all).state
     );
 
-    // The log continues from a fresh checkpoint of the accepted state, in a new epoch.
     let c1 = b.checkpoint().unwrap();
     assert_eq!(c1.provenance().parent, Some(c0.digest()));
     assert_eq!(c1.provenance().revision, Revision(1));
@@ -132,7 +128,6 @@ fn a_repair_replays_from_the_ancestor_and_publishes_one_new_pair_then_delivers_t
         (1, 2, 0, 2, 1)
     );
 
-    // Fresh input reaches the new code through the live path, with no further replay.
     assert_eq!(
         live(&mut b, &Tick).1,
         Some(Ok(ToyObs::Ticked { hot: false }))
@@ -157,11 +152,9 @@ fn a_candidate_prepared_against_a_head_that_moved_is_refused_as_stale() {
             live: Box::new(h1.clone())
         })
     );
-    // Untouched: still paused over the old pair at the same head.
     assert!(b.is_paused());
     assert_eq!(b.pair().code.id(), code(Variant::Stranded).id());
     assert_eq!(b.head(), &h1);
-    // Rerunning against the new head publishes.
     let again = b.prepare(code(Variant::Good)).unwrap();
     assert_eq!(again.expected(), &h1);
     assert!(b.commit(again).is_ok());
@@ -210,8 +203,6 @@ fn a_full_queue_rejects_the_update_before_dropping_anything_and_delivers_each_in
         ]
     );
     assert!(b.take_delivered().is_empty());
-    // The old pair received all four, once each, in order (`seen` is an order-sensitive
-    // fold, so a loss, a repeat or a reorder would show).
     let all = adds(&[1, 2, 3, 4]);
     assert_eq!(b.pair().code.id(), code(Variant::Stranded).id());
     assert_eq!(
@@ -294,8 +285,6 @@ fn a_queued_input_the_old_code_refuses_is_reported_and_left_out_of_the_log() {
 fn a_live_head_the_log_does_not_reproduce_is_refused() {
     let mut b = attached(Variant::Good, 4);
     assert_eq!(b.admit(&Add(1)), Admit::Run);
-    // The host applies another input than the one it admitted: the log is not the history
-    // that produced the head.
     let schema = b.schema().clone();
     let (live_code, state) = b.pair_mut();
     live_code
@@ -386,8 +375,7 @@ fn a_boundary_constructed_with_another_contract_than_the_identity_names_refuses_
     assert!(b.is_paused());
 }
 
-/// What a judge was shown of one run: its observation count, first and last cursors,
-/// observation chain and state digest.
+/// What a judge was shown of one run.
 type Shown = (usize, Option<u64>, Option<u64>, Digest, Digest);
 
 /// The corrected contract, keeping what it was shown of every run it judged.
@@ -532,8 +520,6 @@ fn a_candidate_failing_the_boundarys_contract_is_refused_whatever_judge_the_call
     let committed = b.commit(p).unwrap();
     assert_eq!(committed.witness.contract(), contract().id());
 
-    // The trusted constructor: given the lenient judge under the identity's id, the boundary
-    // publishes what that judge passes.
     let mut trusted = judged_by(Variant::Good, ToyState::default(), 4, lenient);
     trusted.attach(1, 64).unwrap();
     for i in &trace {
@@ -765,8 +751,6 @@ fn each_full_log_reanchor_names_the_checkpoint_it_replaced_and_an_admit_with_roo
         if c != seen.last().unwrap() {
             seen.push(c.clone());
         }
-        // Two inputs per log: the log after input i + 1 holds the inputs past the last
-        // re-anchor, never more than its bound.
         assert_eq!(b.log().unwrap().len(), i % 2 + 1, "after input {n}");
         assert_eq!(b.stats().reanchors, i as u64 / 2, "after input {n}");
     }
@@ -819,7 +803,6 @@ fn detaching_while_paused_rejects_first_and_delivers_the_queue() {
     assert_eq!(b.take_delivered(), vec![Ok(ToyObs::Added { total: 3 })]);
     assert!(b.checkpoint().is_none() && b.log().is_none());
     assert_eq!(b.pair().state.total, 3);
-    // Detached, the live path still runs (nothing is recorded).
     assert_eq!(
         live(&mut b, &Add(1)),
         (Admit::Run, Some(Ok(ToyObs::Added { total: 4 })))
@@ -837,7 +820,6 @@ fn reattaching_reanchors_at_the_current_boundary_under_the_old_checkpoint() {
     assert_eq!(c1.provenance().input_cursor, 1);
     assert_eq!(c1.provenance().log_epoch, 5);
     assert!(b.log().unwrap().is_empty());
-    // A pending pause is rejected first, its queue delivered.
     b.pause().unwrap();
     assert_eq!(b.admit(&Add(2)), Admit::Queued);
     b.attach(6, 64).unwrap();
@@ -1003,7 +985,6 @@ fn graft_refusals(a: &mut crate::toy::ToyBoundary, b: &crate::toy::ToyBoundary) 
     assert_eq!(a.commit(prepared).err(), Some(mismatch));
     assert!(a.is_paused(), "the refusal held the pause");
     assert_eq!(a.stats().publications, 0);
-    // The control: A's own log beside A's checkpoint prepares and commits.
     a.graft_log(a_log).unwrap();
     let prepared = a.prepare(code(Variant::Good)).unwrap();
     assert!(a.commit(prepared).is_ok());

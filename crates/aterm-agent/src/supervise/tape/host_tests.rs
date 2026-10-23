@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The host's answers and arguments on a tape (`host.rs`): every answer type
-// the host's trait returns reads back as written, an `Instant` in it placed
-// at the same span from the reading's origin as from the writer's; a byte
-// this build did not write is refused, never guessed; and a request names
-// each argument, and fails this crate's tests if it holds a raw `Instant`.
-
 use std::time::{Duration, Instant};
 
 use super::*;
@@ -65,6 +59,7 @@ fn every_host_answer_reads_back_as_written() {
         Some(HostTurn::Notice),
         Some(HostTurn::CarryOn),
         Some(HostTurn::Check),
+        Some(HostTurn::Fact),
     ] {
         same(Some(HostStep {
             line: "HOST seq=102 carry-on step=continued".to_string(),
@@ -74,7 +69,12 @@ fn every_host_answer_reads_back_as_written() {
         }));
     }
     same(None::<(String, HostTurn)>);
-    for turn in [HostTurn::Notice, HostTurn::CarryOn, HostTurn::Check] {
+    for turn in [
+        HostTurn::Notice,
+        HostTurn::CarryOn,
+        HostTurn::Check,
+        HostTurn::Fact,
+    ] {
         same(Some(("released:give-up".to_string(), turn)));
     }
     same(None::<LastTurn>);
@@ -99,8 +99,6 @@ fn every_host_answer_reads_back_as_written() {
         paths: vec!["src/a.rs".to_string(), "notes/".to_string()],
         state: Some(u64::MAX),
     }));
-    // A tape recorded before the probe read the remote's default branch:
-    // no default branch known (and before it read the work's state: none).
     let old =
         br#"{"repo":"/r","changed":1,"untracked":0,"stashes":0,"unpushed":2,"paths":["a.rs"]}"#;
     assert_eq!(
@@ -388,8 +386,6 @@ fn an_answers_instant_keeps_its_span_from_the_origin() {
                 otherwise: Some(Box::new(AccountAdvice::Wait { until: to + span })),
             })
         );
-        // An instant the host placed BEFORE the tape's origin (a measure's
-        // run begun before the loop) lands as far before the replay's.
         if let Some(earlier) = from.checked_sub(span) {
             assert_eq!(
                 moved(&Reach::Down { since: earlier }, from, to),
@@ -416,10 +412,6 @@ fn an_answer_this_build_did_not_write_is_refused() {
     assert!(refused::<Result<(), ProbeNo>>(b"\"not-a-word\""));
     assert!(refused::<ResetWord>(b"{\"no\":\"never\"}"));
     assert!(refused::<ResetWord>(b"\"maybe\""));
-    // A go for a kind of reset this build does not know, and one written
-    // before a go carried its row's kind: refused, never a reset guessed (a
-    // reset step taped before the 2.1.304 port does not replay: host.rs's
-    // `ResetWordWire`). CONTROL: the same go with a kind it knows is read.
     let take = |kind: &str| {
         format!(
             "{{\"take\":{{\"until\":1,\"long\":true,\"limits\":[\"weekly\"],{kind}\"left\":2,\
@@ -434,8 +426,6 @@ fn an_answer_this_build_did_not_write_is_refused() {
         take("\"kind\":\"weekly\",").as_bytes()
     ));
     assert!(refused::<ResetOutcome>(b"\"spent\""));
-    // A spend with a kind this build does not know, and one written before
-    // a spend carried its kind: refused, as the go is. CONTROL: with one.
     let spent =
         |kind: &str| format!("{{\"spent\":{{{kind}\"asks\":true,\"left\":1,\"cleared_at\":5}}}}");
     assert!(refused::<ResetOutcome>(
@@ -514,7 +504,6 @@ fn an_argument_that_holds_an_instant_is_refused_in_tests() {
         built.is_err(),
         "a raw Instant in a request is a failed test"
     );
-    // The same argument with its instant as an offset is fine.
     let fine = std::panic::catch_unwind(|| {
         request(&[(
             "wait",
@@ -625,7 +614,6 @@ fn needs_standing_is_a_taped_notification() {
     assert_eq!(core.left(), 0, "every tell matched on the tape");
     assert!(core.diverged().is_none());
 
-    // NEGATIVE CONTROL: another set diverges at the door.
     let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
     let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -683,7 +671,6 @@ fn a_land_hold_is_a_tape_arg_without_an_instant() {
         b"held=None"
     );
 
-    // NEGATIVE CONTROL: an `Instant` carried beside the hold.
     #[derive(Debug)]
     struct HeldAt {
         #[expect(dead_code, reason = "read through Debug alone")]
@@ -780,7 +767,6 @@ fn land_held_is_a_taped_notification() {
     assert_eq!(core.left(), 0, "every tell matched on the tape");
     assert!(core.diverged().is_none());
 
-    // NEGATIVE CONTROL: another hold diverges at the door.
     let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
     let other = crate::harness::acts::LandHeld {
@@ -856,10 +842,8 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
     };
     assert!(refused(wire("\"panic\"", "null").as_bytes()));
     assert!(refused(wire("null", "\"full\"").as_bytes()));
-    // CONTROL: the same bytes with words it knows are read.
     assert!(!refused(wire("\"critical\"", "\"emergency\"").as_bytes()));
 
-    // Recorded: the window's host's answer, at its door.
     let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
     let host = TapedHost::new(
         Arc::new(Occupied(full.clone())) as Arc<dyn IdleHost>,
@@ -877,8 +861,6 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
         "{records:?}"
     );
 
-    // Replayed from the tape: a core no header set, and one whose header
-    // names the door.
     let doors = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
     for named in [None, Some(doors(&["host.wants", "host.occupancy"]))] {
         let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
@@ -890,8 +872,6 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
         assert_eq!(core.left(), 0, "answered from the tape");
     }
 
-    // A tape whose build had no such door (its header names others, or none:
-    // an older header): the empty reading, no record taken.
     for named in [doors(&["host.wants"]), Vec::new()] {
         let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
         core.recorded_doors(named);
@@ -900,7 +880,6 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
         assert!(core.diverged().is_none());
     }
 
-    // NEGATIVE CONTROL: the header names the door, the tape never asked it.
     let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
     core.recorded_doors(doors(&["host.occupancy"]));
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
@@ -910,7 +889,6 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
     assert!(asked.is_err(), "the replay halts: the tape never asked");
     assert!(core.diverged().is_some());
 
-    // NEGATIVE CONTROL: a door the header lacks with no absent answer.
     let core = ReplayCore::start(Vec::new(), VERBATIM, VERBATIM, TAPE_ID, None);
     core.recorded_doors(Vec::new());
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
@@ -919,4 +897,132 @@ fn the_occupancy_reading_is_taped_and_absent_only_where_the_build_lacked_it() {
         asked.is_err(),
         "no absent answer: the replay halts as before"
     );
+}
+
+/// A host whose machine pace answers what it holds, and whose upgrade's
+/// notice is due.
+#[derive(Debug)]
+struct Paced(crate::supervise::occupancy::PaceGrant);
+
+impl crate::supervise::IdleHost for Paced {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn upgrade_due(&self) -> bool {
+        true
+    }
+    fn occupancy_pace(
+        &self,
+        _: crate::supervise::occupancy::RuleId,
+        _: i64,
+    ) -> crate::supervise::occupancy::PaceGrant {
+        self.0
+    }
+}
+
+/// THE DOOR'S HOST CALLS ON A TAPE (the occupancy red-team's F10, F11): every
+/// pace answer reads back as written and a word this build does not know is
+/// refused; `occupancy_pace` is a round trip whose request names the rule and
+/// the hold's start, `upgrade_due` a round trip, `break_taken` an output, and
+/// a replay of the same calls answers from the tape alone. NEGATIVE CONTROL: a
+/// replay asked the pace for another rule diverges at `host.occupancy_pace`.
+#[test]
+fn the_doors_host_calls_are_taped() {
+    use astream_effects::EffectRecord;
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::occupancy::{PaceGrant, PaceRefusal, RuleId};
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    for grant in [
+        PaceGrant::Local,
+        PaceGrant::Granted,
+        PaceGrant::Machine,
+        PaceGrant::Reserved,
+    ]
+    .into_iter()
+    .chain(PaceRefusal::ALL.map(PaceGrant::Refused))
+    {
+        same(grant);
+    }
+    let refused = |bytes: &[u8]| PaceGrant::take(bytes, Instant::now()).is_err();
+    assert!(refused(b"\"refused:tired\""));
+    assert!(refused(b"\"slow\""));
+    // CONTROL: a word it knows is read.
+    assert!(!refused(b"\"refused:carry-owed\""));
+
+    let since = 1_760_000_000_000;
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let host = TapedHost::new(
+        Arc::new(Paced(PaceGrant::Reserved)) as Arc<dyn IdleHost>,
+        tape.fx.clone(),
+    );
+    assert!(IdleHost::upgrade_due(&host));
+    assert_eq!(
+        IdleHost::occupancy_pace(&host, RuleId::HoldRoom, since),
+        PaceGrant::Reserved
+    );
+    IdleHost::break_taken(&host);
+    let read = tape.finish("done");
+    let records: Vec<EffectRecord> = read
+        .items
+        .iter()
+        .filter_map(|i| i.record().cloned())
+        .collect();
+    let seen: Vec<(String, String)> = records
+        .iter()
+        .map(|r| match r {
+            EffectRecord::Exchange { door, request, .. } => {
+                (door.clone(), String::from_utf8_lossy(request).into_owned())
+            }
+            EffectRecord::Emit { door, bytes } => {
+                (door.clone(), String::from_utf8_lossy(bytes).into_owned())
+            }
+            other => panic!("a host call: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("host.upgrade_due".to_string(), String::new()),
+            (
+                "host.occupancy_pace".to_string(),
+                format!("rule=HoldRoom\nhold_since_ms={since}")
+            ),
+            ("host.break_taken".to_string(), String::new()),
+        ]
+    );
+    assert!(matches!(&records[1], EffectRecord::Exchange { .. }));
+    assert!(matches!(&records[2], EffectRecord::Emit { .. }));
+
+    let core = ReplayCore::start(records.clone(), VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    assert!(IdleHost::upgrade_due(&replay));
+    assert_eq!(
+        IdleHost::occupancy_pace(&replay, RuleId::HoldRoom, since),
+        PaceGrant::Reserved
+    );
+    IdleHost::break_taken(&replay);
+    assert_eq!(core.left(), 0, "answered from the tape");
+    assert!(core.diverged().is_none());
+
+    // NEGATIVE CONTROL: another rule's pace diverges at the door.
+    let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
+    let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+    assert!(IdleHost::upgrade_due(&replay));
+    let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        IdleHost::occupancy_pace(&replay, RuleId::WaitNudge, since)
+    }));
+    assert!(asked.is_err(), "the replay halts at the divergence");
+    let d = core.diverged().expect("latched");
+    assert_eq!(d.door.as_deref(), Some("host.occupancy_pace"), "{d:?}");
 }

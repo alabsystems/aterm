@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `ScopeBalance` (`aterm_models_misc::scope_balance_model`): each
-//! scene of the split's tests (`aterm_vitals::explain::fixtures`) is read
-//! through the real `Vitals::absorb`, and its split, as the caller's tab sees
-//! it (`CoalSplit::parts`), is projected onto the model. The scene's readings,
-//! written down here from the scene and never from the split, are the state
-//! its readings leave (`fresh = 0`); the split's figures are the states `Move`
-//! and then `Close` must reach, every law holding at the end.
-//!
-//! NEGATIVE CONTROLS (§17's table): the real split with one injected defect
-//! (`explain::Fault`, a `cfg(any(test, debug_assertions))` seam). Each is
-//! refused at Buggy 0, admitted by its own mutant, and that mutant's state
-//! breaks its own law — so a projection that accepts everything fails here.
+//! Tier-1 for `ScopeBalance` (`aterm_models_misc::scope_balance_model`): each scene of the split's
+//! tests (`aterm_vitals::explain::fixtures`) is read through the real `Vitals::absorb`, and its
+//! split, as the caller's tab sees it (`CoalSplit::parts`), is projected onto the model.
 
 use std::collections::BTreeMap;
 

@@ -58,7 +58,50 @@ pub(crate) fn push_grid_quad(
     }
 }
 
-/// Push additive premultiplied light in window px, clamped to the effects box and split per cell row.
+/// Premultiplied `0x00RRGGBB` light scaled by `share` (`0..=1`), rounding per channel.
+#[inline]
+#[must_use]
+pub(crate) fn scale_premul(c: u32, share: f32) -> u32 {
+    let share = share.clamp(0.0, 1.0);
+    let ch = |sh: u32| ((((c >> sh) & 0xff) as f32 * share).round() as u32).min(255) << sh;
+    ch(16) | ch(8) | ch(0)
+}
+
+/// How far inside the effects box's top and bottom edges a light that crosses them eases to
+/// nothing ([`fx_fade_y`]), as a share of the cell height.
+pub(crate) const FX_EDGE_FADE: f32 = 0.35;
+/// How far inside the effects box's left and right edges a light that crosses them eases to
+/// nothing ([`fx_fade_x`]), as a share of the cell width.
+pub(crate) const FX_EDGE_FADE_X: f32 = 0.6;
+
+/// The share of its strength a light keeps at window row `y` near the effects box's top or
+/// bottom edge: whole [`FX_EDGE_FADE`] of a cell height inside, easing to nothing at the
+/// edge. The box clips what crosses it, so a light round a caret on the grid's last row (the
+/// typing glow, a water ring) stood cut by a straight line along the edge; laid through
+/// this it fades out instead.
+#[inline]
+#[must_use]
+pub(crate) fn fx_fade_y(geom: Geom, y: f32) -> f32 {
+    let reach = (geom.ch as f32 * FX_EDGE_FADE).max(1.0);
+    let d = (y - geom.fx_top() as f32).min(geom.fx_bot() as f32 - y);
+    let k = (d / reach).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// [`fx_fade_y`] across the effects box's left and right edges, at window column `x`, over
+/// [`FX_EDGE_FADE_X`] of a cell width.
+#[inline]
+#[must_use]
+pub(crate) fn fx_fade_x(geom: Geom, x: f32) -> f32 {
+    let reach = (geom.cw as f32 * FX_EDGE_FADE_X).max(1.0);
+    let d = (x - geom.fx_left() as f32).min(geom.fx_right() as f32 - x);
+    let k = (d / reach).clamp(0.0, 1.0);
+    k * k * (3.0 - 2.0 * k)
+}
+
+/// Push additive premultiplied light in window px (`geom.origin_*` applied), clamped to the
+/// effects box (grid + head band) and split into per-cell-row [`GlowQuad`]s with
+/// origin-anchored row tags.
 #[inline]
 pub(crate) fn push_fx_rect(
     out: &mut Vec<GlowQuad>,

@@ -23,11 +23,11 @@ struct Termios([u8; TERMIOS_BYTES]);
 const _: () = assert!(align_of::<libc::termios>() <= 8);
 
 impl Termios {
-    fn as_ptr(&self) -> *const libc::termios {
+    const fn as_ptr(&self) -> *const libc::termios {
         self.0.as_ptr().cast()
     }
 
-    fn as_mut_ptr(&mut self) -> *mut libc::termios {
+    const fn as_mut_ptr(&mut self) -> *mut libc::termios {
         self.0.as_mut_ptr().cast()
     }
 

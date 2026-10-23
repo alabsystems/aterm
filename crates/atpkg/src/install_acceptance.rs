@@ -64,9 +64,7 @@ pub(super) fn vendor_artifact(archive: &Path, payload: &str, root: &str) -> Arti
     a
 }
 
-/// Write `content` at `dir/rel` with `mode`, creating parents — the REPLICA the
-/// expected roots below are learned from, so no expectation ever comes out of the
-/// function under test.
+/// Write `content` at `dir/rel` with `mode`, creating parents.
 #[cfg(unix)]
 pub(super) fn lay(dir: &Path, rel: &str, content: &[u8], mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -101,9 +99,8 @@ pub(super) fn add_acl(path: &Path, ace: &str) {
     );
 }
 
-/// Whether `path` carries an ACL entry: `ls -led` lists each one on a line of its
-/// own (`  0: group:everyone allow write`) after the entry's. (The `+` after the mode
-/// is no witness: an entry with extended attributes shows `@` there instead.)
+/// Whether `path` carries an ACL entry: `ls -led` lists each one on a line of its own (`  0:
+/// group:everyone allow write`) after the entry's.
 #[cfg(target_os = "macos")]
 pub(super) fn has_acl(path: &Path) -> bool {
     let out = aterm_uds::spawnfd::command("/bin/ls")
@@ -124,21 +121,9 @@ pub(super) fn has_acl(path: &Path) -> bool {
         .any(|line| line.trim_start().starts_with("0:"))
 }
 
-/// `Foo.app` laid at `src` as an image's root: an executable, two internal symlinks,
-/// one of them a `..` climb to the stage root and back, and the modes and ACL AT3 is
-/// about, beside the usual `Applications` link and a README. Answers the row a stage of
-/// the image at `image` takes, its root that of a replica laid at the archive lanes'
-/// modes with the row's one link (`bin/foo`); only the bundle is copied. `make` writes
-/// the image at `image` from `src`.
-///
-/// AT3 (2026-10-10): the bundle carries what survives an unprivileged `hdiutil create`
-/// and `ditto` (measured that day): an owner-only `0600` file, a read-only `0400` one,
-/// a world-writable `0666` one, a group-writable executable, a world-writable `0777`
-/// directory, a group-writable `0775` `Contents`, and a file whose ACL lets everyone
-/// write it. Each lands at `0644`/`0755` with no ACL, and the root a row signs is the
-/// root of that sanitised tree. (`hdiutil` and an unprivileged `ditto` drop
-/// setuid, setgid and sticky themselves; ditto run as root keeps the first two, and
-/// the ordinary copy-walk control feeds those modes to the walk.)
+/// `Foo.app` laid at `src` as an image's root: an executable, two internal symlinks, one of them a
+/// `..` climb to the stage root and back, and the modes and ACL AT3 is about, beside the usual
+/// `Applications` link and a README.
 #[cfg(target_os = "macos")]
 pub(super) fn foo_app_image(
     d: &Path,
@@ -194,8 +179,6 @@ pub(super) fn foo_app_image(
         "the image's file carries the ACL under test"
     );
     lay_link(src, "Foo.app/Contents/current", "MacOS/foo");
-    // A `..` climb to the stage root and back into the bundle (frameworks do that):
-    // it must survive the copy byte for byte, pass the vet, and be swapped in.
     lay_link(src, "Foo.app/Contents/Resources/up", UP);
     lay(src, "README.txt", b"not copied", 0o644);
     lay_link(src, "Applications", "/Applications");
@@ -217,12 +200,6 @@ pub(super) fn foo_app_image(
 
 /// Detaches every disk image attached from under `dir` when it goes out of scope —
 /// on EVERY path out of a test: an early `return`, an assertion panic, or success.
-///
-/// It exists because the leak it cleans up OUTLIVES the process. A failed
-/// `hdiutil attach` leaves the image's devices attached with nothing mounted on
-/// them; until [`Mount`] learned to reclaim those, they survived until the machine
-/// was rebooted or a human ran `hdiutil detach` by hand, and each one made the next
-/// attach of the same image fail `Resource busy`.
 #[cfg(all(debug_assertions, target_os = "macos"))]
 struct DetachAll {
     prefixes: Vec<PathBuf>,
@@ -307,8 +284,6 @@ fn prerequisites() -> std::io::Result<()> {
 }
 
 /// Stage a real mounted image's single app, including link/mode/ACL and detach controls.
-/// Run the `dmg_acceptance` bench with `--profile test`; macOS may request consent.
-///
 /// # Errors
 /// Returns a setup failure when required tools or the disk-image service are unavailable.
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -334,8 +309,6 @@ pub fn a_real_image_stages_its_single_app(d: &Path) -> std::io::Result<()> {
 }
 
 /// Refuse a real image with no app and prove detach plus absence of build/scratch.
-/// Run the `dmg_acceptance` bench with `--profile test`; macOS may request consent.
-///
 /// # Errors
 /// Returns a setup failure when required tools or the disk-image service are unavailable.
 #[cfg(all(debug_assertions, target_os = "macos"))]

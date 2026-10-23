@@ -1,10 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The stage's start probe (`verify::probe_staged_bundle_starts`), driven through
-//! the real stage gate on an ad-hoc-signed bundle in the structural tier: the
-//! candidate runs only once every check before it has passed, and one that cannot
-//! start is refused before any ready marker.
+//! The stage's start probe (`verify::probe_staged_bundle_starts`), driven through the real stage
+//! gate on an ad-hoc-signed bundle in the structural tier: the candidate runs only once every check
+//! before it has passed, and one that cannot start is refused before any ready marker.
 
 use super::*;
 
@@ -76,13 +75,11 @@ fn stage(staging: &Staging, incoming: &Path, manifest: &Manifest) -> Result<(), 
 /// once, before its marker, and published.
 #[test]
 fn the_stage_starts_the_candidate_only_after_its_whole_gate_passes() {
-    // Signing and judging a bundle wait on trustd.
     aterm_uds::deadline::require_trust_service();
     /// What the case does to the bundle's executable, and the manifest it stages under.
     type Prepare = fn(&Path) -> Manifest;
     let refusals: [(&str, Prepare); 3] = [
         ("failed verification", |exe| {
-            // Tampered after signing: the seal no longer holds.
             let mut text = std::fs::read_to_string(exe).unwrap();
             text.push_str("# changed\n");
             std::fs::write(exe, text).unwrap();
@@ -178,8 +175,6 @@ fn a_candidate_that_cannot_start_is_refused_before_any_marker() {
 /// never meets an unlinked or renamed path mid-assessment. The same spawn refused for
 /// a cause that comes back every time (`EACCES`) is a verdict, refused before any
 /// marker with the bundle gone: the stage tells the cases apart by the refusal alone.
-/// Negative control: a stage that books every probe failure as a verdict refuses the
-/// first.
 #[test]
 fn a_stage_probe_that_runs_to_no_answer_publishes_for_the_apply_to_judge() {
     aterm_uds::deadline::require_trust_service();

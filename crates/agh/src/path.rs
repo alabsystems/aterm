@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! RFC 3986 encoders for path segments and query values: every byte outside the unreserved
-//! set (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`, uppercase. `+` is `%2B`, `/` is `%2F` and a
-//! space is `%20`.
+//! RFC 3986 encoders and dot-segment guards for URL path segments and query values.
 
 use crate::error::{Error, Result};
 
@@ -26,7 +24,7 @@ fn encode(text: &str) -> String {
     out
 }
 
-/// One segment.
+/// Percent-encodes a single URL path segment.
 #[inline]
 #[must_use]
 pub fn segment(text: &str) -> String {
@@ -53,21 +51,14 @@ pub fn ref_path(reference: &str) -> String {
         .join("/")
 }
 
-/// Whether any `/`-separated part of `text` is exactly `.` or `..`. Such a part is a
-/// dot-segment, which `segment`, `file_path` and `ref_path` keep as it is, and which a server
-/// that normalises paths would resolve, so a request would leave the route it was decided
-/// for. Their callers refuse such a text first; percent-encoding is no cure, because URL
-/// parsers read `%2e%2e` as a dot-segment too.
+/// Returns whether any `/`-separated segment of `text` is `.` or `..`.
 #[inline]
 #[must_use]
 pub fn has_dot_segment(text: &str) -> bool {
     text.split('/').any(|part| part == "." || part == "..")
 }
 
-/// Whether `text`, percent-decoded as a whole, has a part between `/` or `\` that is exactly
-/// `.` or `..`. A typed path is judged this way: decoding before splitting catches a
-/// dot-segment hidden behind an encoded separator (`..%2F..%2Fx`), which a front end that
-/// decodes `%2F` before it removes dot-segments would resolve.
+/// Returns whether `text`, after percent-decoding, contains a `.` or `..` path segment.
 #[must_use]
 pub(crate) fn has_encoded_dot_segment(text: &str) -> bool {
     aterm_codec::pct::decode(text)
@@ -75,19 +66,18 @@ pub(crate) fn has_encoded_dot_segment(text: &str) -> bool {
         .any(|part| part == "." || part == "..")
 }
 
-/// Usage `{what} "{text}" holds a . or .. part: agh sends no dot-segment`.
+/// Builds the usage error for an input containing a `.` or `..` segment.
 pub(crate) fn dot_segment_error(what: &str, text: &str) -> Error {
     Error::usage(format!(
         "{what} \"{text}\" holds a . or .. part: agh sends no dot-segment"
     ))
 }
 
-/// The one refusal of a text with a dot-segment ([`has_dot_segment`]), given before any
-/// request; `what` names the text (`tag`, `ref`, `path`).
+/// Rejects `text` if it contains a `.` or `..` segment.
 ///
 /// # Errors
 ///
-/// Usage, as above.
+/// Returns a usage error if [`has_dot_segment`] is true.
 pub(crate) fn refuse_dot_segment(what: &str, text: &str) -> Result<()> {
     if has_dot_segment(text) {
         return Err(dot_segment_error(what, text));
@@ -95,12 +85,11 @@ pub(crate) fn refuse_dot_segment(what: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`refuse_dot_segment`] for a typed, already-encoded path, judged by
-/// [`has_encoded_dot_segment`].
+/// Rejects a pre-encoded `text` if percent-decoding reveals a `.` or `..` segment.
 ///
 /// # Errors
 ///
-/// Usage, as above.
+/// Returns a usage error if [`has_encoded_dot_segment`] is true.
 pub(crate) fn refuse_encoded_dot_segment(what: &str, text: &str) -> Result<()> {
     if has_encoded_dot_segment(text) {
         return Err(dot_segment_error(what, text));
@@ -108,20 +97,18 @@ pub(crate) fn refuse_encoded_dot_segment(what: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether `tag` cannot be named in a release path: empty, with an empty `/`-part (`v1/`,
-/// `a//b`, which a slash-merging server reads as another tag), or with a dot-segment. Git
-/// refuses all three as a ref name, so no release has such a tag.
+/// Returns whether `tag` is empty, has an empty `/`-separated part, or has a dot-segment.
 #[inline]
 #[must_use]
 pub(crate) fn bad_tag(tag: &str) -> bool {
     tag.split('/').any(str::is_empty) || has_dot_segment(tag)
 }
 
-/// The one refusal of a tag [`bad_tag`] names, given before any request.
+/// Rejects `tag` if [`bad_tag`] is true.
 ///
 /// # Errors
 ///
-/// Usage `tag "{tag}" is empty or holds an empty, . or .. part: no release can have it`.
+/// Returns a usage error when `tag` cannot be used in a release path.
 pub(crate) fn refuse_bad_tag(tag: &str) -> Result<()> {
     if bad_tag(tag) {
         return Err(Error::usage(format!(
@@ -154,8 +141,7 @@ pub(crate) fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `text` as a `T` when it is one or more ASCII digits and nothing else (`str::parse` alone
-/// would take a leading `+`); `None` otherwise, or when it does not fit `T`.
+/// Parses `text` as `T` when it consists solely of one or more ASCII digits.
 #[inline]
 pub(crate) fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
     if is_digits(text) {

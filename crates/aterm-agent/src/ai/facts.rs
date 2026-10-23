@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE DOCTOR READS OF THE MACHINE, per CLI (design §4.1, §7.1).
-//!
-//! Every read is of a file: a `stat` of the CLI's home and login file (never opened),
-//! Claude's profile through its allowlist reader, accounts v2's own records, Codex's own
-//! usage readings and the one `config.toml` key that says where it keeps its login, and this
-//! layer's store. No keychain, no child process, no lock, no write. Child processes the
-//! sign-in and the review start go through [`Runner`], so a test runs none.
+//! Machine and CLI state inspection for the AI doctor.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -52,7 +46,7 @@ pub struct Job<'a> {
     pub budget: Duration,
 }
 
-/// The child processes the AI layer starts. Injected; [`LiveRunner`] is the shipped one.
+/// The child processes the AI layer starts.
 pub trait Runner: Sync {
     /// Runs `job` with captured output, killed with its process group at its budget.
     ///
@@ -61,9 +55,7 @@ pub trait Runner: Sync {
     /// Why it produced nothing ([`RunFailed`]).
     fn run(&self, job: &Job<'_>) -> Result<Ran, RunFailed>;
 
-    /// Runs `program args…` on this terminal (stdio inherited) with `env` and `cwd`, and
-    /// waits for it with SIGINT and SIGQUIT ignored here: a sign-in a person finishes.
-    /// Answers its exit code (`128 + signal` for a signal).
+    /// Runs `program args…` on this terminal and returns its exit code.
     ///
     /// # Errors
     ///
@@ -137,8 +129,7 @@ impl Runner for LiveRunner {
 /// The managed copy of a CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Managed {
-    /// The atpkg shim that runs it (`agents/<id>`, else `bin/<id>`), which applies the
-    /// row's `shim_env` (agy's updater stays off) and execs the verified store copy.
+    /// The atpkg shim that runs the verified store copy.
     pub path: PathBuf,
     /// Its version, from atpkg's record.
     pub version: Option<String>,
@@ -160,16 +151,15 @@ pub enum Kept {
 pub struct ClaudeAccounts {
     /// The own row's label.
     pub label: String,
-    /// Whether `accounts.toml` lists the row (not accounts' stand-in for an empty roster).
+    /// Whether `accounts.toml` lists the row.
     pub listed: bool,
-    /// Why `accounts.toml` is refused, when it is: then it stands for no roster at all.
+    /// Why `accounts.toml` is refused, when it is.
     pub refused: Option<String>,
-    /// Whether the row has an email: its lifecycle runs and it renews by itself.
+    /// Whether the row has an email and renews by itself.
     pub renews: bool,
-    /// The login a renewal bound it to (`CLAUDE_SECURESTORAGE_CONFIG_DIR`), verbatim;
-    /// `None` is the default login.
+    /// The login directory a renewal bound the row to, or `None` for the default login.
     pub login: Option<String>,
-    /// Whether that bound login holds one (`accounts::login_made`).
+    /// Whether that bound login holds a completed sign-in.
     pub made: bool,
     /// `accounts::LoginState::as_str`, where the row renews.
     pub state: Option<&'static str>,
@@ -179,11 +169,9 @@ pub struct ClaudeAccounts {
     pub limited_until: Option<i64>,
     /// The newest turn served under it.
     pub served_at: Option<i64>,
-    /// When a renewal last bound it, unix seconds: a renewal is the newest proof of a
-    /// working login.
+    /// When a renewal last bound it, in unix seconds.
     pub renewed_at: Option<i64>,
-    /// When the serving row is at a usage limit and another row in `accounts.toml` has an
-    /// email, is not limited, and is not enrolled/signed-in yet (`accounts::sign_in_next`).
+    /// The next unenrolled row with an email to sign into when the serving row is limited.
     pub next_sign_in: Option<String>,
 }
 
@@ -204,8 +192,7 @@ pub struct Facts {
     pub home_exists: bool,
     /// A login file seen, and when the vendor last wrote it.
     pub login_file: Option<(PathBuf, Option<i64>)>,
-    /// Codex keeps its login in the OS keyring here (`cli_auth_credentials_store`), where
-    /// aterm does not look.
+    /// Whether Codex keeps its login in the OS keyring (`cli_auth_credentials_store`).
     pub hidden_store: bool,
     /// Claude: its profile names a signed-in account (`oauthAccount`).
     pub profile_signed_in: bool,
@@ -241,9 +228,7 @@ pub struct Machine<'a> {
     pub roster: Option<PathBuf>,
 }
 
-/// The CLI's home: the row's variable when set and not empty (`Err` with its value when it
-/// is not absolute: the vendor resolves it against a directory aterm does not know), else
-/// the default under `$HOME`.
+/// Resolves the home directory for `c` from environment variable `var` or `$HOME`.
 ///
 /// # Errors
 ///
@@ -311,7 +296,6 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         _ => None,
     };
     if refused.is_some() {
-        // No roster at all: sessions run on the default login, and so does a review.
         return Some(ClaudeAccounts {
             label: crate::ai::login::OWN_LABEL.to_string(),
             listed: false,
@@ -337,8 +321,6 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
     let bound = accounts::bound(&roster, &logins);
     let state = store.load(m.now).map(|(s, _)| s).unwrap_or_default();
     let enrolled = accounts::enrolled(&bound);
-    // The machine's own row: the one on the default login, or the one a renewal moved off
-    // it (bound to a staging directory of its own).
     let own_row = bound.row_for_login(None).or_else(|| {
         bound
             .rows
@@ -488,8 +470,6 @@ pub fn gather(m: &Machine<'_>, c: &'static Connector) -> Facts {
                 (p, w)
             })
     });
-    // Accounts v2's view is of the DEFAULT home's login: under another home the vendor keys
-    // the login by that home, and the accounts' rows say nothing of it.
     let default_home = c
         .home
         .var

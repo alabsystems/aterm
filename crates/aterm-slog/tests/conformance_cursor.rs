@@ -1,25 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: what [`Log::read`] tells a reader, against the derived
-//! `SessionLogCursor` model (`aterm_models_session::session_log_cursor_model`,
-//! checked at Tier-0 in `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk drives a real two-record ring through four seqs: marks
-//! (evicted oldest first), a run whose open record is pinned while later
-//! records go (so evictions fall in the middle of the window), the run's
-//! close, an update's overlap ([`Log::skip_to`], a seq never held), and a
-//! carried update played whole: the carry taken and the readers fenced
-//! ([`Log::fence_reads`]), the outgoing process writing on, then the
-//! successor continuing the carry ([`Log::from_carry`]) or the update
-//! standing down. A reader pulls in between, to the head or cut at a live
-//! record. After every
-//! step each seq's standing (live, evicted, never held) and the reader's
-//! tallies are projected onto the model, and the step must be the model's:
-//! an append (or a hole) followed by the evictions its batch made, or the
-//! read the reader made. NEGATIVE CONTROLS: a reader that counts a hole as
-//! lost, one left untold of an eviction, and one handed a record the
-//! outgoing process wrote past its fence, are each rejected.
+//! Tier-1 conformance: what [`Log::read`] tells a reader, against the derived `SessionLogCursor`
+//! model (`aterm_models_session::session_log_cursor_model`, checked at Tier-0 in
+//! `aterm-models/tests/derived_ring_ty.rs`).
 
 use aterm_models_session::session_log_cursor_model;
 use aterm_slog::{
@@ -221,8 +205,6 @@ fn update(w: &mut World, what: &str) -> (Vec<&'static str>, Vec<u64>) {
             vec!["OverlapAppend"]
         }
         "stand" => {
-            // The overlap's records stay this process's: the ones its ring
-            // evicted meanwhile read as evicted now.
             let fence = w.carry.take().map_or(0, |c| c.last_seq());
             w.log.lift_read_fence();
             let gone: Vec<u64> = (fence + 1..=w.log.last_seq())
@@ -248,8 +230,6 @@ fn update(w: &mut World, what: &str) -> (Vec<&'static str>, Vec<u64>) {
             vec!["Commit", "Append"]
         }
     };
-    // An overlap record's fate in the outgoing ring is no reader's: it is
-    // never shown, and the successor never holds it.
     let fenced = w.carry.as_ref().map(aterm_slog::CarrySnapshot::last_seq);
     let evicted = live_before
         .into_iter()
@@ -309,7 +289,6 @@ fn walk(m: &Model, seed: u64) -> std::collections::BTreeSet<&'static str> {
         let can_append = w.log.last_seq() < SLOTS;
         let pick = rng.below(8);
         if pick >= 6 && !w.committed {
-            // A commit needs a seq for the successor's handoff mark.
             let what = match (&w.carry, pick, can_append) {
                 (None, _, _) if w.log.last_seq() > 0 => Some("export"),
                 (Some(_), 6, true) => Some("overlap"),
@@ -383,8 +362,6 @@ fn slog_cursor_conforms_to_derived_model() {
 #[test]
 fn slog_cursor_conformance_rejects_what_a_read_never_says() {
     let m = session_log_cursor_model();
-    // Seq 1 a run's open (pinned), 2 a mark the batch takes, 3 never held,
-    // 4 the run's close.
     let mut w = World::new();
     for what in ["open", "mark"] {
         let prev = w.project();
@@ -415,27 +392,23 @@ fn slog_cursor_conformance_rejects_what_a_read_never_says() {
         "two records, the middle eviction counted, the hole said, not counted"
     );
 
-    // A hole counted as lost.
     let mut counted = w.reader;
     counted.rlost += 1;
     let bad = project_reader(&w, counted);
     assert!(!m.check_invariant("HoleNeverCountsAsLoss", &bad));
     assert!(!m.successors("ReadAll", &before).contains(&bad));
 
-    // An evicted seq left untold.
     let mut blind = w.reader;
     blind.rlost -= 1;
     let bad = project_reader(&w, blind);
     assert!(!m.check_invariant("NoSilentLoss", &bad));
     assert!(!m.successors("ReadAll", &before).contains(&bad));
 
-    // A hole crossed and not said.
     let mut deaf = w.reader;
     deaf.told = honest.told;
     let bad = project_reader(&w, deaf);
     assert!(!m.check_invariant("HandoffSaid", &bad));
 
-    // A reader handed a record the outgoing process wrote past its fence.
     let mut f = World::new();
     for what in ["open", "mark"] {
         let prev = f.project();

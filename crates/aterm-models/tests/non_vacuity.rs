@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Every registered model holds, and each of its laws is what it declares.
-//!
-//! An invariant no mutant can falsify is a GHOST: it holds whatever the code
-//! does, and a proof of it proves nothing. So every model in
-//! `xref::model_configurations()` — in every configuration it declares — is
-//! held to `verify::sweep_faults`: it holds with no mutant on, each design
-//! claim is broken by some member of its mutant family, each `bound` is a
-//! range over one variable, a `bound` no mutant breaks stays so declared,
-//! and every action that never fires with no mutant on is
-//! an audited negative control. A liveness obligation is held to the same
-//! rule: proved at the committed config, every fairness assumption
-//! load-bearing, and each named mutant breaking it alone.
+//! Non-vacuity and mutant fault-sweep tests for all registered models.
 
 #[test]
 fn every_registered_model_holds_and_each_law_is_what_it_declares() {
@@ -58,9 +47,7 @@ fn every_liveness_obligation_is_proven_minimal_and_caught() {
     );
 }
 
-/// Every fault `check` finds across `items`, sorted. The items are independent, so they run on
-/// as many threads as the host offers, each taking the next unclaimed item; a panic is its
-/// item's fault, named by `name`, and the others still run.
+/// Every fault `check` finds across `items`, sorted.
 fn faults_across<T: Sync>(
     items: &[T],
     name: impl Fn(&T) -> &'static str + Sync,

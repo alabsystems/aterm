@@ -37,7 +37,7 @@ pub enum Verb {
 impl Verb {
     /// Command-line name of the verb.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Setup => "setup",
             Self::Join => "join",

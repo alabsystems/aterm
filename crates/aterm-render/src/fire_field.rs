@@ -408,6 +408,86 @@ const FIRE_PAL_ADD: [[i32; 3]; 5] = [
     [0xFF, 0xF0, 0xC0],
 ];
 
+/// The brightest light the additive fire ([`FireMode::Add`](crate::render_api::FireMode::Add))
+/// lays per unit coverage: its palette at the legibility ceiling [`FIRE_IDX_MAX`] (rim and
+/// root cooling only lower the index, and every anchor's channels rise along the ramp). The
+/// effects side solves the dark flame's ceiling under a letter against it.
+pub const FIRE_ADD_HOTTEST: u32 = {
+    let (r, g, b) = fire_pal(&FIRE_PAL_ADD, FIRE_IDX_MAX);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+};
+
+/// The brightest light per unit coverage the additive fire lays on scanline `py` of a
+/// patch with params `p` ([`FIRE_ADD_HOTTEST`] at most): its palette at the highest index
+/// any column reaches there. The tallest crest a column can raise gives the least relative
+/// height, the hottest body turbulence the most heat; the root lift and the rim only cool
+/// it, and every anchor's channels rise along the ramp. `0` where no tongue reaches. Lets
+/// the effects side solve a ceiling against the flame's colour at that height instead of
+/// its hottest anywhere: a tongue's upper body is orange and red, not its root's
+/// white-yellow. CPU-only; no shader evaluates it.
+#[inline]
+#[must_use]
+pub const fn fire_add_hottest_at(p: &FireFieldParams, py: i32) -> u32 {
+    let idx = fire_add_index_at(p, py);
+    if idx < 0 { 0 } else { fire_add_light(idx) }
+}
+
+/// The palette index behind [`fire_add_hottest_at`]: the highest any column of a patch
+/// with params `p` reaches on scanline `py`, `0..=`[`FIRE_IDX_MAX`]; `-1` where no tongue
+/// reaches.
+#[inline]
+#[must_use]
+pub const fn fire_add_index_at(p: &FireFieldParams, py: i32) -> i32 {
+    let v = p.base_y - py;
+    let v = if v >= 0 { v } else { -v * 5 };
+    let vv = v * 256;
+    let peak = if p.peak_h < 1 {
+        1
+    } else if p.peak_h > 2048 {
+        2048
+    } else {
+        p.peak_h
+    };
+    // The silhouette's tallest crest: `hq` reaches 30 + 256 at the folded ridge's top.
+    let hcol = (peak * FIRE_HQ_MAX * p.strength) / 255;
+    if hcol <= vv {
+        return -1;
+    }
+    let q = (vv * 256) / hcol;
+    let heat = ((256 - q) * (112 + ((p.temp * 120) >> 8))) >> 6;
+    // The body turbulence at its most (`body` 255).
+    let idx_raw = (heat * (150 + ((255 * 212) >> 8))) >> 8;
+    let idx = if idx_raw > FIRE_IDX_MAX {
+        FIRE_IDX_MAX
+    } else {
+        idx_raw
+    };
+    let ch = if p.cell_h > 2 { p.cell_h } else { 2 };
+    let root_raw = (v * 1536) / ch;
+    let root = if root_raw < 256 { root_raw } else { 256 };
+    (idx * (192 + (root >> 2))) >> 8
+}
+
+/// The additive fire's light per unit coverage at palette index `idx` (`0..=1023`,
+/// clamped), `0x00RRGGBB`: what [`fire_shade_add`] lays at that index before coverage.
+#[inline]
+#[must_use]
+pub const fn fire_add_light(idx: i32) -> u32 {
+    let idx = if idx < 0 {
+        0
+    } else if idx > 1023 {
+        1023
+    } else {
+        idx
+    };
+    let (r, g, b) = fire_pal(&FIRE_PAL_ADD, idx);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// The tallest a column's tongue stands, fp8 of the patch's `peak_h` ([`FireRow::core`]'s
+/// `hq` at the ridge's top).
+const FIRE_HQ_MAX: i32 = 30 + ((((((255 * 255) >> 8) * (256 + 255)) >> 9) * 260) >> 8);
+
 /// The darkest ink the ink-fire ([`FireMode::Over`](crate::render_api::FireMode::Over))
 /// lays: its first palette anchor, where rim darkening drives the index. The
 /// effects side solves the flame's light-ground coverage ceiling against it
@@ -701,5 +781,89 @@ mod tests {
             tip_idx_max < root_idx_max,
             "tips must stay cooler than the root ({tip_idx_max} vs {root_idx_max})"
         );
+    }
+
+    /// No additive sample is brighter, per channel and per unit coverage, than
+    /// [`FIRE_ADD_HOTTEST`], the light a ceiling under a letter is solved
+    /// against. Negative control: the palette's amber anchor, one segment
+    /// cooler, is passed by the hot field's cores.
+    #[test]
+    fn the_hottest_light_bounds_every_additive_sample() {
+        let over = |bound: u32| {
+            let mut over = 0usize;
+            for temp in [0, 128, 255] {
+                let p = params(temp, 0, 7_000);
+                for px in (0..300).step_by(3) {
+                    for py in (40..200).step_by(2) {
+                        let c = core_at(px, py, &p);
+                        let cov = fire_cov_add(&c, &p);
+                        let lit = fire_shade_add(&c, &p, 255);
+                        let ch = |v: u32, sh: u32| (v >> sh) & 0xff;
+                        if [16, 8, 0]
+                            .iter()
+                            .any(|&sh| ch(lit, sh) > (ch(bound, sh) * cov as u32 + 127) / 255)
+                        {
+                            over += 1;
+                        }
+                    }
+                }
+            }
+            over
+        };
+        assert_eq!(
+            over(FIRE_ADD_HOTTEST),
+            0,
+            "a sample outshines the hottest light"
+        );
+        let amber = {
+            let [r, g, b] = FIRE_PAL_ADD[3];
+            ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        };
+        assert!(
+            over(amber) > 0,
+            "control: the hot cores pass the amber anchor"
+        );
+    }
+
+    /// No additive sample on a scanline is brighter, per channel and per unit coverage,
+    /// than [`fire_add_hottest_at`] says for that scanline, at any heat, strength and
+    /// lean; and high in a tongue that light is well under [`FIRE_ADD_HOTTEST`] (a
+    /// ceiling solved against it there buys the flame its orange). Negative control: the
+    /// bound read a third of the peak higher up the tongue is passed.
+    #[test]
+    fn the_light_at_a_height_bounds_every_sample_on_it() {
+        let over = |up: i32| {
+            let mut over = 0usize;
+            for (temp, strength, lean) in [(0, 255, 0), (128, 230, 40), (255, 255, -60)] {
+                let mut p = params(temp, lean, 7_000);
+                p.strength = strength;
+                for phase in [7_000u32, 91_337, 400_001] {
+                    p.phase = phase;
+                    for py in (40..230).step_by(2) {
+                        let bound = fire_add_hottest_at(&p, py - up);
+                        for px in (0..300).step_by(2) {
+                            let c = core_at(px, py, &p);
+                            let cov = fire_cov_add(&c, &p);
+                            let lit = fire_shade_add(&c, &p, 255);
+                            let ch = |v: u32, sh: u32| (v >> sh) & 0xff;
+                            if [16, 8, 0].iter().any(|&sh| {
+                                ch(lit, sh) > (ch(bound, sh) * cov as u32 + 127) / 255 + 1
+                            }) {
+                                over += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            over
+        };
+        assert_eq!(over(0), 0, "a sample outshines its scanline's bound");
+        let p = params(128, 0, 7_000);
+        let high = fire_add_hottest_at(&p, p.base_y - p.peak_h * 3 / 4);
+        assert!(
+            (high >> 8) & 0xff < 0x60,
+            "three quarters up a tongue its light is still #{high:06x}"
+        );
+        assert!(over(40) > 0, "control: the bound read higher up is passed");
     }
 }

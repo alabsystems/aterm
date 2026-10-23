@@ -125,7 +125,7 @@ macro_rules! bind {
             /// The banked sub-row residual in rows, in `(-1.0, 1.0)`, positive toward older
             /// lines; `0` whenever the viewport is row-aligned.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn scroll_frac_rows(&self) -> f64 {
+            pub const fn scroll_frac_rows(&self) -> f64 {
                 self.scroll_input.frac_rows()
             }
 

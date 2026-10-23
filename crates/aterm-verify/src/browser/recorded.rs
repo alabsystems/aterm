@@ -1,26 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recorded-frame differential (docs/AUDIT-third-party-2026-10-15.md,
-//! wasm-platform WP.8): every frame the GPU page presents, held to the frame
-//! the wgpu-WebGL module presented for the same content in the same browser.
-//! That module's frames were recorded before WP.8 replaced wgpu's WebGL2
-//! backend, and are committed in `crates/aterm-verify/browser/wgpu-webgl/`
-//! (its README says how and where).
-//!
-//! A recording is a directory: `recording.json` (the module, the browser,
-//! the WebGL2 adapter, and each frame's name, size and the SHA-256 of its
-//! RGBA8 bytes) and one RGBA8 PNG per frame. Every session writes the
-//! frames it saw to `<work>/<backend>/gpu-frames/` in that layout
-//! ([`write`]), so a run's frames can be looked at, and the recording was
-//! made by copying one (then `<work>/gpu-frames/`: the lane ran Metal alone).
-//!
-//! [`judge`]: on the recording's adapter each frame must be byte-identical
-//! to its recorded twin; on another adapter, within the CPU parity tolerance
-//! ([`super::judge::TOLERANCE`]), and the verdict says which. NEGATIVE
-//! CONTROL: each frame after the first of a sequence must lie outside that
-//! tolerance of the recorded frame before it, so a comparison that cannot
-//! tell frames apart, or a page that stopped presenting, cannot pass.
+//! The recorded-frame differential (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8):
+//! every frame the GPU page presents, held to the frame the wgpu-WebGL module presented for the
+//! same content in the same browser.
 
 use std::path::{Path, PathBuf};
 
@@ -76,8 +59,7 @@ fn png(frame: &Frame) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Write `rec` into `dir` (emptied first): the manifest and one PNG per
-/// frame.
+/// Write `rec` into `dir` (emptied first): the manifest and one PNG per frame.
 pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
@@ -93,7 +75,6 @@ pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
             "sha256": sha256(&frame.rgba),
         }));
     }
-    // One field, and one frame, per line, so a re-recording diffs by frame.
     let ser = |v: &Value| {
         aterm_json::to_string(v).map_err(|e| format!("could not serialize the manifest: {e}"))
     };
@@ -116,8 +97,8 @@ pub(crate) fn write(dir: &Path, rec: &Recording) -> Result<(), String> {
     std::fs::write(&path, text).map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
-/// Read the recording in `dir`: every frame's PNG decoded and held to the
-/// manifest's size and digest.
+/// Read the recording in `dir`: every frame's PNG decoded and held to the manifest's size and
+/// digest.
 pub(crate) fn read(dir: &Path) -> Result<Recording, String> {
     let path = dir.join(MANIFEST);
     let text = std::fs::read_to_string(&path)

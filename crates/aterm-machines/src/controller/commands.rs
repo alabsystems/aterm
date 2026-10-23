@@ -1610,7 +1610,7 @@ enum HelloError {
 }
 
 impl HelloError {
-    fn unreachable(&self) -> bool {
+    const fn unreachable(&self) -> bool {
         matches!(self, Self::Ssh(f) if f.unreachable())
     }
 

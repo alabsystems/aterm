@@ -122,4 +122,13 @@ pub trait Item: Send + Sync {
     fn stands_aside(&self) -> Option<StoodAside> {
         None
     }
+
+    /// Why the probe just made could not read what it judges because the run lacks what
+    /// the read needs (a network that is down): the engine then reports that `Unusable`
+    /// probe `Blocked` with this line and its kind, so a surface counts it as it counts an
+    /// apply that stood aside (69 offline). Asked only right after a probe answered
+    /// `Unusable`. `None`, the default: the row is `Unknown`, as every unreadable row was.
+    fn read_aside(&self) -> Option<StoodAside> {
+        None
+    }
 }

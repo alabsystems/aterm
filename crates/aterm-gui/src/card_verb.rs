@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `card [seed=<u64>|seed=off]`: THE HARNESS CARD'S CONSTELLATION, PINNED,
-//! in a debug or test build (`docs/DESIGN-card-engine-2026-10-19.md` §7), so
-//! the card two builds draw over the same screen can be compared pixel for
-//! pixel — an A/B of the card engine in a private headless instance
-//! (`targo --unverified lab instance --pre 'card seed=42' --image …`) — when
-//! each card's stars would otherwise be seeded by its session and its
-//! process, which no two runs share. Bare, the verb reads the pin.
-//!
-//! A pin re-arms every card on show ([`crate::App::rearm_claude_cards`]), so
-//! each draws its next frame from the pinned seed; `seed=off` gives the
-//! cards their own seeds back on the same terms. The pin is the main
-//! thread's ([`crate::claude_card::pin_card_seed`]): a test's thread pins its
-//! own cards only.
+//! `card [seed=<u64>|seed=off]`: THE HARNESS CARD'S CONSTELLATION, PINNED, in a debug or test build
+//! (`docs/DESIGN-card-engine-2026-10-19.md` §7), so the card two builds draw over the same screen
+//! can be compared pixel for pixel — an A/B of the card engine in a private headless instance
+//! (`targo --unverified lab instance --pre 'card seed=42' --image …`) — when each card's stars
+//! would otherwise be seeded by its session and its process, which no two runs share.
 
 /// Whether this build pins ([`cmd`]): a debug or test build only.
 const PIN_ENABLED: bool = cfg!(any(test, debug_assertions));
@@ -28,7 +20,7 @@ pub(crate) enum Asked {
     Pin(Option<u64>),
 }
 
-/// The verb's arguments, refused where this build does not pin. Pure.
+/// The verb's arguments, refused where this build does not pin.
 pub(crate) fn parse(rest: &str, enabled: bool) -> Result<Asked, String> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     let asked = match words.as_slice() {
@@ -57,8 +49,7 @@ pub(crate) fn line(pin: Option<u64>, rearmed: usize) -> String {
     }
 }
 
-/// The verb's control-thread half: the read or the pin on the main thread
-/// (`Wake::CardSeed`).
+/// The verb's control-thread half: the read or the pin on the main thread (`Wake::CardSeed`).
 pub(crate) fn cmd(
     proxy: &aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     rest: &str,

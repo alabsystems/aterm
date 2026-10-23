@@ -1,18 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows key path end to end on RECORDED input: the window messages Windows posts for a
-//! hand on a German, French, US or US-International keyboard, or for a Japanese or Korean input
-//! method, replayed through winit's real key path (`aterm_window::platform::windows::recorded`: the
-//! key event builder, the modifier read, the Alt-code and IME handling, with Windows' answers
-//! recorded), then through `App::on_key`, the modifier update and the IME arms, down to the
-//! bytes the program reads. Nothing touches the desktop: no window, no `SendInput`, no layout
-//! loaded into the session.
-//!
-//! The bytes of a forwarded key are the encoder's for the key the press left in
-//! `physical_press_owners` (what the seam encodes), under the legacy keyboard mode a VT reader
-//! sees and under win32-input-mode (DEC 9001), which every console host turns on; a literal press
-//! is its text; a commit is `encode_committed_text`'s.
+//! The Windows key path end to end on RECORDED input: the window messages Windows posts for a hand
+//! on a German, French, US or US-International keyboard, or for a Japanese or Korean input method,
+//! replayed through winit's real key path (`aterm_window::platform::windows::recorded`: the key
+//! event builder, the modifier read, the Alt-code and IME handling, with Windows' answers
+//! recorded), then through `App::on_key`, the modifier update and the IME arms, down to the bytes
+//! the program reads.
 
 use aterm_window::event::{ElementState, Ime};
 use aterm_window::keyboard::ModifiersState;
@@ -109,7 +103,6 @@ fn bytes(
                         *base_layout,
                         *layout_text,
                     )),
-                    // A repeat writes the press's repeat payload where it has one.
                     Some(PhysicalPressOwner::Literal {
                         repeat: Some(crate::input::InputEvent::Text(text)),
                         ..
@@ -260,7 +253,6 @@ fn german_altgr_and_shift() {
         .release(LSHIFT)
         .release(LALT);
     assert_types(de, de_de_shift_state, &alt_shift_7, b"\x1b/");
-    // The keypad's decimal key types the layout's `,`.
     let decimal = Typist::new().toggled(VK_NUMLOCK).tap(NUMPAD_DECIMAL, ",");
     assert_types(de, de_de_shift_state, &decimal, b",");
 }
@@ -438,7 +430,6 @@ fn a_hangul_commit_types_once() {
         &typed,
         "한".as_bytes(),
     );
-    // Space ends the composition and then types itself; the composition held no key back.
     let then_space = typed.tap(SPACE, " ");
     assert_types(
         &layouts::ko_kr(),

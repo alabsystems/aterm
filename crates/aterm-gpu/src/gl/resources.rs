@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's textures, buffers and samplers. Each holds its device's shared
-//! half and deletes its GL name on drop, on the context that made it.
-//!
-//! Textures are immutable-storage (`glTexStorage2D`, one level). A texture
-//! drawn into gets its framebuffer object on first use and keeps it, so a pass
-//! binds one name. The six [`TexelFormat`]s map onto GLES 3.0 internal formats
-//! except the BGRA pair, which GLES has no sized format for (the GL arm's
-//! swapchain is the window surface's own RGBA buffer).
+//! The GL arm's textures, buffers and samplers.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -17,8 +10,7 @@ use super::device::{Current, GlDevice, GlShared};
 use super::ffi::{self, GLenum, GLint, GLuint};
 use crate::device_layer::{SamplerKind, TexelFormat};
 
-/// A texel format's GL spelling: internal format, upload format and type, and
-/// bytes per texel.
+/// A texel format's GL spelling: internal format, upload format and type, and bytes per texel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GlFormat {
     pub(crate) internal: GLenum,
@@ -60,10 +52,9 @@ pub(crate) struct GlTexture {
     pub(crate) format: GlFormat,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// Whether the storage is `SRGB8_ALPHA8` standing for the native plan's
-    /// `Rgba8Unorm` texture with its sRGB alias: drawn and sampled raw (the
-    /// Unorm view) or encoded (the sRGB view) per pass, through
-    /// `EXT_sRGB_write_control` / `EXT_texture_sRGB_decode`.
+    /// Whether the storage is `SRGB8_ALPHA8` standing for the native plan's `Rgba8Unorm` texture
+    /// with its sRGB alias: drawn and sampled raw (the Unorm view) or encoded (the sRGB view) per
+    /// pass, through `EXT_sRGB_write_control` / `EXT_texture_sRGB_decode`.
     pub(crate) views: bool,
     /// The framebuffer object with this texture at `COLOR_ATTACHMENT0`, made
     /// on the first pass, copy or readback that needs one (0: none yet). An
@@ -83,15 +74,13 @@ impl std::fmt::Debug for GlTexture {
 }
 
 impl GlTexture {
-    /// Whether this texture was made on `dev`'s context (a GL name means
-    /// nothing on another context).
+    /// Whether this texture was made on `dev`'s context.
     #[inline]
     pub(crate) fn on(&self, dev: &GlDevice) -> bool {
         Arc::ptr_eq(&self.shared, dev.shared())
     }
 
-    /// The texture's framebuffer object, made and checked complete on first
-    /// use. The context is current (`cur`).
+    /// The texture's framebuffer object, made and checked complete on first use.
     pub(crate) fn fbo(&self, cur: &Current<'_>) -> Result<GLuint, String> {
         let have = self.fbo.load(Ordering::Relaxed);
         if have != 0 {
@@ -99,8 +88,8 @@ impl GlTexture {
         }
         let gl = cur.gl();
         let mut fbo = 0;
-        // SAFETY: the context is current; out-pointer live; the texture name
-        // belongs to this context and has storage.
+        // SAFETY: the context is current; out-pointer live; the texture name belongs to this
+        // context and has storage.
         let status = unsafe {
             (gl.gen_framebuffers)(1, &raw mut fbo);
             (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
@@ -129,8 +118,6 @@ impl GlTexture {
 impl Drop for GlTexture {
     fn drop(&mut self) {
         let Ok(cur) = self.shared.enter() else {
-            // The context cannot be made current here (held on another
-            // thread): the names leak with the context, which frees them.
             return;
         };
         let gl = cur.gl();
@@ -227,10 +214,7 @@ impl Drop for GlSampler {
 }
 
 impl GlDevice {
-    /// Create a 2-D texture of one level. `alias` is the device layer's view
-    /// alias: `Rgba8Unorm` storage aliased as `Rgba8UnormSrgb` becomes one
-    /// `SRGB8_ALPHA8` texture with both views ([`GlTexture::views`]), which
-    /// needs [`super::device::GlCaps::srgb_views`]. Any other alias is refused.
+    /// Create a 2-D texture of one level.
     pub(crate) fn texture_2d(
         &self,
         format: TexelFormat,
@@ -262,8 +246,8 @@ impl GlDevice {
         let cur = self.enter()?;
         let gl = cur.gl();
         let mut name = 0;
-        // SAFETY: the context is current; dimensions checked against the
-        // device's maximum; one level of a sized internal format.
+        // SAFETY: the context is current; dimensions checked against the device's maximum; one
+        // level of a sized internal format.
         unsafe {
             (gl.gen_textures)(1, &raw mut name);
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, name);
@@ -274,7 +258,6 @@ impl GlDevice {
                 width as i32,
                 height as i32,
             );
-            // Level 0 is the only level: sampling never consults mips.
             (gl.tex_parameteri)(ffi::GL_TEXTURE_2D, ffi::GL_TEXTURE_MAX_LEVEL, 0);
         }
         let tex = GlTexture {
@@ -290,8 +273,8 @@ impl GlDevice {
         Ok(tex)
     }
 
-    /// Upload rows `[y0, y0 + rows)` at full width from `bytes`, tightly
-    /// packed at `bytes_per_row`: [`Self::upload_region`]'s full-width case.
+    /// Upload rows `y0, y0 + rows)` at full width from `bytes`, tightly packed at `bytes_per_row`:
+    /// `Self::upload_region`'s full-width case.
     #[inline]
     pub(crate) fn upload_rows(
         &self,
@@ -305,9 +288,8 @@ impl GlDevice {
         self.upload_region(tex, 0, y0, width, rows, bytes, bytes_per_row)
     }
 
-    /// Upload the `w × h` region at `(x, y)` from `bytes`, rows
-    /// `bytes_per_row` apart, at unpack alignment 1 (an R8 region of odd
-    /// width is legal).
+    /// Upload the `w × h` region at `(x, y)` from `bytes`, rows `bytes_per_row` apart, at unpack
+    /// alignment 1 (an R8 region of odd width is legal).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload_region(
         &self,
@@ -343,9 +325,8 @@ impl GlDevice {
         }
         let cur = self.enter()?;
         let gl = cur.gl();
-        // SAFETY: the context is current; the region is inside the texture and
-        // `bytes` covers it at the stated row length (checked above). The
-        // unpack state is set for this call and restored.
+        // SAFETY: the context is current; the region is inside the texture and `bytes` covers it at
+        // the stated row length (checked above).
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);
@@ -390,8 +371,7 @@ impl GlDevice {
         Ok(buf)
     }
 
-    /// Write `bytes` into `buf` from offset 0. GL orders the write after every
-    /// draw already issued that reads the buffer, so no caller has to fence.
+    /// Write `bytes` into `buf` from offset 0.
     pub(crate) fn write_buffer(&self, buf: &GlBuffer, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() > buf.size {
             return Err(format!(
@@ -418,8 +398,7 @@ impl GlDevice {
         cur.check("buffer write")
     }
 
-    /// One of the two clamp samplers (never mipped: every texture has one
-    /// level).
+    /// One of the two clamp samplers (never mipped: every texture has one level).
     pub(crate) fn sampler(&self, kind: SamplerKind) -> Result<GlSampler, String> {
         let filter = match kind {
             SamplerKind::NearestClamp => ffi::GL_NEAREST,
@@ -444,9 +423,7 @@ impl GlDevice {
         Ok(s)
     }
 
-    /// Read `width` x `height` texels of an RGBA8 `tex` (either sRGB or
-    /// Unorm storage; the stored bytes, never converted) into rows of
-    /// `padded` bytes. Waits for every draw into it.
+    /// Read `width` x `height` texels of an RGBA8 `tex` into rows of `padded` bytes.
     pub(crate) fn read_rgba8(
         &self,
         tex: &GlTexture,
@@ -477,9 +454,9 @@ impl GlDevice {
         let cur = self.enter()?;
         let fbo = tex.fbo(&cur)?;
         let gl = cur.gl();
-        // SAFETY: the context is current; `out` holds `height` rows of
-        // `padded` bytes and the pack row length is `padded / 4` texels, so
-        // the copy stays inside it; the pack state is restored.
+        // SAFETY: the context is current; `out` holds `height` rows of `padded` bytes and the pack
+        // row length is `padded / 4` texels, so the copy stays inside it; the pack state is
+        // restored.
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
             (gl.pixel_storei)(ffi::GL_PACK_ALIGNMENT, 4);

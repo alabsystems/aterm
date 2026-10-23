@@ -77,7 +77,7 @@ pub(super) fn spawn<'s>(
     command
         .args(&args)
         .env_clear()
-        .current_dir("/")
+        .current_dir(cmd.cwd.as_deref().unwrap_or(std::path::Path::new("/")))
         .setsid(true)
         .stdin(Stdio::from(read))
         .stdout(Stdio::from(stdout))

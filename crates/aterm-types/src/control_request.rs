@@ -1,27 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ONE REQUEST GRAMMAR of the control wire: a request line's optional
-//! `@<selector>`, its verb and the rest, read the same way by the server (its
-//! lanes, relay and dispatch) and by every client that frames a reply.
-//!
-//! Words are separated by SP or HT. Separators before the first word are
-//! skipped, and so is a run of them after the selector; `rest` is everything
-//! after exactly ONE separator following the verb, so a payload verb (`send
-//! hello`, `send  two spaces`) keeps its text byte for byte. A trailing `\r` is
-//! not part of the line. Both separators are ASCII, so every span below falls
-//! on a char boundary. A leading `@` with nothing after it before a separator
-//! is no selector: it is read as the verb, never as the connection's own
-//! session (`@.` names that).
+//! Control wire request line parser for optional `@<selector>`, verb, and payload.
 
 use core::ops::Range;
 
-/// A stable session id as the wire spells it: `s-` and one or more lower-case
-/// hex digits, the form `SessionId::generate` mints and `whoami`/`sessions`
-/// report. Any other text names no session, so it never reaches a lookup, a
-/// path or a relay. An upper-case digit is other text: the store looks ids up
-/// case-sensitively, and on a case-insensitive volume the rendezvous entry
-/// `graph/s-<UPPER>` would name another id's.
+/// A stable session id as the wire spells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Sid<'a>(&'a str);
 
@@ -52,10 +36,7 @@ pub enum Selector<'a> {
     Local(u64),
     /// `@s-<hex>`: a stable session id.
     Sid(Sid<'a>),
-    /// Any other body (`@S-1`, `@./s-1`, `@self`, a number past `u64`, an empty
-    /// one): names no session, so it answers `ERR no such session` without a
-    /// lookup. An empty body is never self: `@.` says that
-    /// (`control_verbs::EMPTY_SELECTOR`).
+    /// Any other body (`@S-1`, `@./s-1`, `@self`, a number past `u64`, an empty one).
     Invalid(&'a str),
 }
 
@@ -92,8 +73,7 @@ pub struct Head<'a> {
     pub rest: &'a str,
 }
 
-/// Where a line's [`Head`] lies in it, so a request can keep its line and its
-/// parse together without borrowing one from the other.
+/// Where a line's [`Head`] lies in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Spans {
     /// The selector's body (after the `@`).
@@ -136,8 +116,6 @@ impl Spans {
         let bytes = line.as_bytes();
         let end = bytes.len() - usize::from(bytes.last() == Some(&b'\r'));
         let mut at = skip_separators(bytes, 0, end);
-        // An `@` with no body is no selector: it stays the verb, so nothing that
-        // missed the empty-selector gate reads it as the connection's own session.
         let selector =
             (at + 1 < end && bytes[at] == b'@' && !is_separator(bytes[at + 1])).then(|| {
                 let stop = word_end(bytes, at + 1, end);
@@ -154,7 +132,7 @@ impl Spans {
         }
     }
 
-    /// The [`Head`] these spans mark in `line`, the line they were read from.
+    /// Borrows the [`Head`] slices marked by these spans in `line`.
     #[inline]
     #[must_use]
     pub fn head<'a>(&self, line: &'a str) -> Head<'a> {
@@ -176,19 +154,13 @@ pub fn head(line: &str) -> Head<'_> {
     Spans::of(line).head(line)
 }
 
-/// The words of `text` (a verb's rest) by the same separators, SP and HT, with
-/// none empty: how a verb whose rest is words reads them, so it splits them
-/// where every other stage does.
+/// The words of `text` (a verb's rest) by the same separators, SP and HT, with none empty.
 #[inline]
 pub fn words(text: &str) -> impl Iterator<Item = &str> {
     text.split([' ', '\t']).filter(|word| !word.is_empty())
 }
 
-/// The one session a `subscribe` names in its text (`rest`, the line after the
-/// verb: `subscribe @<sel> <streams> …`), and the text after that selector:
-/// `Some` only when the first word is a single `@<sid>`. Self (`@`, `@.`), a
-/// local number, a list, `@*` (the instance's live target set) or no selector
-/// is `None`: only one stable id can live on another instance.
+/// Extracts the single target session named in a `subscribe` request's `rest`.
 #[inline]
 #[must_use]
 pub fn subscribe_target(rest: &str) -> Option<(Sid<'_>, &str)> {
@@ -281,10 +253,8 @@ mod tests {
         assert_eq!(read("@7"), (Some(Selector::Local(7)), "", ""));
         assert_eq!(read(""), (None, "", ""));
         assert_eq!(read("   "), (None, "", ""));
-        // Only SP and HT separate: another space character is part of a word.
         assert_eq!(read("text\u{a0}x"), (None, "text\u{a0}x", ""));
         assert_eq!(read("feed-bin\x0b4"), (None, "feed-bin\x0b4", ""));
-        // The spans mark the same text the head reads.
         let line = "  @s-1a\tsend  hi\r";
         let spans = Spans::of(line);
         assert_eq!(spans.head(line), head(line));

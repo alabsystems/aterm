@@ -1,19 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! The OpenType layout answers of the font oracle, written once for both
 //! readers: `reader.rs` includes this file, with `font` naming `ttf_parser`
 //! in the recorder and `aterm_font` in aterm-render's and aterm-font's
 //! replays (TF.3 and TF.5 of docs/AUDIT-third-party-2026-10-15.md); the
 //! layout reader is carved from ttf-parser's and keeps its names. One
 //! digest, two readers.
-//!
-//! - [`layout`]: a `GSUB` or `GPOS` table's script, feature and lookup lists.
-//! - [`gsub_lookups`]: every `GSUB` lookup's subtables, whole: coverage,
-//!   class definitions, substitutes, sequences, alternates, ligatures and
-//!   (chained) context rules, extension subtables resolved.
-//!
-//! The including module provides `font`, `Fnv`, `pin` and `tag_str`.
 
 use super::font::GlyphId;
 use super::font::gsub::{SingleSubstitution, SubstitutionSubtable};
@@ -362,9 +354,8 @@ fn subtable(h: &mut Fnv, s: SubstitutionSubtable) {
     }
 }
 
-/// Every `GSUB` lookup's subtables, digested whole, with the count of each
-/// lookup type the subtables resolved to (`kinds=<type>:<count>`, an
-/// extension counted as what it wraps).
+/// Every `GSUB` lookup's subtables, digested whole, with the count of each lookup type the
+/// subtables resolved to (`kinds=<type>:<count>`, an extension counted as what it wraps).
 pub(crate) fn gsub_lookups(table: Option<LayoutTable>) -> String {
     let Some(t) = table else {
         return "absent".to_string();

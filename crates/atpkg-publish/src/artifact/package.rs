@@ -749,7 +749,7 @@ pub fn pack_package_with(
         .map_err(|e| Error::io(format!("mkdir {}", ctx.shown(&stage_dir)), &e))?;
     let asset_name = pkgdoc::asset_name(program, request.build, triple);
     let asset = stage_dir.join(&asset_name);
-    let packed = tarwrite::write(&pkg.root, &asset)?;
+    let packed = tarwrite::write_with(&pkg.root, &asset, tools.compressor())?;
     let header = Header {
         program: program.to_string(),
         version: pkg.version.clone(),

@@ -374,6 +374,8 @@ pub struct WatcherSet {
     /// The unfinished frame's hang detector as the last observation saw it
     /// ([`super::Terminal::frame_hang_deadline`]); `None` when that frame was whole.
     frame_hang: Option<Instant>,
+    /// The host read none of the output since [`Self::restart_idle`], so the hang detector is held.
+    parked: bool,
 }
 
 /// Default capacity — bounds adversarial arming.
@@ -397,6 +399,7 @@ impl WatcherSet {
             next_id: 0,
             cap: cap.max(1),
             frame_hang: None,
+            parked: false,
         }
     }
 
@@ -509,6 +512,7 @@ impl WatcherSet {
     }
 
     /// The soonest pending `IdleFor` / `MomentumBelow` deadline, a settling `RowsClear`'s ([`GONE_SETTLE`] past its `clear_since`), and the unfinished frame's hang detector where a watcher waits on a whole frame ([`WatcherSpec::FrameWhole`], a row scan the frame held), which the arming `await`/`ready` verb uses to bound its `Subscription::wait` park.
+    /// The hang detector is no deadline while [`Self::restart_idle`] holds it.
     #[inline]
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
@@ -518,7 +522,7 @@ impl WatcherSet {
             .filter_map(|w| {
                 let hang = self
                     .frame_hang
-                    .filter(|_| w.spec.waits_on_frame(w.deferred));
+                    .filter(|_| !self.parked && w.spec.waits_on_frame(w.deferred));
                 [w.deadline, w.settled_at(), hang]
                     .into_iter()
                     .flatten()
@@ -670,8 +674,9 @@ impl WatcherSet {
         latched_any
     }
 
-    /// Restart every un-latched `IdleFor` deadline at `now + dur`: unseen time is not quiet time.
+    /// Restart every un-latched `IdleFor` deadline at `now + dur`: unseen time is not quiet time, nor hang time, so the hang detector is held until the next [`Self::expire`].
     pub fn restart_idle(&mut self, now: Instant) {
+        self.parked = true;
         for w in &mut self.watchers {
             if w.latched.is_some() {
                 continue;
@@ -685,8 +690,9 @@ impl WatcherSet {
         }
     }
 
-    /// The idle-fire call, run when the host's `WaitUntil` wake reaches `now` (and once at a replay target).
+    /// The idle-fire call, run when the host's `WaitUntil` wake reaches `now` (and once at a replay target); it ends the hang detector's hold ([`Self::restart_idle`]).
     pub fn expire(&mut self, now: Instant) -> bool {
+        self.parked = false;
         let last_seq = self.clock.last_seq;
         let mut latched_any = false;
         for w in &mut self.watchers {
@@ -846,7 +852,7 @@ impl super::Terminal {
         expired || hung
     }
 
-    /// Idle hold: while the host consumes none of this terminal's output, restart every pending `IdleFor` at `now` ([`WatcherSet::restart_idle`]).
+    /// Idle hold: while the host consumes none of this terminal's output, restart every pending `IdleFor` at `now` and hold the hang detector ([`WatcherSet::restart_idle`]).
     #[inline]
     pub fn watch_restart_idle(&mut self, now: Instant) {
         self.watchers.restart_idle(now);

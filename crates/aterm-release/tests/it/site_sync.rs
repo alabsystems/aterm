@@ -218,7 +218,7 @@ enum Deploy {
 /// What the sync asked of the world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
-    Gh(String),
+    Github(String),
     Download(String),
     Live(String),
     Build {
@@ -273,7 +273,7 @@ impl Launch for Signals {
 struct Fake {
     releases: String,
     main_sha: Option<String>,
-    gh_dead: bool,
+    github_dead: bool,
     /// The live site cannot be fetched at all (no network, a DNS failure).
     live_dead: bool,
     live: PathBuf,
@@ -317,17 +317,17 @@ impl World for Fake {
         self.signals.clone()
     }
 
-    fn gh_api(&mut self, path: &str, _paginate: bool) -> Result<String, String> {
-        self.calls.push(Call::Gh(path.into()));
-        if self.gh_dead {
-            return Err("gh: not logged in".into());
+    fn github(&mut self, path: &str, _paginate: bool) -> Result<String, String> {
+        self.calls.push(Call::Github(path.into()));
+        if self.github_dead {
+            return Err("GitHub GET failed: HTTP 401: Bad credentials".into());
         }
         if path == format!("repos/{SLUG}/releases?per_page=100") {
             return Ok(self.releases.clone());
         }
         match (&self.main_sha, path == format!("repos/{SLUG}/commits/main")) {
             (Some(sha), true) => Ok(format!("{{\"sha\":\"{sha}\"}}")),
-            _ => Err(format!("unexpected gh api {path}")),
+            _ => Err(format!("unexpected GitHub read {path}")),
         }
     }
 
@@ -704,7 +704,7 @@ impl Lab {
         Fake {
             releases,
             main_sha: None,
-            gh_dead: false,
+            github_dead: false,
             live_dead: false,
             live: self.live.clone(),
             home: self.root.join("home"),
@@ -1003,7 +1003,7 @@ fn a_release_sync_rewrites_rebuilds_commits_pushes_deploys_and_verifies() {
         world
             .calls
             .iter()
-            .all(|c| !matches!(c, Call::Gh(p) if !p.starts_with("repos/")))
+            .all(|c| !matches!(c, Call::Github(p) if !p.starts_with("repos/")))
     );
     assert!(world.calls.iter().all(|c| match c {
         Call::Live(u) => u.starts_with(ORIGIN),
@@ -1343,7 +1343,7 @@ fn an_interrupt_starts_nothing_further() {
     }
     assert!(world.builds().is_empty() && world.deploys().is_empty());
     assert_eq!(
-        world.count(|c| matches!(c, Call::Gh(_) | Call::Download(_))),
+        world.count(|c| matches!(c, Call::Github(_) | Call::Download(_))),
         0
     );
     assert_eq!((lab.head(), lab.status()), (before, String::new()));
@@ -1640,7 +1640,7 @@ fn a_stream_with_nothing_installable_keeps_the_previous_link() {
 /// asks the authenticated gh for main's tip; a gh that cannot answer stops both GitHub
 /// reads, naming gh, with nothing fetched around it.
 #[test]
-fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
+fn the_commit_is_the_promoted_one_and_github_is_read_through_its_api_only() {
     let lab = Lab::new();
     for (commit, fetched) in [
         (Some("0000000000000000000000000000000000000000"), true),
@@ -1675,7 +1675,7 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
     assert!(synced(&ended, &out));
     assert_eq!(
         world.calls[0],
-        Call::Gh(format!("repos/{SLUG}/commits/main"))
+        Call::Github(format!("repos/{SLUG}/commits/main"))
     );
     assert_eq!(
         read(&lab.site.join("public/assets/term/ENGINE_SOURCE")).trim(),
@@ -1684,9 +1684,9 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
 
     let lab = Lab::new();
     let mut world = lab.fake("releases-fat.json");
-    world.gh_dead = true;
+    world.github_dead = true;
     let (ended, out) = lab.sync(&latest, &env, &mut world);
-    assert_eq!(failed_child(ended, &out).0, "gh", "main's tip");
+    assert_eq!(failed_child(ended, &out).0, "github", "main's tip");
     let (ended, out) = lab.sync(
         &Options {
             no_deploy: true,
@@ -1695,9 +1695,9 @@ fn the_commit_is_the_promoted_one_and_github_is_read_through_gh_only() {
         &lab.env(),
         &mut world,
     );
-    assert_eq!(failed_child(ended, &out).0, "gh", "the release list");
+    assert_eq!(failed_child(ended, &out).0, "github", "the release list");
     assert!(
-        world.calls.iter().all(|c| matches!(c, Call::Gh(_))),
+        world.calls.iter().all(|c| matches!(c, Call::Github(_))),
         "{:?}",
         world.calls
     );

@@ -15,7 +15,7 @@ use aterm_spec::walk::{only, walk};
 use aterm_spec::{interp, verify};
 
 #[test]
-fn supervise_tape_recovery_proves_and_catches() {
+fn supervise_tape_recovery_fires_every_committed_move() {
     let model = supervise_tape_recovery_model();
     let committed = interp::fired_actions(&model);
     for action in [
@@ -26,11 +26,6 @@ fn supervise_tape_recovery_proves_and_catches() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "harness tape: a whole-frame prefix, every whole frame back, damage and misplaced frames \
-         refused, a tear said",
-    );
 }
 
 /// Each wrong reader breaks the law it was written to break, alone.
@@ -304,10 +299,10 @@ fn supervise_replay_cursor_walks_a_counterfactual() {
 
 // -- model 3: the stop flag's latch ------------------------------------------
 
-/// Tier-0 of `SupervisorRaisedLatch` (model 3): proved at `Buggy = 0`, caught
-/// at `Buggy = 1`, every move firing at the committed configuration.
+/// Tier-0 of `SupervisorRaisedLatch` (model 3): every move fires at the committed
+/// configuration (`aterm-models`' `non_vacuity` proves and catches it).
 #[test]
-fn supervisor_raised_latch_proves_and_catches() {
+fn supervisor_raised_latch_fires_every_committed_move() {
     use aterm_models_harness::supervisor_raised_latch_model;
     let model = supervisor_raised_latch_model();
     let committed = interp::fired_actions(&model);
@@ -317,10 +312,6 @@ fn supervisor_raised_latch_proves_and_catches() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "a raised flag is taped by the loop's own read, and its replay never diverges",
-    );
 }
 
 /// The setter that tapes the flag itself breaks both laws, each alone.

@@ -518,7 +518,7 @@ impl Run<'_> {
         if !opts.dry_run && !std::fs::metadata(&ctx.tokens.staging).is_ok_and(|m| m.len() > 0) {
             return Err(Error::cannot_run(format!(
                 "staging token file missing/empty: {} — the lane reads the private staging \
-                 repos as that identity, never gh's own login",
+                 repos as that identity, never anonymously",
                 ctx.shown(&ctx.tokens.staging)
             )));
         }
@@ -1686,7 +1686,8 @@ impl Ready<'_> {
         s.push_str(&format!(
             "\nThe ceremony, from THIS directory on a rostered machine (do not reformat any \
              staged file — the signature covers exact bytes; `sign` uses the machine key at \
-             {key}):\n\n```sh\n"
+             {key}, `upload staging` the staging token and `upload public` the channel token \
+             at {token}):\n\n```sh\n"
         ));
         for (p, new) in self.ready {
             let (name, build) = (&p.name, p.build);
@@ -1703,14 +1704,17 @@ impl Ready<'_> {
             s.push_str(&format!(
                 "# --- {name}@{build} ({}) ---\n\
                  atpkg-publish sign {}\n\
-                 gh release upload {tag} -R {} --clobber{tarballs} {} {}\n\
-                 GH_TOKEN=\"$(cat {token})\" gh release upload {tag} -R {} --clobber{tarballs} {} {}\n",
-                new.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
+                 atpkg-publish upload staging {} {tag}{tarballs} {} {}\n\
+                 atpkg-publish upload public {} {tag}{tarballs} {} {}\n",
+                new.iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 pkg.display(),
-                ctx.staging_slug(&p.repo),
+                p.repo,
                 pkg.display(),
                 sig.display(),
-                ctx.public_slug(&p.repo),
+                p.repo,
                 pkg.display(),
                 sig.display(),
             ));

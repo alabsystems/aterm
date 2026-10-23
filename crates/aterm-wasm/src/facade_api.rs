@@ -81,12 +81,12 @@ macro_rules! bind {
             }
 
             /// Authorize OSC 52 clipboard write events for draining via [`Self::take_osc_events`].
-            pub fn authorize_clipboard_write(&mut self) {
+            pub const fn authorize_clipboard_write(&mut self) {
                 self.term.authorize_clipboard_access(ClipboardAccess::Write);
             }
 
             /// Revoke OSC 52 clipboard write authorization, returning to fail-closed.
-            pub fn revoke_clipboard_write(&mut self) {
+            pub const fn revoke_clipboard_write(&mut self) {
                 self.term.revoke_clipboard_access(ClipboardAccess::Write);
             }
 
@@ -119,13 +119,13 @@ macro_rules! bind {
 
             /// Display-relative cursor column (0-based).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn cursor_x(&self) -> u16 {
+            pub const fn cursor_x(&self) -> u16 {
                 self.term.grid().cursor().col
             }
 
             /// Display-relative cursor row (0-based, top of viewport).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn cursor_y(&self) -> u16 {
+            pub const fn cursor_y(&self) -> u16 {
                 self.term.grid().cursor().row
             }
 
@@ -171,7 +171,7 @@ macro_rules! bind {
             }
 
             /// Drain the edge-triggered BEL flag.
-            pub fn drain_bell(&mut self) -> bool {
+            pub const fn drain_bell(&mut self) -> bool {
                 self.term.drain_bell()
             }
 
@@ -223,7 +223,7 @@ macro_rules! bind {
             }
 
             /// Set the input-line budget per [`Self::pump_reflow`] step (`0` restores default).
-            pub fn pump_reflow_budget(&mut self, max_lines: u32) {
+            pub const fn pump_reflow_budget(&mut self, max_lines: u32) {
                 self.reflow_budget = if max_lines == 0 {
                     REFLOW_STEP_BUDGET_LINES
                 } else {
@@ -233,22 +233,22 @@ macro_rules! bind {
 
             /// True while a deferred scrollback rewrap is pending.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn reflow_pending(&self) -> bool {
+            pub const fn reflow_pending(&self) -> bool {
                 self.pending_reflow.is_some()
             }
 
             /// True when the last `render()` was skipped because nothing visual changed.
-            pub fn last_render_skipped(&self) -> bool {
+            pub const fn last_render_skipped(&self) -> bool {
                 self.last_render_gated
             }
 
             /// Monotone revision of the spill-band RGBA buffer.
-            pub fn spill_rev(&self) -> u32 {
+            pub const fn spill_rev(&self) -> u32 {
                 self.spill.rev()
             }
 
             /// Number of dirty spill rects from the last `render()`.
-            pub fn spill_rect_count(&self) -> u32 {
+            pub const fn spill_rect_count(&self) -> u32 {
                 (self.spill.rects().len() / 4) as u32
             }
 
@@ -263,12 +263,12 @@ macro_rules! bind {
             }
 
             /// Byte length of the RGBA spill buffer (`0` when chrome is 0/0).
-            pub fn spill_len(&self) -> usize {
+            pub const fn spill_len(&self) -> usize {
                 self.spill.rgba().len()
             }
 
             /// Configure whether `HaloMode::Over` veils are included in the spill band.
-            pub fn set_spill_include_veils(&mut self, on: bool) {
+            pub const fn set_spill_include_veils(&mut self, on: bool) {
                 self.note_host_visual_change();
                 self.spill.set_include_veils(on);
             }
@@ -293,37 +293,37 @@ macro_rules! bind {
 
             /// Lines the viewport is scrolled up from the live bottom (0 = at bottom).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn display_offset(&self) -> usize {
+            pub const fn display_offset(&self) -> usize {
                 self.term.grid().display_offset()
             }
 
             /// True when the alternate screen buffer is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_alt_screen(&self) -> bool {
+            pub const fn is_alt_screen(&self) -> bool {
                 self.term.is_alternate_screen()
             }
 
             /// True when DEC mode 1007 (alternate scroll) is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_alternate_scroll(&self) -> bool {
+            pub const fn is_alternate_scroll(&self) -> bool {
                 self.term.modes().alternate_scroll()
             }
 
             /// True when DECCKM (application cursor keys) is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_app_cursor_mode(&self) -> bool {
+            pub const fn is_app_cursor_mode(&self) -> bool {
                 self.term.modes().application_cursor_keys()
             }
 
             /// True when any mouse-tracking mode (DECSET 9/1000/1002/1003) is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_mouse_tracking(&self) -> bool {
+            pub const fn is_mouse_tracking(&self) -> bool {
                 self.term.mouse_tracking_enabled()
             }
 
             /// True when the active mouse mode reports drag or all motion (1002 or 1003).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn mouse_wants_motion(&self) -> bool {
+            pub const fn mouse_wants_motion(&self) -> bool {
                 matches!(
                     self.term.mouse_mode(),
                     MouseMode::ButtonEvent | MouseMode::AnyEvent
@@ -332,25 +332,25 @@ macro_rules! bind {
 
             /// True when the active mouse mode reports button-less motion (1003).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn mouse_wants_any_motion(&self) -> bool {
+            pub const fn mouse_wants_any_motion(&self) -> bool {
                 matches!(self.term.mouse_mode(), MouseMode::AnyEvent)
             }
 
             /// True when DECSET 1004 focus reporting is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_focus_event_mode(&self) -> bool {
+            pub const fn is_focus_event_mode(&self) -> bool {
                 self.term.focus_reporting_enabled()
             }
 
             /// True when DEC mode 2031 color-scheme notifications are enabled.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn is_color_scheme_updates_mode(&self) -> bool {
+            pub const fn is_color_scheme_updates_mode(&self) -> bool {
                 self.term.report_color_scheme_enabled()
             }
 
             /// Active DECSCUSR cursor style discriminant (`CursorStyle as u8`).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn cursor_style(&self) -> u8 {
+            pub const fn cursor_style(&self) -> u8 {
                 self.term.cursor_style() as u8
             }
 
@@ -615,7 +615,7 @@ macro_rules! bind {
 
             /// True when bracketed-paste mode (DECSET 2004) is active.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn bracketed_paste_mode(&self) -> bool {
+            pub const fn bracketed_paste_mode(&self) -> bool {
                 self.term.modes().bracketed_paste()
             }
 

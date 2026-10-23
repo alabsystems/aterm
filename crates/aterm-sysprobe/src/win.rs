@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows arm's CALLS (64-bit Windows: both cells, x86_64 and aarch64):
-//! direct `extern "system"` declarations against kernel32 and ntdll, the
-//! way windows-link writes them (`raw-dylib`, so no import library is
-//! needed), each signature transcribed from the Windows SDK. Every buffer
-//! the kernel fills is handed to [`crate::windows`]'s decoders, which are
-//! pure and tested on every host; this module only calls and sizes.
-//!
-//! Handles are plain `isize` and the one kept (the low-memory resource
-//! notification, made once and held for the process) is never dereferenced
-//! by Rust. No call here can block on a remote file system: a volume is read
-//! only through a drive the spelling names and `GetDriveTypeW` calls fixed.
+//! Windows `extern "system"` FFI calls for [`crate::windows`].
 
 #![allow(
     non_snake_case,
@@ -40,16 +30,15 @@ type BOOL = i32;
 type HANDLE = isize;
 type NTSTATUS = i32;
 
-/// `SYSTEM_INFORMATION_CLASS` values (`winternl.h`, and the documented
-/// numbering of the page-file class).
+/// `SYSTEM_INFORMATION_CLASS` values.
 const SYSTEM_PROCESS_INFORMATION: i32 = 5;
 const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: i32 = 8;
 const SYSTEM_PAGEFILE_INFORMATION: i32 = 18;
-/// `STATUS_INFO_LENGTH_MISMATCH`: the buffer was too small.
+/// `STATUS_INFO_LENGTH_MISMATCH`.
 const STATUS_INFO_LENGTH_MISMATCH: NTSTATUS = 0xC000_0004_u32.cast_signed();
 /// `MEMORY_RESOURCE_NOTIFICATION_TYPE::LowMemoryResourceNotification`.
 const LOW_MEMORY_RESOURCE_NOTIFICATION: i32 = 0;
-/// The largest process table read (64 MiB): past it the sweep answers `None`.
+/// The largest process table read (64 MiB).
 const PROCESS_TABLE_CAP: usize = 64 << 20;
 /// The largest CPU Set table read (1 MiB: some 32,000 CPU Sets).
 const CPU_SET_CAP: u32 = 1 << 20;
@@ -112,16 +101,13 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 }
 
-/// A `u64` buffer (8-byte aligned, as the NT information classes want) seen
-/// as its bytes.
+/// A `u64` buffer (8-byte aligned, as the NT information classes want) seen as its bytes.
 fn as_bytes(words: &[u64]) -> &[u8] {
-    // SAFETY: `u8` has alignment 1 and no invalid values, and the slice
-    // covers exactly the words' bytes, borrowed for as long as they are.
+    // SAFETY: `u8` has alignment 1 and no invalid values, covering the slice's exact byte span.
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
-/// Each active processor group's width (`GetActiveProcessorCount`), in
-/// group order.
+/// Each active processor group's width (`GetActiveProcessorCount`), in group order.
 fn group_widths() -> Vec<u32> {
     // SAFETY: takes nothing, returns a count.
     let groups = unsafe { GetActiveProcessorGroupCount() };
@@ -131,8 +117,7 @@ fn group_widths() -> Vec<u32> {
         .collect()
 }
 
-/// The reader behind [`crate::Probe::core_ticks`] on Windows: the groups'
-/// widths, read once, and a buffer reused across readings.
+/// The reader behind [`crate::Probe::core_ticks`] on Windows.
 #[derive(Debug)]
 pub(crate) struct Ticks {
     widths: Vec<u32>,
@@ -147,8 +132,7 @@ impl Ticks {
         }
     }
 
-    /// One reading: each group's processors in turn, padded (or cut) to the
-    /// group's width so the logical ids stay those [`cpu_layout`] uses.
+    /// One reading: each group's processors in turn, padded.
     pub(crate) fn sample(&mut self) -> Option<Vec<CoreTicks>> {
         let mut out = Vec::new();
         let single = self.widths.len() == 1;
@@ -160,8 +144,7 @@ impl Ticks {
             let group = u16::try_from(g).ok()?;
             let cap = u32::try_from(self.buf.len() * 8).ok()?;
             let mut got = 0u32;
-            // SAFETY: the input is one readable u16 (the group number), the
-            // output `cap` writable bytes, and `got` a writable u32.
+            // SAFETY: input is one readable u16; `buf` and `got` are writable.
             let mut status = unsafe {
                 NtQuerySystemInformationEx(
                     SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
@@ -173,7 +156,6 @@ impl Ticks {
                 )
             };
             if status < 0 && single {
-                // One group: the plain query answers the same processors.
                 // SAFETY: as above, with no input buffer.
                 status = unsafe {
                     NtQuerySystemInformation(
@@ -196,8 +178,7 @@ impl Ticks {
     }
 }
 
-/// The CPU Set table's bytes (`GetSystemCpuSetInformation`, sized by a
-/// first call), at most [`CPU_SET_CAP`].
+/// The CPU Set table's bytes.
 fn cpu_set_bytes() -> Option<Vec<u8>> {
     let mut len = 0u32;
     // SAFETY: a null buffer of length zero asks only for the size.
@@ -222,8 +203,7 @@ fn layout_and_parked() -> Option<(CpuLayout, Vec<u16>)> {
     layout_from_cpu_sets(&cpu_sets(&cpu_set_bytes()?), &group_widths())
 }
 
-/// [`crate::cpu_layout`] on Windows: the CPU Sets by efficiency class, else
-/// one cluster of every active processor.
+/// [`crate::cpu_layout`] on Windows.
 pub(crate) fn cpu_layout() -> CpuLayout {
     layout_and_parked().map_or_else(
         || {
@@ -234,7 +214,7 @@ pub(crate) fn cpu_layout() -> CpuLayout {
     )
 }
 
-/// [`crate::withdrawn_cores`] on Windows: the parked CPU Sets.
+/// [`crate::withdrawn_cores`] on Windows.
 pub(crate) fn withdrawn() -> Option<Vec<u16>> {
     layout_and_parked().map(|(_, parked)| parked)
 }
@@ -268,9 +248,7 @@ fn page_file_pages() -> Option<(u64, u64)> {
     None
 }
 
-/// Whether the low-memory resource notification is set: physical memory is
-/// low by the kernel's own measure. The notification object is made on the
-/// first call and kept for the process.
+/// Whether the low-memory resource notification is set.
 fn low_memory() -> bool {
     static NOTE: OnceLock<HANDLE> = OnceLock::new();
     // SAFETY: takes an enum value, returns a handle or 0.
@@ -281,8 +259,7 @@ fn low_memory() -> bool {
         return false;
     }
     let mut state: BOOL = 0;
-    // SAFETY: `note` is a live notification handle (never closed) and
-    // `state` a writable BOOL.
+    // SAFETY: `note` is a live notification handle (never closed) and `state` a writable BOOL.
     let ok = unsafe { QueryMemoryResourceNotification(note, &raw mut state) };
     ok != 0 && state != 0
 }
@@ -315,8 +292,7 @@ pub(crate) fn memory_detail() -> Option<MemoryDetail> {
     memory_detail_of(&status, &perf, page_file_pages(), low_memory())
 }
 
-/// [`crate::pid_counts`] on Windows: the process count of one
-/// `K32GetPerformanceInfo` (a zero is not read); one user's is not read.
+/// [`crate::pid_counts`] on Windows: the process count of one `K32GetPerformanceInfo`.
 pub(crate) fn pid_counts() -> (Option<u64>, Option<u64>) {
     let all = performance_info()
         .map(|p| u64::from(p.process_count))
@@ -324,8 +300,7 @@ pub(crate) fn pid_counts() -> (Option<u64>, Option<u64>) {
     (all, None)
 }
 
-/// [`crate::processes`] on Windows: one `SystemProcessInformation` pass into
-/// a buffer sized from the last pass, grown on `STATUS_INFO_LENGTH_MISMATCH`.
+/// [`crate::processes`] on Windows.
 pub(crate) fn processes() -> Option<Sweep> {
     static HINT: AtomicUsize = AtomicUsize::new(512 * 1024);
     let mut len = HINT.load(Ordering::Relaxed);
@@ -336,8 +311,7 @@ pub(crate) fn processes() -> Option<Sweep> {
         let mut buf = vec![0u64; len.div_ceil(8)];
         let cap = u32::try_from(buf.len() * 8).ok()?;
         let mut got = 0u32;
-        // SAFETY: `buf` is `cap` writable, 8-byte-aligned bytes; `got` a
-        // writable u32.
+        // SAFETY: `buf` is `cap` writable, 8-byte-aligned bytes; `got` a writable u32.
         let status = unsafe {
             NtQuerySystemInformation(
                 SYSTEM_PROCESS_INFORMATION,
@@ -347,8 +321,6 @@ pub(crate) fn processes() -> Option<Sweep> {
             )
         };
         if status == STATUS_INFO_LENGTH_MISMATCH {
-            // The table grows between calls: ask for room past what was
-            // reported.
             len = usize::try_from(got)
                 .unwrap_or(len)
                 .max(len.saturating_mul(2))
@@ -361,7 +333,6 @@ pub(crate) fn processes() -> Option<Sweep> {
         HINT.store(len, Ordering::Relaxed);
         let n = usize::try_from(got).ok()?.min(buf.len() * 8);
         let base = u64::try_from(buf.as_ptr().addr()).ok()?;
-        // The table is one snapshot: every process's counters are of now.
         let at = Some(std::time::Instant::now());
         let mut sweep = crate::windows::processes(&as_bytes(&buf)[..n], base);
         for p in &mut sweep.procs {
@@ -378,8 +349,7 @@ fn wide_text(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
-/// [`crate::volume`] on Windows: the drive the path's spelling names, read
-/// only when `GetDriveTypeW` calls it fixed or a RAM disk.
+/// [`crate::volume`] on Windows.
 pub(crate) fn volume(path: &Path) -> Option<VolumeReading> {
     let letter = drive_root(&path.to_string_lossy())?;
     let root = root_wide(letter);
@@ -396,8 +366,7 @@ pub(crate) fn volume(path: &Path) -> Option<VolumeReading> {
         return None;
     }
     let mut fs = [0u16; 64];
-    // SAFETY: `root` is NUL-terminated; the name buffer is 64 writable wide
-    // characters and every other output is null (not asked for).
+    // SAFETY: `root` is NUL-terminated.
     let named = unsafe {
         GetVolumeInformationW(
             root.as_ptr(),
@@ -424,8 +393,7 @@ pub(crate) fn volume(path: &Path) -> Option<VolumeReading> {
     ))
 }
 
-/// [`crate::caps`] on Windows (design §16's Windows column as this build
-/// reads it).
+/// [`crate::caps`] on Windows.
 pub(crate) fn caps() -> Caps {
     let read = |ok: bool| {
         if ok {
@@ -446,18 +414,14 @@ pub(crate) fn caps() -> Caps {
         } else {
             Cap::No(Why::Unsupported)
         },
-        // Coarse: commit against its limit and the low-memory notification.
         pressure: if memory.is_some() {
             Cap::Estimate
         } else {
             Cap::No(Why::Unsupported)
         },
         commit: read(memory.is_some_and(|m| m.commit.is_some())),
-        // The compression store's size is the `Memory Compression` process's
-        // working set, unverified for a non-admin reader.
         compressor: Cap::No(Why::NotRead),
         swap: read(memory.is_some()),
-        // PDH's `GPU Engine` counters: public, but dearer than the sampler.
         gpu_device: Cap::No(Why::NotRead),
         gpu_per_proc: Cap::No(Why::NotRead),
         proc_cpu_others: Cap::Yes,

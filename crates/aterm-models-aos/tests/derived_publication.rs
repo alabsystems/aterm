@@ -11,7 +11,6 @@ use std::collections::BTreeSet;
 use aterm_models_aos::aos_boundary_publication_model;
 use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{self, State};
-use aterm_spec::{verify, xref};
 
 /// Each dial and the one law it is written to break.
 const DIALS: [(i64, &str); 4] = [
@@ -39,7 +38,6 @@ fn walk(model: &Model, steps: &[&str]) -> State {
 #[test]
 fn publication_holds_and_each_law_has_its_own_mutant() {
     let model = aos_boundary_publication_model();
-    verify::prove_and_catch_scalar(&model, "aos boundary publication");
 
     let actions: BTreeSet<&str> = model.actions.iter().map(|a| a.name).collect();
     assert_eq!(interp::fired_actions(&model), actions);
@@ -61,19 +59,6 @@ fn publication_holds_and_each_law_has_its_own_mutant() {
             "Buggy {dial}"
         );
     }
-}
-
-/// What `aterm-models`' `non_vacuity` sweep asks of every registered model, asked here of this
-/// one alone in both of its declared configurations (the committed queue and `Cap = 0`).
-#[test]
-fn the_registry_sweep_finds_no_fault_in_either_configuration() {
-    let name = aos_boundary_publication_model().name;
-    let configs = xref::model_configurations()
-        .into_iter()
-        .find(|configs| configs.first().is_some_and(|m| m.name == name))
-        .expect("writing the model registered it");
-    assert_eq!(configs.len(), 2);
-    assert_eq!(verify::sweep_faults(&configs), Vec::<String>::new());
 }
 
 /// Commit publishes code, replayed state and a new revision together, then hands the queue to the

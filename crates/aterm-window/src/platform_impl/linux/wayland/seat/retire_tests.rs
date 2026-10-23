@@ -6,21 +6,6 @@
 
 //! LW.7's capability-removal race, live (d5f7317b01): a window's pointer and text input are
 //! destroyed on the loop's thread even when another thread holds them as their capability goes.
-//!
-//! A window keeps weak references to its seat's `WinitPointer` and `TextInput`, and a request
-//! from the application's thread (`set_ime_allowed`, `apply_on_pointer`) upgrades them for its
-//! length. Here a second thread holds both upgrades for as long as the test says, the stretch of
-//! one such request, while a RemoteDesktop session of headless Mutter (`lane-bus seat`) ends and
-//! the seat's keyboard and pointer go. The loop keeps its references ([`super::Retired`]), so
-//! when the holder lets go the objects live on, and the loop's next turn destroys them. The
-//! negative control clears [`super::RETIRE`], as before the fix: the loop lets go at the
-//! removal, and the holder's drop is the last, destroying both on the holder's thread (here
-//! while the loop waits for it, so nothing races). No timing decides either arm: each step waits
-//! (a hang detector) for the one before it.
-//!
-//! It runs where the Linux lane names its Mutter and lane-bus (`LANE_SEAT_WAYLAND_DISPLAY`,
-//! `LANE_SEAT_MUTTER_PID`, `LANE_SEAT_BUS`, as aterm-wayland's `live_seat` reads them); elsewhere
-//! it says SKIP and returns.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
@@ -123,13 +108,11 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
         };
         let window = Window::new(target, WindowAttributes::default().with_title("winit retire"))
             .expect("a window");
-        // WC.8: the attributes carry no maximized state on Linux; the window asks once made.
         window.set_maximized(true);
         window
     };
     pump(&mut event_loop, "the maximized configure", |_| window.is_maximized());
 
-    // A buffer maps the window, so the seat's focus and pointer can reach it.
     let surface = window.wl_surface();
     let size = window.inner_size();
     let (w, h) = (i32::try_from(size.width).unwrap(), i32::try_from(size.height).unwrap());
@@ -148,12 +131,9 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
         wl_surface::commit(surface);
         (pool, buffer)
     };
-    // The loop's reference to its wl_shm, which must not outlive the loop's queue.
     drop(shm);
     pump(&mut event_loop, "the mapped window", |_| true);
 
-    // The seat: its first key makes the keyboard (and gives the window its focus), its first
-    // motion the pointer, which enters the window once the client has bound it.
     let pace = aterm_tempfile::tempdir().unwrap();
     let file = |n: &str| pace.path().join(n).display().to_string();
     let steps = [
@@ -190,7 +170,6 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
         shared.lock().unwrap().pointers.iter().any(|p| p.strong_count() > 0)
     });
 
-    // The holder: both upgrades, as a request on its thread holds them, kept until told.
     let (to_holder, told) = mpsc::channel::<()>();
     let (holding, held) = mpsc::channel::<(Weak<WinitPointer>, Weak<TextInput>)>();
     let (dropped, let_go) = mpsc::channel::<()>();
@@ -210,7 +189,6 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
     });
     let (pointer, text_input) = held.recv_timeout(HANG).expect("the holder's upgrades");
 
-    // The session ends: Mutter removes its devices, and the seat's capabilities go.
     touch(pace.path(), "held");
     pump(&mut event_loop, "the seat without its devices", |el| {
         with_state(el, |s| {
@@ -230,7 +208,6 @@ fn arm(lane: &Lane, retire: bool) -> Outcome {
     assert!(status.success(), "lane-bus seat: {status:?}");
     drop(reap);
 
-    // The holder lets go, the loop waiting for it.
     to_holder.send(()).unwrap();
     let_go.recv_timeout(HANG).expect("the holder let go");
     holder.join().unwrap();
@@ -276,7 +253,6 @@ fn a_held_pointer_and_text_input_die_on_the_loop_s_thread() {
         Outcome { pointer_after_holder: 1, text_input_after_holder: 1, reaped_by_the_loop: true },
         "the loop's reference outlived the holder's, and the loop destroyed both"
     );
-    // The negative control: let go at the removal, the holder's drop is the last.
     let unfixed = arm(&lane, false);
     eprintln!("not retired: {unfixed:?}");
     assert_eq!(

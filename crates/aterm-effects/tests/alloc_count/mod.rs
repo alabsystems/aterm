@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE EXACT-ALLOCATION COUNTER: one `#[global_allocator]` for every binary that
-//! mounts this file (`effects_suite`, and the `rainbow_kitty_v2_frame_cost`
-//! bench by path), counting per thread.
-//!
-//! [`allocations_during`] arms a flag on the calling thread, and the allocator
-//! counts only the allocations made on a thread whose flag is armed, into that
-//! thread's own tally. So the pins that assert a warmed hot path allocates
-//! nothing (`rainbow_kitty_v2_frame_cost`, `streak_beam_alloc`,
-//! `trick_flash_alloc`, `typed_tricks_alloc`, `word_reflow_identity`) share
-//! one process with each other and with every other test of the suite: none
-//! of them bleeds into another's count, which a process-global flag would
-//! allow (each used to need a binary of its own for that). [`assert_counter_is_per_thread`] holds both
-//! halves of that claim.
+//! Per-thread allocation counter (`#[global_allocator]`) for zero-allocation hot-path tests.
 
 #![allow(dead_code, reason = "a binary that mounts this uses what it needs")]
 
@@ -103,8 +91,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// Count the allocations `f` makes on this thread. Returns the count and the
-/// first sizes.
+/// Count allocations performed by `f` on the current thread.
 pub fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize, [usize; SIZE_SLOTS]) {
     ALLOCATIONS.set(0);
     ALLOCATION_SIZES.set([0; SIZE_SLOTS]);
@@ -114,11 +101,7 @@ pub fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize, [usize; SIZE_S
     (out, ALLOCATIONS.get(), ALLOCATION_SIZES.get())
 }
 
-/// The counter's two-sided check: one allocation on this thread inside a
-/// counted window counts exactly once, and one on another thread in the same
-/// window (libtest's timeout report) does not. The hand-off is two atomics and
-/// a yield loop, none of which allocates. And a pool worker's own window sees
-/// its own allocation, which is how every cell below is counted.
+/// Verify that [`allocations_during`] counts only the calling thread's allocations.
 pub fn assert_counter_is_per_thread() {
     let go = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));

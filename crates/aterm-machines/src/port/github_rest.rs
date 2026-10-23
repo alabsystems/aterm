@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The machines controller's GitHub REST door (docs/DESIGN-init-system-2026-10-20.md S14, §6.1
-//! row 22): one bounded request at a time over aterm-http to the API origin, with no gh.
-//!
-//! - The machine user's token goes into an `Authorization` header built in this process
-//!   (aterm-http's scrub-on-drop secret header), never an argument, a variable or a log line.
-//! - aterm-http follows no redirect, and this door refuses a 3xx answer outright: a followed
-//!   redirect is how a bearer token reaches a host nobody named, so a redirect is never a
-//!   second request.
-//! - The body is bounded and read whole; one cut short (fewer bytes than its
-//!   `Content-Length`) fails the request instead of becoming a shorter page.
-//! - It carries the SSH-key writes (`POST` and `DELETE /user/keys`), which agh's M1
-//!   transport refuses (agh design §16.4: step 5a moves them into `users().keys()`), and the
-//!   reads beside them, so one controller session speaks through one client.
+//! Bounded GitHub REST client over `aterm-http`.
 
 use std::time::Duration;
 
@@ -75,12 +63,9 @@ pub(super) fn live_client() -> Client {
     Client::new(Trust::PlatformVerifier, ProxyMode::Environment, BUDGET)
 }
 
-/// Send `method endpoint` to `origin` carrying `token`, with `body` as JSON when it is
-/// given, and read the whole answer.
-///
+/// Send `method endpoint` to `origin` carrying `token`, with `body` as JSON when it is given.
 /// # Errors
-/// An endpoint that is not one absolute path, a request that failed or was cut short, an
-/// answer over the bound, or a redirect. No error carries the token.
+/// An endpoint that is not one absolute path.
 pub(super) fn send(
     client: &Client,
     origin: &str,
@@ -131,9 +116,7 @@ pub(super) fn send(
     })
 }
 
-/// A loopback GitHub for this crate's tests: a plain-HTTP listener on 127.0.0.1 that answers
-/// each connection with the next scripted reply, raw, and records each request it read (its
-/// request line, its headers and its body).
+/// A loopback GitHub for this crate's tests.
 #[cfg(test)]
 pub(crate) mod fixture {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -184,8 +167,7 @@ pub(crate) mod fixture {
         out.into_bytes()
     }
 
-    /// A head that declares `body`'s length plus `missing`, then only `body`: a page the
-    /// connection ends inside.
+    /// A head that declares `body`'s length plus `missing`, then only `body`.
     pub(crate) fn cut_short(body: &str, missing: usize) -> Vec<u8> {
         format!(
             "HTTP/1.1 200 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -208,7 +190,6 @@ pub(crate) mod fixture {
                     };
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
-                    // An empty read is the drop's wake-up (or a client that hung up): stop.
                     if reader.read_line(&mut line).is_err() || line.is_empty() {
                         return;
                     }
@@ -256,7 +237,6 @@ pub(crate) mod fixture {
 
     impl Drop for Server {
         fn drop(&mut self) {
-            // Unblock an accept still waiting for a connection no test will make.
             let _ = std::net::TcpStream::connect(self.origin.trim_start_matches("http://"));
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
@@ -295,18 +275,21 @@ mod tests {
     const NEXT: &str = "<https://api.github.com/user/keys?per_page=2&page=2>; rel=\"next\", <https://api.github.com/user/keys?per_page=2&page=2>; rel=\"last\"";
 
     /// Two pages read whole over a real socket, the token in the Authorization header alone.
-    /// Negative control: the same listing whose second page ends inside its body is refused,
-    /// not shortened.
     #[test]
     fn pagination_reads_every_page_and_a_page_cut_short_is_refused() {
         let server = Server::start(vec![
             json(200, &[("Link", NEXT)], r#"[{"id":1},{"id":2}]"#),
             json(200, &[], r#"[{"id":3}]"#),
         ]);
-        let items = crate::github_pages::all("/user/keys?per_page=2", 2, |endpoint| {
-            let page_no = endpoint.rsplit_once("page=").unwrap().1.parse().unwrap();
-            page(&server, page_no)
-        })
+        let items = crate::github_pages::all(
+            crate::github_pages::API,
+            "/user/keys?per_page=2",
+            2,
+            |endpoint| {
+                let page_no = endpoint.rsplit_once("page=").unwrap().1.parse().unwrap();
+                page(&server, page_no)
+            },
+        )
         .unwrap();
         assert_eq!(items.len(), 3);
         let seen = server.seen();
@@ -327,10 +310,15 @@ mod tests {
             json(200, &[("Link", NEXT)], r#"[{"id":1},{"id":2}]"#),
             cut_short(r#"[{"id":3},"#, 9),
         ]);
-        let why = crate::github_pages::all("/user/keys?per_page=2", 2, |endpoint| {
-            let page_no = endpoint.rsplit_once("page=").unwrap().1.parse().unwrap();
-            page(&server, page_no)
-        })
+        let why = crate::github_pages::all(
+            crate::github_pages::API,
+            "/user/keys?per_page=2",
+            2,
+            |endpoint| {
+                let page_no = endpoint.rsplit_once("page=").unwrap().1.parse().unwrap();
+                page(&server, page_no)
+            },
+        )
         .unwrap_err();
         assert!(
             why.starts_with("GitHub GET /user/keys?per_page=2&page=2: "),

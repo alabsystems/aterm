@@ -208,7 +208,9 @@ impl<C: Ctl> Session<'_, C> {
         self.land_over(land, seq);
         self.fallback_asked(unasked, seq);
         if self.turn_end.limit_ended() {
-            let why = if reading.taskless && reading.wall.is_none() {
+            let why = if self.turn_end.limit_ended_elsewhere() {
+                approvals::LIMIT_ENDED_ELSEWHERE
+            } else if reading.taskless && reading.wall.is_none() {
                 WALL_LEFT_NO_TASK
             } else {
                 approvals::LIMIT_ENDED

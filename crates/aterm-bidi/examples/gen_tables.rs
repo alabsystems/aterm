@@ -1,30 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regenerate aterm-bidi's Unicode data from the Unicode Character Database.
-//!
-//! ```text
-//! targo --unverified run -p aterm-bidi --example gen_tables -- tables <DerivedBidiClass.txt> <BidiBrackets.txt>
-//! targo --unverified run -p aterm-bidi --example gen_tables -- subset <BidiTest.txt> <BidiCharacterTest.txt>
-//! ```
-//!
-//! `tables` rewrites `src/tables.rs` whole from the UCD's
-//! `extracted/DerivedBidiClass.txt` (its `@missing` defaults included, which
-//! assign R / AL / ET to unassigned code points in the RTL and currency
-//! blocks) and `BidiBrackets.txt`.
-//!
-//! `subset` cuts the checked-in conformance subsets in `tests/data/` from the
-//! full UAX #9 test files. BidiCharacterTest keeps every line of the
-//! hand-written sections (everything before the generated "Permutations of
-//! sequences containing paired brackets" block) plus every 40th data line
-//! after it. BidiTest keeps its header, every `@Levels`/`@Reorder` line (each
-//! data line is judged against the most recent ones) and every 150th data
-//! line. The full files pass too (91,707 and 770,241 cases, measured
-//! 2026-09-25); the subsets keep the repository small.
-//!
-//! Every input comes from the one UCD version `src/tables.rs` names, from
-//! `https://www.unicode.org/Public/<version>/ucd/`. Nothing is printed on
-//! success.
+//! Regenerates `aterm-bidi` Unicode tables and test subsets from the UCD.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -32,8 +9,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: gen_tables tables <DerivedBidiClass.txt> <BidiBrackets.txt>\n       \
                      gen_tables subset <BidiTest.txt> <BidiCharacterTest.txt>";
 
-/// Every `Bidi_Class` long name the UCD writes, with its abbreviation (the
-/// `BidiClass` variant).
+/// Every `Bidi_Class` long name the UCD writes, with its abbreviation (the `BidiClass` variant).
 const NAMES: &[(&str, &str)] = &[
     ("Left_To_Right", "L"),
     ("Right_To_Left", "R"),
@@ -100,8 +76,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// The file at `path`, or the reason it cannot be read, carried as its text
-/// so the generators report it in place.
+/// Reads the file at `path` or exits with an error.
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
@@ -224,7 +199,6 @@ fn tables(
         "/// The same pairs keyed by closer: `(close, open)`, sorted by closer.\n\
          pub(crate) const BRACKET_CLOSERS: &[(u32, u32)] = &[\n",
     );
-    // Stable, so a tie keeps the file's order.
     pairs.sort_by_key(|&(_, close)| close);
     for (a, b) in &pairs {
         out.push_str(&format!("    (0x{b:04X}, 0x{a:04X}),\n"));
@@ -241,8 +215,7 @@ fn fields<const N: usize>(line: &str) -> Result<[&str; N], String> {
         .map_err(|parts: Vec<&str>| format!("`{line}` has {} fields, not {N}", parts.len()))
 }
 
-/// `BidiCharacterTest-subset.txt`: the hand-written sections whole, then
-/// every 40th data line of the generated permutations.
+/// `BidiCharacterTest-subset.txt`.
 fn cut_character_test(text: &Result<String, String>) -> Result<String, String> {
     let lines: Vec<&str> = text.as_deref()?.lines().collect();
     let marker = lines
@@ -260,8 +233,7 @@ fn cut_character_test(text: &Result<String, String>) -> Result<String, String> {
     Ok(out.join("\n") + "\n")
 }
 
-/// `BidiTest-subset.txt`: the header (the comments and blank lines before the
-/// first data line), every `@` line, and every 150th data line.
+/// `BidiTest-subset.txt`.
 fn cut_bidi_test(text: &Result<String, String>) -> Result<String, String> {
     let mut out: Vec<&str> = Vec::new();
     let mut seen = 0usize;

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `HoldClock`, and `Books`.
+//! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `write_held`,
+//! `HoldClock`, and `Books`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -12,8 +13,8 @@ use aterm_agent::supervise::occupancy::rules::{
     HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, episode,
 };
 use aterm_agent::supervise::occupancy::{
-    Books, Guards, HoldClock, HoldEvent, HoldSeen, OccupancyReading, RuleId, SlotsSeen, Verdict,
-    decide,
+    AtWrite, Books, Guards, HoldClock, HoldEvent, HoldSeen, OccupancyReading, RuleId, SlotsSeen,
+    Verdict, decide, write_held,
 };
 use aterm_agent::supervise::{Autopilot, Guard};
 use aterm_models_harness::occupancy_door_model;
@@ -45,6 +46,10 @@ struct Real {
     episode: Option<EpisodeKey>,
     /// This idle point's decision was fed to the clock already.
     pointed: bool,
+    /// The host's answer: the upgrade's notice is due (`IdleHost::upgrade_due`).
+    upgrade_due: bool,
+    /// The host typed its own line at this break (`IdleHost::at_background`).
+    host_line: bool,
 }
 
 /// How a walk departs from the committed real code, for the negative controls.
@@ -102,10 +107,15 @@ fn guards(st: &State, mode: Autopilot, variant: usize) -> Guards {
 /// The model term a real guard stands for.
 fn term(g: Guard) -> &'static str {
     match g {
-        Guard::Person | Guard::Halted | Guard::Draft => "person",
+        // A manager's fabric note holds the door as a person's hand does.
+        Guard::Person | Guard::Halted | Guard::Draft | Guard::Managed => "person",
         Guard::Taskless | Guard::Exchange => "task",
         Guard::Stall | Guard::Credits | Guard::Memory | Guard::Reach => "brake",
         Guard::ActUntaken => "untaken",
+        // A host's withhold is a brake of the break's own.
+        Guard::HostWithheld => "brake",
+        Guard::UpgradeDue => "upg",
+        Guard::HostLine => "lines",
         Guard::Autopilot => "mode",
         other => panic!("no model term for {other:?}"),
     }
@@ -146,7 +156,8 @@ enum Said {
     Other(String),
 }
 
-/// The real decider's verdict for `run.rule` at `st`'s break; the other rule must be quiet.
+/// The real decider's verdict for `run.rule` at `st`'s break, a due line then judged by the
+/// write's own holds at the host's state; the other rule must be quiet.
 fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     let reading = match run.rule {
         RuleId::WaitNudge => OccupancyReading::default(),
@@ -168,7 +179,14 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
         }
         said = match verdict {
             Verdict::Quiet => Said::Quiet,
-            Verdict::Due(_) => Said::Due,
+            Verdict::Due(_) => {
+                let at = AtWrite {
+                    host_line: r.host_line,
+                    withheld: false,
+                    upgrade_due: r.upgrade_due,
+                };
+                write_held(rule, at).map_or(Said::Due, |g| Said::Held(term(g)))
+            }
             Verdict::Held(g) => Said::Held(term(g)),
             Verdict::Paced { .. } => Said::Paced,
             Verdict::Spent => Said::Other(String::from("spent")),
@@ -200,6 +218,8 @@ fn agrees(m: &Model, st: &State, said: &Said) -> bool {
         ("brake", s["brake"] == 0),
         ("untaken", s["untaken"] == 0),
         ("mode", mode == 1 || (mode == 2 && s["due"] == 2)),
+        ("upg", s["due"] == 2 || s["upg"] == 0),
+        ("lines", s["lines"] == 0),
     ]
     .into_iter()
     .filter_map(|(name, holds)| (!holds).then_some(name))
@@ -219,8 +239,10 @@ fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
         return false;
     }
     match action {
-        "UpgradeDue" | "OpenWake" => false,
+        "OpenWake" => false,
         "Intend" | "Type" => st["door"] == 1,
+        // The model's `owed = held` keeps no young hold's answer, which the real clock owes.
+        "UpgradeTypes" => st["held"] == 1,
         "HoldAges" => st["told"] == 0 && st["paced"] == 0,
         "Holds" => rule == RuleId::HoldRoom,
         "Fails" => rule == RuleId::HoldRoom || st["owed"] == 0,
@@ -287,9 +309,19 @@ fn point(closing: bool, variant: usize) -> HoldEvent {
 /// Mirrors `action` (from `st` to `next`) on the real side.
 fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> bool {
     let rule = run.rule;
+    if matches!(action, "Break" | "IdleRead" | "Point" | "Turn") {
+        // A new break, a point or a live turn: the host's line was this break's.
+        r.host_line = false;
+    }
     match action {
         "Break" | "IdleRead" => break_read(r, rule),
         "Point" => r.pointed = false,
+        "UpgradeDue" => r.upgrade_due = true,
+        "UpgradeTypes" => {
+            r.upgrade_due = false;
+            r.host_line = true;
+            r.clock.step(HoldEvent::HarnessLine);
+        }
         "Turn" => {
             if st["door"] == 2 && !std::mem::take(&mut r.pointed) {
                 // nothing while the work showed.
@@ -421,6 +453,8 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
             intent: None,
             episode: None,
             pointed: false,
+            upgrade_due: false,
+            host_line: false,
         };
         let mut w = Walked {
             states: BTreeSet::new(),
@@ -457,40 +491,10 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     }
 }
 
-/// How many threads [`walks`] spreads independent walks over.
-const WALK_WORKERS: usize = 4;
-
-/// [`walk`] of [`under`]`(mode)` for each `(mode, run)`, over [`WALK_WORKERS`] threads of their
-/// own (the fault seam is per thread), returned in `runs`' order. A walk's panic is re-raised
-/// as it was.
+/// [`walk`] of [`under`]`(mode)` for each `(mode, run)`, on every core (the fault seam is per
+/// thread, so each walk plants its own), in `runs`' order.
 fn walks(runs: &[(i64, Run)], strict: bool) -> Vec<Walked> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut done: Vec<(usize, Walked)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..WALK_WORKERS.min(runs.len()))
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut mine = Vec::new();
-                    loop {
-                        let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&(mode, run)) = runs.get(at) else {
-                            return mine;
-                        };
-                        mine.push((at, walk(&under(mode), strict, run)));
-                    }
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|worker| {
-                worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            })
-            .collect()
-    });
-    done.sort_by_key(|(at, _)| *at);
-    done.into_iter().map(|(_, w)| w).collect()
+    aterm_spec::check::each(runs, |&(mode, run)| walk(&under(mode), strict, run))
 }
 
 /// The model under autopilot `mode` (0 Off, 1 Cruise, 2 Land).
@@ -536,6 +540,8 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
             "ActOwed",
             "ActTaken",
             "Fails",
+            "UpgradeDue",
+            "UpgradeTypes",
             "OpenNudge",
             "Intend",
             "Skip",
@@ -570,6 +576,8 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
                 "Held(\"task\")",
                 "Held(\"brake\")",
                 "Held(\"untaken\")",
+                "Held(\"upg\")",
+                "Held(\"lines\")",
             ]
         } else {
             &["Quiet", "Held(\"mode\")"]
@@ -594,10 +602,11 @@ type Shows = fn(&State) -> bool;
 /// due; a clock restarted at an idle read, or one that ends the hold at the harness line's own
 /// turn, at the point that ends its answer, or at a point that decides nothing (F5), loses the
 /// hold the model keeps; a seed that reads an intent or a skip as told says told where the
-/// model's episode is untold.
+/// model's episode is untold; a write that lets a nudge go over the upgrade's notice due, or a
+/// second line at the door the host's line went at, says due where the model holds it.
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
-    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 7] = [
+    let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 9] = [
         (
             Fault::DedupeByRule,
             Some(RuleId::WaitNudge),
@@ -633,6 +642,18 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
             Fault::SeedSkipAsTold,
             None,
             |st| st["told"] == 0 && st["intent"] == 0 && st["due"] > 0,
+            None,
+        ),
+        (
+            Fault::NudgeOverNotice,
+            None,
+            |st| st["door"] == 1 && st["upg"] == 1,
+            None,
+        ),
+        (
+            Fault::StackOnHostLine,
+            None,
+            |st| st["door"] == 1 && st["lines"] == 1,
             None,
         ),
     ];
@@ -689,7 +710,15 @@ fn tier1_the_anchors_name_what_the_code_implements() {
         .collect();
     assert_eq!(
         anchored,
-        BTreeSet::from(["Crash", "HoldCloses", "IdleRead", "Intend", "Lapse"]),
+        BTreeSet::from([
+            "Crash",
+            "HoldCloses",
+            "IdleRead",
+            "Intend",
+            "Lapse",
+            "Skip",
+            "Type"
+        ]),
         "{anchored:?}"
     );
 }

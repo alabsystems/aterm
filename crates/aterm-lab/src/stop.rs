@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Interrupts (`^C`, TERM, the hang-up of a terminal that closed) as a value
-//! the long verbs return through: the first one is noted and every wait of the
-//! lab ([`sleep`], the frame recorder's) ends with [`Stopped`], so each verb
-//! runs its own cleanup — a lab it brought up comes down, a relay it held is
-//! released — and exits 128 + the signal. A second interrupt ends the process
-//! at once, after the one act a verb said must happen even then
-//! ([`at_hard_exit`]). A signal the lab was started ignoring stays ignored
-//! (`nohup`: a closed terminal does not end it; [`crate::sys::SignalPipe`]).
+//! Signal interruption handling for long lab verbs ([`sleep`], [`Stopped`]).
+//! Hard-exit cleanup uses [`at_hard_exit`] over [`crate::sys::SignalPipe`].
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -32,16 +26,12 @@ static CAUGHT: AtomicBool = AtomicBool::new(false);
 /// What a second interrupt runs before the process ends ([`at_hard_exit`]).
 static HARD_EXIT: Mutex<Option<fn()>> = Mutex::new(None);
 
-/// Run `undo` when a second interrupt ends the process at once, before it
-/// exits: what must be undone even then (`meta-keys` puts the person's input
-/// sources back). It runs on the interrupt thread, not the main one. The last
-/// call wins.
+/// Run `undo` when a second interrupt ends the process at once, before it exits.
 pub fn at_hard_exit(undo: fn()) {
     *HARD_EXIT.lock().unwrap_or_else(|p| p.into_inner()) = Some(undo);
 }
 
-/// Catch INT, TERM and HUP for the rest of the process (the first call does it),
-/// but none it was started ignoring.
+/// Installs signal handlers for unignored `INT`, `TERM`, and `HUP` signals.
 pub fn install() {
     if CAUGHT.swap(true, Ordering::SeqCst) {
         return;
@@ -60,8 +50,6 @@ pub fn install() {
                     }
                     std::process::exit(128 + sig);
                 }
-                // Under the bell's lock: a sleeper between its check and its
-                // wait holds it, so the wakeup cannot fall in that gap.
                 let (lock, cv) = bell();
                 let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
                 cv.notify_all();
@@ -109,9 +97,7 @@ pub fn ring() {
     cv.notify_all();
 }
 
-/// Wait until `done` holds or `limit` has passed: `Ok(true)` once it holds,
-/// `Ok(false)` at the limit. It is asked again only when the bell rings — an
-/// interrupt, or a [`ring`] from whoever makes it hold — never on a timer.
+/// Wait until `done` holds or `limit` has passed ([`ring`]).
 ///
 /// # Errors
 /// The run was interrupted.
@@ -160,7 +146,6 @@ mod tests {
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
         cmd.args(["--exact", test, "--nocapture", "--test-threads=1"])
             .env(PROBE, mode);
-        // A hang detector, never a budget: past the probe's own minute.
         let out =
             aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_mins(2))
                 .expect("the probe ends within the hang detector");
@@ -214,16 +199,11 @@ mod tests {
         const TEST: &str =
             "stop::tests::a_second_interrupt_runs_the_hard_exit_act_and_ends_the_run";
         if std::env::var_os(PROBE).is_some() {
-            // Interrupts start at their default, whatever the runner left: a
-            // background job of a non-interactive shell starts with INT ignored,
-            // which `install` keeps ignored (`nohup`), and the probe would sleep.
             crate::sys::start_signal(libc::SIGINT, false);
             super::install();
             super::at_hard_exit(hard_exit_act);
             let me = i32::try_from(std::process::id()).expect("pid");
             crate::sys::kill(me, libc::SIGINT).expect("the first interrupt");
-            // Two pending interrupts would merge into one: the second is sent once
-            // the first was noted (the lab's own wait ends with it).
             assert_eq!(
                 super::sleep(Duration::from_mins(1)),
                 Err(super::Stopped(libc::SIGINT)),

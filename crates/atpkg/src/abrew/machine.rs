@@ -10,16 +10,17 @@
 use std::sync::OnceLock;
 
 /// macOS releases abrew can name, newest first: (major version, Homebrew's
-/// name for it in bottle tags and `variations` keys).
-const RELEASES: [(u64, &str); 8] = [
-    (27, "golden_gate"),
-    (26, "tahoe"),
-    (15, "sequoia"),
-    (14, "sonoma"),
-    (13, "ventura"),
-    (12, "monterey"),
-    (11, "big_sur"),
-    (10, "catalina"),
+/// name for it in bottle tags and `variations` keys, the major version of the
+/// Xcode released with it: one ahead until both took the year's number at 26).
+const RELEASES: [(u64, &str, u64); 8] = [
+    (27, "golden_gate", 27),
+    (26, "tahoe", 26),
+    (15, "sequoia", 16),
+    (14, "sonoma", 15),
+    (13, "ventura", 14),
+    (12, "monterey", 13),
+    (11, "big_sur", 12),
+    (10, "catalina", 11),
 ];
 
 /// The oldest release a bottle tag is selected for: no catalina bottle pours.
@@ -33,8 +34,22 @@ const ARCHES: [&str; 2] = ["arm64", "x86_64"];
 pub fn release_name(major: u64) -> Option<&'static str> {
     RELEASES
         .iter()
-        .find(|(known, _)| *known == major)
-        .map(|(_, name)| *name)
+        .find(|(known, ..)| *known == major)
+        .map(|(_, name, _)| *name)
+}
+
+/// The Xcode released with macOS `macos` (`16.0` for `15.5`), the one a
+/// modelled Mac on it runs unless another is named; a release newer than the
+/// table keeps the shared number. `None` for one older than the table.
+#[must_use]
+pub fn release_xcode(macos: &str) -> Option<String> {
+    let major: u64 = macos.split('.').next()?.parse().ok()?;
+    let xcode = match RELEASES.iter().find(|(known, ..)| *known == major) {
+        Some((.., xcode)) => *xcode,
+        None if major > RELEASES[0].0 => major,
+        None => return None,
+    };
+    Some(format!("{xcode}.0"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,9 +71,9 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// The running machine. Its versions are probed (`sw_vers`,
-    /// `xcodebuild -version`, the CommandLineTools folder) at most once per
-    /// process, the first time admission needs each.
+    /// The running machine. Its versions are probed (`sw_vers`, the
+    /// selected Xcode's version plist, the CommandLineTools folder) at most
+    /// once per process, the first time admission needs each.
     #[must_use]
     pub fn this() -> &'static Machine {
         static THIS: OnceLock<Machine> = OnceLock::new();
@@ -126,7 +141,7 @@ impl Machine {
     #[must_use]
     pub fn newest_mac() -> Machine {
         let version = format!("{}.0", RELEASES[0].0);
-        Machine::mac("arm64", &version, Some(&version), true)
+        Machine::mac("arm64", &version, release_xcode(&version).as_deref(), true)
     }
 
     /// Homebrew's architecture name (`arm64`, `x86_64`).
@@ -199,8 +214,8 @@ impl Machine {
                 let prefix = if self.arch == "arm64" { "arm64_" } else { "" };
                 RELEASES
                     .iter()
-                    .filter(|(release, _)| (OLDEST_BOTTLE_MAJOR..=major).contains(release))
-                    .map(|(_, name)| format!("{prefix}{name}"))
+                    .filter(|(release, ..)| (OLDEST_BOTTLE_MAJOR..=major).contains(release))
+                    .map(|(_, name, _)| format!("{prefix}{name}"))
                     .collect()
             }
             Os::Other => Vec::new(),
@@ -257,21 +272,94 @@ fn probe_macos() -> Option<String> {
     super::formula::numeric_macos_version(&version).then_some(version)
 }
 
-/// `xcodebuild -version`'s first line (`Xcode 26.1`).
+/// The selected Xcode's version, read off disk ([`DeveloperDir::bundle_version`]).
+/// Never `xcodebuild -version`: `/usr/bin/xcodebuild` is an `xcode-select`
+/// shim that raises Apple's install dialog on a Mac without the developer
+/// tools, and with only the Command Line Tools selected it names no Xcode
+/// anyway.
 fn probe_xcode() -> Option<String> {
-    let out = super::fetch::run_capture("/usr/bin/xcodebuild", &["-version"]).ok()?;
-    if !out.status.success() {
-        return None;
+    DeveloperDir::this().bundle_version()
+}
+
+/// The developer directory `xcode-select`'s shims (`/usr/bin/otool`,
+/// `install_name_tool`, `xcodebuild`, `cc`) would run a tool from, read
+/// without running one: each shim raises Apple's install dialog, and waits
+/// for a person, on a Mac without the developer tools. Its sources are
+/// injected so tests read scratch folders.
+pub(super) struct DeveloperDir {
+    /// `DEVELOPER_DIR`, which the shims honour before the selection.
+    developer_dir_env: Option<std::ffi::OsString>,
+    /// The developer-dir link `xcode-select --switch` writes.
+    select_link: std::path::PathBuf,
+    /// Where the shims look when nothing is selected, in their order: the
+    /// first that is a directory.
+    defaults: Vec<std::path::PathBuf>,
+}
+
+impl DeveloperDir {
+    /// This Mac's: `DEVELOPER_DIR`, `/var/db/xcode_select_link`, then
+    /// `/Applications/Xcode.app` and the Command Line Tools.
+    pub(super) fn this() -> DeveloperDir {
+        DeveloperDir {
+            developer_dir_env: std::env::var_os("DEVELOPER_DIR"),
+            select_link: "/var/db/xcode_select_link".into(),
+            defaults: vec![
+                "/Applications/Xcode.app/Contents/Developer".into(),
+                "/Library/Developer/CommandLineTools".into(),
+            ],
+        }
     }
-    let text = String::from_utf8(out.stdout).ok()?;
-    let version = text
-        .lines()
-        .next()?
-        .strip_prefix("Xcode ")?
-        .split_whitespace()
-        .next()?
-        .to_string();
-    super::formula::numeric_macos_version(&version).then_some(version)
+
+    /// The developer directory: `DEVELOPER_DIR` (a bundle names its
+    /// `Contents/Developer`, as `xcode-select` accepts), else the link's
+    /// target, else the first default that is a directory. `None` when
+    /// nothing is selected and no default is there.
+    fn active(&self) -> Option<std::path::PathBuf> {
+        let mut dir = match &self.developer_dir_env {
+            Some(env) if !env.is_empty() => std::path::PathBuf::from(env),
+            _ => match std::fs::read_link(&self.select_link) {
+                Ok(target) => target,
+                Err(_) => self.defaults.iter().find(|d| d.is_dir())?.clone(),
+            },
+        };
+        if dir.extension().is_some_and(|e| e == "app") {
+            dir = dir.join("Contents/Developer");
+        }
+        Some(dir)
+    }
+
+    /// The developer tool `name` a shim would run: the developer
+    /// directory's `usr/bin/<name>`, else its default toolchain's (where an
+    /// Xcode keeps `install_name_tool` and `otool`), when it is an executable
+    /// file. `None` on a Mac without the developer tools, where the shim
+    /// would raise the install dialog instead.
+    pub(super) fn tool(&self, name: &str) -> Option<std::path::PathBuf> {
+        let dir = self.active()?;
+        ["usr/bin", "Toolchains/XcodeDefault.xctoolchain/usr/bin"]
+            .iter()
+            .map(|bin| dir.join(bin).join(name))
+            .find(|tool| crate::toolchain::is_executable_file(tool))
+    }
+
+    /// `CFBundleShortVersionString` from the `version.plist` of the Xcode
+    /// bundle the developer directory sits in (`26.1`). `None` when the
+    /// directory is not an Xcode bundle's `Contents/Developer` (the Command
+    /// Line Tools), or the plist is missing, unreadable or names no numeric
+    /// version.
+    fn bundle_version(&self) -> Option<String> {
+        let dir = self.active()?;
+        let contents = dir.parent()?;
+        if dir.file_name()? != "Developer" || contents.file_name()? != "Contents" {
+            return None;
+        }
+        let plist = crate::metadata_io::read_bounded_regular_utf8(
+            &contents.join("version.plist"),
+            64 * 1024,
+        )
+        .ok()?;
+        let version = crate::doctor::plist_short_version(&plist)?;
+        super::formula::numeric_macos_version(&version).then_some(version)
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +438,208 @@ mod tests {
         }
     }
 
+    /// A version plist the way an Xcode bundle carries it.
+    fn version_plist(version: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+             \t<key>BuildVersion</key>\n\t<string>7</string>\n\
+             \t<key>CFBundleShortVersionString</key>\n\t<string>{version}</string>\n\
+             \t<key>CFBundleVersion</key>\n\t<string>24000</string>\n</dict>\n</plist>\n"
+        )
+    }
+
+    /// The Xcode version is read off the selected developer directory's
+    /// bundle, no process run: the link `xcode-select` writes, overridden by
+    /// `DEVELOPER_DIR` (a bundle or its `Contents/Developer`), else the
+    /// default bundle. NEGATIVE CONTROL: the Command Line Tools selected, a
+    /// missing or non-numeric plist and an unset selection with no default
+    /// Xcode all read as no Xcode, and so does a developer directory that is
+    /// not a bundle's `Contents/Developer` even with a version plist beside
+    /// it (a folder named otherwise, or a `Developer` outside `Contents`).
+    #[cfg(unix)]
+    #[test]
+    fn the_xcode_version_is_read_from_the_selected_bundle() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let xcode = root.join("Xcode-26.1.app");
+        std::fs::create_dir_all(xcode.join("Contents/Developer")).unwrap();
+        std::fs::write(xcode.join("Contents/version.plist"), version_plist("26.1")).unwrap();
+        let beta = root.join("Xcode-beta.app");
+        std::fs::create_dir_all(beta.join("Contents/Developer")).unwrap();
+        std::fs::write(beta.join("Contents/version.plist"), version_plist("27.0")).unwrap();
+        let clt = root.join("CommandLineTools");
+        std::fs::create_dir_all(&clt).unwrap();
+        let link = root.join("xcode_select_link");
+        let absent = root.join("absent/Contents/Developer");
+        let probe = |env: Option<&std::path::Path>, default: &std::path::Path| {
+            DeveloperDir {
+                developer_dir_env: env.map(|p| p.as_os_str().to_owned()),
+                select_link: link.clone(),
+                defaults: vec![default.to_path_buf()],
+            }
+            .bundle_version()
+        };
+        std::os::unix::fs::symlink(xcode.join("Contents/Developer"), &link).unwrap();
+        assert_eq!(probe(None, &absent).as_deref(), Some("26.1"));
+        assert_eq!(
+            probe(Some(&beta.join("Contents/Developer")), &absent).as_deref(),
+            Some("27.0")
+        );
+        assert_eq!(probe(Some(&beta), &absent).as_deref(), Some("27.0"));
+        assert_eq!(probe(Some(&clt), &absent), None);
+        // Not a bundle's `Contents/Developer`, though a version plist sits
+        // where the bundle's would.
+        let tools = root.join("Library/Developer/CommandLineTools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            root.join("Library/Developer/version.plist"),
+            version_plist("16.4"),
+        )
+        .unwrap();
+        let loose = root.join("Odd.app/Resources/Developer");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(
+            root.join("Odd.app/Resources/version.plist"),
+            version_plist("16.4"),
+        )
+        .unwrap();
+        for not_a_bundle in [&tools, &loose] {
+            assert_eq!(
+                probe(Some(not_a_bundle), &absent),
+                None,
+                "{}",
+                not_a_bundle.display()
+            );
+        }
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&clt, &link).unwrap();
+        assert_eq!(probe(None, &xcode.join("Contents/Developer")), None);
+        std::fs::remove_file(&link).unwrap();
+        assert_eq!(
+            probe(None, &xcode.join("Contents/Developer")).as_deref(),
+            Some("26.1"),
+            "nothing selected: the default bundle"
+        );
+        assert_eq!(probe(None, &absent), None);
+        std::fs::write(xcode.join("Contents/version.plist"), version_plist("26.x")).unwrap();
+        assert_eq!(probe(None, &xcode.join("Contents/Developer")), None);
+        std::fs::remove_file(xcode.join("Contents/version.plist")).unwrap();
+        assert_eq!(probe(None, &xcode.join("Contents/Developer")), None);
+    }
+
+    /// On this Mac the probe agrees with `xcodebuild -version` for the
+    /// selected developer directory. An Xcode's own `xcodebuild`, run from
+    /// inside its bundle, names the version the probe reads. With the Command
+    /// Line Tools selected, the `/usr/bin` shim refuses ("requires Xcode")
+    /// and the probe reads no Xcode: the shim runs only once that directory
+    /// holds the tools (its `clang`), so it cannot raise Apple's install
+    /// dialog. With no developer tools at all the comparison ends COULD NOT
+    /// RUN, never a pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_agrees_with_the_selected_xcode() {
+        let probe = DeveloperDir {
+            developer_dir_env: None,
+            ..DeveloperDir::this()
+        };
+        let read = probe.bundle_version();
+        let Some(developer) = probe.active() else {
+            aterm_uds::host::could_not_run_without(&["xcodebuild"]);
+            return;
+        };
+        let own = developer.join("usr/bin/xcodebuild");
+        let (xcodebuild, is_xcode) = if own.is_file() {
+            (own, true)
+        } else if probe.tool("clang").is_some() {
+            (std::path::PathBuf::from("/usr/bin/xcodebuild"), false)
+        } else {
+            aterm_uds::host::could_not_run_without(&["xcodebuild"]);
+            return;
+        };
+        let out = aterm_uds::spawnfd::command(&xcodebuild)
+            .arg("-version")
+            .env_remove("DEVELOPER_DIR")
+            .output()
+            .expect("xcodebuild runs");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !is_xcode {
+            assert!(
+                !out.status.success(),
+                "{} names an Xcode the probe did not: {said}",
+                developer.display()
+            );
+            assert_eq!(read, None, "{} is no Xcode", developer.display());
+            return;
+        }
+        assert!(out.status.success(), "{said}");
+        let first = said.lines().next().unwrap_or_default().to_owned();
+        assert_eq!(first.strip_prefix("Xcode "), read.as_deref(), "{first}");
+    }
+
+    /// A developer tool is the selected directory's own, found without
+    /// running the `/usr/bin` shim: the Command Line Tools' `usr/bin`, an
+    /// Xcode's default toolchain (`DEVELOPER_DIR` naming the bundle), and
+    /// with nothing selected the first default there. NEGATIVE CONTROL: a
+    /// selection whose directory holds no such tool, one whose tool is not
+    /// executable, a `DEVELOPER_DIR` over a link that does hold one, and no
+    /// selection and no default each find none, where the shim would raise
+    /// Apple's install dialog.
+    #[cfg(unix)]
+    #[test]
+    fn a_developer_tool_is_found_only_in_the_selected_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |path: &std::path::Path, mode: u32| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let clt = root.join("CommandLineTools");
+        put(&clt.join("usr/bin/install_name_tool"), 0o755);
+        let xcode = root.join("Xcode.app");
+        let in_xcode = xcode.join(
+            "Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/install_name_tool",
+        );
+        put(&in_xcode, 0o755);
+        let bare = root.join("Bare");
+        std::fs::create_dir_all(bare.join("usr/bin")).unwrap();
+        let unusable = root.join("Unusable");
+        put(&unusable.join("usr/bin/install_name_tool"), 0o644);
+        let link = root.join("xcode_select_link");
+        let dir = |env: Option<&std::path::Path>, defaults: &[&std::path::Path]| DeveloperDir {
+            developer_dir_env: env.map(|p| p.as_os_str().to_owned()),
+            select_link: link.clone(),
+            defaults: defaults.iter().map(|d| d.to_path_buf()).collect(),
+        };
+        let tool = |d: DeveloperDir| d.tool("install_name_tool");
+        std::os::unix::fs::symlink(&clt, &link).unwrap();
+        assert_eq!(
+            tool(dir(None, &[])),
+            Some(clt.join("usr/bin/install_name_tool"))
+        );
+        assert_eq!(tool(dir(Some(&xcode), &[])), Some(in_xcode.clone()));
+        assert_eq!(tool(dir(Some(&bare), &[])), None, "DEVELOPER_DIR wins");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&bare, &link).unwrap();
+        assert_eq!(tool(dir(None, &[&clt])), None, "the selection wins");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&unusable, &link).unwrap();
+        assert_eq!(tool(dir(None, &[])), None, "not executable");
+        std::fs::remove_file(&link).unwrap();
+        let absent = root.join("absent");
+        assert_eq!(
+            tool(dir(None, &[&absent, &clt])),
+            Some(clt.join("usr/bin/install_name_tool")),
+            "nothing selected: the first default there"
+        );
+        assert_eq!(tool(dir(None, &[&absent])), None, "no developer tools");
+    }
+
     #[test]
     fn the_newest_mac_is_the_api_default_system() {
         let newest = Machine::newest_mac();
@@ -361,5 +651,25 @@ mod tests {
             newest.describe(),
             "arm64, macOS 27.0, Xcode 27.0, Command Line Tools"
         );
+    }
+
+    /// Xcode and macOS share a number only from 26 on: no Sequoia ran an
+    /// Xcode 15.5.
+    #[test]
+    fn a_release_runs_the_xcode_released_with_it() {
+        for (macos, xcode) in [
+            ("27.0", Some("27.0")),
+            ("26.1", Some("26.0")),
+            ("15.5", Some("16.0")),
+            ("13.5", Some("14.0")),
+            ("11.7", Some("12.0")),
+            ("10.15", Some("11.0")),
+            ("30.0", Some("30.0")),
+            ("20.0", None),
+            ("9.3", None),
+            ("garbage", None),
+        ] {
+            assert_eq!(release_xcode(macos).as_deref(), xcode, "{macos}");
+        }
     }
 }

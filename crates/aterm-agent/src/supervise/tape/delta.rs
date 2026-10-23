@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PER-KEY DELTA (the replay plan's §6.3): a body the loop sees again and
-//! again, stored against the last one it saw under the same key.
-//!
-//! A supervising loop reads the same screen every step — a `text --json
-//! tail=40` reply of three or four kilobytes, every twenty seconds, for hours —
-//! and between two reads usually nothing changed, or only the rows at the
-//! bottom did. Compression inside one frame cannot see that (one screen alone
-//! compresses about 2×, measured; twelve in a row 18.8×), and a frame holds
-//! only what arrived since the last act or wait. So before the frame's LZ4,
-//! each reply door's reply is stored against the previous reply to the SAME
-//! request at the same door, and each output against the previous output at
-//! the same door:
-//! * `Same`: an exact repeat, one byte;
-//! * `Splice`: the common prefix and suffix kept, only the middle stored;
-//! * `Full`: the body itself.
-//!
-//! Only a body longer than [`DELTA_MIN`] is stored against another (a short
-//! one is cheaper whole). The table remembers the last body of at most
-//! [`KEYS`] keys, least recently used out first, and only bodies of at most
-//! [`BODY_MAX`]: a bigger one is still stored against the base its key holds,
-//! if any (its middle is in the frame, so the base is all it borrows), but is
-//! never remembered — its key is forgotten, and the next body under it is
-//! whole. Keys are
-//! remembered by their xxh64, so a long request costs eight bytes; two keys
-//! with one hash share a slot, which costs only compression — the decoder
-//! computes the same hash from the same key and finds the same base. The
-//! table starts empty with each file, and both sides update it in the same
-//! order, which is why a tape decodes from its start.
+//! THE PER-KEY DELTA (the replay plan's §6.3).
 
 use super::codec::{CodecError, Input, len64, put_bytes, put_varint};
 
@@ -48,8 +21,7 @@ const FULL: u8 = 0;
 const SAME: u8 = 1;
 const SPLICE: u8 = 2;
 
-/// What a body is stored against: the previous reply to the same request at
-/// the same reply door, or the previous output at the same output door.
+/// What a body is stored against.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Key<'a> {
     Exchange { door: &'a str, request: &'a [u8] },

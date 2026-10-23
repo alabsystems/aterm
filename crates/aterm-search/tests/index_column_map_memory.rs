@@ -1,17 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
-//
-// What an index of non-ASCII scrollback holds, measured as REAL net heap (the
-// suite's counting global allocator, `search_suite.rs`), against its text and
-// against the same rows in ASCII.
-//
-// Every indexed line keeps a column map. One entry of three `usize` per
-// grapheme, in a doubling `Vec`, made a non-ASCII row's index 10-25 times its
-// text (r15 content-3: 100,000 rows of CJK held 370 MiB, of decomposed
-// accents 663 MiB), and ONE box-drawing glyph in an ASCII agent row made the
-// row cost 9 times the plain one. The bounds below sit between that and the
-// run-length encoded map.
 
 use aterm_search::TerminalSearch;
 
@@ -33,21 +22,18 @@ fn rows(shape: &str) -> Vec<String> {
         .map(|i| {
             let mut row = String::new();
             match shape {
-                // 100 ideographs: a 200-column row of CJK.
                 "cjk" => {
                     for _ in 0..100 {
                         let c = char::from_u32(0x4E00 + (lcg(&mut state) % 3000) as u32);
                         row.push(c.unwrap_or('中'));
                     }
                 }
-                // 100 letters, each with a combining acute: decomposed accents.
                 "decomposed" => {
                     for _ in 0..100 {
                         row.push(char::from(b'a' + (lcg(&mut state) % 26) as u8));
                         row.push('\u{301}');
                     }
                 }
-                // An agent's tool-output row, with and without its one glyph.
                 "agent" | "ascii" => {
                     row.push_str(if shape == "agent" {
                         "  \u{23bf}  "
@@ -66,9 +52,7 @@ fn rows(shape: &str) -> Vec<String> {
         .collect()
 }
 
-/// Net heap a cold index over `shape`'s rows holds once built (the GUI's cold
-/// build: `with_capacity_and_max` then `index_visible_content`), and the
-/// rows' text bytes.
+/// Net heap a cold index over `shape`'s rows holds once built, and the rows' text bytes.
 fn held(shape: &str) -> (f64, f64) {
     let rows = rows(shape);
     let text: usize = rows.iter().map(String::len).sum();
@@ -97,7 +81,6 @@ fn an_index_of_non_ascii_rows_holds_a_small_multiple_of_their_text() {
     let (agent, _) = held("agent");
     let (ascii, _) = held("ascii");
 
-    // origin/main: 12.9x and 11.6x.
     assert!(
         cjk <= 4.0 * cjk_text,
         "a CJK index holds {:.1}x its text",
@@ -108,7 +91,6 @@ fn an_index_of_non_ascii_rows_holds_a_small_multiple_of_their_text() {
         "a decomposed-accent index holds {:.1}x its text",
         decomposed / decomposed_text
     );
-    // origin/main: 8.9x.
     assert!(
         agent <= 1.5 * ascii,
         "one glyph makes an agent row's index {:.1}x the plain row's",

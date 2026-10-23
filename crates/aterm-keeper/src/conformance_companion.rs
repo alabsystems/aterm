@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 of `KeeperCompanionCustody` (the crash-restore plan §7.2): the real `KeeperCore`
-//! against the model (`aterm_models_core::keeper_companion_custody_model`). A unit-test module,
-//! not an integration test, so `cfg(test)` compiles in the `#[refines]` anchors it checks.
-//!
-//! A runner plays the reader, an update's successor and the recovering windows (window `n` is
-//! connection `n`, process `1000 + n`) and feeds the real core what the server would: an accept
-//! and a HELLO with or without `CAP_JOURNAL` (`OfferNew`, `OfferOld`), a REGISTER (`Claim`), a
-//! PENDING then the successor's HELLO and its Commit REGISTER (`SuccessorCommits`), a COMPANION
-//! (`ReaderCompanion`), a COMPANION_RELEASE (`ReaderReleases`), a RELEASE (`Release`), and a
-//! death, its EOF then its kernel status (`ReaderDies`, `RecipientDrops`, `OutgoingEnds`). The
-//! world answers that every shell lives and nobody else holds the master.
-//!
-//! Projection: `state`, `comp` (the window whose region `KeeperCore::companion_view` says an
-//! offer would carry), `done`, `attempts` and `ocomp` (the window whose region a claim that is
-//! not the reader holds) come from the core; `reader`, `live`, `next`, `dead_reader`,
-//! `outgoing` and `jcap` are the runner's own bookkeeping of what it did; the `bad_*` flags are
-//! read off the real OFFER (`Out::Offer`'s journal): a region offered at attempts 0 that is not
-//! the dead reader's, one offered past the cap, one offered to a window that did not state
-//! `CAP_JOURNAL`. Every reachable state of the model is reached by real steps, each of which is
-//! a transition the model admits, with every invariant holding after it.
-//!
-//! Negative controls: the core with the poison brake's attempt count removed (the core's
-//! `fault` point) is rejected by the committed model at the deaths and conforms to the model's
-//! `Buggy = 1`; and each of the model's five defects rejects real steps at its own site.
+//! Tier-1 of `KeeperCompanionCustody`: the real `KeeperCore` against the model.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -147,8 +124,6 @@ impl Rig {
         match self.core.companion_view(R) {
             None => {
                 // The record is gone: any companion the core still holds anywhere (there is no
-                // other record) is one its master's close left behind. That the server closes
-                // the descriptors the core lets go is `server.rs`'s test.
                 st.insert("state", 3);
                 st.insert(
                     "comp",
@@ -163,7 +138,6 @@ impl Rig {
                     RecordState::Claimed => 0,
                     RecordState::Orphaned => 1,
                     RecordState::Offered { .. } => 2,
-                    // The model has no hold; no step here makes one.
                     RecordState::Held { .. } => 99,
                 };
                 st.insert("state", state);
@@ -221,7 +195,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
     match action {
         "Release" => {
             // The last claim closes the tab: the reader's, or the outgoing window's once its
-            // successor's claim ended.
             let last = if before["live"] == 1 {
                 reader
             } else {
@@ -231,7 +204,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
         }
         "SuccessorCommits" => {
             // The reader names window `next` as its successor; the successor says HELLO as a
-            // window that journals, and registers the master at its Commit.
             let now = rig.tick();
             rig.live.insert(pid_of(next));
             rig.core.pending(conn_of(reader), pid_of(next), now, None);
@@ -245,7 +217,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
         }
         "OutgoingEnds" => {
             // The outgoing window's process ends by a signal (its Commit's own `exit(0)` inside
-            // the death grace is a hold, which the model leaves to `PtyKeeperCustody`).
             rig.die(before["outgoing"]);
             env.insert("outgoing", 0);
         }
@@ -397,7 +368,6 @@ fn the_real_keeper_conforms_to_the_companion_model() {
         }
     }
 
-    // Both tiers, on a sample of distinct real transitions (two per action).
     let mut per_action: BTreeMap<&str, usize> = BTreeMap::new();
     for (before, action, after) in &out.steps {
         let n = per_action.entry(action).or_default();
@@ -442,7 +412,6 @@ fn a_keeper_that_counts_no_attempt_is_rejected() {
             "{action}: {before:?} -> {after:?} is not Buggy = 1's either"
         );
     }
-    // And with the fault disarmed again, this thread's core counts.
     assert!(explore(&model, true).fired.contains("RecipientDrops"));
 }
 

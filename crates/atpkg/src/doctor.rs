@@ -29,7 +29,11 @@ fn is_problem_state(state: &str) -> bool {
         || state.starts_with(crate::state::HELD_FAILED_PREFIX)
 }
 
-fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> Option<usize> {
+const fn problem_listing_start(
+    declined: bool,
+    store_empty: bool,
+    problems: usize,
+) -> Option<usize> {
     if declined || problems == 0 {
         None
     } else if store_empty {
@@ -172,7 +176,7 @@ fn in_coherence_group(layout: &Layout, program: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn unserved_store_is_quiet(
+const fn unserved_store_is_quiet(
     unserved: bool,
     recorded_problems: &[String],
     missing_unexplained: &[String],
@@ -287,7 +291,7 @@ pub enum ChainWhy {
 
 /// `targo trust`'s rule for one component of the physical chain from `/` to a verified.
 #[must_use]
-pub fn chain_component_refusal(ours: u32, owner: u32, mode: u32) -> Option<ChainWhy> {
+pub const fn chain_component_refusal(ours: u32, owner: u32, mode: u32) -> Option<ChainWhy> {
     if owner != 0 && owner != ours {
         Some(ChainWhy::Foreign { owner, ours })
     } else if mode & 0o022 != 0 {
@@ -4289,11 +4293,11 @@ fn manual_path_hint(bin: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn native_hook_ext() -> &'static str {
+const fn native_hook_ext() -> &'static str {
     "ps1"
 }
 #[cfg(not(windows))]
-fn native_hook_ext() -> &'static str {
+const fn native_hook_ext() -> &'static str {
     "zsh"
 }
 
@@ -4436,7 +4440,7 @@ fn running_bundle_plist() -> Option<String> {
     crate::metadata_io::read_bounded_regular_utf8(&contents.join("Info.plist"), 1024 * 1024).ok()
 }
 
-fn plist_short_version(text: &str) -> Option<String> {
+pub(crate) fn plist_short_version(text: &str) -> Option<String> {
     let key = "<key>CFBundleShortVersionString</key>";
     let after = text.find(key)? + key.len();
     let value = text[after..].trim_start().strip_prefix("<string>")?;
@@ -4503,7 +4507,7 @@ pub struct Row {
     pub text: String,
 }
 
-fn level_word(level: Level) -> &'static str {
+const fn level_word(level: Level) -> &'static str {
     match level {
         Level::Ok => "ok",
         Level::Warn => "warn",

@@ -69,10 +69,7 @@ fn a_live_take_holds_the_automatic_park_before_land_and_only_until_its_bound() {
             "an explicit apply parks at once"
         );
     }
-    // The bound comes due inside the hold: the take never stands the
-    // successor down.
     assert!(VIDEO_PARK_WAIT_MAX < PRELAUNCH_HOLD_MAX);
-    // Control: no take, no wait.
     assert_eq!(
         recording_park_refusal(ApplyMode::Automatic, ApplyPhase::PreferIdle, false, early),
         None
@@ -86,12 +83,8 @@ fn a_live_take_holds_the_automatic_park_before_land_and_only_until_its_bound() {
 /// `App::video_answer_before_commit`.
 #[test]
 fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
-    // The park records its landed cost in the update ledger (`keep_landed_park`);
-    // held, as every ledger test does, so the dry-run seed tests never read it.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = crate::App::headless_for_test();
-    // Session 0 on a real PTY, so the park's descriptor reservation and
-    // proof term see a live master.
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
     app.pool
         .sessions
@@ -103,7 +96,6 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
     let (root, replies) = live_take(&mut app);
     assert!(app.video_request_live());
 
-    // An explicit apply's launched lane: the gate parks at once.
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
     let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
@@ -116,7 +108,6 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
         "a landed park leaves the take running and its client untold"
     );
 
-    // The proof fails: the attempt rolls back and the process runs on.
     let live = app.handoff_live_sessions();
     app.rollback_overlap(None, &live);
     app.pending_update_handoff = None;
@@ -130,7 +121,6 @@ fn a_landed_park_keeps_a_live_take_until_commit_answers_it() {
         "and its client is told nothing"
     );
 
-    // Control: a park that lands and reaches Commit answers it there.
     let (record, _cancelled, _stood_down, _transferred) =
         prelaunch_record(71, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
@@ -178,7 +168,6 @@ fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
         .expect("session 0")
         .session
         .master = master;
-    // Apply begins: the automatic lane adds no row, and nothing is frozen.
     app.begin_update_installing(false);
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Immediate);
     app.update_handoff_prelaunch = Some(record);
@@ -195,8 +184,6 @@ fn the_upgrade_rim_starts_at_the_launched_lanes_park() {
         .level_up
         .as_ref()
         .expect("the park starts the rim that explains the freeze");
-    // Its cap outlives everything after the park: the explicit apply's proof
-    // deadline, the longest of the lanes', with room for the capture.
     let proof_deadline =
         super::handoff_proof_deadline(ApplyMode::Immediate, 0, std::time::Instant::now());
     assert!(!rim.is_expired(proof_deadline + std::time::Duration::from_secs(30)));
@@ -263,10 +250,8 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
         .expect("session 0")
         .session
         .master = master;
-    // Output its reader has not taken: an automatic park waits for it.
     let pending = b"still printing\r\n";
-    // SAFETY: `slave` is the open slave end of the pair above; the buffer is
-    // a live byte slice of the length passed.
+    // SAFETY: `slave` is the open slave end of the pair above.
     let wrote = unsafe { libc::write(slave, pending.as_ptr().cast(), pending.len()) };
     assert_eq!(
         usize::try_from(wrote).ok(),
@@ -275,7 +260,6 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
     );
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Automatic);
     app.update_handoff_prelaunch = Some(record);
-    // The rim a park that missed its budget left running.
     app.level_up = Some(crate::level_up::LevelUp::charging(
         7,
         std::time::Instant::now(),
@@ -295,8 +279,6 @@ fn a_gate_wait_after_a_missed_park_takes_the_rim_away() {
 
     app.update_handoff_prelaunch = None;
     drop(app);
-    // The master first: a slave closed over output its master never read
-    // waits out the tty's drain (0.6 s on macOS).
     aterm_pty::close_fd(master);
     aterm_pty::close_fd(slave);
 }
@@ -330,7 +312,6 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
         .pending_update_handoff
         .as_mut()
         .expect("the parked attempt");
-    // The dispatch fence has had its loop time.
     pending.commit_drain_started =
         Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
     assert!(
@@ -400,7 +381,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
     );
 
     let under_a_grain = super::HANDOFF_INPUT_DRAIN_YIELD - std::time::Duration::from_micros(1);
-    // (what the claim's answers are taken to cost, a quit pressed during the fence)
     for (chosen_cost, quit_during_the_fence) in
         [(None, false), (None, true), (Some(under_a_grain), false)]
     {
@@ -414,11 +394,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             .session
             .master = master;
         let (root, replies) = live_take(&mut app);
-        // The take's client writes its answer one fence grain after it is SENT:
-        // it waits for the answer first, so that grain is always time the
-        // claim's pass spent answering, however late the main thread got
-        // there (a clock begun before the claim can run out first, and the
-        // pass then answers under the yield and writes the Commit at once).
         let (wire, release) = crate::control::ReplyWire::new();
         app.video_reply_wires.push(wire);
         let reader = std::thread::spawn(move || {
@@ -432,8 +407,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             prelaunch_record(7, ApplyMode::Immediate);
         let nonce = record.nonce.clone();
         app.update_handoff_prelaunch = Some(record);
-        // A row the park's carry leaves (in flight, not yet revealed), which ends with this
-        // process at its Commit.
         let uncarried = app.post_message(
             aterm_messages::Message::new(
                 aterm_messages::tags::PACKAGES,
@@ -464,7 +437,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         let arbiter = pending.arbiter.clone();
         app.handoff_reposts = Some(Vec::new());
-        // No reader: a Commit written fails with EPIPE, and the test runs on.
         let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
         drop(commit_rd);
         let (reject, rejected) = std::sync::mpsc::sync_channel(1);
@@ -486,7 +458,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             .into_parts();
         assert_eq!(body, "ERR video: recording aborted: aterm is updating\n");
         if chosen_cost.is_some() {
-            // CONTROL: under one grain, the claim's own pass wrote the Commit.
             assert_eq!(arbiter.phase(), crate::HandoffAttemptPhase::Rejecting);
             assert!(rejected.try_recv().is_ok(), "the worker is told to reject");
             assert_eq!(
@@ -532,7 +503,6 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
         assert_eq!(reposted.len(), 1, "the attempt went back through the gate");
         let respin = reposted.remove(0);
 
-        // The run loop dispatched; the fence has had its loop time.
         let pending = app.pending_update_handoff.as_mut().expect("the attempt");
         pending.commit_drain_started =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
@@ -602,7 +572,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
         .master = master;
     let ctx = app.pool.get(0).expect("session 0").ctx.clone();
     let sid = ctx.self_id.as_str().to_string();
-    // The supervisor's escalation of the box, standing at the park.
     let owner = crate::harness_host::ATTENTION_OWNER;
     ctx.meta
         .lock()
@@ -632,7 +601,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
             while !job.stop.load(Ordering::SeqCst) {
                 std::thread::park();
             }
-            // The loop's last act: the badge it raised goes.
             let _ = ctx
                 .meta
                 .lock()
@@ -657,8 +625,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     });
 
     let (root, replies) = live_take(&mut app);
-    // The Commit's answers cost one fence grain, so its claim is held, however late a
-    // loaded main thread reaches it.
     app.handoff_commit_answers_took = Some(super::HANDOFF_INPUT_DRAIN_YIELD);
     let (record, _cancelled, _stood_down, _transferred) = prelaunch_record(7, ApplyMode::Immediate);
     let nonce = record.nonce.clone();
@@ -691,7 +657,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
         Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
     let arbiter = pending.arbiter.clone();
     app.handoff_reposts = Some(Vec::new());
-    // No reader: a Commit written fails with EPIPE, and the test runs on.
     let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
     drop(commit_rd);
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
@@ -714,8 +679,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
             .is_some_and(|pending| pending.held_commit.is_some()),
         "PRECONDITION: the claim is held through one more fence"
     );
-    // A stop that reached the worker by now has its last act land before
-    // the held pass reads the admission, as the real one's does.
     let stopped_at_the_claim = stopped.load(Ordering::SeqCst);
     if stopped_at_the_claim {
         until("the stopped worker's last act", &|| {
@@ -726,7 +689,6 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     assert_eq!(reposted.len(), 1, "the attempt went back through the gate");
     let respin = reposted.remove(0);
 
-    // The run loop dispatched; the fence has had its loop time.
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_drain_started =
         Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
@@ -768,14 +730,11 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The successor is activated (`App::handoff_activations`) only at the Commit
-/// write, after any held claim's re-posted pass has passed admission, and only
-/// when an aterm window has focus at the write (rather than at the park).
+/// Stand-in successor process for handoff activation tests (`App::handoff_activations`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_held_claim_activates_the_successor_only_at_its_write() {
-    /// The stand-in successor, killed (`SIGKILL`) and reaped however the
-    /// test ends.
+    /// The stand-in successor, killed (`SIGKILL`) and reaped however the test ends.
     struct StandIn(aterm_uds::spawnfd::Child);
     impl Drop for StandIn {
         fn drop(&mut self) {
@@ -786,7 +745,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let scratch = aterm_tempfile::tempdir().expect("a scratch rendezvous");
     let _rendezvous = crate::identity_claim::rendezvous_override(scratch.path());
-    // (refused, focused at the park, focused at the write)
     for (refused, at_park, at_write) in [
         (false, true, true),
         (true, true, true),
@@ -809,8 +767,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             .session
             .master = master;
         let (root, replies) = live_take(&mut app);
-        // The Commit's answers cost one fence grain, so its claim is held, however
-        // late a loaded main thread reaches it.
         app.handoff_commit_answers_took = Some(super::HANDOFF_INPUT_DRAIN_YIELD);
         let (record, _cancelled, _stood_down, _transferred) =
             prelaunch_record(7, ApplyMode::Immediate);
@@ -833,7 +789,6 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         let arbiter = pending.arbiter.clone();
         app.handoff_reposts = Some(Vec::new());
-        // No reader: a Commit written fails with EPIPE, and the test runs on.
         let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
         drop(commit_rd);
         let (reject, rejected) = std::sync::mpsc::sync_channel(1);
@@ -868,14 +823,12 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
         assert_eq!(reposted.len(), 1, "the attempt went back through the gate");
         let respin = reposted.remove(0);
 
-        // The run loop dispatched; the fence has had its loop time.
         let pending = app.pending_update_handoff.as_mut().expect("the attempt");
         pending.commit_drain_started =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         if refused {
             pending.teardown = crate::DeferredHandoffTeardown::QuitRequested;
         }
-        // The person moved to another app during the fence, or back to aterm.
         for ws in app.windows.values_mut() {
             ws.focused = at_write;
         }
@@ -949,7 +902,6 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     );
     assert!(!app.commit_flush_refences(), "once per attempt");
 
-    // Control: a hold under one grain keeps the fence it has; one grain restarts it.
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_drain_started = Some(drain_started);
     let under = super::HANDOFF_INPUT_DRAIN_YIELD - std::time::Duration::from_micros(1);
@@ -961,8 +913,6 @@ fn a_slow_commit_flush_restarts_the_dispatch_fence() {
     let pending = app.pending_update_handoff.as_ref().expect("the attempt");
     assert_eq!(pending.commit_drain_started, None, "one grain restarts it");
 
-    // Control: with no writer behind, the flush waits on nothing: answered, and the fence it
-    // has stands.
     app.messages_log = None;
     let pending = app.pending_update_handoff.as_mut().expect("the attempt");
     pending.commit_flush = None;
@@ -1035,7 +985,6 @@ fn a_park_that_misses_keeps_a_live_take() {
     app.update_handoff_prelaunch = Some(record);
 
     let term = app.pool.get(0).expect("session 0").term.clone();
-    // On the real rung: a test park's default deadline would wait it out.
     let real = super::park_budget_for_test::real();
     let holder = super::dry_run_capture_tests::hold_engine_until_the_park_gives_up(&term);
     let missed = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
@@ -1054,7 +1003,6 @@ fn a_park_that_misses_keeps_a_live_take() {
         "and its client is told nothing — no update happened"
     );
 
-    // Control: the park that lands, then its Commit, answers it.
     let parked = app.park_and_transfer_to_prelaunched_successor(std::time::Instant::now());
     assert!(
         matches!(parked, ParkAttempt::Parked),
@@ -1085,16 +1033,11 @@ fn a_park_that_misses_keeps_a_live_take() {
 /// returning for `_exit`. Each stand-in connection writes only once the step
 /// waits on its wire (`ReplyWritten::awaited_within`), so a step that went on
 /// without waiting finds its reply unwritten on every run.
-///
-/// [`ReplyWire`]: crate::control::ReplyWire
 #[test]
 fn commit_waits_until_every_video_reply_is_written() {
     const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
     let mut app = crate::App::headless_for_test();
     let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // A connection thread: waits for its request's answer, writes it once
-    // Commit's step waits on its wire, and releases the wire as the write
-    // does.
     let connection = |answers: std::sync::mpsc::Receiver<String>| {
         let (wire, release) = crate::control::ReplyWire::new();
         let written = std::sync::Arc::clone(&written);
@@ -1111,7 +1054,6 @@ fn commit_waits_until_every_video_reply_is_written() {
         (wire, thread)
     };
 
-    // A live take, answered on its channel.
     let (root, take_replies) = live_take(&mut app);
     let (take_answers, take_answered) = std::sync::mpsc::channel();
     let forward = std::thread::spawn(move || {
@@ -1124,8 +1066,6 @@ fn commit_waits_until_every_video_reply_is_written() {
     let (take_wire, take_connection) = connection(take_answered);
     app.video_reply_wires.push(take_wire);
 
-    // An export mid-frame: it answers at its next frame boundary, after the
-    // cancel, and only then drops its permit.
     let export = crate::VideoCancellation::new();
     let permit = app
         .video_export
@@ -1187,7 +1127,6 @@ fn commit_waits_until_every_video_reply_is_written() {
         "ERR video: export failed"
     );
 
-    // Bounded: a reply nobody ever writes costs Commit its bound, and is said.
     let (stuck, _never_released) = crate::control::ReplyWire::new();
     app.video_reply_wires.push(stuck);
     let started = std::time::Instant::now();
@@ -1200,7 +1139,6 @@ fn commit_waits_until_every_video_reply_is_written() {
     assert_eq!(answered.unwritten, 1);
     assert!(!answered.answered);
 
-    // Control: with nothing live the step costs nothing, not its bound.
     app.video_reply_wires.clear();
     let started = std::time::Instant::now();
     assert_eq!(
@@ -1224,7 +1162,6 @@ fn commit_waits_until_every_video_reply_is_written() {
 /// starting any take.
 #[test]
 fn a_video_request_after_the_park_is_refused() {
-    // The park that lands keeps its cost in the update ledger.
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = crate::App::headless_for_test();
     let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");

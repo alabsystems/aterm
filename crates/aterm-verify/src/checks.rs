@@ -549,6 +549,8 @@ mod tests {
             "fish (verify provision)",
             "pwsh (verify provision)",
             "cc (CLT)",
+            // The producer's one real-CLI pack test (§6.1 row 18); the rest pack through
+            // aterm-zstd's raw-block writer.
             "zstd (unprovided)",
             "python3 (unprovided)",
             "vim (OS)",

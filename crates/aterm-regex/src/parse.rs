@@ -1,31 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pattern text → [`Ast`].
-//!
-//! A single flat loop over the pattern's code points with an explicit [`Group`] stack,
-//! so no `(((((…)))))` can recurse it into the guard page. The [`Ast`] it produces, and
-//! its `Drop`, are recursive, so every node records its depth and parsing fails past
-//! [`MAX_NESTING_DEPTH`].
-//!
-//! ## Syntax
-//!
-//! Literals, `.`, character classes (ranges, negation, escapes, `\d\w\s`, POSIX names),
-//! the assertions `^ $ \A \z \b \B \< \>`, groups (capturing, `(?:`, named) with inline
-//! flags `i m s x U`, alternation, and the quantifiers `* + ? {n} {n,} {n,m}`, greedy and
-//! lazy. The constructs `regex` accepts and this engine refuses are listed in the crate
-//! docs; each is an [`Error::Syntax`] naming it, never a reinterpretation (a naive reading
-//! of `[a--b]` is "a, -, b"). Backreferences and look-around are refused, as in `regex`.
+//! Pattern text to [`Ast`] parser bounded by [`MAX_NESTING_DEPTH`].
 
 use crate::Error;
 use crate::unicode;
 
-/// Maximum nesting depth of the parsed AST. Matches the `regex` crate's default
-/// nest limit. Bounds both parse-time work and the recursive `Drop` of the tree.
+/// Maximum nesting depth of the parsed AST.
 pub(crate) const MAX_NESTING_DEPTH: usize = 250;
 
-/// A zero-width assertion, evaluated against the code points either side of a
-/// position in the *whole* haystack.
+/// A zero-width assertion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Assertion {
     /// `\A`, and `^` outside multi-line mode.
@@ -46,8 +30,7 @@ pub(crate) enum Assertion {
     WordEnd,
 }
 
-/// One of the perl classes, carried symbolically so `\w` never has to be
-/// expanded into the ~800 ranges of `Alphabetic | M | Nd | Pc | Join_Control`.
+/// Symbolic Perl character class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PerlClass {
     Digit,
@@ -72,13 +55,7 @@ impl PerlClass {
     }
 }
 
-/// A set of code points: explicit ranges, plus any perl classes named inside it,
-/// plus one negation applied to the union of the two.
-///
-/// Keeping the perl classes symbolic is what makes `[^\s<>…]` cheap, and
-/// splitting negation out is what makes `(?i)[^k]` *correct*: case folding
-/// happens to the ranges first and the complement is taken afterwards, which is
-/// the order the `regex` crate uses (`(?i)[^k]` must reject KELVIN SIGN).
+/// Code-point set of explicit ranges, symbolic Perl classes, and optional negation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ClassSet {
     /// Sorted, disjoint, inclusive ranges.
@@ -88,7 +65,7 @@ pub(crate) struct ClassSet {
 }
 
 impl ClassSet {
-    /// A class holding exactly the code points of one inclusive range.
+    /// A class holding the code points of one inclusive range.
     pub(crate) fn range(lo: char, hi: char) -> Self {
         Self {
             ranges: vec![(lo, hi)],
@@ -152,7 +129,6 @@ impl ClassSet {
         let mut merged: Vec<(char, char)> = Vec::with_capacity(self.ranges.len());
         for &(lo, hi) in &self.ranges {
             match merged.last_mut() {
-                // Coalesce overlapping and adjacent ranges: `[a-mn-z]` is one range.
                 Some(last) if lo as u32 <= last.1 as u32 + 1 => {
                     if hi > last.1 {
                         last.1 = hi;
@@ -165,10 +141,7 @@ impl ClassSet {
         self.perls.dedup();
     }
 
-    /// Mark, in `out`, every leading UTF-8 byte of a code point this class can match. A
-    /// continuation byte (`0x80..=0xBF`) is never marked, so the prefilter's byte-at-a-time
-    /// walk can only stop on a boundary. The non-ASCII side is marked conservatively, which
-    /// is safe: the prefilter skips only positions no candidate could match.
+    /// Mark every leading UTF-8 byte of a code point this class can match.
     pub(crate) fn mark_lead_bytes(&self, out: &mut [bool; 256]) {
         for b in 0u8..0x80 {
             if self.matches(b as char) {
@@ -185,8 +158,7 @@ impl ClassSet {
         }
     }
 
-    /// Heap bytes this class costs, charged against the compile-time ceiling
-    /// alongside the instruction that indexes it.
+    /// Heap bytes this class costs.
     #[inline]
     pub(crate) const fn byte_size(&self) -> usize {
         size_of::<Self>()
@@ -206,13 +178,6 @@ impl ClassSet {
     }
 
     /// Add one POSIX item (`[:lower:]` or `[:^lower:]`) to this class.
-    ///
-    /// The item's own `^` is applied after folding, as a bracketed class's is (`regex`'s
-    /// `unicode_fold_and_negate`). The other order is wrong: the complement of `[a-z]`
-    /// holds `A-Z`, `ſ` and the KELVIN SIGN, whose orbits cover `a-z`, so folding it
-    /// yields every code point and `(?i)[[:^lower:]]` matches letters. Folding the whole
-    /// class again when it closes is idempotent: a complement taken after folding holds no
-    /// member of any orbit it excluded.
     fn add_posix(&mut self, table: &[(char, char)], negated: bool, case_insensitive: bool) {
         let mut item = Self {
             ranges: table.to_vec(),
@@ -407,14 +372,10 @@ impl Parser<'_> {
                         '+' => (1, None),
                         _ => (0, Some(1)),
                     };
-                    // `*`, `+` and `?` take their laziness marker only when it
-                    // is adjacent: in `x` mode `a? ?` is `(a?)?`, not `a??`.
                     self.apply_repeat(min, max, false)?;
                 }
                 '{' => {
                     let (min, max) = self.parse_counted()?;
-                    // A counted repetition is the exception — `a{1,2} ?` *is*
-                    // lazy. Asymmetric, and the `regex` crate's asymmetry.
                     self.apply_repeat(min, max, true)?;
                 }
                 '[' => {
@@ -490,10 +451,6 @@ impl Parser<'_> {
     }
 
     /// Attach a quantifier to the last item of the current branch.
-    ///
-    /// `space_before_lazy` says whether `x` mode may separate the operator from
-    /// its `?` laziness marker. It may after `{n,m}` and may not after `*`, `+`
-    /// or `?` — see the two call sites.
     fn apply_repeat(
         &mut self,
         min: u32,
@@ -532,9 +489,6 @@ impl Parser<'_> {
     }
 
     /// `{n}`, `{n,}`, `{n,m}`.
-    ///
-    /// An unescaped `{` always opens one, as in `regex` (`a{b}` and `a{,3}` are errors
-    /// there too). A literal brace is `\{`; a lone `}` is a literal.
     fn parse_counted(&mut self) -> Result<(u32, Option<u32>), Error> {
         debug_assert_eq!(self.peek(), Some('{'));
         let open = self.pos;
@@ -612,9 +566,7 @@ impl Parser<'_> {
 
     fn open_group(&mut self) -> Result<(), Error> {
         let open_at = self.pos;
-        self.pos += 1; // '('
-        // `x` mode may separate the paren from the `?` that qualifies it:
-        // `( ?i)` is `(?i)`.
+        self.pos += 1;
         self.skip_ignorable();
         let mut flags = self.flags;
         if self.peek() == Some('?') {
@@ -650,8 +602,6 @@ impl Parser<'_> {
                     self.parse_group_name()?;
                 }
                 Some(_) => {
-                    // A flag directive: `(?flags)` changes the rest of the
-                    // enclosing group in place; `(?flags:…)` opens a new one.
                     flags = self.parse_flags()?;
                     match self.bump() {
                         Some(')') => {
@@ -720,7 +670,7 @@ impl Parser<'_> {
         let Some(group) = self.stack.pop() else {
             return self.err("unopened group");
         };
-        self.pos += 1; // ')'
+        self.pos += 1;
         let branch = take_concat(&mut self.concat);
         self.alts.push(branch);
         let inner = finish_alts(core::mem::take(&mut self.alts));
@@ -776,7 +726,6 @@ impl Parser<'_> {
                         's' => flags.dot_matches_new_line = on,
                         'x' => flags.ignore_whitespace = on,
                         'U' => flags.swap_greed = on,
-                        // `u` is Unicode mode, which is the only mode there is.
                         _ => {}
                     }
                 }
@@ -789,7 +738,7 @@ impl Parser<'_> {
     /// a single code point.
     fn parse_escape(&mut self) -> Result<Ast, Error> {
         let start = self.pos;
-        self.pos += 1; // '\'
+        self.pos += 1;
         let Some(c) = self.peek() else {
             self.pos = start;
             return self.err("incomplete escape sequence, reached end of pattern prematurely");
@@ -901,8 +850,7 @@ impl Parser<'_> {
     /// names. Refuses the set-operation syntax rather than misreading it.
     fn parse_class(&mut self) -> Result<ClassSet, Error> {
         let open = self.pos;
-        self.pos += 1; // '['
-        // In `x` mode `[ ^a]` is `[^a]`.
+        self.pos += 1;
         self.skip_ignorable();
         let negated = self.peek() == Some('^');
         if negated {
@@ -928,8 +876,6 @@ impl Parser<'_> {
                 return Ok(set);
             }
             first = false;
-            // Set operations would silently become "a, -, b" under a naive
-            // reading, so they are refused outright.
             if matches!(c, '&' | '-' | '~') && self.peek_at(1) == Some(c) {
                 return self.err(&format!(
                     "character-class set operations (`{c}{c}`) are not supported; escape the \
@@ -947,8 +893,6 @@ impl Parser<'_> {
                      match it literally",
                 );
             }
-            // An item: either a shorthand (never a range endpoint) or one code
-            // point (which may open a range).
             let lo = if c == '\\' {
                 self.pos += 1;
                 let Some(e) = self.peek() else {
@@ -973,14 +917,12 @@ impl Parser<'_> {
             if self.flags.ignore_whitespace {
                 self.skip_ignorable();
             }
-            // A `--` right after an item is set difference, not a range ending in `-`.
             if self.peek() == Some('-') && self.peek_at(1) == Some('-') {
                 return self.err(
                     "character-class set operations (`--`) are not supported; escape the \
                      operator (`\\-`) to match it literally",
                 );
             }
-            // `-` is a range operator unless it closes the class.
             if self.peek() == Some('-') && self.peek_at(1) != Some(']') {
                 let dash = self.pos;
                 self.pos += 1;
@@ -999,9 +941,6 @@ impl Parser<'_> {
                     }
                     self.parse_escape_char()?
                 } else if h == '[' {
-                    // `[a-[:digit:]]` is a bad range boundary; `[a-[b]]` is the
-                    // nested-class syntax. Say which, so the message is
-                    // actionable.
                     if self.parse_posix_class()?.is_some() {
                         self.pos = dash;
                         return self.err("invalid range boundary, must be a literal");
@@ -1255,8 +1194,6 @@ mod tests {
                 }
             }
         }
-        // Fold before complement: `(?i)[:^lower:]` excludes the exotic members of the
-        // `k` and `s` orbits along with `A-Z`.
         let mut no = ClassSet::default();
         no.add_posix(posix_class("lower").expect("known"), true, true);
         for c in ['a', 'Z', '\u{17f}', '\u{212a}'] {

@@ -205,11 +205,11 @@ pub enum Remedy {
         /// The item id or layer name.
         only: String,
     },
-    /// `aterm init --develop`. No item answers with it yet: it names S8's flag, and only
-    /// an item of that slice may answer with it, so no row names a command this build
-    /// lacks (#89). It is in the wire already because a report crosses builds (the
-    /// machines agent reads the person's `aterm pkg doctor --json`, whatever aterm that
-    /// is), and an older agent must still read a report that carries one.
+    /// `aterm init --develop`: the remedy of every `develop.*` item (the profile record,
+    /// a checkout's alignment, its submodule and its test tools), which that flag runs.
+    /// It crosses builds (the machines agent reads the person's `aterm pkg doctor
+    /// --json`, whatever aterm that is), so an older agent still reads a report that
+    /// carries one.
     Develop,
     /// `targo --unverified verify provision <args>` (`--linux`, `--record`, or nothing),
     /// the verb of a checkout's tools (S7): `ship provision`'s `develop` item answers

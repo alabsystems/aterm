@@ -28,7 +28,7 @@ const BULLETS: &[&str] = &["- ", "* ", "+ "];
 
 /// The columns left on a line `line_width` columns wide before
 /// `fill_column`: none once the line reaches it.
-fn room(line_width: u64, fill_column: u64) -> u64 {
+const fn room(line_width: u64, fill_column: u64) -> u64 {
     fill_column.saturating_sub(line_width)
 }
 

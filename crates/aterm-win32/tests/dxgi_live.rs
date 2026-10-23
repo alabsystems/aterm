@@ -1,19 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The hand-written DXGI slice (src/dxgi.rs) on a live Windows: aterm-gui's
-//! peak-luminance walk (`CreateDXGIFactory1`, `EnumAdapters1` at slot 12,
-//! `EnumOutputs` at 7, `QueryInterface` for `IDXGIOutput6`, `GetDesc1` at 27),
-//! each output's description held to what user32 says of the same monitor.
-//!
-//! user32 is the independent witness, declared here and not taken from
-//! aterm-win32: a wrong slot, interface ID or `DXGI_OUTPUT_DESC1` layout
-//! answers with a failure, a crash, no output at all, or a description whose
-//! monitor, rectangle or device name user32 does not give. Session 0 (sshd's
-//! logons, services) has no display: DXGI reports no output there while user32
-//! reports a placeholder monitor, so the test ends COULD NOT RUN and compares
-//! nothing. The Windows lane runs it in `lane`'s desktop session
-//! (docs/WINDOWS-RUNTIME-LANE.md, `exec --desktop`).
+//! Live Windows DXGI output enumeration tests against `user32`.
 
 #![cfg(windows)]
 #![allow(non_snake_case)]
@@ -26,8 +14,7 @@ use aterm_win32::dxgi::{
 use core::ffi::c_void;
 use core::ptr;
 
-/// user32's and kernel32's own declarations (winuser.h, processthreadsapi.h),
-/// independent of aterm-win32's.
+/// user32's and kernel32's own declarations, independent of aterm-win32's.
 mod user32 {
     use core::ffi::c_void;
 
@@ -85,7 +72,7 @@ unsafe extern "system" fn collect(
 /// user32's monitors in this session, by handle.
 fn monitors() -> Vec<usize> {
     let mut monitors = Vec::new();
-    // SAFETY: the callback writes only into `monitors`, which outlives the call.
+    // SAFETY: The callback writes only into `monitors`, which outlives the call.
     let ok = unsafe {
         user32::EnumDisplayMonitors(
             ptr::null_mut(),
@@ -99,39 +86,33 @@ fn monitors() -> Vec<usize> {
 }
 
 /// The reference a successful call wrote to `out`, owned.
-///
-/// # Safety
-///
-/// `out` is what the call whose result is `hr` wrote.
 unsafe fn owned(hr: i32, out: *mut c_void) -> Option<Com> {
-    // SAFETY: the caller's contract.
+    // SAFETY: The caller's contract.
     (hr >= 0).then(|| unsafe { Com::from_raw(out) }).flatten()
 }
 
 /// Every output's `GetDesc1`, through aterm-win32 alone.
 fn outputs() -> Vec<DXGI_OUTPUT_DESC1> {
     let mut out = ptr::null_mut();
-    // SAFETY: the factory's IID and an out pointer written on success.
+    // SAFETY: The factory's IID and an out pointer written on success.
     let factory = unsafe { owned(CreateDXGIFactory1(&IID_IDXGIFactory1, &mut out), out) }
         .expect("CreateDXGIFactory1");
-    // SAFETY: an IDXGIFactory1.
+    // SAFETY: An IDXGIFactory1.
     let factory_vt = unsafe { factory.vtable::<IDXGIFactory1_Vtbl>() };
     let mut descriptions = Vec::new();
     for adapter in 0u32.. {
         let mut out = ptr::null_mut();
-        // SAFETY: EnumAdapters1 hands back an owned IDXGIAdapter1, or fails
-        // past the last adapter.
+        // SAFETY: EnumAdapters1 hands back an owned IDXGIAdapter1, or fails past the last adapter.
         let hr = unsafe { (factory_vt.EnumAdapters1)(factory.as_raw(), adapter, &mut out) };
         // SAFETY: `out` is that call's.
         let Some(adapter) = (unsafe { owned(hr, out) }) else {
             break;
         };
-        // SAFETY: an IDXGIAdapter1.
+        // SAFETY: An IDXGIAdapter1.
         let adapter_vt = unsafe { adapter.vtable::<IDXGIAdapter1_Vtbl>() };
         for output in 0u32.. {
             let mut out = ptr::null_mut();
-            // SAFETY: EnumOutputs hands back an owned IDXGIOutput, or fails
-            // past the last output.
+            // SAFETY: EnumOutputs hands back an owned IDXGIOutput, or fails past the last output.
             let hr = unsafe { (adapter_vt.EnumOutputs)(adapter.as_raw(), output, &mut out) };
             // SAFETY: `out` is that call's.
             let Some(output) = (unsafe { owned(hr, out) }) else {
@@ -141,7 +122,7 @@ fn outputs() -> Vec<DXGI_OUTPUT_DESC1> {
                 .query(&IID_IDXGIOutput6)
                 .expect("Windows 11's outputs are IDXGIOutput6");
             let mut desc = DXGI_OUTPUT_DESC1::default();
-            // SAFETY: an IDXGIOutput6; GetDesc1 fills `desc`.
+            // SAFETY: An IDXGIOutput6; GetDesc1 fills `desc`.
             let hr = unsafe {
                 (output6.vtable::<IDXGIOutput6_Vtbl>().GetDesc1)(output6.as_raw(), &mut desc)
             };
@@ -155,7 +136,7 @@ fn outputs() -> Vec<DXGI_OUTPUT_DESC1> {
 /// This process's Terminal Services session; 0 has no display.
 fn session() -> u32 {
     let mut session = 0;
-    // SAFETY: this process's id and an out pointer.
+    // SAFETY: This process's id and an out pointer.
     let ok = unsafe { user32::ProcessIdToSessionId(user32::GetCurrentProcessId(), &mut session) };
     assert_ne!(ok, 0, "ProcessIdToSessionId");
     session
@@ -172,8 +153,6 @@ fn every_output_is_a_monitor_user32_describes_the_same_way() {
         outputs.len()
     );
     if session == 0 {
-        // aterm_uds::host::COULD_NOT_RUN's words (aterm-win32 depends on
-        // nothing): a run that compared nothing is not a pass.
         panic!(
             "aterm-gate: COULD NOT RUN — session 0 has no display, so there is no \
              output to compare; run it in a desktop session (`lab windows exec --desktop`)"
@@ -191,7 +170,7 @@ fn every_output_is_a_monitor_user32_describes_the_same_way() {
             flags: 0,
             device: [0; 32],
         };
-        // SAFETY: a live monitor handle and a sized MONITORINFOEXW.
+        // SAFETY: A live monitor handle and a sized MONITORINFOEXW.
         assert_ne!(
             unsafe { user32::GetMonitorInfoW(desc.Monitor, &mut info) },
             0

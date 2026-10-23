@@ -18,6 +18,8 @@ mod scratch;
 mod screen_lock;
 mod scroll_direction;
 mod secret;
+#[cfg(test)]
+pub(crate) mod spawns;
 mod staged_child;
 mod stops;
 
@@ -76,6 +78,10 @@ pub struct Cmd {
     /// Kill the process group at the deadline and return `Ok` with `status: None` and captured
     /// output instead of [`RunFailed::TimedOut`].
     pub keep_on_timeout: bool,
+    /// The directory the program starts in; `/` when `None`. A tool that reads where it
+    /// runs (cargo finds a checkout's `.cargo/config.toml` and its aliases from there) is
+    /// given its directory ([`Cmd::current_dir`]).
+    pub cwd: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Cmd {
@@ -95,6 +101,7 @@ impl std::fmt::Debug for Cmd {
             .field("budget", &self.budget)
             .field("env", &env)
             .field("keep_on_timeout", &self.keep_on_timeout)
+            .field("cwd", &self.cwd)
             .finish()
     }
 }
@@ -113,7 +120,15 @@ impl Cmd {
             env: Vec::new(),
             masked: Vec::new(),
             keep_on_timeout: false,
+            cwd: None,
         }
+    }
+
+    /// Start the program in `dir` ([`Cmd::cwd`]).
+    #[must_use]
+    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
     }
 
     /// Add `key=value` to the child's environment (the `env` field says how it travels).
@@ -184,10 +199,18 @@ impl Cmd {
         self
     }
 
-    /// The command formatted as a single shell-quoted line.
+    /// The command as one shell-quoted line: the form revert lines and logs print, and the
+    /// key the test arm's script is matched on (`cd <dir> && ` first when [`Cmd::cwd`] is
+    /// set, then `<user>$ ` when `user` is, each [`Cmd::env`] variable as a `NAME=value`
+    /// word before the program).
     #[must_use]
     pub fn display(&self) -> String {
         let mut out = String::new();
+        if let Some(dir) = &self.cwd {
+            out.push_str("cd ");
+            out.push_str(&shell_word(&dir.to_string_lossy()));
+            out.push_str(" && ");
+        }
         if let Some(user) = &self.user {
             out.push_str(&user.name);
             out.push_str(if self.session { "@gui$ " } else { "$ " });
@@ -744,7 +767,7 @@ impl Live {
                 .open(staged.path())
                 .map_err(failed)
         };
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd));
+        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let stdin = match &cmd.stdin {
             Some(path) => aterm_uds::spawnfd::Stdio::from(
                 std::fs::File::open(path)
@@ -834,9 +857,13 @@ fn fixed_command(
     program: &Path,
     args: &[OsString],
     env: &[(String, String)],
+    cwd: Option<&Path>,
 ) -> aterm_uds::spawnfd::Command {
     let mut child = aterm_uds::spawnfd::command(program);
-    child.args(args).env_clear().current_dir("/");
+    child
+        .args(args)
+        .env_clear()
+        .current_dir(cwd.unwrap_or(Path::new("/")));
     for (key, value) in env {
         child.env(key, value);
     }
@@ -905,7 +932,7 @@ impl System for Live {
             return self.run_until_deadline(cmd);
         }
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd));
+        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let stdin = match &cmd.stdin {
             Some(path) => aterm_uds::spawnfd::Stdio::from(
                 std::fs::File::open(path)
@@ -941,7 +968,7 @@ impl System for Live {
             )));
         }
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd));
+        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let stdin = match &cmd.stdin {
             Some(path) => aterm_uds::spawnfd::Stdio::from(
                 std::fs::File::open(path)
@@ -990,6 +1017,9 @@ impl System for Live {
         for (key, value) in &cmd.env {
             child.env(key, value);
         }
+        if let Some(dir) = &cmd.cwd {
+            child.current_dir(dir);
+        }
         let status = child
             .args(&args)
             .stdin(aterm_uds::spawnfd::Stdio::inherit())
@@ -1009,7 +1039,7 @@ impl System for Live {
             )));
         }
         let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd));
+        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let (reader, mut writer) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
         writer
             .write_all(input.bytes())
@@ -1282,7 +1312,7 @@ impl System for Live {
         child
             .args(&args)
             .env_clear()
-            .current_dir("/")
+            .current_dir(cmd.cwd.as_deref().unwrap_or(Path::new("/")))
             .setsid(true)
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(aterm_uds::spawnfd::Stdio::from(open_log()?))
@@ -2624,6 +2654,28 @@ mod fake {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
 
+        /// `path` with each seeded link ([`Fake::link`]) a prefix of it names followed, as
+        /// `realpath(3)` would; a path through no link is its own canonical form.
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            let links = self.links.lock().unwrap();
+            let mut path = path.to_path_buf();
+            // macOS's MAXSYMLINKS: a cycle of links fails as ELOOP does.
+            for _ in 0..32 {
+                let Some((link, target)) = links.iter().find(|(link, _)| path.starts_with(link))
+                else {
+                    return Ok(path);
+                };
+                let target = link.parent().unwrap_or(Path::new("/")).join(target);
+                let rest = path.strip_prefix(link).unwrap_or(Path::new(""));
+                path = if rest.as_os_str().is_empty() {
+                    target
+                } else {
+                    target.join(rest)
+                };
+            }
+            Err(io::Error::other("too many levels of symbolic links"))
+        }
+
         fn relay(&self, cmd: &Cmd) -> Result<Box<dyn Relaying + '_>, RunFailed> {
             self.calls
                 .lock()
@@ -3091,5 +3143,31 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    /// The Dock pins the copy [`System::running_app`] names, so the live answer follows
+    /// the link on PATH (`~/.local/bin/aterm`) into the bundle it runs from.
+    #[test]
+    fn the_running_app_is_the_bundle_the_resolved_executable_sits_in() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let app = root.join("Applications/aterm.app");
+        let macos = app.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("aterm"), b"").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(macos.join("aterm"), root.join("bin/aterm")).unwrap();
+        std::fs::write(root.join("bin/built"), b"").unwrap();
+        let live = |exe: &str| Live {
+            agent_exe: root.join(exe),
+            full_disk_access: None,
+        };
+        assert_eq!(live("bin/aterm").running_app(), Some(app.clone()));
+        assert_eq!(
+            live("Applications/aterm.app/Contents/MacOS/aterm").running_app(),
+            Some(app)
+        );
+        assert_eq!(live("bin/built").running_app(), None, "a build is no app");
+        assert_eq!(live("bin/gone").running_app(), None);
     }
 }

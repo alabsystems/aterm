@@ -2179,6 +2179,34 @@ fn the_message_that_opened_the_turn_is_read_under_its_rule() {
     assert_eq!(ClaudeReader.turn_opened_by(&rows), None);
 }
 
+/// THE LOGIN agy's LAUNCH CARD NAMES ([`launch_card_login`]): `Gemini API
+/// key` as measured, a signed-in account's row whole (email and plan), each
+/// at every screen that still draws the card (the 429's end of a turn
+/// included). NEGATIVE CONTROLS: the card's model row is no login; a screen
+/// with no card (another program's) names none.
+#[test]
+fn the_launch_card_names_its_login() {
+    let idle = screen(lab::IDLE);
+    assert_eq!(launch_card_login(&idle), Some("Gemini API key"));
+    assert_eq!(
+        launch_card_login(&screen(lab::ERROR_429)),
+        Some("Gemini API key")
+    );
+    let signed: Vec<String> = idle
+        .iter()
+        .map(|r| r.replacen("Gemini API key", "user@example.com (Google AI Pro)", 1))
+        .collect();
+    assert_eq!(
+        launch_card_login(&signed),
+        Some("user@example.com (Google AI Pro)")
+    );
+    assert_ne!(launch_card_login(&idle), Some("Gemini 3.1 Pro (Low)"));
+    assert_eq!(
+        launch_card_login(&screen(crate::gemini::fixtures::IDLE)),
+        None
+    );
+}
+
 /// Styled message row indices (`5c5cff` bold at col 0) for `PERSON_PARAGRAPHS_LONG_REPLY`.
 const LONG_REPLY_MESSAGE_ROWS: [usize; 3] = [30, 31, 32];
 

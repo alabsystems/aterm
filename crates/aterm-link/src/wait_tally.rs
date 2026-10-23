@@ -139,13 +139,13 @@ impl Row {
 
     /// Its place in the line.
     #[must_use]
-    pub fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         self as usize
     }
 
     /// Its name in the line.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Row::Request => "request",
             Row::Ack => "ack",
@@ -177,7 +177,7 @@ impl Row {
 
     /// What its values measure.
     #[must_use]
-    pub fn unit(self) -> Unit {
+    pub const fn unit(self) -> Unit {
         match self {
             Row::DrainPosts => Unit::Count,
             _ => Unit::Ns,
@@ -186,7 +186,7 @@ impl Row {
 
     /// Whether the row is one of the disjoint spans that partition the loop's time.
     #[must_use]
-    pub fn partitions(self) -> bool {
+    pub const fn partitions(self) -> bool {
         matches!(
             self,
             Row::Request
@@ -207,7 +207,7 @@ impl Row {
 
     /// The row the state dir keeps ([`Kept`]).
     #[must_use]
-    pub fn kept_by_the_dir(self) -> bool {
+    pub const fn kept_by_the_dir(self) -> bool {
         matches!(
             self,
             Row::DirReplace
@@ -363,7 +363,7 @@ fn row_text(row: Row, h: &Hist) -> Vec<u8> {
 }
 
 /// A row's text's length: its name's, and 214.
-fn row_len(row: Row) -> usize {
+const fn row_len(row: Row) -> usize {
     1 + row.name().len() + 1 + 3 * 17 + BUCKETS * 9 - 1
 }
 
@@ -439,13 +439,13 @@ fn checksum(body: &[u8]) -> u64 {
 impl Tally {
     /// One row.
     #[must_use]
-    pub fn row(&self, r: Row) -> &Hist {
+    pub const fn row(&self, r: Row) -> &Hist {
         &self.rows[r.index()]
     }
 
     /// Every wait on the broker, requests and acks.
     #[must_use]
-    pub fn blocked_ns(&self) -> u64 {
+    pub const fn blocked_ns(&self) -> u64 {
         self.row(Row::Request)
             .total
             .saturating_add(self.row(Row::Ack).total)
@@ -769,7 +769,7 @@ impl Recorder {
     }
 
     /// Whether anything is counted.
-    pub(crate) fn on(&self) -> bool {
+    pub(crate) const fn on(&self) -> bool {
         self.out.is_some()
     }
 

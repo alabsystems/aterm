@@ -947,8 +947,7 @@ fn adopting_a_full_source_release_would_publish_it_before_any_proof() {
     }
 }
 
-/// The live adopt path reads the flag as `gh api … --jq '.prerelease | tostring'`, and
-/// only an exact `true`/`false` is a flag: nothing garbled reads as an answer.
+/// The live adopt path reads the flag as `jq`'s `.prerelease | tostring` spells it: only an exact `true`/`false` is a flag.
 #[test]
 fn the_prerelease_flag_parses_exactly() {
     assert_eq!(publish::parse_prerelease_flag("true\n"), Ok(true));
@@ -1121,24 +1120,12 @@ fn a_non_app_release_holding_latest_is_taken_over() {
     assert_eq!(github.latest, Some(id));
 }
 
-/// The live PATCH's argv, byte for byte: `-F` for the two JSON booleans, `-f` for
-/// `make_latest`, which GitHub types as a string enum.
+/// The live PATCH's JSON body, byte for byte: two JSON booleans and the string `make_latest`.
 #[test]
 fn the_live_head_patch_sends_exactly_the_table() {
     assert_eq!(
-        channel::head_patch_argv("repos/alabsystems/aterm/releases/7"),
-        [
-            "api",
-            "--method",
-            "PATCH",
-            "repos/alabsystems/aterm/releases/7",
-            "-F",
-            "draft=false",
-            "-F",
-            "prerelease=false",
-            "-f",
-            "make_latest=true",
-        ]
+        channel::head_patch_body().to_string(),
+        r#"{"draft":false,"make_latest":"true","prerelease":false}"#
     );
 }
 

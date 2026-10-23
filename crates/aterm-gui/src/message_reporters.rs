@@ -4711,27 +4711,46 @@ pub(crate) fn resume_exceptions(
     for (kind, group) in kinds {
         let (_, first, _, first_spot) = group[0];
         let n = group.len();
-        let head = match kind {
-            ExceptionKind::Spend => "Account limit stops Claude",
-            ExceptionKind::Bucket => "Model limit stops Claude",
-            ExceptionKind::GoalCleared => "Claude lost its goal",
-            ExceptionKind::Futile => "Limit still holds Claude",
+        let who = resume_limit_agent(&group);
+        let (named, bare) = match kind {
+            ExceptionKind::Spend => (
+                who.map(|w| format!("Account limit stops {w}")),
+                "Account limit reached",
+            ),
+            ExceptionKind::Bucket => (
+                who.map(|w| format!("Model limit stops {w}")),
+                "Model limit reached",
+            ),
+            // `/goal` is Claude Code's alone.
+            ExceptionKind::GoalCleared => (None, "Claude lost its goal"),
+            ExceptionKind::Futile => (
+                who.map(|w| format!("Limit still holds {w}")),
+                "Limit still holds",
+            ),
             ExceptionKind::Login
             | ExceptionKind::Stalled
             | ExceptionKind::Dialog
             | ExceptionKind::Context
             | ExceptionKind::Refused => continue,
         };
-        let what = if n == 1 {
-            fitted_title(head, &first_spot.place)
-        } else {
-            let many = format!("{head} in {n} tabs");
-            if aterm_messages::text::glass_title_fault(&many).is_none() {
-                many
+        // The place first, the agent's name next: a title over the glass's
+        // six words drops the name before it drops where.
+        let placed = |head: &str| {
+            if n == 1 {
+                placed_title(head, &first_spot.place, "")
             } else {
-                head.to_string()
+                format!("{head} in {n} tabs")
             }
         };
+        let fits = |t: &String| aterm_messages::text::glass_title_fault(t).is_none();
+        let what = named
+            .iter()
+            .map(String::as_str)
+            .chain([bare])
+            .map(placed)
+            .find(fits)
+            .or_else(|| named.clone().filter(fits))
+            .unwrap_or_else(|| bare.to_string());
         let mut entry = Entry::new(
             Family::Resume,
             "",
@@ -4879,6 +4898,19 @@ fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
         | aterm_phase::Program::Muse
         | aterm_phase::Program::Gemini => agent.product(),
     }
+}
+
+/// The agent a limit's line of the digest names after its verb (`Limit still
+/// holds <who>`), for the tabs `group` holds: the agent every one of them
+/// runs, as [`resume_agent_word`] names it, and `None` where they run
+/// different ones or a program no reader names.
+fn resume_limit_agent(
+    group: &[&(String, Exception, aterm_phase::Program, UpgradeSpot)],
+) -> Option<&'static str> {
+    let mut agents = group.iter().map(|(_, _, agent, _)| *agent);
+    let first = agents.next()?;
+    (first != aterm_phase::Program::Generic && agents.all(|a| a == first))
+        .then(|| resume_agent_word(first))
 }
 
 fn stall_record_key(sid: &str) -> String {

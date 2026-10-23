@@ -378,7 +378,7 @@ mod content {
     }
 
     impl<'de> TagOrContentVisitor<'de> {
-        fn new(name: &'static str) -> Self {
+        const fn new(name: &'static str) -> Self {
             TagOrContentVisitor {
                 name,
                 value: PhantomData,
@@ -666,7 +666,7 @@ mod content {
 
     impl<T> TaggedContentVisitor<T> {
         /// Visitor for the content of an internally tagged enum with the given tag name.
-        pub fn new(name: &'static str, expecting: &'static str) -> Self {
+        pub const fn new(name: &'static str, expecting: &'static str) -> Self {
             TaggedContentVisitor {
                 tag_name: name,
                 expecting,
@@ -1161,7 +1161,7 @@ mod content {
 
     impl<'de, E> ContentDeserializer<'de, E> {
         /// private API, don't use.
-        pub fn new(content: Content<'de>) -> Self {
+        pub const fn new(content: Content<'de>) -> Self {
             ContentDeserializer {
                 content,
                 err: PhantomData,
@@ -1536,7 +1536,10 @@ mod content {
     where
         E: de::Error,
     {
-        pub fn new(variant: Content<'de>, value: Option<Content<'de>>) -> EnumDeserializer<'de, E> {
+        pub const fn new(
+            variant: Content<'de>,
+            value: Option<Content<'de>>,
+        ) -> EnumDeserializer<'de, E> {
             EnumDeserializer {
                 variant,
                 value,
@@ -2078,7 +2081,7 @@ mod content {
 
     impl<'a, 'de, E> ContentRefDeserializer<'a, 'de, E> {
         /// private API, don't use.
-        pub fn new(content: &'a Content<'de>) -> Self {
+        pub const fn new(content: &'a Content<'de>) -> Self {
             ContentRefDeserializer {
                 content,
                 err: PhantomData,
@@ -2580,14 +2583,14 @@ mod content {
     }
 
     /// The deserializer for a buffered map key.
-    pub(super) fn key_deserializer<'de, E>(
+    pub(super) const fn key_deserializer<'de, E>(
         key: Content<'de>,
     ) -> de::value::TextKeyDeserializer<ContentDeserializer<'de, E>> {
         de::value::TextKeyDeserializer::new(ContentDeserializer::new(key))
     }
 
     /// [`key_deserializer`] over a borrowed buffer.
-    pub(super) fn key_ref_deserializer<'a, 'de, E>(
+    pub(super) const fn key_ref_deserializer<'a, 'de, E>(
         key: &'a Content<'de>,
     ) -> de::value::TextKeyDeserializer<ContentRefDeserializer<'a, 'de, E>> {
         de::value::TextKeyDeserializer::new(ContentRefDeserializer::new(key))
@@ -2601,7 +2604,7 @@ mod content {
 
     impl<'a> InternallyTaggedUnitVisitor<'a> {
         /// Not public API.
-        pub fn new(type_name: &'a str, variant_name: &'a str) -> Self {
+        pub const fn new(type_name: &'a str, variant_name: &'a str) -> Self {
             InternallyTaggedUnitVisitor {
                 type_name,
                 variant_name,
@@ -2645,7 +2648,7 @@ mod content {
 
     impl<'a> UntaggedUnitVisitor<'a> {
         /// Not public API.
-        pub fn new(type_name: &'a str, variant_name: &'a str) -> Self {
+        pub const fn new(type_name: &'a str, variant_name: &'a str) -> Self {
             UntaggedUnitVisitor {
                 type_name,
                 variant_name,

@@ -114,6 +114,17 @@ pub(super) fn numeric_macos_version(version: &str) -> bool {
         })
 }
 
+/// A cask artifact source as brew loads it from the API: `$APPDIR/` is the
+/// appdir, `/Applications/` by default, so `/Applications/WezTerm.app/…` names
+/// a file of the app wezterm installs there, wherever its payload keeps it
+/// (`cask::payload_source` resolves that), and `info` shows what brew shows.
+fn appdir_source(source: &str) -> String {
+    match source.strip_prefix("$APPDIR/") {
+        Some(rest) => format!("/Applications/{rest}"),
+        None => source.to_owned(),
+    }
+}
+
 /// The supported Generic destination mapping without a concrete prefix. Shared
 /// by dual-target admission and the actual cask destination producer.
 pub(super) fn generic_target_relative(
@@ -224,8 +235,9 @@ pub enum Requirement {
     MacosMax(String),
     /// `depends_on arch: :arm64` / `:x86_64`.
     Arch(String),
-    /// `depends_on xcode:` with an optional numeric floor, probed
-    /// with `xcodebuild -version` at preflight like brew probes it.
+    /// `depends_on xcode:` with an optional numeric floor, probed at
+    /// preflight from the selected Xcode's version plist (no
+    /// `xcodebuild` run).
     XcodeMin(Option<String>),
 }
 
@@ -528,8 +540,9 @@ pub struct Variation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Artifact {
-    /// Source path inside the payload and the installed name the cask's
-    /// `target:` rename asks for, when it names a plain file name.
+    /// Source path as brew spells it (payload-relative, or where brew
+    /// installed it: `cask::payload_source`) and the installed name the
+    /// cask's `target:` rename asks for, when it names a plain file name.
     App(String, Option<String>),
     Binary(String, Option<String>),
     Font(String, Option<String>),
@@ -736,8 +749,8 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                                     }
                                 }
                             }
-                            let exe = opts.get("executable").and_then(Value::as_str)?;
-                            let exe = exe.strip_prefix("$APPDIR/").unwrap_or(exe);
+                            let exe =
+                                appdir_source(opts.get("executable").and_then(Value::as_str)?);
                             let args = match opts.get("args") {
                                 None => Vec::new(),
                                 Some(Value::Array(items)) => {
@@ -760,7 +773,7 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                                 Some(_) => return None,
                                 None => None,
                             };
-                            Some(Artifact::Wrapper(name.clone(), exe.to_string(), args, dest))
+                            Some(Artifact::Wrapper(name.clone(), exe, args, dest))
                         })();
                         artifacts.push(parsed.unwrap_or_else(|| {
                             Artifact::Other(
@@ -818,9 +831,7 @@ fn parse_artifacts(v: Option<&Value>) -> Vec<Artifact> {
                         )));
                         continue;
                     };
-                    // $APPDIR names the staged .app of the same cask;
-                    // in the payload it is simply payload-relative.
-                    let first = first.strip_prefix("$APPDIR/").unwrap_or(first).to_owned();
+                    let first = appdir_source(first);
                     if matches!(inline_dest, Some(None))
                         || matches!((&dest_name, &inline_dest), (Some(Some(a)), Some(Some(b))) if a != b)
                     {
@@ -1413,7 +1424,7 @@ mod tests {
         assert_eq!(
             cask.artifacts,
             [Artifact::Binary(
-                "Demo.app/Contents/MacOS/demo".into(),
+                "/Applications/Demo.app/Contents/MacOS/demo".into(),
                 Some("demo".into())
             )]
         );
@@ -1476,7 +1487,7 @@ mod tests {
             Cask::from_api(&wrapper).unwrap().artifacts,
             [Artifact::Wrapper(
                 "demo".into(),
-                "Demo.app/Contents/MacOS/demo".into(),
+                "/Applications/Demo.app/Contents/MacOS/demo".into(),
                 vec!["--fixed".to_string()],
                 Some("demo".into())
             )]

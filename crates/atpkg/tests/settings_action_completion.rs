@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Process-level regression for the two native Settings Packages actions.
-//!
-//! The GUI waits for the co-located atpkg child before clearing its busy state.
-//! Plant writerless FIFOs at the action-reachable config, floor, and offline
-//! registry manifest paths, then prove both real child verbs terminate under a
-//! deadline. Unit tests cover the other local metadata seams independently.
 
 #![cfg(unix)]
 #![allow(
@@ -25,8 +20,8 @@ fn make_fifo(path: &Path) {
         std::fs::create_dir_all(parent).unwrap();
     }
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-    // SAFETY: `path` is a live NUL-terminated pathname in this test's private
-    // fixture, and `mkfifo` retains no pointer.
+    // SAFETY: `path` is a live NUL-terminated pathname in this test's private fixture, and `mkfifo`
+    // retains no pointer.
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
 }
 
@@ -40,9 +35,6 @@ fn run_with_deadline(
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)
-        // No root-key env var: the anchor is the compiled-in paper-master keyset
-        // (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS` via `atpkg::PKG_TRUST_ANCHORS`)
-        // and nothing ambient can supply or swap it.
         .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -84,25 +76,14 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&registry).unwrap();
 
-    // Both actions consume this same config through config::cached().
     make_fifo(&config_home.join("aterm/aterm.toml"));
 
-    // Check & Update short-circuits cleanly on an empty store after the config
-    // admission returns defaults; it must not wait for a FIFO writer.
-    //
-    // THE PROPERTY UNDER TEST IS TERMINATION, not the exit code: the GUI clears its busy
-    // state on the child exiting, and a hang is what strands Settings.
-    // `run_with_deadline` panics if it does not exit, so reaching this line IS the
-    // assertion; a specific code would only pin whether the fleet happens to be armed.
     let update = run_with_deadline(&home, &config_home, &registry, &["update"]);
     assert!(
         update.code().is_some(),
         "the child exited on its own rather than being signalled"
     );
 
-    // Install ALab Toolset reaches the floor and dir-registry index. Both are
-    // FIFOs here; the child should reject them and exit nonzero, never remain
-    // alive and strand Settings in its busy state.
     let prefix = home
         .join("Library")
         .join("Application Support")
@@ -158,14 +139,6 @@ fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) 
 }
 
 /// A FLAG IS NEVER A PROGRAM NAME — and, above all, never a DURABLE one.
-///
-/// Replays a recorded bug: `atpkg install --help` resolved `"--help"` against the signed
-/// index and wrote `[programs.--help]` into `status.toml`, where nothing removed it, so
-/// `atpkg doctor` reported a healthy toolset as incomplete forever; `atpkg uninstall
-/// --version` cleared adoption and exited 0.
-///
-/// The durable half is what this test really pins: an exit code is a moment; a poisoned
-/// record is forever, and `doctor` reads it back.
 #[test]
 fn subverb_flags_never_become_program_names() {
     let tmp = scratch("flag-guard");
@@ -181,7 +154,6 @@ fn subverb_flags_never_become_program_names() {
         .to_path_buf();
     let record = || std::fs::read_to_string(&status_toml).unwrap_or_default();
 
-    // A flag right after a name-taking verb is someone asking how the verb works.
     for verb in [
         "install",
         "update",
@@ -197,10 +169,6 @@ fn subverb_flags_never_become_program_names() {
         );
     }
 
-    // An unrecognized flag is refused as a flag — never resolved as a program.
-    //
-    // Asserts the PROPERTY, not one wording: the refusal NAMES the spelling it rejected
-    // and the verb it rejected it for; the sentence around them is free to change.
     for verb in ["install", "update", "uninstall"] {
         let (code, err) = run_capture(&home, &config_home, &registry, &[verb, "--nonsense"]);
         assert_eq!(code, 2, "atpkg {verb} --nonsense exits 2");
@@ -214,7 +182,6 @@ fn subverb_flags_never_become_program_names() {
         );
     }
 
-    // THE DURABLE ASSERTION: none of the above left a program row behind.
     let recorded = record();
     for ghost in ["--help", "--nonsense", "--version"] {
         assert!(
@@ -223,8 +190,6 @@ fn subverb_flags_never_become_program_names() {
         );
     }
 
-    // NON-REGRESSION. These two are real operands that merely look like flags: they name a
-    // SET where a program name would go, and the guard must let them through.
     for legit in [["install", "--default-set"], ["uninstall", "--all"]] {
         let (_, err) = run_capture(&home, &config_home, &registry, &legit);
         assert!(

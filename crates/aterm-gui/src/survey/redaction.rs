@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Secret-shape detection for the survey's excerpts, the text that leaves the
-//! session ([`super::redact`]): assignment keys, structured labels, URL
-//! userinfo, and raw credential/JWT shapes. Kept from the retired Smart
-//! Titles' privacy boundary (`title_summary::redaction`, 64b1d6833), whose
-//! context lines it guarded the same way; its endpoint checks went with it.
+//! Secret-shape detection for the survey's excerpts, the text that leaves the session
+//! ([`super::redact`]): assignment keys, structured labels, URL userinfo, and raw credential/JWT
+//! shapes.
 
 /// A line longer than this is withheld whole rather than scanned (Smart
 /// Titles' context cap, 12 KiB): the work stays bounded, and no credential
@@ -14,18 +12,9 @@ const MAX_SENSITIVE_SCAN_BYTES: usize = 12 * 1024;
 const MAX_SENSITIVE_FIELDS: usize = 64;
 const MAX_SENSITIVE_LABEL_BYTES: usize = 128;
 
-/// Best-effort privacy boundary for an excerpt that leaves the session, after
-/// [`super::redact`]'s word pass: a sensitive marker, a sensitive assignment
-/// key, URL userinfo, or more than can be scanned. The token-shape rule —
-/// each token split at [`is_token_break`] and judged by
-/// [`looks_like_raw_credential`] — is that word pass, which replaces a token
-/// instead of the line and judges a path a segment at a time, so it is not
-/// run over the line again.
-///
-/// This recognizes common credential shapes and structured labels, but no lexical
-/// heuristic can guarantee semantic secret classification. Oversized or excessively
-/// structured input is therefore rejected conservatively so work stays bounded and a
-/// hostile line cannot move a credential beyond the inspected region.
+/// Best-effort privacy boundary for an excerpt that leaves the session, after [`super::redact`]'s
+/// word pass: a sensitive marker, a sensitive assignment key, URL userinfo, or more than can be
+/// scanned.
 pub(super) fn contains_sensitive_phrase(text: &str) -> bool {
     text.len() > MAX_SENSITIVE_SCAN_BYTES
         || has_sensitive_marker(text)
@@ -38,7 +27,6 @@ fn has_sensitive_assignment_key(text: &str) -> bool {
     for (separator, _) in text.match_indices(['=', ':']) {
         fields = fields.saturating_add(1);
         if fields > MAX_SENSITIVE_FIELDS {
-            // Fail closed rather than let an attacker hide a key after the work cap.
             return true;
         }
         if has_structured_sensitive_label(&text[..separator]) {
@@ -74,9 +62,6 @@ fn has_structured_sensitive_label(prefix: &str) -> bool {
         return true;
     }
 
-    // YAML permits unquoted multi-word keys (`private key: value`). Only extend a
-    // bare `key` by one identifier so unrelated prose before an assignment does not
-    // become part of the label.
     if label.eq_ignore_ascii_case("key")
         && let Some((modifier, _, modifier_overlong)) = trailing_identifier(&prefix[..start])
     {
@@ -243,10 +228,8 @@ fn contains_ascii_word_pair(text: &str, first: &str, second: &str) -> bool {
 }
 
 /// Where the token-shape rule splits a line into the tokens it judges with
-/// [`looks_like_raw_credential`]: whitespace, quotes and the punctuation that
-/// wraps a value in prose or structured text. An excerpt is natural-language
-/// prose, so a token-shaped high-entropy string is taken for a credential even
-/// without a key.
+/// [`looks_like_raw_credential`]: whitespace, quotes and the punctuation that wraps a value in
+/// prose or structured text.
 pub(super) fn is_token_break(ch: char) -> bool {
     ch.is_whitespace()
         || matches!(
@@ -255,9 +238,7 @@ pub(super) fn is_token_break(ch: char) -> bool {
         )
 }
 
-/// Conservative credential-shape detector for one word. It deliberately
-/// recognizes common fixed prefixes, compact JWTs, exact SHA/token hex, and long
-/// lowercase+digit, uppercase+digit and mixed-case opaque tokens.
+/// Conservative credential-shape detector for one word.
 pub(super) fn looks_like_raw_credential(value: &str) -> bool {
     let value = value.trim().trim_matches(|ch: char| {
         !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-' | '.' | '+' | '/' | '=')
@@ -351,14 +332,6 @@ fn looks_like_compact_jwt(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    //! The corpora of the retired Smart Titles' privacy tests
-    //! (`title_summary.rs`'s `likely_secret_lines_are_removed_before_prompting`
-    //! and `structured_secret_labels_are_identifier_aware_and_bounded`), kept
-    //! on the predicates here and asserted through the survey's own
-    //! [`redact`] — the path every excerpt takes — so a change to its word
-    //! pass that lets a corpus credential through fails here; the asserts on
-    //! what went with Smart Titles (its context lines, prompt and provider
-    //! checks) went with it.
 
     use super::super::redact;
     use super::*;
@@ -411,7 +384,6 @@ mod tests {
         ] {
             assert!(looks_like_raw_credential(credential), "missed {credential}");
             assert!(redacted(credential), "did not redact {credential}");
-            // At a sentence's end, in a path, and quoted: never out whole.
             for line in [
                 format!("pushed with {credential}."),
                 format!("cat /tmp/{credential}/env"),
@@ -488,7 +460,6 @@ mod tests {
             assert!(!redacted(benign), "privacy false positive in {benign}");
         }
 
-        // Past the bounds a line is withheld whole, its content unread.
         let oversized = "keyboard ".repeat(MAX_SENSITIVE_SCAN_BYTES / 2);
         assert!(oversized.len() > MAX_SENSITIVE_SCAN_BYTES);
         assert!(redacted(&oversized));

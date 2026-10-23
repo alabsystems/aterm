@@ -724,6 +724,8 @@ pub(crate) fn type_launch_line(
             entering_command: true,
             ..InputFence::default()
         },
+        // Inert: a fence that reads no row never waits, whichever thread is named.
+        crate::ReadOn::EventLoop,
         None,
     );
     match result {

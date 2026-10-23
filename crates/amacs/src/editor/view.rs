@@ -41,12 +41,12 @@ impl Selection {
         self.anchor == self.head
     }
 
-    pub(super) fn collapse(&mut self, position: usize) {
+    pub(super) const fn collapse(&mut self, position: usize) {
         self.anchor = position;
         self.head = position;
     }
 
-    pub(super) fn move_head(&mut self, position: usize, preserve_anchor: bool) {
+    pub(super) const fn move_head(&mut self, position: usize, preserve_anchor: bool) {
         if preserve_anchor {
             self.head = position;
         } else {
@@ -120,14 +120,14 @@ impl EditorBufferView {
     }
 
     /// Find may start or repeat a search without interrupting another prompt.
-    pub fn can_start_search(&self) -> bool {
+    pub const fn can_start_search(&self) -> bool {
         matches!(
             self.minibuffer,
             Minibuffer::Inactive | Minibuffer::Search { .. }
         )
     }
 
-    pub fn has_search_query(&self) -> bool {
+    pub const fn has_search_query(&self) -> bool {
         match &self.minibuffer {
             Minibuffer::Search { query, .. } => {
                 !query.is_empty() || !self.last_search_query.is_empty()
@@ -264,7 +264,7 @@ impl EditorBufferView {
         self.last_command = None;
     }
 
-    pub fn minibuffer_active(&self) -> bool {
+    pub const fn minibuffer_active(&self) -> bool {
         matches!(
             self.minibuffer,
             Minibuffer::Command { .. }
@@ -315,7 +315,7 @@ impl EditorBufferView {
         self.viewport_anchor = lines.byte_of(anchor);
     }
 
-    pub fn chord_pending(&self) -> bool {
+    pub const fn chord_pending(&self) -> bool {
         !self.chord_prefix.is_empty()
     }
 

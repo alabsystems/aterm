@@ -38,6 +38,9 @@ aterm-secrets = { workspace = true }
 aterm-converge = { workspace = true }
 # The native initial repository inventory uses agh's routed credential and HTTP doors.
 agh = { workspace = true }
+# GitHub's REST pagination (`github_pages`), which init's repository inventory and the
+# controller's key listing share with the publishers' REST lane (init-system S15).
+aterm-update-core = { workspace = true }
 # The machines controller's SSH-key writes as its machine user (port/github_rest.rs): agh M1
 # sends only GET and HEAD, so they go over aterm-http, as agh's own transport does.
 aterm-http = { workspace = true }

@@ -353,6 +353,27 @@ fn a_box_taller_than_the_pane_is_pressed_whole_only_where_its_head_reads() {
     }
 }
 
+/// A SEARCH OF AN UNFINISHED FRAME LEFT NOTHING OUT: `frame=open` in the header (the
+/// program's DEC 2026 frame was unfinished at the search) is no completeness cause, so the
+/// head is joined and pressed as it is under a bare header; the screen re-read unmoved still
+/// fences the press. With or without ` incomplete older` before it.
+#[test]
+fn a_search_of_an_unfinished_frame_still_joins_the_head() {
+    for qualifier in [" frame=open", " incomplete older frame=open"] {
+        let (mut m, opts) = breaker_host(8);
+        m.search_qualifier = qualifier;
+        let mut s = session(&mut m, None);
+        let r = s.supervise(&opts);
+        drop(s);
+        assert_eq!(
+            m.presses().len(),
+            1,
+            "{qualifier}: {r:?}: {:#?}",
+            m.requests
+        );
+    }
+}
+
 /// A CUT THE JOIN DOES NOT TAKE READS NO HISTORY and is held as the cut is: a
 /// question (its answer's keys re-read the dialog off the screen, and the
 /// policy's memory of it is the screen's).

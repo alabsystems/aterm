@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CORPUS'S SCREENS (plan 5B-2): every `see <word> [<detail>]
-//! fixture=<name>` line of aterm-slog's `.seq` replay corpus
-//! (`crates/aterm-slog/tests/sequences`, read from the directory: a file
-//! added there is checked here) names a screen of `aterm-phase`'s fixtures
-//! (main's set) that presence's one adapter ([`agent_verdict`], the mapping
-//! the sweep publishes) reads, under the file's `program=`, to exactly the
-//! line's word and detail (one token, as the replay reads it: a
-//! corpus detail is a `ShortId`). So the verdicts a `.seq` replays through the
-//! session log are ones a real screen gives.
-//!
-//! NEGATIVE CONTROLS: a line with another word, another detail, a detail
-//! dropped, or another program each fail.
+//! Verifies that every `see <word> [<detail>] fixture=<name>` line in
+//! `aterm-slog`'s `.seq` corpus matches [`agent_verdict`] on the named
+//! `aterm-phase` fixture.
 
 use super::*;
 

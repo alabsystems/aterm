@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Unit tests that a blocking verb gives its lane back when its caller hangs up: the verbs'
-//! hangup checks, and the lanes (`control_lanes.rs`) marking which caller a verb serves.
-//! The end-to-end half is `crates/aterm/tests/control_lanes_live_headless.rs`.
+//! Unit tests that blocking control verbs release their lane when the caller hangs up.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -41,12 +39,6 @@ fn await_while_serving(
 
 /// Wait for `seen` (the lane's view of its caller's hangup) with a hang detector
 /// ([`aterm_spec::wait::MUST_HAPPEN`]), never a latency budget.
-///
-/// A dropped caller reads as hung up (`POLLHUP` on the lane's write-side probe,
-/// `aterm_uds::hangup`) only once its socket's last descriptor closes, and sibling tests'
-/// forks hold copies until they exec: macOS does not honor `FD_CLOFORK`, and std marks a
-/// socketpair close-on-exec only after creating it. A `shutdown` cannot stand in, since a
-/// half-close must never read as a hangup, so these tests wait for the hangup.
 #[track_caller]
 fn until_seen(what: &str, mut seen: impl FnMut() -> bool) {
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || seen().then_some(()));
@@ -120,8 +112,6 @@ fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thre
         if main_hop_refused_for_hangup() {
             return false;
         }
-        // The caller dies once its text is in the composer; the turn goes on once its
-        // lane has seen that ([`until_seen`]).
         drop(client.lock().expect("client slot").take());
         until_seen("the hangup to become visible to the lane", caller_hung_up);
         true
@@ -155,7 +145,6 @@ fn a_turn_whose_caller_hangs_up_after_typing_still_submits_through_the_main_thre
         !reply.starts_with("ERR"),
         "the turn ran to its verdict: {reply}"
     );
-    // The commitment ends with the turn: the next hop on this lane is refused.
     assert!(
         main_hop_refused_for_hangup(),
         "a hop after the turn is refused for the hangup"
@@ -276,15 +265,11 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
             .last()
             .map(|r| (r.text.to_string(), r.submitted, r.status))
     };
-    // The target echoes the text, and the Enter runs it: the press moves the
-    // screen, so the submit verifies (`submitted=1`) and the settle runs.
     let paste = |text: &str| {
         handle.term.lock().expect("term").process(text.as_bytes());
         true
     };
 
-    // The caller dies with its Enter; the settle (5 s of idle asked) sees it once the lane
-    // has ([`until_seen`]).
     let (client, server) = CtlStream::pair().expect("socket pair");
     let client = Mutex::new(Some(client));
     let press = |key: &str| {
@@ -318,7 +303,6 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
         "the submitted turn must be in the ledger"
     );
 
-    // Negative control: with its caller still there the same turn settles.
     let (_client, server) = CtlStream::pair().expect("socket pair");
     let press = |_: &str| {
         handle.term.lock().expect("term").process(b"\r\nran\r\n");
@@ -354,10 +338,6 @@ fn a_turn_whose_caller_hangs_up_after_its_submit_is_still_recorded() {
 /// only a seen hangup answers within the test's hang detector. Off a serving
 /// lane the writer's own answers are what they say: its receipt is the write's,
 /// and a write dropped unrun wrote nothing.
-///
-/// Negative control: a caller that only half-closed is still there, so the same
-/// wait, bounded just past one [`HANGUP_POLL`] slice, asks after it and runs to
-/// its bound: `Queued`.
 #[test]
 fn a_write_waited_on_gives_its_lane_back_when_its_caller_hangs_up() {
     use super::{Waited, await_written};
@@ -471,7 +451,6 @@ impl LaneService for ParkingService {
     ) -> Option<ServeDisposition> {
         let line = request.line();
         let reply = if line == "park" {
-            // Past the test's hang detector: only a seen hangup releases it.
             let deadline = Instant::now() + Duration::from_secs(600);
             loop {
                 let hung_up = caller_hung_up();
@@ -528,8 +507,6 @@ fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
     assert!(lanes.admit(server).is_ok(), "the connection is admitted");
     client.write_all(b"AUTH ok\npark\n").expect("send the wait");
 
-    // Parked, with the caller alive: the wait's hangup check has run, and
-    // every answer it gave says the caller is there.
     until_seen("the parked wait to ask after its caller", || {
         !service.checks().is_empty()
     });
@@ -538,7 +515,6 @@ fn a_wait_lane_is_given_back_when_its_caller_hangs_up() {
         "a wait whose caller is still there saw a hangup: {:?}",
         service.checks()
     );
-    // It is inside the wait (the check ran), so where it runs is settled.
     let census = lanes.census();
     assert_eq!(
         (census.waits, census.wait_threads),
@@ -580,7 +556,6 @@ fn a_main_thread_request_whose_caller_hung_up_is_refused_before_it_is_posted() {
         "a half-closed caller still reads its reply"
     );
     drop(client);
-    // The refusal sees the hangup once its lane does ([`until_seen`]).
     until_seen(
         "a closed caller's request to be refused before it is posted",
         || main_thread_refusal() == hung_up,

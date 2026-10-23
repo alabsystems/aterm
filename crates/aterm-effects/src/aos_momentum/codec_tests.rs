@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The task ABI's encodings and artifacts: every input round-trips at its extremes, every
-//! byte string no encoder writes is refused naming its field (an unknown tag, a truncation,
-//! a trailing byte, a bool or option tag of 2, a non-canonical duration, a snapshot that is
-//! not canonical or not reachable), every reachable state round-trips byte for byte, distinct
-//! observations encode distinctly, the artifacts carry their kinds and bind what they
-//! declare (the build id, the demonstration note), and the paused classes are as designed.
+//! The task ABI's encodings and artifacts.
 
 use std::time::Duration;
 
@@ -254,8 +249,6 @@ fn a_bool_or_option_byte_no_encoding_writes_is_refused_naming_its_field() {
             Err(WireFault::BadTag { field, tag: 2 })
         );
     }
-    // The option tags: `cur` directly after the input tag; the glyph span last but its
-    // eight bytes.
     let mut bad = base.clone();
     bad[1] = 2;
     assert_eq!(
@@ -367,7 +360,6 @@ fn a_state_that_is_not_canonical_or_not_reachable_is_refused_naming_its_field() 
             field: "state.snapshot.schema"
         })
     );
-    // The rate's offset tag follows the schema (2 bytes) and the rate value (4 bytes).
     let mut bad_tag = good.clone();
     assert_eq!(bad_tag[6], 1, "fixture: the rate is stamped");
     bad_tag[6] = 2;

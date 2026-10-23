@@ -77,14 +77,14 @@ pub fn set_console_host(_choice: ConsoleHostChoice) {}
 /// Unix-seam parity for the Windows backend's `take_console_host_fallback`: nothing falls back where there is no console host.
 #[cfg(unix)]
 #[must_use]
-pub fn take_console_host_fallback() -> Option<String> {
+pub const fn take_console_host_fallback() -> Option<String> {
     None
 }
 
 /// Unix-seam parity for the Windows backend's `conpty_host`: no session runs in a console host off Windows.
 #[cfg(unix)]
 #[must_use]
-pub fn conpty_host(_master: i32) -> Option<ConsoleHostKind> {
+pub const fn conpty_host(_master: i32) -> Option<ConsoleHostKind> {
     None
 }
 

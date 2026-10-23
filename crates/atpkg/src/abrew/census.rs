@@ -357,8 +357,8 @@ mod tests {
     /// needs `openssl`), a disabled formula, one asking for a newer macOS
     /// than the machine runs, relocating `libgit`, and relocation-free
     /// `client`, which needs both relocating formulae; a zip cask, a dmg
-    /// cask, a pkg cask, and a zip cask that depends on the relocating
-    /// formula.
+    /// cask, a pkg cask, a zip cask that depends on the relocating formula,
+    /// and a zip cask that needs macOS 14 or newer.
     fn fixture() -> (Vec<u8>, Vec<u8>) {
         let formulae = vec![
             formula("zlib-ng", ":any_skip_relocation", &[]),
@@ -391,6 +391,11 @@ mod tests {
                 "depends_on",
                 aterm_json::json!({"formula": ["openssl"]}),
             ),
+            with(
+                cask("floored", "Floored.zip"),
+                "depends_on",
+                aterm_json::json!({"macos": {">=": ["14"]}}),
+            ),
         ];
         (bytes(formulae), bytes(casks))
     }
@@ -403,7 +408,7 @@ mod tests {
     fn the_census_counts_what_admission_decides() {
         let (formulae, casks) = fixture();
         let census = measure(&formulae, &casks, &tahoe()).unwrap();
-        assert_eq!((census.formulae, census.casks), (8, 4));
+        assert_eq!((census.formulae, census.casks), (8, 5));
         assert_eq!(
             census.solo.admitted,
             ["zlib-ng", "tool", "curl-ish", "client"]
@@ -437,7 +442,7 @@ mod tests {
             census.solo.admitted.len(),
             census.closure.admitted.len() + census.closure.refused
         );
-        assert_eq!(census.cask.admitted, ["zipped", "imaged"]);
+        assert_eq!(census.cask.admitted, ["zipped", "imaged", "floored"]);
         assert_eq!(
             census.cask.ranked(),
             [
@@ -462,7 +467,7 @@ mod tests {
             text.contains("  admitted solo, refused with closure: 2\n   openssl needs its Homebrew build/relocation recipe (its bottle relocates: cellar /opt/homebrew/Cellar): 2 (1 alone)\n"),
             "{text}"
         );
-        assert!(text.contains("casks: 2/4 (50.0%)\n"), "{text}");
+        assert!(text.contains("casks: 3/5 (60.0%)\n"), "{text}");
         let json = census.json();
         assert_eq!(
             json.pointer("/formulae/closure").and_then(Value::as_u64),
@@ -470,15 +475,15 @@ mod tests {
         );
         assert_eq!(
             json.pointer("/casks/admitted").and_then(Value::as_u64),
-            Some(2)
+            Some(3)
         );
     }
 
     /// Negative control: the same records judged for other machines get
     /// other verdicts, so the counts above are admission's decisions for
     /// the machine modelled, not the fixture's shape. Big Sur has no bottle
-    /// the relocation-free formulae were built for; macOS 30 meets
-    /// `future`'s floor.
+    /// the relocation-free formulae were built for and is older than
+    /// `floored`'s floor; macOS 30 meets `future`'s.
     #[test]
     fn the_census_follows_the_machine_it_models() {
         let (formulae, casks) = fixture();
@@ -510,8 +515,13 @@ mod tests {
                 .refusals
                 .contains_key("<name> needs a newer macOS")
         );
-        // Casks judge the same machine: neither changes what the fixture's do.
+        // Casks judge the same machine.
         assert_eq!(big_sur.cask.admitted, ["zipped", "imaged"]);
+        assert_eq!(
+            big_sur.cask.refusals["cask <name> needs macOS >= 14"],
+            (1, 1)
+        );
+        assert_eq!(next.cask.admitted, ["zipped", "imaged", "floored"]);
     }
 
     #[test]

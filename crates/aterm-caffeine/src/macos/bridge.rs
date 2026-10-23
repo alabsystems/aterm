@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The bridge: the Mac kept awake while an update restart's new mug starts.
-//!
-//! A mug that ends for launchd to start the new build ([`super::app`]'s restart) lets go of its
-//! activity as it exits, and the new mug begins its own only once launchd has started it, `serve`
-//! has cloned the new bundle and macOS has assessed the clone's first exec, which takes from
-//! seconds to minutes ([`aterm_uds::deadline::FIRST_EXEC_HANG`]). A Mac nobody is at has been
-//! idle all along, so its display, and on battery the system, would sleep as soon as the old
-//! activity ended. So a mug that restarts holding the activity first starts a bridge
-//! ([`start`]): `aterm caffeine bridge` from the executable the mug runs (its own copy of the
-//! app; a bare build's path, which the update may have replaced), in a session of its own
-//! (launchd ends what is left in a job's process group when the job exits), which begins the
-//! same activity and says so on its stdout before the mug lets go of its own.
-//!
-//! The bridge ([`run`]) writes its pid into [`Paths::bridge_file`] and holds while that file
-//! names it, the saved mode reads on and [`MAX`] has not passed on the awake clock
-//! ([`holds`]). The new mug removes the file once its own activity has begun, or it starts off
-//! ([`release`]); `off` and `quit` save off, which ends it too. Nothing signals the pid the
-//! file names: a bridge that holds ends by its own look. The one signal is [`start`]'s kill,
-//! through its child handle, of a bridge it started that never said it holds.
+//! Keep-awake bridge process across aterm update restarts.
 
 use std::io::{self, BufRead as _, Read as _, Write};
 use std::path::Path;
@@ -49,10 +31,7 @@ const READY_WAIT: Duration = Duration::from_secs(10);
 /// The most of [`Paths::bridge_file`] read: a pid is a few digits.
 const PID_CAP: u64 = 32;
 
-/// Start a bridge from the code this process runs and wait until it holds the activity;
-/// whether it does. One that has not said so in [`READY_WAIT`] is killed (a bare build replaced
-/// by the update execs new code, which macOS may still be assessing; the kill leaves its file
-/// as it was), and the mug restarts without one, as before.
+/// Starts a bridge process from the current executable and waits until it holds the activity.
 pub(super) fn start() -> bool {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -86,7 +65,6 @@ pub(super) fn start() -> bool {
         let _ = child.kill();
         let _ = child.wait();
     }
-    // A bridge that holds outlives this process: the handle goes, the child keeps running.
     held
 }
 
@@ -103,8 +81,7 @@ fn said_held(out: impl io::Read + Send + 'static, within: Duration) -> bool {
         .is_ok_and(|line| line.trim_end() == HELD)
 }
 
-/// `aterm caffeine bridge`: hold the activity while [`holds`] says so. Exit 0 once it let go,
-/// or at once when the mode reads off; 1 when it could not hold (said on stderr).
+/// Runs `aterm caffeine bridge` and holds the keep-awake activity until released.
 pub(crate) fn run() -> ExitCode {
     let Some(paths) = Paths::from_env() else {
         eprintln!("aterm caffeine: bridge: no home directory");
@@ -139,7 +116,6 @@ fn bridge(
         forget(&file, me);
         return Err("the keep-awake activity did not begin".into());
     };
-    // A mug that stopped waiting has closed the pipe: the activity holds all the same.
     let _ = writeln!(out, "{HELD}").and_then(|()| out.flush());
     eprintln!("aterm caffeine: bridge (pid {me}) keeps the Mac awake while the mug restarts");
     let since = Instant::now();
@@ -168,8 +144,7 @@ fn mode_on(paths: &Paths) -> bool {
     state::load(&paths.state_file(), now).is_on(now)
 }
 
-/// The new mug's activity has begun, or it starts off: the bridge an update restart left, if
-/// one runs, lets go at its next look.
+/// Releases any running update-restart bridge by removing the bridge PID file.
 pub(super) fn release(paths: &Paths) {
     let file = paths.bridge_file();
     match std::fs::remove_file(&file) {
@@ -262,15 +237,11 @@ mod tests {
         let max = Duration::from_secs(60);
         let short = Duration::from_secs(1);
         assert!(holds(Some(7), 7, true, short, max));
-        // The new mug took over (the file gone or naming another bridge).
         assert!(!holds(None, 7, true, short, max));
         assert!(!holds(Some(8), 7, true, short, max));
-        // `off` or `quit` saved off, or a timed span ran out.
         assert!(!holds(Some(7), 7, false, short, max));
-        // The bound.
         assert!(holds(Some(7), 7, true, max - Duration::from_millis(1), max));
         assert!(!holds(Some(7), 7, true, max, max));
-        // The bound covers both first-exec assessments a restart can wait on.
         assert!(MAX > 2 * aterm_uds::deadline::FIRST_EXEC_HANG);
     }
 
@@ -356,7 +327,6 @@ mod tests {
 
     #[test]
     fn a_bridge_with_nothing_to_hold_ends_at_once_and_says_nothing() {
-        // The mode reads off: no file, no activity, no line.
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let paths = scratch(dir.path());
         let (tx, rx) = mpsc::channel();
@@ -372,8 +342,6 @@ mod tests {
         .expect("off");
         assert!(rx.try_recv().is_err());
         assert!(!paths.bridge_file().exists());
-        // The activity refused: an error, its file gone, and never a line the mug takes for
-        // a hold.
         state::save(&paths.state_file(), Mode::Forever).expect("saved on");
         let (tx, rx) = mpsc::channel();
         let mut out = Said(tx, Vec::new());
@@ -384,11 +352,9 @@ mod tests {
 
     #[test]
     fn the_mug_waits_for_held_alone() {
-        // Each of these answers at once: the wait is only the hang detector.
         assert!(said_held(&b"held\n"[..], SAYS));
         assert!(!said_held(&b"error\n"[..], SAYS));
         assert!(!said_held(&b""[..], SAYS));
-        // A child that says nothing within the wait.
         let (read, _write) = std::io::pipe().expect("pipe");
         assert!(!said_held(read, Duration::from_millis(50)));
     }
@@ -406,7 +372,6 @@ mod tests {
         assert!(!file.exists());
         std::fs::write(&file, b"not a pid").expect("write");
         assert_eq!(read_pid(&file), None);
-        // A pid that starts past the cap is not read: only blanks are.
         let past = format!(
             "{}4242\n",
             " ".repeat(usize::try_from(PID_CAP).expect("small"))

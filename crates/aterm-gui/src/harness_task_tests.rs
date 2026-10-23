@@ -749,6 +749,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         login_method: None,
         login_shared: None,
         roster: None,
+        seat: Default::default(),
     }
 }
 

@@ -3,6 +3,7 @@
 
 // Turn-end policy tests over the scripted supervisor loop.
 
+use super::*;
 use crate::harness::login_latch::LoginLatches;
 use crate::harness::repo_work::RepoWork;
 use crate::supervise::policy::login::LoginShared;
@@ -14,6 +15,9 @@ use std::sync::PoisonError;
 
 #[path = "remembered_limit_tests.rs"]
 mod remembered_limit;
+
+#[path = "walls_tests.rs"]
+mod walls;
 
 #[path = "hold_journal_tests.rs"]
 mod hold_journal;
@@ -4373,56 +4377,246 @@ fn gemini_clis_command_menu_is_never_typed_into() {
     }
 }
 
-/// GEMINI CLI'S PER-DAY USAGE-LIMIT DIALOG IS TOLD TO A PERSON AT ONCE, AND
-/// THE ERROR ITS `Stop` LEAVES IS A PERSON'S, end to end under
-/// `program=node` at full power: the dialog (`1. Keep trying` / `2. Stop`,
-/// no reset named) is badged with its own words at its first read and no
-/// key is pressed before its ladder's first rung (half an hour off; the
-/// ladder itself is
-/// [`gemini_clis_usage_limit_with_no_reset_is_kept_trying_while_a_person_is_told`]'s),
-/// and the `[API Error: An unknown error occurred.]` the person's `Stop`
-/// leaves is handed over too, nothing typed at it — no `Keep trying` by key
-/// or by a typed retry.
+/// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` IS KEPT TRYING WHILE A
+/// PERSON IS TOLD (X1 of the walls-3 stage; FOREVER, the owner's direction
+/// of 2026-10-21: NEEDS YOU is loud and never blocks), end to end under
+/// `program=node` at full power. The dialog that names no reset (a key's
+/// per-day quota, `1. Keep trying` / `2. Stop`) is badged with its own words
+/// at its first read (`names no reset`) and held for its ladder's first
+/// rung, no key pressed; a person's `2. Stop` leaves `✕ [API Error: An
+/// unknown error occurred.]`, which is read as that limit: waited on to the
+/// rung the dialog's next `Keep trying` was due (`WAITING … until=<first
+/// read + 30 min> … usage-session resets`), the badge carried there — never
+/// lowered, never raised again, nothing escalated about the error — and
+/// `usage-resume@v1` typed at that rung, a try of the episode. The dialog
+/// drawn again on it climbs the ladder (`… (drawn again after its typed
+/// resume, try 1)`, 2 h from the resume), and the `Keep trying` that gets
+/// through takes the badge down (`CLEARED … box`). Measured before (walls-2,
+/// `gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person`): the
+/// Stop's error was escalated as an API error not retried, the badge up and
+/// nothing typed, for good. NEGATIVE CONTROLS: the same error with no
+/// dialog read before it, and after a point that was neither (the dialog's
+/// read forgotten there), is still a person's — escalated with the error's
+/// words, nothing typed: nothing names a limit; and the shell box in the
+/// dialog's place is pressed.
 #[test]
-fn gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person() {
+fn gemini_clis_per_day_usage_limit_answered_stop_is_kept_trying_while_a_person_is_told() {
     use aterm_phase::gemini::fixtures as g;
     use aterm_phase::prompt::fixtures::screen;
+    let dialog = screen(g::LIMIT_DIALOG);
+    assert_eq!(
+        aterm_phase::gemini::limit_reset(&dialog),
+        None,
+        "PRECONDITION"
+    );
+    let (dir, journal) = journal_file("te-gemini-day-stopped");
     let mut m = gemini_mock(vec![
         screen(g::BUSY_THINKING),
-        screen(g::LIMIT_DIALOG),
+        dialog.clone(),
         screen(g::LIMIT_STOPPED),
+        screen(g::BUSY_THINKING),
+        dialog.clone(),
+        screen(g::BUSY_THINKING),
+        gemini_ended("Carried on."),
     ]);
+    // The dialog sits till its badge is up (then a person's Stop); the error
+    // till the resume; the dialog drawn again on it till its `Keep trying`.
     m.attention_gates = vec![(1, 0)];
-    m.vanish_after = Some(3);
+    m.turn_gates = vec![2];
+    m.key_gates = vec![(4, 0)];
+    m.stall_sleep = Some(Duration::from_secs(3600));
+    // Ends once the badge came down after the press: a badge taken down
+    // sooner leaves the run going, to be counted.
+    m.exit_when = Some(|m| {
+        let unset = m
+            .requests
+            .iter()
+            .rposition(|r| r.starts_with("meta unset attention owner=supervisor"));
+        let key = m.requests.iter().rposition(|r| verb_of(r) == "key");
+        key.is_some() && unset > key
+    });
     let opts = SuperviseOpts {
         policy: owners_policy(),
-        ..auto(30)
+        journal: Some(journal.clone()),
+        ..auto(6 * 3600)
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {
             min_work: Duration::ZERO,
             ..TurnEndTiming::default()
         });
+        s.set_clock_running();
     });
-    assert!(m.presses().is_empty(), "{lines:#?}\n{:#?}", m.requests);
-    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    let (records, _) = journal_records(&journal);
+    let _ = std::fs::remove_dir_all(&dir);
+    let all = || records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>();
+    let at = |needle: &str| -> Vec<usize> {
+        m.requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.starts_with(needle))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let verb_at = |verb: &str| -> Vec<usize> {
+        m.requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| verb_of(r) == verb)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    // One resume typed, `usage-resume@v1`, and one `Keep trying` after it.
+    let turns = verb_at("turn");
+    let keys = verb_at("key");
+    assert_eq!(turns.len(), 1, "{lines:#?}\n{:#?}", all());
+    assert_eq!(keys.len(), 1, "{:#?}", m.requests);
+    assert!(turns[0] < keys[0], "{:#?}", m.requests);
+    assert!(m.presses()[0].ends_with(" 1"), "{:?}", m.presses());
+    let typed: Vec<_> = records
+        .iter()
+        .filter(|r| r.line.starts_with("CONTINUED "))
+        .collect();
+    assert_eq!(typed.len(), 1, "{:#?}", all());
     assert!(
-        !m.requests.iter().any(|r| r.starts_with("send ")),
+        typed[0].line.contains("rule=usage-resume@v1"),
         "{:#?}",
+        all()
+    );
+    // The badge: raised once, at the dialog, before the resume, and taken
+    // down once, after the `Keep trying` that got through.
+    let raised = at("meta set attention owner=supervisor");
+    let lowered = at("meta unset attention owner=supervisor");
+    assert_eq!(raised.len(), 1, "raised once: {:#?}", m.requests);
+    assert!(
+        m.requests[raised[0]].contains("names no reset"),
+        "{}",
+        m.requests[raised[0]]
+    );
+    assert!(raised[0] < turns[0], "{:#?}", m.requests);
+    assert_eq!(lowered.len(), 1, "taken down once: {:#?}", m.requests);
+    assert!(lowered[0] > keys[0], "{:#?}", m.requests);
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| r.contains("An unknown error occurred.")),
+        "the error is no person's: {:#?}",
         m.requests
     );
-    let said = |needle: &str| lines.iter().chain(&m.requests).any(|l| l.contains(needle));
+    // The error waited on to the ladder's first rung from the dialog's
+    // first read; the resume typed there, not before.
+    let until = |l: &str| -> i64 {
+        let stamp = l
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("until="))
+            .expect("an until");
+        aterm_types::rfc3339::parse_utc(stamp).expect("a stamp")
+    };
+    let near = |got: i64, want: i64| (want..want + 30).contains(&got);
+    let error_wait = records
+        .iter()
+        .find(|r| r.line.starts_with("WAITING ") && r.line.contains("usage-session resets"))
+        .unwrap_or_else(|| panic!("the error waited on: {:#?}", all()));
     assert!(
-        said("Gemini CLI's usage limit"),
-        "{lines:#?}\n{:#?}",
-        m.requests
+        near(until(&error_wait.line), TEST_NOW + 1800),
+        "the first rung: {:#?}",
+        all()
+    );
+    // What the run's clock spent on the error before the resume (each wait
+    // on a screen that sits skips the whole time it asks).
+    let waited_ms: u64 = m.requests[..turns[0]]
+        .iter()
+        .filter(|r| r.starts_with("await seq "))
+        .filter_map(|r| r.rsplit(' ').next().and_then(|ms| ms.parse::<u64>().ok()))
+        .sum();
+    assert!(
+        waited_ms >= 1_700_000,
+        "typed at the rung, not into the quota: {waited_ms} ms {:#?}",
+        all()
+    );
+    // The dialog drawn again on that resume: the ladder's next rung from it,
+    // said as the return of a typed resume, not of a `Keep trying`.
+    let again = records
+        .iter()
+        .find(|r| {
+            r.line.starts_with("WAITING ")
+                && r.line.contains("rule=limit-retry@v1")
+                && r.line.contains("try 1)")
+        })
+        .unwrap_or_else(|| panic!("the dialog's return waited on: {:#?}", all()));
+    assert!(
+        again
+            .line
+            .contains("(drawn again after its typed resume, try 1)"),
+        "{}",
+        again.line
     );
     assert!(
-        said("An unknown error occurred."),
-        "{lines:#?}\n{:#?}",
-        m.requests
+        near(until(&again.line), until(&error_wait.line) + 2 * 3600),
+        "the second rung, from the resume: {:#?}",
+        all()
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.line.starts_with("CLEARED ") && r.line.contains(" box ")),
+        "{:#?}",
+        all()
     );
 
+    // NEGATIVE CONTROLS: the error alone; the error after the dialog and a
+    // point that was neither, which forgets the dialog's read.
+    for (tag, screens, gates) in [
+        (
+            "the error alone",
+            vec![screen(g::BUSY_THINKING), screen(g::LIMIT_STOPPED)],
+            vec![(1, 0)],
+        ),
+        (
+            "after a point that was neither",
+            vec![
+                screen(g::BUSY_THINKING),
+                dialog.clone(),
+                gemini_ended("Answered."),
+                screen(g::LIMIT_STOPPED),
+            ],
+            vec![(1, 0), (3, 1)],
+        ),
+    ] {
+        let mut m = gemini_mock(screens);
+        m.attention_gates = gates;
+        m.vanish_after = Some(6);
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            ..auto(30)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+        });
+        assert!(
+            m.presses().is_empty(),
+            "{tag}: {lines:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("turn ") && r.contains("usage-resume")),
+            "{tag}: {:#?}",
+            m.requests
+        );
+        assert!(
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention owner=supervisor")
+                    && r.contains("An unknown error occurred.")),
+            "{tag}: the error handed over: {lines:#?}\n{:#?}",
+            m.requests
+        );
+    }
     let mut m = gemini_mock(vec![screen(g::BUSY_THINKING), screen(g::BOX_SHELL)]);
     m.key_releases = Some(1);
     m.vanish_after = Some(2);
@@ -4431,6 +4625,360 @@ fn gemini_clis_usage_limit_and_its_stop_are_handed_to_a_person() {
         m.presses().iter().any(|r| r.ends_with(" 1")),
         "the control: {:#?}",
         m.requests
+    );
+}
+
+/// `rows` (a Gemini CLI usage-limit dialog drawn with `Access resets at
+/// 5:06 AM`) with its reset drawn as `reset`, its right border kept where
+/// Gemini's renderer keeps it.
+fn gemini_reset_redrawn(rows: &[String], reset: &str) -> Vec<String> {
+    rows.iter()
+        .map(|r| {
+            if !r.starts_with("│ Access resets at") {
+                return r.clone();
+            }
+            let width = r.chars().count() - 1;
+            let with = r.replacen("5:06 AM", reset, 1);
+            let body = with.trim_end_matches('│').trim_end();
+            format!("{body:<width$}│")
+        })
+        .collect()
+}
+
+/// GEMINI CLI'S BUCKET DIALOG IS WAITED ON, THEN TRIED BY ITS `Stop` AND A
+/// TYPED RESUME (X2 of the walls-3 stage: the model's own bucket, `Usage
+/// limit reached for all Pro models.` over `Switch to gemini-3.5-flash` and
+/// `Stop`), end to end under `program=node` at full power: held to the end
+/// of its reset's minute and the grace (`WAITING … until=<9:07 AM PDT>
+/// rule=limit-retry@v1 … Stop is pressed and the turn resumed past it`, the
+/// same wait as the account's dialog), its `2` (`Stop`) pressed then — never
+/// the switch, never before — and the error that `Stop` leaves read as that
+/// limit, its reset passed, so `usage-resume@v1` is typed at once: the try,
+/// whose turn goes on to its end. Never handed to a person. The Google
+/// login's dialog (`Upgrade for higher limits` between them) gets its `3`.
+/// Measured before: escalated as `only Keep trying over Stop is pressed`,
+/// nothing pressed or typed, for good. NEGATIVE CONTROL: the account's
+/// dialog at the same reset gets its `1` (`Keep trying`), never its `Stop`,
+/// and no resume is typed.
+#[test]
+fn gemini_clis_bucket_dialog_is_waited_on_then_tried_by_its_stop_and_a_resume() {
+    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::prompt::fixtures::screen;
+    for (tag, fixture, digit) in [
+        ("bucket", g::LIMIT_DIALOG_BUCKET, " 2"),
+        (
+            "bucket under the Google login",
+            g::LIMIT_DIALOG_BUCKET_UPGRADE,
+            " 3",
+        ),
+        (
+            "NEGATIVE CONTROL: the account's",
+            g::LIMIT_DIALOG_ACCOUNT,
+            " 1",
+        ),
+    ] {
+        let bucket = digit != " 1";
+        let dialog = gemini_reset_redrawn(&screen(fixture), "9:05 AM");
+        assert_eq!(
+            aterm_phase::gemini::limit_reset(&dialog)
+                .map(|r| r.to_string())
+                .as_deref(),
+            Some("9:05 AM PDT"),
+            "PRECONDITION {tag}"
+        );
+        let (dir, journal) = journal_file("te-gemini-bucket");
+        let after = if bucket {
+            screen(g::LIMIT_STOPPED)
+        } else {
+            screen(g::BUSY_THINKING)
+        };
+        let mut m = gemini_mock(vec![
+            screen(g::BUSY_THINKING),
+            dialog,
+            after,
+            screen(g::BUSY_THINKING),
+            gemini_ended("Carried on."),
+        ]);
+        m.key_gates = vec![(1, 0)];
+        if bucket {
+            m.turn_gates = vec![2];
+        }
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        // Ends at the first turn typed: the resume at the error, or the
+        // control's act at its turn's end.
+        m.exit_when = Some(|m| m.requests.iter().any(|r| verb_of(r) == "turn"));
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            journal: Some(journal.clone()),
+            ..auto(2 * 3600)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+            s.set_clock_running();
+        });
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let all = || records.iter().map(|r| r.line.as_str()).collect::<Vec<_>>();
+        let presses = m.presses();
+        assert_eq!(presses.len(), 1, "{tag}: {lines:#?}\n{:#?}", m.requests);
+        assert!(presses[0].ends_with(digit), "{tag}: {presses:?}");
+        assert!(
+            !m.requests
+                .iter()
+                .any(|r| r.starts_with("meta set attention owner=supervisor")),
+            "{tag}: never handed over: {:#?}",
+            m.requests
+        );
+        // Held to the end of 9:05's minute and a minute of grace, then
+        // pressed: not before.
+        let due_s = TEST_NOW + 10 * 60 + 60 + 60;
+        let wait = records
+            .iter()
+            .map(|r| r.line.as_str())
+            .find(|l| l.starts_with("WAITING ") && l.contains("rule=limit-retry@v1"))
+            .unwrap_or_else(|| panic!("{tag}: the dialog waited on: {:#?}", all()));
+        assert!(
+            wait.contains(&format!(
+                "until={}",
+                utc_stamp(u64::try_from(due_s).expect("a time"))
+            )),
+            "{tag}: {wait}"
+        );
+        let said = if bucket {
+            "resets at 9:05 AM PDT: Stop is pressed and the turn resumed past it"
+        } else {
+            "resets at 9:05 AM PDT: Keep trying is pressed past it"
+        };
+        assert!(wait.contains(said), "{tag}: {wait}");
+        let key = m
+            .requests
+            .iter()
+            .position(|r| verb_of(r) == "key")
+            .expect("the press");
+        let waited: u64 = m.requests[..key]
+            .iter()
+            .filter(|r| r.starts_with("await gone ^│") && r.contains("Access"))
+            .filter_map(|r| r.rsplit(' ').next().and_then(|ms| ms.parse::<u64>().ok()))
+            .sum();
+        assert!(waited >= 710_000, "{tag}: the reset waited out: {waited}");
+        let subject = if bucket {
+            "Stop (reset 9:05 AM PDT)"
+        } else {
+            "Keep trying (reset 9:05 AM PDT)"
+        };
+        assert!(
+            records
+                .iter()
+                .any(|r| r.line.starts_with("APPROVED ") && r.line.ends_with(subject)),
+            "{tag}: {:#?}",
+            all()
+        );
+        let typed: Vec<&str> = records
+            .iter()
+            .map(|r| r.line.as_str())
+            .filter(|l| l.starts_with("CONTINUED "))
+            .collect();
+        if bucket {
+            assert_eq!(typed.len(), 1, "{tag}: {:#?}", all());
+            assert!(
+                typed[0].contains("rule=usage-resume@v1"),
+                "{tag}: {typed:?}"
+            );
+            let turn = m
+                .requests
+                .iter()
+                .position(|r| verb_of(r) == "turn")
+                .expect("the resume");
+            assert!(turn > key, "{tag}: {:#?}", m.requests);
+        } else {
+            assert!(
+                !typed.iter().any(|l| l.contains("rule=usage-resume@v1")),
+                "{tag}: {typed:?}"
+            );
+        }
+    }
+}
+
+/// THE ERROR A `Stop` LEAVES WHERE NO POINT DECIDED THE DIALOG IS THE LIMIT
+/// A READ DREW (X1 of the walls-3 stage, `Session::limit_stopped_adopt`):
+/// Gemini CLI's dialog read on a busy wait's read or inside a settle, then
+/// answered `2. Stop` before any point held it, leaves
+/// `✕ [API Error: An unknown error occurred.]` with no episode standing.
+/// That read names the limit: the per-day dialog's error is read as its
+/// limit with no reset, due the ladder's first rung from the dialog's first
+/// read (half an hour, less the grace the turn-end policy adds back); the
+/// account's dialog's (`Access resets at 9:05 AM PDT.`) is due at its reset's
+/// minute's end. Measured before: such an error escalated, nothing typed.
+/// NEGATIVE CONTROLS: the error with no dialog read, after a read of
+/// another box (the no-access dialog's `Stop` leaves the same words: the
+/// shell box stands in for it here), and with `limit_wait` off is none of a
+/// limit's; and a read of the dialog with its head off the rows read keeps
+/// no reset it cannot see.
+#[test]
+fn the_error_a_stop_leaves_is_the_limit_a_read_drew_with_no_point_deciding_it() {
+    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::prompt::fixtures::screen;
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        ..auto(60)
+    };
+    let off = SuperviseOpts {
+        policy: SupervisorConfig {
+            limit_wait: false,
+            ..owners_policy()
+        },
+        ..auto(60)
+    };
+    let stopped = screen(g::LIMIT_STOPPED);
+    let reading = aterm_phase::Program::Gemini.reader().read(&stopped, None);
+    assert!(
+        reading
+            .wall
+            .as_ref()
+            .is_some_and(aterm_phase::gemini::stopped_error),
+        "PRECONDITION: {reading:?}"
+    );
+    let grace = i64::try_from(
+        TurnEndTiming::default()
+            .grace_for(aterm_phase::Program::Gemini)
+            .as_secs(),
+    )
+    .expect("a grace");
+    let gemini = aterm_phase::Program::Gemini;
+    // `reads`: the screens read before the error, none a point, each at its
+    // second from the first (the reader's phase says which are busy), the
+    // loop's own `Keep trying` pressed after them where `pressed`; `opts`.
+    let adopted_as = |reads: &[(Vec<String>, i64)], pressed: bool, opts: &SuperviseOpts| {
+        let mut m = gemini_mock(vec![stopped.clone()]);
+        let mut s = session(&mut m, None);
+        s.program = Some("node".to_owned());
+        let mut last = 0;
+        for (rows, at) in reads {
+            s.set_clock(TEST_NOW + at, PDT);
+            let busy = gemini.reader().phase(rows) == aterm_phase::Phase::Busy;
+            s.note_limit_dialog(gemini, rows, busy);
+            last = *at;
+        }
+        if pressed {
+            s.limit_retry_pressed();
+        }
+        s.set_clock(TEST_NOW + last + 2, PDT);
+        s.limit_stopped_adopt(&reading, opts);
+        s.limit_stopped(&reading, &stopped)
+            .map(|l| (l.wall.kind, l.wall.reset, l.reset_unix))
+    };
+    // Each read 20 s after the one before it.
+    let adopted = |reads: &[Vec<String>], opts: &SuperviseOpts| {
+        let timed: Vec<(Vec<String>, i64)> = (0..)
+            .zip(reads)
+            .map(|(i, rows)| (rows.clone(), 20 * i))
+            .collect();
+        adopted_as(&timed, false, opts)
+    };
+    let day = screen(g::LIMIT_DIALOG);
+    assert_eq!(
+        adopted(std::slice::from_ref(&day), &opts),
+        Some((
+            aterm_phase::WallKind::UsageSession,
+            None,
+            TEST_NOW + 1800 - grace
+        )),
+        "the per-day dialog: its ladder's first rung from its first read"
+    );
+    // The same dialog read again later keeps its first read.
+    assert_eq!(
+        adopted(&[day.clone(), day.clone()], &opts),
+        Some((
+            aterm_phase::WallKind::UsageSession,
+            None,
+            TEST_NOW + 1800 - grace
+        ))
+    );
+    // 9:05 AM PDT, ten minutes after the clock: its minute's end.
+    assert_eq!(
+        adopted(&[gemini_reset_dialog("9:05 AM PDT")], &opts),
+        Some((
+            aterm_phase::WallKind::UsageSession,
+            Some("9:05 AM PDT".to_owned()),
+            TEST_NOW + 10 * 60 + 60
+        )),
+        "the account's dialog: its reset placed"
+    );
+    // A frame between the dialog and the error that is neither keeps it —
+    // a spinner within `LIMIT_DIALOG_FRAME_S` of the dialog included.
+    assert!(
+        adopted_as(
+            &[(day.clone(), 0), (screen(g::BUSY_THINKING), 3)],
+            false,
+            &opts
+        )
+        .is_some(),
+        "a frame between"
+    );
+    // CONTROLS.
+    assert_eq!(adopted(&[], &opts), None, "no dialog read");
+    // The worker working past the dialog (A1 of the review of walls-3): an
+    // hour of a turn's spinner after it, then an error that ends the turn —
+    // no dialog this read drew is what it answered.
+    assert_eq!(
+        adopted_as(
+            &[
+                (day.clone(), 0),
+                (screen(g::BUSY_THINKING), 60),
+                (screen(g::BUSY_THINKING), 3600)
+            ],
+            false,
+            &opts
+        ),
+        None,
+        "the worker working past the dialog"
+    );
+    // The loop's own `Keep trying` answered the dialog read.
+    assert_eq!(
+        adopted_as(&[(day.clone(), 0)], true, &opts),
+        None,
+        "the loop's own press"
+    );
+    assert_eq!(
+        adopted(&[day.clone(), screen(g::BOX_SHELL)], &opts),
+        None,
+        "another box read after it"
+    );
+    assert_eq!(
+        adopted(std::slice::from_ref(&day), &off),
+        None,
+        "limit_wait off"
+    );
+    // The dialog with its head off the rows (T5 of the review of walls-3):
+    // scrolled so its first rows read are its options, every row above them
+    // (its top border, its head) off the screen, so the reader reads a box
+    // whose head it cannot see (`head_off_screen`), which it names no
+    // usage-limit dialog — alone it names no limit, and after the dialog's
+    // read it forgets that read, as another box does.
+    let head_end = day
+        .iter()
+        .position(|r| r.contains("/model to switch models."))
+        .expect("PRECONDITION: the dialog's head");
+    let headless: Vec<String> = day[head_end + 1..].to_vec();
+    let read = aterm_phase::gemini::prompt(&headless).expect("PRECONDITION: a box read");
+    assert!(read.head_off_screen, "PRECONDITION: {read:?}");
+    assert_ne!(
+        read.kind,
+        aterm_phase::PromptKind::UsageLimit,
+        "PRECONDITION"
+    );
+    assert_eq!(
+        adopted(std::slice::from_ref(&headless), &opts),
+        None,
+        "its head off the rows"
+    );
+    assert_eq!(
+        adopted(&[day.clone(), headless], &opts),
+        None,
+        "its head off the rows after its read"
     );
 }
 
@@ -4998,7 +5546,7 @@ fn a_reset_first_read_long_past_is_tried_within_the_bound() {
 #[test]
 fn a_reset_the_loop_cannot_place_is_kept_trying_on_the_ladder() {
     use super::super::approval_loop::RetryDue;
-    use crate::supervise::policy::approval::limit_no_reset_reason;
+    use crate::supervise::policy::approval::{LimitTry, limit_no_reset_reason};
     let opts = SuperviseOpts {
         policy: owners_policy(),
         ..auto(60)
@@ -5033,7 +5581,7 @@ fn a_reset_the_loop_cannot_place_is_kept_trying_on_the_ladder() {
         },
         "the ladder's second rung from the press"
     );
-    let said = limit_no_reset_reason(Some("soon"));
+    let said = limit_no_reset_reason(Some("soon"), LimitTry::KeepTrying);
     assert!(
         said.contains("cannot place (soon)") && !said.contains("names no reset"),
         "{said}"
@@ -8800,10 +9348,12 @@ fn the_hosts_background_step_at_the_wake_waits_for_the_settle() {
         }
         let screen = s.screen().expect("the busy read at the wake");
         let mut since = Some(Instant::now());
-        s.host_steps_in_background(&screen, &mut since, None, &mut Alone);
+        s.host_steps_in_background(&screen, &mut since, None, &mut Alone)
+            .expect("the break's step");
         let at_wake = host.backgrounds.load(Ordering::SeqCst);
         s.pass_wake_settle();
-        s.host_steps_in_background(&screen, &mut since, None, &mut Alone);
+        s.host_steps_in_background(&screen, &mut since, None, &mut Alone)
+            .expect("the break's step");
         let after = host.backgrounds.load(Ordering::SeqCst);
         let withheld: Vec<&str> = host
             .withheld
@@ -11356,6 +11906,10 @@ struct AccountHost {
     /// a limit over with no sign-in that took ([`IdleHost::limit_over`]).
     backs: std::sync::atomic::AtomicUsize,
     overs: std::sync::atomic::AtomicUsize,
+    /// [`IdleHost::relaunch_owed`]: the agent's last relaunch is the host's
+    /// own, as a test sets it; and how many times the loop asked it.
+    relaunch_owed: std::sync::atomic::AtomicBool,
+    relaunch_owed_asked: std::sync::atomic::AtomicUsize,
 }
 
 impl AccountHost {
@@ -11515,6 +12069,10 @@ impl IdleHost for AccountHost {
     }
     fn agent_pid(&self) -> Option<u32> {
         *self.pid.lock().unwrap()
+    }
+    fn relaunch_owed(&self) -> bool {
+        self.relaunch_owed_asked.fetch_add(1, Ordering::SeqCst);
+        self.relaunch_owed.load(Ordering::SeqCst)
     }
     fn agent_started(&self) -> Option<i64> {
         *self.started.lock().unwrap()
@@ -25830,7 +26388,8 @@ fn the_hosts_background_step_is_withheld_on_usage_credits() {
             ..SupervisorConfig::default()
         };
         let mut since = Some(Instant::now());
-        s.host_steps_in_background(&screen, &mut since, Some(&cfg), &mut Alone);
+        s.host_steps_in_background(&screen, &mut since, Some(&cfg), &mut Alone)
+            .expect("the break's step");
         let offered = host.backgrounds.load(Ordering::SeqCst);
         let withheld: Vec<&str> = host
             .withheld
@@ -26874,6 +27433,144 @@ fn a_turn_the_verdict_never_saw_busy_is_rechecked_under_a_short_settle() {
             .count(),
         1,
         "no new point: {lines:#?}"
+    );
+}
+
+/// GEMINI CLI'S PER-DAY USAGE LIMIT ANSWERED `Stop` BEFORE ANY POINT DECIDED
+/// ITS DIALOG IS READ AS THAT LIMIT (X1 of the walls-3 stage), end to end
+/// under `program=node` at full power: the dialog is read once, too young to
+/// judge (the box settle), and the next read is already the error its
+/// `Stop` left — no episode stands. The read that drew the dialog names the
+/// limit (`Session::limit_stopped_adopt`): the error is waited on to the
+/// ladder's first rung from that read (`WAITING … usage-session resets`),
+/// NEEDS YOU is raised at it (`… after Stop, resumed on a back-off ladder`,
+/// its reason the limit's, not the error's), and `usage-resume@v1` is typed there; the
+/// try that gets through takes the badge down. Measured before: escalated
+/// as an API error not retried, nothing typed. NEGATIVE CONTROL: another box
+/// read before the error in the dialog's place (the shell box) names no
+/// limit, and the error is still a person's, nothing typed.
+#[test]
+fn gemini_clis_usage_limit_stopped_before_any_point_decided_it_is_read_as_its_limit() {
+    use aterm_phase::gemini::fixtures as g;
+    use aterm_phase::prompt::fixtures::screen;
+    let run = |before: Vec<String>| {
+        let (dir, journal) = journal_file("te-gemini-unsettled-stop");
+        let mut m = gemini_mock(vec![
+            screen(g::BUSY_THINKING),
+            before,
+            screen(g::LIMIT_STOPPED),
+            screen(g::BUSY_THINKING),
+            gemini_ended("Carried on."),
+        ]);
+        m.turn_gates = vec![2];
+        m.attention_gates = vec![(2, 0)];
+        m.stall_sleep = Some(Duration::from_secs(3600));
+        m.vanish_after = Some(8);
+        m.exit_when = Some(|m| {
+            m.requests
+                .iter()
+                .any(|r| r.starts_with("meta unset attention owner=supervisor"))
+        });
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            journal: Some(journal.clone()),
+            ..auto(3 * 3600)
+        };
+        let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+            s.set_turn_end_timing(TurnEndTiming {
+                min_work: Duration::ZERO,
+                ..TurnEndTiming::default()
+            });
+            s.set_box_settle(Duration::from_secs(1));
+            s.set_clock_running();
+        });
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<String> = records
+            .iter()
+            .map(|r| r.line.clone())
+            .chain(lines)
+            .collect();
+        (m, lines)
+    };
+    let (m, lines) = run(screen(g::LIMIT_DIALOG));
+    let said = |needle: &str| lines.iter().any(|l| l.contains(needle));
+    assert!(
+        !said("rule=limit-retry@v1"),
+        "PRECONDITION: no point decided the dialog: {lines:#?}"
+    );
+    let raised: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("meta set attention owner=supervisor"))
+        .collect();
+    assert_eq!(raised.len(), 1, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        raised[0].contains(
+            "(Gemini CLI's usage limit names no reset; after Stop, resumed on a back-off ladder"
+        ),
+        "the badge's reason is the limit, not the error: {}",
+        raised[0]
+    );
+    let turns: Vec<usize> = m
+        .requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| verb_of(r) == "turn")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .find(|l| l.starts_with("CONTINUED "))
+            .is_some_and(|l| l.contains("rule=usage-resume@v1")),
+        "the first turn typed is the limit's resume: {lines:#?}"
+    );
+    let wait = lines
+        .iter()
+        .find(|l| l.starts_with("WAITING ") && l.contains("usage-session resets"))
+        .unwrap_or_else(|| panic!("the error waited on: {lines:#?}"));
+    let until = wait
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("until="))
+        .and_then(aterm_types::rfc3339::parse_utc)
+        .expect("an until");
+    assert!(
+        (TEST_NOW + 1800..TEST_NOW + 1830).contains(&until),
+        "the ladder's first rung from the dialog's read: {wait}"
+    );
+    let unset = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("meta unset attention owner=supervisor"))
+        .expect("the badge taken down");
+    assert!(
+        unset > turns[0],
+        "after the try got through: {:#?}",
+        m.requests
+    );
+
+    // NEGATIVE CONTROL: the shell box in the dialog's place.
+    let (m, lines) = run(screen(g::BOX_SHELL));
+    assert!(
+        !m.requests
+            .iter()
+            .any(|r| verb_of(r) == "turn" && r.contains("keep going")),
+        "the control: {lines:#?}\n{:#?}",
+        m.requests
+    );
+    let raised: Vec<&String> = m
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("meta set attention owner=supervisor"))
+        .collect();
+    assert!(
+        raised
+            .iter()
+            .any(|r| r.contains("An unknown error occurred."))
+            && !raised.iter().any(|r| r.contains("after Stop")),
+        "the control: the error handed over as itself: {lines:#?}\n{:#?}",
+        m.requests
     );
 }
 

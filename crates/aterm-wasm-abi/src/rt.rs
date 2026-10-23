@@ -1,16 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! What `#[export]`'s expansion calls, under `aterm_wasm_abi::__rt`. Not an
-//! API: the paths and signatures change with the macro.
+//! Internal runtime hooks called by `#[export]` expansions under `aterm_wasm_abi::__rt`.
 
 pub use crate::descriptor::{Part, TypeDesc, record, record_len};
 pub use crate::handle::{Class, borrow, borrow_mut, into_raw};
 pub use crate::marshal::{Describe, FromAbi, IntoAbi, OptIntoAbi, RefFromAbi, RetWord, Thrown};
 
-/// `aterm_alloc`: [`crate::mem::alloc`]. A bad layout or an exhausted heap
-/// traps, as wasm-bindgen's release allocator aborts: the glue is mid-way
-/// through lowering arguments, with no call to return a throw from.
+/// `aterm_alloc`: [`crate::mem::alloc`], trapping on an invalid layout or exhausted heap.
 #[must_use]
 pub fn alloc(size: usize, align: usize) -> usize {
     crate::mem::alloc(size, align).unwrap_or_else(|| malloc_failure(size, align))
@@ -33,8 +30,7 @@ fn malloc_failure(size: usize, align: usize) -> ! {
 
 pub use crate::mem::{free as free_buffer, ret_slot};
 
-/// An export's last step: lower `out`, leave its slot value, and return its
-/// word.
+/// An export's last step: lower `out`, leave its slot value, and return its word.
 ///
 /// # Errors
 /// What the value throws (`Err` of a `Result`).
@@ -44,10 +40,7 @@ pub fn finish<R: IntoAbi>(out: R) -> Result<R::Ret, Thrown> {
     Ok(word)
 }
 
-/// What an export returns for `out`: its word, or, when the call threw, a
-/// zero word with the throw left in the return slot for the glue
-/// ([`crate::mem::set_thrown`]). The export always returns: every value the
-/// call owned has been dropped, and the shadow stack is restored.
+/// Returns `out`'s word, or `0` with the throw recorded in the return slot.
 pub fn returned<W: RetWord>(out: Result<W, Thrown>) -> W {
     match out {
         Ok(word) => word,
@@ -58,9 +51,7 @@ pub fn returned<W: RetWord>(out: Result<W, Thrown>) -> W {
     }
 }
 
-/// A class's free export: [`crate::handle::free`], whose error `free()`
-/// throws. From the FinalizationRegistry (`from_finalizer != 0`) nothing is
-/// reported: no JS frame is there to catch it, and the glue does not look.
+/// Frees a class handle via [`crate::handle::free`], reporting errors unless in a finalizer.
 ///
 /// # Safety
 /// [`crate::handle::free`]'s contract.
@@ -72,14 +63,7 @@ pub unsafe fn free_export<T: Class>(ptr: usize, from_finalizer: u32) {
     }
 }
 
-/// Export the allocator and the return slot the glue calls (`aterm_alloc`,
-/// `aterm_realloc`, `aterm_free`, `aterm_ret_slot`; see `src/mem.rs`) from
-/// the module being built. Invoke it once, at the root of the crate whose
-/// module uses `#[export]`; `verify glue` refuses a module without them.
-///
-/// They are defined in the invoking crate rather than in aterm-wasm-abi, so
-/// a module that links aterm-wasm-abi for its panic hook alone exports none
-/// of them and imports nothing for them.
+/// Exports `aterm_alloc`, `aterm_realloc`, `aterm_free`, and `aterm_ret_slot`.
 #[macro_export]
 macro_rules! export_runtime {
     () => {

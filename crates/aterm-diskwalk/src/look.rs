@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Marker looks for the host's root discovery (design §10.4): what a name is
-//! inside one directory, where a link points, and the git worktree above a
-//! folder. Each directory passes [`refuse_look`] on its logical and canonical
-//! spellings before it is opened, is opened component-wise with no link
-//! followed, and is asked one no-follow `stat` of one name. No file's
-//! contents are read and no link is followed: a link's target is read as
-//! text and handed back for the caller to path-test.
+//! No-follow directory marker and symlink target inspection for root discovery.
 
 #[cfg(unix)]
 use std::path::Component;
@@ -34,13 +28,11 @@ pub enum Marker {
 pub struct Worktree {
     /// The folder holding `.git`.
     pub root: PathBuf,
-    /// `.git` is a file: a linked worktree, whose object store belongs to the
-    /// main checkout (counted there, never twice).
+    /// Whether `.git` is a file (a linked worktree).
     pub linked: bool,
 }
 
-/// What `name` is inside `dir`, by one no-follow `stat`; `None` when nothing
-/// has that name.
+/// What `name` is inside `dir`, by one no-follow `stat`; `None` when nothing has that name.
 ///
 /// # Errors
 ///
@@ -50,13 +42,11 @@ pub fn marker_at(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Marke
     Ok(one)
 }
 
-/// What each of `names` is inside `dir`: [`marker_at`] for several names through one open
-/// of `dir`, so a climb asking three marker names per folder opens each folder once.
+/// What each of `names` is inside `dir` through one open of `dir`.
 ///
 /// # Errors
 ///
-/// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s
-/// (other than `ENOENT`, which is `None` for that name).
+/// The [`Refusal`] `dir` earned before anything was opened, or the open's or a `stat`'s.
 pub fn markers_at<const N: usize>(
     dir: &Path,
     names: [&str; N],
@@ -90,10 +80,7 @@ pub fn markers_at<const N: usize>(
     }
 }
 
-/// Where the link `name` inside `dir` points, as an absolute path with `.`
-/// and `..` resolved lexically against `dir` (a `target → target.noindex`
-/// link, design §10.4 `build`). `None` when `name` is not a link. The target
-/// is text: the caller path-tests it before using it as a root.
+/// Where the link `name` inside `dir` points, resolved lexically against `dir`.
 ///
 /// # Errors
 ///
@@ -137,11 +124,7 @@ pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Pat
     }
 }
 
-/// The git worktree root above `start` (itself included): the nearest
-/// folder holding `.git`, a directory for a main checkout and a file for a
-/// linked worktree. The search climbs only through folders that pass
-/// [`refuse_look`], and stops below the home folder and below a mount point,
-/// each in any spelling (design §10.4 `repo`); a refused folder ends it.
+/// The nearest git worktree root at or above `start` below the home folder and any mount point.
 #[must_use]
 pub fn worktree_above(start: &Path, policy: &Policy) -> Option<Worktree> {
     let canon = canonical(start)?;
@@ -176,12 +159,7 @@ pub fn worktree_above(start: &Path, policy: &Policy) -> Option<Worktree> {
 /// and `.rustc_info.json` in its target folder and `.cargo-lock` in each profile folder.
 const BUILD_MARKERS: [&str; 3] = ["CACHEDIR.TAG", ".rustc_info.json", ".cargo-lock"];
 
-/// The build folder above `start` (itself included): the nearest folder holding
-/// `CACHEDIR.TAG` or `.rustc_info.json` (a cargo target folder), else the nearest holding
-/// `.cargo-lock` (a profile folder whose target folder carries neither). The climb is
-/// [`worktree_above`]'s: only through folders that pass [`refuse_look`], stopping below the
-/// home folder and below a mount point, each in any spelling; a refused folder ends it.
-/// Every folder is opened once and asked the three names ([`markers_at`]).
+/// The nearest cargo target or profile folder at or above `start`.
 #[must_use]
 pub fn build_dir_above(start: &Path, policy: &Policy) -> Option<PathBuf> {
     let canon = canonical(start)?;

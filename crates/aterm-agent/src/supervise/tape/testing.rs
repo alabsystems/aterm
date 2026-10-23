@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A run's door recording into memory, for the tests of the loop: what a
-//! `--tape FILE` run records, with the file a buffer a test reads back.
+//! In-memory tape recorder and replay assertion helpers for supervisor loop tests.
 
 use astream_effects::EffectRecord;
 
@@ -16,12 +15,10 @@ use super::replay::{Options, replay};
 use super::report::{Report, Verdict};
 use crate::supervise::fx::Fx;
 
-/// The header a test's tape carries: the frame layer takes any text, and no
-/// test reads a header back from a run's tape.
+/// Default header frame used for in-memory test tapes.
 pub(crate) const HEADER: &str = "atape 1\ntape=test\nentry=watch\n";
 
-/// The id a test's memory tape is recorded under (its recorder seeds the
-/// worker's digest with it): a replay's header names the same id.
+/// Default tape id used for in-memory test tapes.
 pub(crate) const TAPE_ID: &str = "test";
 
 /// A tape in memory a test reads back, and its door.
@@ -78,12 +75,7 @@ impl MemoryTape {
         read
     }
 
-    /// The tape's bytes with `header` as its header frame in place of the
-    /// stand-in [`HEADER`] it was started with: a whole-run helper captures
-    /// the run's real header only once its setup is done, after the door
-    /// (and so the tape) was handed to the transport. The records frames are
-    /// the very bytes the recorder wrote — a header frame stands alone, and
-    /// the decoder's state starts afresh after it.
+    /// Returns the tape bytes with `header` replacing the initial [`HEADER`] frame.
     pub(crate) fn reframed(&self, header: &str) -> Vec<u8> {
         let bytes = self.sink.bytes();
         let first = self.sink.taken().writes.first().copied().unwrap_or(0);
@@ -94,28 +86,7 @@ impl MemoryTape {
     }
 }
 
-/// THE EQUIVALENCE SUITE'S CHECK (the replay plan's §10): the run recorded on
-/// `tape` — its real `header`, the requests the scripted worker was `sent`
-/// (`Mock::order`'s, the claim's included) and the `lines` it printed —
-/// replayed strictly from the tape alone: it must be REPRODUCED, ask exactly
-/// the requests the worker was sent and print exactly the lines, with no
-/// transport at all (`ReplayCtl` holds none, and the replaying door makes no
-/// live call); and replayed a second time it must replay exactly as the first
-/// (the determinism self-check: a decision that hangs on a hash map's order,
-/// or on anything else the tape does not hold, differs between two replays
-/// of one tape).
-///
-/// Every whole-run helper calls this, so each test that runs the loop over a
-/// scripted worker is also a test that the loop's every observation crosses
-/// a door: a value read past one is a value the replay cannot serve, and the
-/// test fails here, naming the first divergence.
-///
-/// A run whose options carry a window host (`SuperviseOpts::idle_host`) —
-/// a hosted run, and a `watch` whose test stages a host (the stall remedies,
-/// the surveys, the idle-point acts of `turn_end_loop_tests`, `stall_tests`,
-/// `run_engine_tests` and more) — is replayed the same way: the host's every
-/// answer crossed the host's door (`tape::host`), and the replay's host gives
-/// them back with no host behind it, so a test's host is never asked twice.
+/// Asserts that `tape` replays deterministically in strict and acts modes.
 pub(crate) fn assert_replays(
     tape: &MemoryTape,
     header: &Header,
@@ -142,11 +113,6 @@ pub(crate) fn assert_replays(
         "the replay prints what the recorded run printed"
     );
     assert_eq!(replayed(), first, "a tape replays the same way twice");
-    // ACTS SELF-CONSISTENCY (the plan's T9): the same tape run as a
-    // counterfactual under its own policy takes every act it holds, asks
-    // what the recorded run asked, and follows the tape record for record —
-    // nothing dropped, served again, made up or left unmatched — so acts mode
-    // over an unchanged run is a strict replay.
     let acts = replay(
         &bytes,
         &Options {
@@ -178,8 +144,7 @@ pub(crate) fn assert_replays(
     first
 }
 
-/// A tape of `items` under `header`, written by the real writer: what a test
-/// that edits a recorded tape's items (a negative control) replays.
+/// Writes `items` under `header` into an in-memory tape.
 pub(crate) fn written(header: &str, items: &[Item]) -> Vec<u8> {
     let sink = Memory::default();
     let mut w = TapeWriter::start(
@@ -190,8 +155,6 @@ pub(crate) fn written(header: &str, items: &[Item]) -> Vec<u8> {
     );
     for item in items {
         w.append(item);
-        // Frames closed where the recorder's door closes them: after an act,
-        // before a wait.
         if let Some(EffectRecord::Exchange { door, request, .. }) = item.record()
             && door == super::doors::CTL
             && let Ok(words) = super::codec::ctl_args(request)

@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: the timeline's rows ([`Log::keep_rows`], the row
-//! counter and the row floor in `Log::evict_batch`) against the derived
-//! `SessionLogRows` model (`aterm_models_session::session_log_rows_model`,
-//! checked at Tier-0 in `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk drives a real ring of eight records (a floor of two rows)
-//! under a session and an open run, both opened before the walk, through a
-//! test grammar: a bell is no row, a directory mark one, and a handoff mark
-//! or a handoff or crash gap one (a record of two rows, a session close, is
-//! `row_floor.rs`'s). It appends, then takes at most one update or adoption: a carried
-//! update (the successor's counter continued past the predecessor's head
-//! plus the overlap's reserve), an uncarried one, or a crash adoption at a
-//! new epoch. After every step the live records are projected onto the
-//! model (the records that are no rows, the rows outside the floor and
-//! within it, the newest's class, the counter, the log's own `lost`), and
-//! the step must be the model's: the action, then whatever the batch took.
-//! NEGATIVE CONTROLS, each its mutant's successor (T11): a successor whose
-//! counter is not carried, a crash adoption at its predecessor's epoch (an
-//! epoch the world picks: the projection's check; the host's own pick is
-//! aterm-gui's test), a carried update that dropped a record uncounted, and
-//! a batch that took a floor row while a bell could go; and a projection
-//! that miscounts a row as a bell.
+//! Tier-1 conformance: the timeline's rows ([`Log::keep_rows`], the row counter and the row floor
+//! in `Log::evict_batch`) against the derived `SessionLogRows` model
+//! (`aterm_models_session::session_log_rows_model`, checked at Tier-0 in
+//! `aterm-models/tests/derived_ring_ty.rs`).
 
 use aterm_models_session::session_log_rows_model;
 use aterm_slog::{
@@ -94,8 +76,6 @@ impl World {
 
     fn project(&self) -> State {
         let rows: std::collections::BTreeSet<u64> = self.log.rows().map(|r| r.rec.seq).collect();
-        // The world's opens (the session's, the run's) are pinned: no
-        // record of the walk's.
         let walk: Vec<&Rec> = self.log.window().filter(|r| r.op != Op::Open).collect();
         let nrows = walk.iter().filter(|r| rows.contains(&r.seq)).count();
         let rf = nrows.min(FLOOR);
@@ -295,8 +275,6 @@ fn slog_rows_conform_to_derived_model() {
 /// batch after it) makes of `prev`, and it is exactly what mutant `mutant`
 /// makes of `from` (T11: each negative control is its mutant's successor,
 /// so the conformance check would catch that mutant's call in the code).
-/// An append's mutant steps from `prev`; a batch's from the honest state
-/// the batch left.
 fn rejected(m: &Model, action: &str, prev: &State, (mutant, from): (&str, &State), broken: &State) {
     assert!(
         !reach(m, action, prev).contains(broken),
@@ -408,8 +386,6 @@ fn slog_rows_conformance_rejects_a_floor_row_taken_early_and_a_miscount() {
         ("EvictRowUnderFloor", &honest),
         &under,
     );
-    // A row counted as a bell (the projection's own miscount: no mutant
-    // makes it, and no honest step does).
     let miscounted = moved(&honest, &[("rf", -1), ("u", 1)]);
     assert!(!reach(&m, "AppendOther", &prev).contains(&miscounted));
 }

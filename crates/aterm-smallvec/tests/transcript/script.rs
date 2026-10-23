@@ -1,36 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The operation script behind `tests/upstream_transcript.rs`, written so it
-//! compiles unchanged against two crates named `smallvec`: this repository's
-//! facade, and the crates.io 1.15.1 package it replaces.
-//!
-//! [`run`] drives a fixed section and a seeded operation fuzz, and writes one
-//! line per step: the operation, what it returned (or `panic`), the contents,
-//! the length, `spilled()`, whether `capacity()` is consistent with that
-//! (`inline_size()` when inline, above it and at least `len()` when spilled),
-//! whether `Hash` is the slice's, and the values of every element dropped
-//! since the previous line, in drop order. Heap capacities and hash values are
-//! deliberately not printed: the facade grows its heap buffer on a different
-//! schedule, and `DefaultHasher` is not stable across toolchains.
-//!
-//! `transcript/smallvec-1.15.1.txt` is this script's output against the
-//! registry crate. To re-record it, make a crate OUTSIDE this workspace (a
-//! registry `smallvec` inside it would be redirected by `[patch.crates-io]`):
-//!
-//! ```text
-//! [package]
-//! name = "smallvec-recorder"
-//! edition = "2024"
-//! [dependencies]
-//! smallvec = { version = "=1.15.1", features = ["union", "const_generics", "const_new"] }
-//! [workspace]
-//! ```
-//!
-//! with `src/main.rs` holding
-//! `#[path = "<this file>"] mod script; fn main() { print!("{}", script::run()); }`,
-//! and run `targo --unverified run --offline > smallvec-1.15.1.txt` there. The
-//! features are the ones aterm's graph turns on (wgpu-hal and wayland-backend).
+//! Operation script for comparing `SmallVec` behavior against upstream `smallvec` 1.15.1.
 
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
@@ -174,7 +145,6 @@ fn fixed(rec: &mut Rec) {
         rec.line(&format!("with_capacity({n})"), "", &v);
     }
 
-    // from_vec keys on the Vec's capacity, not its length.
     for (len, cap) in [(2, 2), (2, 3), (2, 8), (5, 5), (0, 16)] {
         let mut vec = Vec::with_capacity(cap);
         vec.extend((0..len).map(E));
@@ -199,7 +169,6 @@ fn fixed(rec: &mut Rec) {
     rec.line("collect(filter)", "", &v);
     drop(v);
 
-    // `Copy` items: from_slice and extend_from_slice.
     let mut c: SmallVec<[u32; 3]> = SmallVec::from_slice(&[1, 2]);
     rec.line("from_slice(2)", "", &c);
     c.extend_from_slice(&[3]);
@@ -209,7 +178,6 @@ fn fixed(rec: &mut Rec) {
     let c: SmallVec<[u32; 3]> = SmallVec::from_slice(&[1, 2, 3, 4, 5]);
     rec.line("from_slice(5)", "", &c);
 
-    // Clone of a spilled vector whose items fit inline is inline.
     let mut v: SmallVec<[E; 3]> = (0..5).map(E).collect();
     v.truncate(2);
     rec.line("spilled truncate(2)", "", &v);
@@ -227,7 +195,6 @@ fn fixed(rec: &mut Rec) {
     rec.line("clone_from(longer)", "", &x);
     drop((v, x, long));
 
-    // Comparison traits.
     let a: SmallVec<[E; 3]> = smallvec![E(1), E(2)];
     let b: SmallVec<[E; 2]> = smallvec![E(1), E(2)];
     let c: SmallVec<[E; 3]> = smallvec![E(1), E(3)];
@@ -241,7 +208,6 @@ fn fixed(rec: &mut Rec) {
     rec.line("eq/cmp", &result, &a);
     drop((a, b, c));
 
-    // Panics.
     let mut v: SmallVec<[E; 3]> = smallvec![E(1), E(2)];
     let p = panics(|| {
         v.insert(3, E(9));
@@ -298,9 +264,6 @@ fn fuzz<A: Array<Item = E>>(rec: &mut Rec, seed: u64, steps: usize) {
                 rec.line(&format!("insert({i},{x})"), "", &v);
             }
             7 => {
-                // Out of range, but never on a full inline vector: upstream
-                // reserves before it checks the index, so that case would
-                // spill before panicking.
                 let i = len + 1 + r.below(2);
                 let p = if v.spilled() || len < v.inline_size() {
                     panics(|| v.insert(i, E(x)))
@@ -393,7 +356,6 @@ fn fuzz<A: Array<Item = E>>(rec: &mut Rec, seed: u64, steps: usize) {
                 rec.line(&label, &format!("{yielded:?}"), &v);
             }
             18 => {
-                // A Drain consumed from both ends and dropped part-way.
                 let s = r.below(len + 1);
                 let e = s + r.below(len - s + 1);
                 let front = r.below(3);
@@ -417,7 +379,6 @@ fn fuzz<A: Array<Item = E>>(rec: &mut Rec, seed: u64, steps: usize) {
                 );
             }
             19 => {
-                // A by-value iterator over a clone, consumed part-way.
                 let take = r.below(len + 1);
                 let back = r.below(2);
                 let mut it = v.clone().into_iter();
@@ -451,8 +412,6 @@ fn fuzz<A: Array<Item = E>>(rec: &mut Rec, seed: u64, steps: usize) {
                 rec.line("cmp", &result, &v);
             }
             23 => {
-                // `clear` keeps a spilled buffer; a fresh vector is inline
-                // again, so the fuzz does not stay spilled for good.
                 if x.is_multiple_of(2) {
                     v.clear();
                     rec.line("clear", "", &v);

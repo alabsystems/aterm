@@ -60,7 +60,7 @@ pub enum LineageProof {
 }
 
 impl LineageProof {
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Lineage { .. } => "lineage",
             Self::SeedMint { .. } => "seed-mint",

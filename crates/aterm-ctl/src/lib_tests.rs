@@ -282,6 +282,20 @@ fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+/// `frame=open` after the count earns the note; the word in the count's place does not.
+#[test]
+fn frame_open_note_reads_the_word_after_the_count() {
+    assert_eq!(frame_open_note("2 frame=open"), Some(FRAME_OPEN_NOTE));
+    assert_eq!(
+        frame_open_note("1 frame=open trimmed=23"),
+        Some(FRAME_OPEN_NOTE)
+    );
+    assert_eq!(frame_open_note("24"), None);
+    assert_eq!(frame_open_note("24 trimmed=3"), None);
+    assert_eq!(frame_open_note("frame=open"), None);
+    assert_eq!(frame_open_note("2 frame=opened"), None);
+}
+
 /// `search`'s header is `OK <n> incomplete[ capped][ rewrapping][ long-line][ moving][ older]`
 /// when the list is not exhaustive; the count parser reads only the first
 /// token, so the matches are kept, and stderr names every cause.
@@ -313,6 +327,11 @@ fn stream_count_ignores_incomplete_marker() {
     assert!(unknown != depth, "{unknown}");
     assert_eq!(note("3 incomplete screen_first=21").as_deref(), Some(depth));
     assert_eq!(note("3 screen_first=21"), None);
+    assert_eq!(
+        note("3 incomplete frame=open screen_first=21").as_deref(),
+        Some(depth)
+    );
+    assert_eq!(note("3 frame=open screen_first=21"), None);
     let both = note("1 incomplete long-line older").expect("two causes");
     for one in ["7 incomplete long-line", "3 incomplete"] {
         assert!(both.contains(&note(one).expect("a cause")), "{both}");

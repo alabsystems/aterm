@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The application firewall through `socketfilterfw` (design §5.1).
-//!
-//! Since macOS 15 `/Library/Preferences/com.apple.alf.plist` is not authoritative; only
-//! `socketfilterfw` reads and sets the live state. Its answers, measured in the macOS 27.0
-//! VM in both states (exit 0 for every read, root or not):
-//!
-//! * `--getglobalstate`: `Firewall is enabled. (State = 1)` / `Firewall is disabled. (State = 0)`
-//! * `--getstealthmode`: `Firewall stealth mode is on` / `… is off`
-//! * `--getallowsigned`: two lines, `Automatically allow built-in signed software
-//!   ENABLED.` and `Automatically allow downloaded signed software ENABLED.` (or
-//!   `DISABLED.`), the second being `--setallowsignedapp`'s setting
-//!
-//! A `--set…` as root prints nothing and exits 0; not as root it prints `Must be root to
-//! change settings.` and exits 255. Block-all (`--setblockall`) is never touched: it would
-//! refuse the SSH connection every later run arrives on.
+//! macOS application firewall items via `socketfilterfw`.
 
 use super::{Ctx, Item};
 use crate::model::{Probe, Read};
@@ -37,13 +23,11 @@ pub struct Table {
     pub allow_signed: Option<bool>,
     /// `--setallowsignedapp` (signed downloads).
     pub allow_signed_downloaded: Option<bool>,
-    /// Refused whatever its value: block-all refuses incoming SSH, the only way the
-    /// controller reaches the Mac. Kept so the refusal can say why.
+    /// Refused whatever its value.
     pub block_all: Option<bool>,
 }
 
 /// The items `table` asks for.
-///
 /// # Errors
 /// `block_all` named, with the reason.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -225,7 +209,6 @@ impl Item for Switch {
         if ran.success() {
             Ok(())
         } else {
-            // `Must be root to change settings.` goes to standard output.
             let said = format!("{} {}", ran.out().trim(), ran.err());
             let how = ran
                 .status

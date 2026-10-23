@@ -4,36 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! Where and when the input method is told the caret is (`XNSpotLocation`), the desk audit's
-//! two findings (GNOME 46 on Xorg with IBus through XIM, 2026-10-22).
-//!
-//! Where: the spot is the caret box's bottom-left. ibus-x11 opens its candidate popup at the
-//! spot, and upstream's top-left put the popup over the line being typed. A box aterm-gui
-//! reports (`set_ime_cursor_area`, the caret cell in window pixels) becomes the request the
-//! event loop sends on. The negative control: with the box's size dropped again, as upstream
-//! dropped it, the request carries the box's top, 20, where its bottom is 36.
-//!
-//! When: setting the spot is a synchronous XIM request (`XSetICValues`, no timeout) on the event
-//! loop's thread, and upstream sent one whenever any window's caret moved, an unfocused one's
-//! too, so a stalled ibus-x11 froze every window. Only the focused window's input context is
-//! told, only a spot it does not have, and an unfocused window's latest goes out once when it
-//! gains the focus. Each spot sent is counted at the send (`ime::SPOTS_SENT`); the focus events
-//! are XI2 focus events the server would send, handed to the event processor's handlers, as
-//! `focus_tests` does, under the input method `XMODIFIERS` names on `$DISPLAY`, else Xlib's
-//! local one. The negative controls: without the focus check in `Ime::send_xim_spot`, the
-//! unfocused window's move is sent; without `ImeContext::set_spot`'s comparison, the unmoved
-//! caret is sent again; without the send in `Ime::focus`, the focus in sends nothing.
-//!
-//! A context remade (the input method replaced, or the window's context remade by
-//! `set_ime_allowed`) is told the focused window's spot alone, and the focused window's new
-//! context takes the focus its old one had, which IBus needs to compose in it; each focus
-//! given is counted too (`ime::FOCUSES_SENT`). The negative controls: with `replace_im`'s
-//! upstream spot (every old context's), the unfocused window's goes out too; without
-//! `ImeInner::refocus` in it, or the focus in `Ime::create_context`, no new context has the
-//! focus; with no spot for a new context, as upstream gave none, the remade one is told none.
-//!
-//! The windows' parts run where `$DISPLAY` names an X server; elsewhere they say SKIP and
-//! return.
+//! Tests for X11 XIM spot location and focus updates.
 
 use super::event_processor::EventProcessor;
 use super::ffi::{self, XIFocusInEvent};
@@ -208,13 +179,10 @@ fn a_remade_input_context_is_told_the_focused_windows_spot_and_focus() {
     assert_eq!(sent(), [(id(&b), 30, 56), (id(&a), 10, 36)], "each caret went out focused");
     focused();
 
-    // The input method replaced, as its callbacks replace it when IBus restarts: only the
-    // focused window's new context is told its spot, and it takes the focus.
     desk.ime(|ime| assert!(ime.replace_for_test(), "an input method opens again"));
     assert_eq!(sent(), [(id(&a), 10, 36)], "the focused window's spot, not b's");
     assert_eq!(focused(), [id(&a)], "the focused window's new context has the focus");
 
-    // The focused window's context remade to take no compositions, then to take them again.
     a.set_ime_allowed(false);
     desk.send_requests();
     a.set_ime_allowed(true);

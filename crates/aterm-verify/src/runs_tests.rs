@@ -66,6 +66,10 @@ struct FakeKernel {
     wedged: HashSet<i32>,
     /// Live processes whose flavor-18 record does not read (their birth still does).
     unreadable: HashSet<i32>,
+    /// Live processes whose separate birth read fails.
+    birth_unreadable: HashSet<i32>,
+    /// Injected existence-query answers; otherwise presence follows the fake process table.
+    presence: HashMap<i32, ProcessPresence>,
     /// Processes that exit on their own after this many more lineage reads.
     exiting: RefCell<HashMap<i32, usize>>,
     signals: RefCell<Vec<(i32, i32)>>,
@@ -121,7 +125,19 @@ impl EndControl for Control<'_> {
 
 impl Kernel for FakeKernel {
     fn birth(&self, pid: i32) -> Option<ProcessBirth> {
+        if self.birth_unreadable.contains(&pid) {
+            return None;
+        }
         self.lineages.borrow().get(&pid).map(|l| l.identity.birth)
+    }
+    fn presence(&self, pid: i32) -> ProcessPresence {
+        self.presence.get(&pid).copied().unwrap_or_else(|| {
+            if self.lineages.borrow().contains_key(&pid) {
+                ProcessPresence::Present
+            } else {
+                ProcessPresence::Absent
+            }
+        })
     }
     fn lineage(&self, pid: i32) -> Option<Lineage> {
         if self.unreadable.contains(&pid) {
@@ -445,7 +461,7 @@ fn each_condition_of_the_dead_run_pass_names_what_it_cannot_prove() {
         let dead = format!("{}dead_seen uniqueid=400 at=1\n", dead_record());
         let mut files = vec![("41983-999.run", dead.as_str())];
         if let Some(live) = &live {
-            files.push(("7000.run", live.as_str()));
+            files.push(("7000-8000.run", live.as_str()));
         }
         let dir = records(&files);
         let (ended, lines) = start_pass(dir.path(), &k);
@@ -524,6 +540,25 @@ fn a_dead_runs_record_stays_while_it_names_a_member() {
         ("6-1.run", ""),
     ]);
     let path = dir.path().join("41983-999.run");
+    let before: Vec<_> = ["41983-999.run", "5-1.run", "6-1.run"]
+        .into_iter()
+        .map(|name| {
+            let path = dir.path().join(name);
+            let bytes = std::fs::read(&path).expect("seed record");
+            (path, bytes)
+        })
+        .collect();
+    let (ended, _) = start_pass(dir.path(), &k);
+    assert_eq!(ended, 0);
+    assert!(k.signals.borrow().is_empty());
+    assert!(k.markers_read.borrow().is_empty());
+    for (path, bytes) in before {
+        assert_eq!(
+            std::fs::read(path).expect("unknown snapshot retained"),
+            bytes
+        );
+    }
+    std::fs::remove_file(dir.path().join("6-1.run")).expect("retire the incomplete fixture");
     let (_, lines) = start_pass(dir.path(), &k);
     assert!(lines[0].contains("not judged"), "{lines:?}");
     let text = std::fs::read_to_string(&path).expect("the record is kept");
@@ -533,7 +568,6 @@ fn a_dead_runs_record_stays_while_it_names_a_member() {
         "dead_seen at the high-water: {text}"
     );
     assert!(!dir.path().join("5-1.run").exists(), "another boot's");
-    assert!(dir.path().join("6-1.run").exists(), "one being written");
 
     let (_, lines) = start_pass(dir.path(), &k);
     assert!(lines[0].contains("not judged"), "{lines:?}");
@@ -840,10 +874,138 @@ fn a_member_a_live_run_claims_is_spared() {
     );
     k.put(lin(71, 310, 500, 1), "/wt-a/target/debug/aterm");
     k.markers.insert(71, verify_run(DEAD_ID));
-    let dir = records(&[("41983-999.run", &dead_record()), ("7000.run", &live)]);
+    k.put(lin(7100, 0, 7100, 1), "/usr/local/bin/aterm-verify");
+    let header_only = "run v=1 boot=B id=7100-8100 uniqueid=0 start=0 sid=-\n";
+    let dir = records(&[
+        ("41983-999.run", &dead_record()),
+        ("7000-8000.run", &live),
+        ("7100-8100.run", header_only),
+    ]);
+    let live_path = dir.path().join("7000-8000.run");
     let (ended, lines) = start_pass(dir.path(), &k);
     assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
-    assert!(dir.path().join("7000.run").exists(), "a live run's record");
+    assert!(live_path.exists(), "a live run's record");
+
+    let retained = || {
+        ["41983-999.run", "7000-8000.run", "7100-8100.run"]
+            .into_iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                let bytes = std::fs::read(&path).expect("record before refused pass");
+                (path, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    let unknown_keeps_claims = |kernel: &FakeKernel| {
+        let before = retained();
+        kernel.markers_read.borrow_mut().clear();
+        let (ended, _) = start_pass(dir.path(), kernel);
+        assert_eq!(ended, 0);
+        assert!(kernel.signals.borrow().is_empty());
+        assert!(kernel.markers_read.borrow().is_empty());
+        for (path, bytes) in before {
+            assert_eq!(
+                std::fs::read(path).expect("unadmitted record is retained"),
+                bytes
+            );
+        }
+    };
+    let mut invalid_utf8 = live.as_bytes().to_vec();
+    invalid_utf8.extend_from_slice(b"\xff\n");
+    let header = live.lines().next().expect("live header");
+    for bytes in [
+        Vec::new(),
+        invalid_utf8,
+        b"run v=1 boot=B id=7000-8".to_vec(),
+        header.as_bytes().to_vec(),
+        format!("{header}\nroot path=/wt-a\ngroup pgid=50").into_bytes(),
+        format!("{header}\ngroup pgid=500 leader_birth=1\n").into_bytes(),
+        live.replacen("id=7000-8000", "id=7000-8", 1).into_bytes(),
+        live.replacen("uniqueid=1", "uniqueid=broken", 1)
+            .into_bytes(),
+        live.replacen(" uniqueid=1", "", 1).into_bytes(),
+        live.replacen(" start=1", " uniqueid=1 start=1", 1)
+            .into_bytes(),
+        format!("{live}{header}\n").into_bytes(),
+        live.replacen("v=1", "v=2", 1).into_bytes(),
+        live.replace("pgid=500", "pgid=broken").into_bytes(),
+        live.replace("pgid=500", "pgid=500 pgid=500").into_bytes(),
+        live.replace("leader_birth=1", "leader_birth=broken")
+            .into_bytes(),
+        live.replace("path=/wt-a", "path=/wt%G0").into_bytes(),
+        live.replace("sid=-", "sid=%FF").into_bytes(),
+        live.replace("stage=s", "stage=%GG").into_bytes(),
+        live.replace("stage=s", "stage=%FF").into_bytes(),
+        format!("{live}root\n").into_bytes(),
+        format!("{live}closed pgid=broken\n").into_bytes(),
+        format!("{live}closed pgid=500 pgid=500\n").into_bytes(),
+        format!("{live}dead_seen uniqueid=broken at=1\n").into_bytes(),
+        format!("{live}dead_seen at=1 uniqueid=900\n").into_bytes(),
+        format!("{live}end at=broken\n").into_bytes(),
+    ] {
+        std::fs::write(&live_path, bytes).expect("publish incomplete or unreadable fixture");
+        unknown_keeps_claims(&k);
+    }
+    std::fs::write(&live_path, &live).expect("restore the complete live claim");
+    let mismatched = dir.path().join("7000-8001.run");
+    std::fs::rename(&live_path, &mismatched).expect("mismatched record name");
+    let before = std::fs::read(&mismatched).expect("mismatched bytes");
+    let dead_before = std::fs::read(dir.path().join("41983-999.run")).expect("dead record");
+    let other_before = std::fs::read(dir.path().join("7100-8100.run")).expect("other live record");
+    k.markers_read.borrow_mut().clear();
+    let (ended, _) = start_pass(dir.path(), &k);
+    assert_eq!(ended, 0);
+    assert!(k.signals.borrow().is_empty());
+    assert!(k.markers_read.borrow().is_empty());
+    assert_eq!(std::fs::read(&mismatched).expect("kept mismatch"), before);
+    assert_eq!(
+        std::fs::read(dir.path().join("41983-999.run")).expect("kept dead record"),
+        dead_before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("7100-8100.run")).expect("kept other live record"),
+        other_before
+    );
+    std::fs::rename(&mismatched, &live_path).expect("restore canonical name");
+
+    let non_file = dir.path().join("7200-8200.run");
+    std::fs::create_dir(&non_file).expect("non-regular candidate");
+    unknown_keeps_claims(&k);
+    assert!(non_file.is_dir());
+    std::fs::remove_dir(&non_file).expect("retire private non-file fixture");
+    let escaped = live
+        .replace("sid=-", "sid=session%20one%25%3D")
+        .replace("stage=s", "stage=work%20with%25%3D")
+        .replace(
+            "root path=/wt-a\n",
+            "root path=/wt-a\nroot path=/with%20space%25%3D\n",
+        );
+    std::fs::write(&live_path, escaped).expect("complete escaped live claim");
+    let (ended, lines) = start_pass(dir.path(), &k);
+    assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
+
+    k.birth_unreadable.insert(7000);
+    for presence in [ProcessPresence::Present, ProcessPresence::Unknown] {
+        k.presence.insert(7000, presence);
+        let before = std::fs::read(&live_path).expect("live record");
+        let (ended, lines) = start_pass(dir.path(), &k);
+        assert_eq!(
+            (ended, k.termed()),
+            (0, Vec::new()),
+            "{presence:?}: {lines:?}"
+        );
+        assert_eq!(
+            std::fs::read(&live_path).expect("claims retained"),
+            before,
+            "{presence:?}: an unreadable launcher is not declared dead"
+        );
+    }
+
+    // Positive absence releases the old run's claim, allowing the dead run's proven member.
+    k.lineages.borrow_mut().remove(&7000);
+    k.presence.remove(&7000);
+    let (ended, lines) = start_pass(dir.path(), &k);
+    assert_eq!((ended, k.termed()), (1, vec![71]), "{lines:?}");
 }
 
 /// NEGATIVE CONTROL: dropping any one guard ends a named pid, so `termed` is no longer `[71]`.
@@ -853,7 +1015,9 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
     let path = dir.path().join("41983-1.run");
     std::fs::write(
         &path,
-        "run v=1 boot=B id=41983-1 uniqueid=100 start=1 sid=-\n",
+        "run v=1 boot=B id=41983-1 uniqueid=100 start=1 sid=-\n\
+         group pgid=500 leader_birth=1 leader_uniqueid=1 stage=test%20-p%20aterm-link\n\
+         group pgid=501 leader_birth=1 leader_uniqueid=1 stage=fmt\n",
     )
     .expect("seed");
     let runs = Runs {
@@ -872,6 +1036,7 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
         uniqueid: 100,
         roots: vec![PathBuf::from("/wt-a")],
         said: Mutex::new(Vec::new()),
+        may_forget: AtomicBool::new(false),
     };
     let mut k = FakeKernel::default();
     let mut verify = lin(41983, 100, 41983, 1);
@@ -915,6 +1080,26 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
             ..GroupReport::default()
         },
     );
+    let unknown = dir.path().join("7000-8000.run");
+    let partial: &[u8] = b"run v=1 boot=B id=7000-8";
+    std::fs::write(&unknown, partial).expect("partial competing record");
+    let before = std::fs::read(&path).expect("own record before unknown sweep");
+    let _ = runs.end_of_run(&k);
+    runs.finish(&k);
+    assert!(k.signals.borrow().is_empty());
+    assert!(k.markers_read.borrow().is_empty());
+    assert_eq!(
+        std::fs::read(&path).expect("unknown keeps own record"),
+        before
+    );
+    assert_eq!(
+        std::fs::read(&unknown)
+            .expect("unknown record kept")
+            .as_slice(),
+        partial
+    );
+    std::fs::remove_file(&unknown).expect("retire private partial record");
+
     let lines = runs.end_of_run(&k);
     assert_eq!(k.termed(), [71], "{lines:?}");
     assert_eq!(lines.len(), 2, "{lines:?}");
@@ -928,8 +1113,42 @@ fn the_run_end_sweep_ends_this_runs_own_orphans() {
          1 held at macOS's program check, not judged",
         "{lines:?}"
     );
+    let before = std::fs::read(&path).expect("own record before leftover finish");
     runs.finish(&k);
-    assert!(!path.exists(), "the record is removed at the orderly end");
+    assert_eq!(
+        std::fs::read(&path).expect("named and unjudged members keep own record"),
+        before
+    );
+
+    for pid in [73, 74, 75, 76] {
+        k.lineages.borrow_mut().remove(&pid);
+    }
+    let _ = runs.end_of_run(&k);
+    std::fs::write(&unknown, b"\xff\n").expect("new uncertainty after a clear sweep");
+    let before = std::fs::read(&path).expect("own record after clear sweep");
+    let signals_before = k.signals.borrow().clone();
+    k.markers_read.borrow_mut().clear();
+    let _ = runs.end_of_run(&k);
+    runs.finish(&k);
+    assert_eq!(*k.signals.borrow(), signals_before);
+    assert!(k.markers_read.borrow().is_empty());
+    assert_eq!(
+        std::fs::read(&path).expect("unknown clears earlier forget permission"),
+        before
+    );
+    assert_eq!(
+        std::fs::read(&unknown)
+            .expect("unknown bytes kept")
+            .as_slice(),
+        &b"\xff\n"[..]
+    );
+    std::fs::remove_file(&unknown).expect("retire private unreadable record");
+    let _ = runs.end_of_run(&k);
+    runs.finish(&k);
+    assert!(
+        !path.exists(),
+        "a fresh clear sweep permits the orderly end"
+    );
 }
 
 /// Only a group proven empty is written `closed` in the run's own record.
@@ -960,6 +1179,7 @@ fn only_a_group_proven_empty_is_recorded_closed() {
         uniqueid: 1,
         roots: Vec::new(),
         said: Mutex::new(Vec::new()),
+        may_forget: AtomicBool::new(false),
     };
     for (pgid, listed, named) in [
         (500, Some(true), vec![]),
@@ -1040,7 +1260,7 @@ fn a_live_runs_launcher_is_never_a_dead_runs_member() {
         "run v=1 boot=B id=7000-{} uniqueid=310 start=1 sid=-\nroot path=/wt-a\n",
         born(7000)
     );
-    let dir = records(&[("41983-999.run", &dead_record()), ("7000.run", &inner)]);
+    let dir = records(&[("41983-999.run", &dead_record()), ("7000-8000.run", &inner)]);
     let (ended, lines) = start_pass(dir.path(), &k);
     assert_eq!((ended, k.termed()), (0, Vec::new()), "{lines:?}");
 }
@@ -1058,7 +1278,7 @@ fn a_group_a_live_run_closed_claims_nothing() {
     );
     k.put(lin(71, 310, 600, 1), "/wt-a/target/debug/aterm");
     k.markers.insert(71, verify_run(DEAD_ID));
-    let dir = records(&[("41983-999.run", &dead_record()), ("7000.run", &live)]);
+    let dir = records(&[("41983-999.run", &dead_record()), ("7000-8000.run", &live)]);
     let (ended, lines) = start_pass(dir.path(), &k);
     assert_eq!((ended, k.termed()), (1, vec![71]), "{lines:?}");
 }
@@ -1078,6 +1298,32 @@ fn a_member_the_sweep_cannot_read_keeps_its_group_open() {
         "{report:?}"
     );
     assert!(!report.closed(), "{report:?}");
+
+    k.birth_unreadable.insert(71);
+    for presence in [ProcessPresence::Present, ProcessPresence::Unknown] {
+        k.presence.insert(71, presence);
+        let report = sweep_group(&k, 500, "s", &roots);
+        assert_eq!(
+            (report.named.len(), k.termed()),
+            (1, Vec::new()),
+            "{report:?}"
+        );
+        assert!(!report.closed(), "{presence:?}: {report:?}");
+
+        // The same refusal applies after an attempted end, not only before any judgment.
+        k.unreadable.remove(&71);
+        k.refused.insert(71);
+        let report = sweep_group(&k, 500, "s", &roots);
+        assert_eq!(report.named, ["aterm"], "{presence:?}: {report:?}");
+        assert!(report.ended.is_empty() && !report.closed(), "{report:?}");
+        k.unreadable.insert(71);
+    }
+
+    // A positive absence answer permits closure, unlike an unreadable identity.
+    k.lineages.borrow_mut().remove(&71);
+    k.presence.remove(&71);
+    let report = sweep_group(&k, 500, "s", &roots);
+    assert!(report.closed() && report.named.is_empty(), "{report:?}");
 }
 
 /// count every member not ended as named, and a `?` is named and the group stays open.

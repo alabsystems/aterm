@@ -131,6 +131,7 @@ fn token(raw: &str) -> bool {
 /// A style only from a complete, well-formed `OK <glyph> <fg> <bg> <attrs>`
 /// reply, optionally followed by one `link=<percent-token>`. Empty glyphs are
 /// valid; missing colours, future/unknown attributes and extra fields are not.
+/// A trailing `frame=open` (the cell read in an unfinished DEC 2026 frame) is refused on purpose.
 #[must_use]
 pub fn parse_style(line: &str) -> Option<Style<'_>> {
     let body = line
@@ -201,6 +202,21 @@ mod tests {
             "OK x d0d0d0 111318 none\nOK x d0d0d0 111318 dim\n",
         ] {
             assert_eq!(parse_style(raw), None, "{raw}");
+        }
+    }
+
+    /// A cell read on an unfinished frame (` frame=open`) is no evidence, whatever its shape.
+    #[test]
+    fn a_cell_of_an_unfinished_frame_proves_nothing() {
+        for whole in [
+            "OK x d0d0d0 111318 none",
+            "OK  999999 111318 dim,wide_cont",
+            "OK %E2%8F%BA e5e5e5 000000 bold,wide",
+            "OK %E2%9D%AF d0d0d0 111318 bold,underline link=https%3A%2F%2Fexample.test",
+        ] {
+            assert!(parse_style(&format!("{whole}\n")).is_some(), "{whole}");
+            let open = format!("{whole} frame=open\n");
+            assert_eq!(parse_style(&open), None, "{open}");
         }
     }
 }

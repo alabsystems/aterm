@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Wayland CPU presenter: two `wl_shm` buffers in memfd pools, attached
-//! to the window's own `wl_surface` with buffer damage and a commit. It
-//! replaces softbuffer 0.4.8's Wayland backend
-//! (docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6) and keeps its
-//! protocol, so the compositor sees what it saw:
-//!
-//! - its own event queue on winit's display, so the `wl_buffer.release`
-//!   events it waits for are dispatched only here;
-//! - `wl_shm` at version 1, XRGB8888 (aterm's `0x00RRGGBB` words);
-//! - a front and a back buffer: an acquire hands out the back one, waiting
-//!   (dispatching the private queue) until the compositor released it; a
-//!   present swaps them, attaches, damages and commits;
-//! - `damage_buffer` per rectangle on a surface of version 4 and later, the
-//!   whole surface (`damage` to `i32::MAX`) before;
-//! - a pool grows (`wl_shm_pool.resize` over a grown memfd) to the next
-//!   power of two of a new size and never shrinks;
-//! - a buffer's age is 1 when it holds the last present, more when older,
-//!   and 0 when new.
+//! Wayland CPU presenter using double-buffered `wl_shm` memfd pools.
 
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
@@ -75,9 +58,7 @@ impl From<aterm_wayland::proxy::Error> for WaylandPresentError {
     }
 }
 
-/// The pool size for a `width` x `height` buffer: its bytes, rounded up to a
-/// power of two (softbuffer's `get_pool_size`). `None` past what a pool's
-/// `i32` size or a row's `i32` stride can say.
+/// The pool size for a `width` x `height` buffer.
 fn pool_size(width: i32, height: i32) -> Option<usize> {
     let bytes = usize::try_from(width)
         .ok()?
@@ -110,9 +91,7 @@ struct Live {
 struct Buffer {
     mem: ShmMem,
     pool: Proxy,
-    /// The `wl_buffer` at `width` x `height`. `None` between a destroy and
-    /// the next buffer made, so a resize that failed half way leaves nothing
-    /// to attach or destroy twice, and the next resize makes one.
+    /// The `wl_buffer` at `width` x `height`.
     live: Option<Live>,
     width: i32,
     height: i32,
@@ -129,8 +108,7 @@ impl Buffer {
         let len = pool_size(width, height).ok_or_else(size_err)?;
         let len_i32 = i32::try_from(len).map_err(|_| size_err())?;
         let mem = ShmMem::new(c"aterm-wayland", len).map_err(WaylandPresentError::Shm)?;
-        // SAFETY: `shm` is the presenter's live wl_shm; the descriptor is
-        // duplicated by libwayland for the send.
+        // SAFETY: `shm` is the presenter's live wl_shm.
         let pool = unsafe { wl_shm::create_pool(shm, mem.fd().as_raw_fd(), len_i32) }
             .ok_or(aterm_wayland::proxy::Error::NoObject)?;
         let mut b = Buffer {
@@ -146,21 +124,18 @@ impl Buffer {
         Ok(b)
     }
 
-    /// A `wl_buffer` of `width` x `height` over the pool, with its release
-    /// handler; the size is the buffer's only once it is made. The pool holds
-    /// it (the caller grew the pool to [`pool_size`] first).
+    /// A `wl_buffer` of `width` x `height` over the pool, with its release handler ([`pool_size`]).
     fn make_buffer(&mut self, width: i32, height: i32) -> Result<(), WaylandPresentError> {
         let stride = width.checked_mul(4).ok_or(WaylandPresentError::Size(
             width.unsigned_abs(),
             height.unsigned_abs(),
         ))?;
-        // SAFETY: the live pool; the arguments lie inside it.
+        // SAFETY: The live pool; the arguments lie inside it.
         let buffer =
             unsafe { wl_shm_pool::create_buffer(self.pool, 0, width, height, stride, FORMAT) }
                 .ok_or(aterm_wayland::proxy::Error::NoObject)?;
         let released = Arc::clone(&self.released);
-        // SAFETY: a buffer this presenter made, on its queue; the listener is
-        // kept beside it and freed only after the buffer is destroyed.
+        // SAFETY: A buffer this presenter made, on its queue.
         let listener = unsafe {
             buffer.listen(move |_, opcode, _| {
                 if opcode == wl_buffer::evt::RELEASE {
@@ -171,8 +146,7 @@ impl Buffer {
         let listener = match listener {
             Ok(l) => l,
             Err(e) => {
-                // SAFETY: the buffer made above, without a listener, destroyed
-                // once.
+                // SAFETY: The buffer made above, without a listener, destroyed once.
                 unsafe { wl_buffer::destroy(buffer) };
                 return Err(e.into());
             }
@@ -186,18 +160,13 @@ impl Buffer {
     /// Destroy the live `wl_buffer`, if there is one, then free its listener.
     fn destroy_buffer(&mut self) {
         if let Some(Live { buffer, listener }) = self.live.take() {
-            // SAFETY: the live wl_buffer, taken out of `live`, so destroyed
-            // once; its listener goes after.
+            // SAFETY: The live wl_buffer, taken out of `live`, so destroyed once.
             unsafe { wl_buffer::destroy(buffer) };
             drop(listener);
         }
     }
 
-    /// Hold a `width` x `height` buffer. The steps that can fail on this side
-    /// (the size, growing the file and its mapping) come before the old
-    /// buffer is destroyed, so a failure leaves the buffer and the pool as
-    /// they were and the next frame retries; from the destroy on, the
-    /// requests are softbuffer's, in its order.
+    /// Hold a `width` x `height` buffer.
     fn resize(&mut self, width: i32, height: i32) -> Result<(), WaylandPresentError> {
         if (self.width, self.height) == (width, height) && self.live.is_some() {
             return Ok(());
@@ -211,7 +180,7 @@ impl Buffer {
         }
         self.destroy_buffer();
         if grow {
-            // SAFETY: the live pool, grown to the file's new size.
+            // SAFETY: The live pool, grown to the file's new size.
             unsafe { wl_shm_pool::resize(self.pool, len_i32) };
         }
         self.make_buffer(width, height)
@@ -225,7 +194,7 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         self.destroy_buffer();
-        // SAFETY: the live pool, destroyed once (its buffers are gone).
+        // SAFETY: The live pool, destroyed once (its buffers are gone).
         unsafe { wl_shm_pool::destroy(self.pool) };
     }
 }
@@ -241,13 +210,11 @@ pub(crate) struct WaylandPresenter {
     registry: Option<Registry>,
     /// Every object above is on this queue; dropped after them.
     queue: Queue,
-    /// Holds the winit window, and with it the display and the surface;
-    /// dropped last.
+    /// Holds the winit window, and with it the display and the surface; dropped last.
     _window: Arc<Window>,
 }
 
-// SAFETY: libwayland's calls are thread-safe; the presenter moves between
-// threads only with its window state.
+// SAFETY: Libwayland's calls are thread-safe.
 unsafe impl Send for WaylandPresenter {}
 
 impl WaylandPresenter {
@@ -256,8 +223,7 @@ impl WaylandPresenter {
         let Some(NativeWindow::Wayland { display, surface }) = window.native_window() else {
             return Err(WaylandPresentError::NotWayland);
         };
-        // SAFETY: winit's live display and surface, which `_window` keeps
-        // alive for as long as this presenter lives.
+        // SAFETY: Winit's live display and surface.
         let (display, surface) = unsafe { (Display::from_ptr(display), Proxy::from_ptr(surface)) };
         let queue = Queue::new(display)?;
         let registry = Registry::new(&queue)?;
@@ -290,8 +256,7 @@ impl WaylandPresenter {
         Ok(())
     }
 
-    /// The back buffer, once the compositor has released it, at the current
-    /// size.
+    /// The back buffer, once the compositor has released it, at the current size.
     pub(crate) fn buffer_mut(&mut self) -> Result<WaylandFrame<'_>, WaylandPresentError> {
         let Some((w, h)) = self.size else {
             return Err(WaylandPresentError::Size(0, 0));
@@ -311,17 +276,13 @@ impl WaylandPresenter {
     }
 
     fn present(&mut self, damage: &[DamageRect]) -> Result<(), WaylandPresentError> {
-        // Every rectangle is checked before anything is sent, so a refused
-        // present leaves the buffers and the surface as they were.
         if let Some(bad) = damage.iter().find(|r| wl_rect(r).is_none()) {
             return Err(WaylandPresentError::Damage(*bad));
         }
-        // Releases already read, applied before the swap.
         self.queue.dispatch_pending()?;
         let Some((front, back)) = &mut self.buffers else {
             return Ok(());
         };
-        // `buffer_mut` hands a frame out only over a live buffer.
         let Some(attach) = back.live.as_ref().map(|l| l.buffer) else {
             return Err(aterm_wayland::proxy::Error::NoObject.into());
         };
@@ -331,7 +292,7 @@ impl WaylandPresenter {
             back.age = back.age.saturating_add(1);
         }
         front.released.store(false, Ordering::SeqCst);
-        // SAFETY: winit's live surface and this presenter's live buffer.
+        // SAFETY: Winit's live surface and this presenter's live buffer.
         unsafe {
             wl_surface::attach(self.surface, Some(attach), 0, 0);
             if self.surface.version() < 4 {
@@ -343,10 +304,6 @@ impl WaylandPresenter {
             }
             wl_surface::commit(self.surface);
         }
-        // A flush that could not write everything (EAGAIN: the compositor has
-        // not drained the socket) keeps the rest in libwayland for the next
-        // flush, winit's or this presenter's; the commit is sent, so only a
-        // dead display fails the present.
         match self.display.flush() {
             Err(e) if self.display.error().is_some() => Err(e.into()),
             _ => Ok(()),
@@ -357,8 +314,7 @@ impl WaylandPresenter {
 impl Drop for WaylandPresenter {
     fn drop(&mut self) {
         self.buffers = None;
-        // SAFETY: the wl_shm this presenter bound (version 1 has no release
-        // request), destroyed once, before its queue.
+        // SAFETY: The wl_shm this presenter bound (version 1 has no release request).
         unsafe { self.shm.destroy() };
         self.registry = None;
         let _ = self.display.flush();

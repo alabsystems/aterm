@@ -169,7 +169,7 @@ impl Library {
     /// The address of `symbol`, or `None` when the library does not export it.
     #[inline]
     #[must_use]
-    pub const fn symbol(&self, symbol: &CStr) -> Option<NonNull<c_void>> {
+    pub fn symbol(&self, symbol: &CStr) -> Option<NonNull<c_void>> {
         #[cfg(target_os = "linux")]
         {
             sys::symbol(self.handle, symbol)

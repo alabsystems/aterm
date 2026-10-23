@@ -7,11 +7,15 @@ pub mod agh;
 /// In-memory fake host for tests and debug builds.
 #[cfg(any(test, debug_assertions))]
 pub mod fake;
-pub mod gh;
+pub mod rest;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The pause between attempts at a call GitHub did not answer: its release-asset
+/// endpoint's intermittent HTTP 500 is usually still answering a moment later.
+pub const RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 /// `<owner>/<repo>` on the release host.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

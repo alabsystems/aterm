@@ -149,7 +149,10 @@ fn private_lock_file(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-/// [`Instance::adopt`] of descriptor `fd`.
+/// [`Instance::adopt`] of descriptor `fd`. On success `fd` itself is retired (closed, or
+/// `/dev/null` placed on it when it is a stdio slot) and the hold lives on a copy; otherwise
+/// `fd` is left as it was, unless it was open on the lock file (then it is retired too: a
+/// stdin on the lock file is never wanted).
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
 fn adopt_fd(fd: i32, path: &Path) -> Option<Instance> {

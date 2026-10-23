@@ -399,13 +399,10 @@ fn hex4(s: &str, i: &mut usize) -> Result<u32, String> {
     u32::from_str_radix(t, 16).map_err(|_| format!("json: bad \\u escape {t:?}"))
 }
 
-/// Whether a `cell` style reply includes the `dim` attribute.
+/// Whether a `cell` style reply includes the `dim` attribute; a cell of an unfinished frame (` frame=open`) is no evidence.
 #[must_use]
 pub fn cell_is_dim(line: &str) -> bool {
-    line.trim_end()
-        .strip_prefix("OK ")
-        .and_then(|rest| rest.split(' ').nth(3))
-        .is_some_and(|attrs| attrs.split(',').any(|a| a == "dim"))
+    aterm_codec::cell::parse_style(line).is_some_and(|style| style.dim)
 }
 
 /// Classify whether a `cell` reply represents a placeholder (`dim` or matching `hint_fg`).
@@ -427,10 +424,7 @@ pub fn cell_is_placeholder(line: &str, hint_fg: Option<&str>) -> Option<bool> {
 /// Whether a `cell` reply's foreground color matches `fg` (case-insensitive hex).
 #[must_use]
 pub fn cell_fg_is(line: &str, fg: &str) -> bool {
-    line.trim_end()
-        .strip_prefix("OK ")
-        .and_then(|rest| rest.split(' ').nth(1))
-        .is_some_and(|c| c.eq_ignore_ascii_case(fg))
+    aterm_codec::cell::parse_style(line).is_some_and(|style| style.fg.eq_ignore_ascii_case(fg))
 }
 
 /// Return the lowercase foreground hex color of a `cell` reply when its glyph matches `glyph`.
@@ -779,5 +773,14 @@ mod tests {
         assert!(Json::parse("{\"a\" 1}").is_err());
         assert!(Json::parse("tru").is_err());
         assert!(Json::parse("\"\\q\"").is_err());
+    }
+
+    /// [`cell_fg_is`] reads a well-formed cell's colour; a cell of an unfinished frame is no evidence.
+    #[test]
+    fn a_cell_reply_names_its_colour_only_off_a_whole_frame() {
+        assert!(cell_fg_is("OK x 8A8F99 111318 none", "8a8f99"));
+        assert!(!cell_fg_is("OK x d0d0d0 111318 none", "8a8f99"));
+        assert!(!cell_fg_is("OK x 8a8f99 111318 none frame=open", "8a8f99"));
+        assert!(!cell_fg_is("ERR out of range", "8a8f99"));
     }
 }

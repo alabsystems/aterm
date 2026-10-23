@@ -291,7 +291,7 @@ pub fn broker_client(sock: impl AsRef<Path>) -> Client {
 }
 
 /// The first line `child` prints on its (piped) stdout — a readiness line — bounded by [`DEADLINE`].
-pub fn first_line_within(child: &mut Child, what: &str) -> String {
+pub fn first_line_within(child: &mut OwnedChild, what: &str) -> String {
     use std::io::BufRead;
     let out = child.stdout.take().expect("the child's stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -338,6 +338,88 @@ pub fn arm_lifeline(cmd: &mut Command, dir: &Path) {
     cmd.inherit_nothing();
     aterm_uds::lifeline::arm_for_process(cmd, dir)
         .unwrap_or_else(|e| panic!("arm the instance's lifeline in {}: {e}", dir.display()));
+}
+
+/// A real `aterm link broker` child ([`spawn_broker`]) and the lifeline it was armed
+/// with. The broker serves while `lifeline` is held; once it is dropped, or this test
+/// process dies however it dies, the broker ends itself at its next wake.
+#[must_use]
+pub struct BrokerChild {
+    pub child: OwnedChild,
+    pub lifeline: aterm_uds::lifeline::Lifeline,
+}
+
+/// Start `aterm link broker <args>…` (the [`aterm`] under test), the one way these
+/// suites start a broker process: built by `aterm_uds::spawnfd::command`, so it holds its
+/// stdio and nothing else of this process, and armed with a LIFELINE
+/// (`aterm_uds::lifeline::Lifeline::arm`), so it never outlives the test. A broker that
+/// only a `Drop` kills outlived every runner that was SIGKILLed or timed out: launchd
+/// adopted it, and it served for hours
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md`, I2). `stdio` sets the child's stdout,
+/// stderr and environment; stdin is the lifeline, set after it. `dir` is the test's own
+/// scratch directory: the FIFO's name lives there only until both ends are open.
+///
+/// # Panics
+/// The FIFO could not be made in `dir`, or the spawn failed.
+pub fn spawn_broker(
+    dir: &Path,
+    args: &[&str],
+    stdio: impl FnOnce(&mut aterm_uds::spawnfd::Command),
+) -> BrokerChild {
+    let mut cmd = aterm_uds::spawnfd::command(aterm_to_launch());
+    cmd.args(["link", "broker"]).args(args);
+    stdio(&mut cmd);
+    let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, dir)
+        .unwrap_or_else(|e| panic!("arm the broker's lifeline in {}: {e}", dir.display()));
+    let child = cmd.spawn().expect("spawn the broker");
+    BrokerChild { child, lifeline }
+}
+
+/// Who `pid` is, read while it lives: a process this test spawned and has not reaped (so
+/// the number names it), the launcher [`end_bridge`] holds a bridge to.
+#[must_use]
+pub fn identity_of(pid: u32) -> Option<aterm_uds::process::Identity> {
+    aterm_uds::process::read_identity(i32::try_from(pid).ok()?)
+}
+
+/// End the bridge `state/pid` names through the end protocol
+/// ([`aterm_uds::process::end_proven`]), and only while it proves to be one `launcher`
+/// started: its launcher's pid version (`Lineage::launcher_version`, kept through its
+/// adoption) is `launcher`'s, and it runs the [`aterm`] under test. `launcher` is the
+/// node's aterm, read before it was killed ([`identity_of`]). A drop reads the file after
+/// that aterm is gone, when the number may name any process of this user, another test's
+/// aterm among them (pids wrap in minutes on a loaded machine), so a pid that proves
+/// neither is left alone, and a live one is named on stderr. Linux reads no identity yet
+/// (the leftover design's slice 7), so there every live pid is left and named.
+pub fn end_bridge(state: &Path, launcher: Option<aterm_uds::process::Identity>) {
+    use aterm_uds::process::{END_GRACE, EndControlLive, Identity, end_proven, pid_alive};
+    let Some(pid) = std::fs::read_to_string(state.join("pid"))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+    else {
+        return;
+    };
+    let ours = std::fs::canonicalize(aterm()).ok();
+    let proven = |pid: i32| -> Option<Identity> {
+        let lineage = aterm_uds::process::read_lineage(pid)?;
+        let runs = aterm_uds::process::read_process_path(pid)
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        let started = launcher.is_some_and(|l| l.idversion == lineage.launcher_version);
+        (started && ours.is_some() && runs == ours).then_some(lineage.identity)
+    };
+    let Some(token) = proven(pid) else {
+        if u32::try_from(pid).is_ok_and(pid_alive) {
+            eprintln!(
+                "LEFT pid {pid} ({}/pid): not proven the bridge its aterm started",
+                state.display()
+            );
+        }
+        return;
+    };
+    // A refusal sends nothing, which is the point.
+    let _ = end_proven(token, END_GRACE, &mut EndControlLive, |id| {
+        proven(id.pid) == Some(*id)
+    });
 }
 
 /// These Fabric fixtures do not exercise update, package or machine configuration.
@@ -1779,15 +1861,12 @@ pub struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        let launcher = self.gui.as_ref().and_then(|gui| identity_of(gui.id()));
         if let Some(mut gui) = self.gui.take() {
             let _ = gui.kill();
             let _ = gui.wait();
         }
-        if let Ok(pid) = std::fs::read_to_string(self.state.join("pid"))
-            && let Ok(pid) = pid.trim().parse::<i32>()
-        {
-            kill(pid, 9);
-        }
+        end_bridge(&self.state, launcher);
     }
 }
 

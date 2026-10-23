@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm-jpeg` — first-party JPEG decode: the wallpaper decoder off macOS
-//! (where AppKit's colour-managed decoder serves) and the portable floor
-//! everywhere.
-//!
-//! ## Scope, stated as limits
-//!
-//! What cameras, phones, browsers and image editors write (ITU T.81):
-//! baseline and extended sequential Huffman (SOF0, SOF1) and progressive
-//! Huffman (SOF2), 8-bit samples, one, three or four components (grey, JFIF
-//! YCbCr or RGB, Adobe CMYK and YCCK), any sampling factors from 1 to 4,
-//! interleaved and single-component scans, restart intervals, and the EXIF
-//! orientation (the image comes back upright, its sides swapped where the
-//! orientation turns it).
-//!
-//! Not here: arithmetic coding (SOF9 and up), lossless and hierarchical
-//! modes, 12-bit samples, and colour management (an embedded ICC profile is
-//! skipped; the samples are taken as sRGB). A file that uses one of those
-//! is refused, never misread.
-//!
-//! ## Hostile input
-//!
-//! Dimensions are checked against the caller's bound before anything is
-//! allocated, every table and index is checked, and a corrupt or truncated
-//! file is `None` or decodes to its end with the missing data as zeros:
-//! never a panic, never an allocation the dimensions bound does not cover.
+//! `aterm-jpeg` — first-party JPEG decode.
 
 mod color;
 mod huffman;
@@ -44,10 +20,7 @@ const ZIGZAG: [usize; 64] = [
 /// The file name extensions of the format this crate reads, lower case.
 pub const EXTENSIONS: &[&str] = &["jpg", "jpeg", "jpe", "jfif"];
 
-/// Decode a JPEG to packed straight RGBA8 (alpha 255), upright, returning
-/// `(rgba, width, height)`. Either side past `max_dimension` is refused
-/// before any pixel buffer is allocated. `None` for anything that is not a
-/// JPEG this crate reads (see the crate docs) or is too corrupt to frame.
+/// Decode a JPEG to packed straight RGBA8 (alpha 255), upright, returning `(rgba, width, height)`.
 #[inline]
 #[must_use]
 pub fn decode_rgba8(bytes: &[u8], max_dimension: u32) -> Option<(Vec<u8>, usize, usize)> {
@@ -172,18 +145,14 @@ impl<'a> Decoder<'a> {
 
     fn run(&mut self) -> Option<()> {
         loop {
-            // A file that ends without its EOI after a scan is an image cut
-            // short, decoded as far as it goes.
             let Some(marker) = self.next_marker() else {
                 return self.scanned.then_some(());
             };
             match marker {
                 0xD9 => return self.scanned.then_some(()),
-                // TEM: a marker with no segment.
                 0x01 => {}
                 0xC0 | 0xC1 => self.start_of_frame(false)?,
                 0xC2 => self.start_of_frame(true)?,
-                // Lossless, hierarchical, arithmetic: not read.
                 0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return None,
                 0xC4 => self.huffman_tables()?,
                 0xDB => self.quant_tables()?,
@@ -216,7 +185,6 @@ impl<'a> Decoder<'a> {
                         self.adobe_transform = payload.get(11).copied();
                     }
                 }
-                // DNL: the height after the first scan is not supported.
                 0xDC => return None,
                 _ => {
                     self.segment()?;
@@ -406,8 +374,6 @@ impl<'a> Decoder<'a> {
         let frame = self.frame.as_ref()?;
         let (mcus_x, mcus_y) = (frame.mcus_x, frame.mcus_y);
         let progressive = frame.progressive;
-        // A single-component scan walks that component's own blocks (A.2.2),
-        // not the MCU-padded grid.
         let single = scan.members.len() == 1;
         let units = if single {
             let component = &self.components[scan.members[0]];
@@ -422,7 +388,6 @@ impl<'a> Decoder<'a> {
                     && done > 0
                     && done.is_multiple_of(self.restart_interval)
                 {
-                    // Missing marker: carry on from wherever the data is.
                     reader.restart();
                     for &index in &scan.members {
                         self.components[index].dc_pred = 0;
@@ -542,7 +507,6 @@ impl<'a> Decoder<'a> {
     fn finish(mut self) -> Option<(Vec<u8>, usize, usize)> {
         let frame = self.frame.take()?;
         if frame.progressive {
-            // Dequantize and transform every block now that all scans are in.
             for component in &mut self.components {
                 let quant = self.quant[component.quant].as_ref()?;
                 let stride = component.blocks_w * 8;
@@ -710,7 +674,6 @@ fn ac_refine(
         if size == 0 {
             if run < 15 {
                 *eob_run = (1 << run) - 1 + reader.bits(run);
-                // Refine the rest of the band, then stop.
                 run = 64;
             }
         } else {
@@ -795,9 +758,7 @@ mod tests {
     #[test]
     fn the_exif_orientation_is_read_in_both_byte_orders() {
         let little = [
-            b'I', b'I', 42, 0, 8, 0, 0, 0, // header, IFD at 8
-            1, 0, // one entry
-            0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0,
+            b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0,
         ];
         assert_eq!(exif_orientation(&little), Some(6));
         let big = [

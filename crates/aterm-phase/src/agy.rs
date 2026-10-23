@@ -1460,6 +1460,21 @@ pub fn launch_card_account(rows: &[String]) -> Option<(&str, Option<&str>)> {
     None
 }
 
+/// THE LOGIN agy's LAUNCH CARD NAMES, as drawn on its second row: `Gemini
+/// API key` (measured on 1.4.0, [`fixtures::lab::IDLE`]) or the signed-in
+/// `user@example.com (Google AI Ultra)` ([`launch_card_account`] reads its
+/// email). Drawn at the session's start: a relaunch draws the login it runs
+/// on. `None` with no card on the rows, or its row cut short.
+#[must_use]
+pub fn launch_card_login(rows: &[String]) -> Option<&str> {
+    let f = frame(rows)?;
+    let (_, place) = launch_card_scan(&rows[..f.top]);
+    let p = place?;
+    let (_, after) = split_at_col(rows.get(p.top + 1)?, p.text_col)?;
+    let t = crate::text::trim(after);
+    (!t.is_empty() && !t.contains('\u{2026}')).then_some(t)
+}
+
 /// agy's launch card and live footer model/effort for the harness footer.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<LaunchCard> {

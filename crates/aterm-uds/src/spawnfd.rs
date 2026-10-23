@@ -216,7 +216,7 @@ pub struct LaneChild {
 impl LaneChild {
     /// The child's pid.
     #[must_use]
-    pub fn id(&self) -> u32 {
+    pub const fn id(&self) -> u32 {
         self.pid.unsigned_abs()
     }
 
@@ -1065,7 +1065,7 @@ impl InheritStrip {
 
     /// How far a marking loop reaches (exclusive).
     #[must_use]
-    pub fn bound(self) -> RawFd {
+    pub const fn bound(self) -> RawFd {
         self.bound
     }
 

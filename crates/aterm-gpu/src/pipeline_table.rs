@@ -288,7 +288,7 @@ impl TargetFormats {
     /// # Panics
     /// Panics if `role` is [`TargetRole::Present`] and `present` is `None`.
     #[inline]
-    pub(crate) fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
+    pub(crate) const fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
         match role {
             TargetRole::OffscreenSrgb => self.offscreen_srgb,
             TargetRole::OffscreenUnorm => self.offscreen_unorm,

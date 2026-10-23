@@ -269,7 +269,7 @@ impl<R: Read> Archive<R> {
     /// # Errors
     /// Never at this point; the signature leaves room for a variant that can fail here.
     #[inline]
-    pub fn entries(&mut self) -> io::Result<Entries<'_, R>> {
+    pub const fn entries(&mut self) -> io::Result<Entries<'_, R>> {
         Ok(Entries {
             inner: &mut self.inner,
             skip: 0,

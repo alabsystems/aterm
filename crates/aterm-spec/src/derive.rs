@@ -736,7 +736,7 @@ impl Model {
 
     /// Whether the model has function-valued state, which only `ty` can check: the in-process interpreter evaluates scalar models alone.
     #[must_use]
-    pub fn is_function_valued(&self) -> bool {
+    pub const fn is_function_valued(&self) -> bool {
         !self.fn_vars.is_empty()
     }
 

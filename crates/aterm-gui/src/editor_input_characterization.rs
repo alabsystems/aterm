@@ -1,34 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native Editor's key translation, pinned as a table
-//! (docs/DESIGN-amacs-2026-10-19.md §4.4).
-//!
-//! Each row opens a fresh Editor tab on [`long`] with the caret at byte 6 (the
-//! `b` of `beta`) and keyboard focus on the buffer, drives the row's `before`
-//! keys, then presses the row's key through the native input boundary
-//! ([`App::native_input_event`], the path a winit press and a controller's
-//! `key` verb both take). What the key did is read back as one line: the
-//! document, the primary selection, a pending key sequence, the minibuffer,
-//! keyboard focus, the viewport's top line and the status line. A row names
-//! the key (winit key, modifiers, the layout's text) and, through `before`,
-//! whether a chord is pending when it lands.
-//!
-//! The table reads outcomes, not the events the host builds on the way, so it
-//! holds the GUI to the same behaviour whichever layer translates the key. It
-//! was written against the host's own translation, before an Editor's keys
-//! moved into amacs's shared input reducer (`EditorWorkspace::handle_input`);
-//! the rows that move changed on purpose say CHANGED: Tab indents and F6
-//! moves focus. Escape is what it was: it quits, and the key after it is
-//! itself (ESC as Meta is the terminal face's alone, `Profile::escape_is_meta`).
+//! Native Editor key translation characterization tests ([`App::native_input_event`], [`long`]).
 
 use crate::input::InputEvent;
 use crate::native_app::{AppEvent, AppKind, AppViewState};
 use crate::{App, WindowId};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
-/// The document every row starts from: two short lines, then enough lines
-/// that a page of scrolling moves the viewport.
+/// Initial multi-line document for every table row.
 fn long() -> String {
     let mut text = String::from("alpha beta\ngamma\n");
     for line in 3..=40 {
@@ -81,8 +61,7 @@ fn cmd(character: char) -> InputEvent {
     press(Key::Character(character), Modifiers::SUPER)
 }
 
-/// The chord that opens incremental search on this host: `C-s`, except on
-/// Windows, where `C-s` saves and isearch is `M-s`.
+/// The chord that opens incremental search on this host.
 fn isearch() -> InputEvent {
     if cfg!(windows) { alt('s') } else { ctrl('s') }
 }
@@ -109,8 +88,7 @@ fn row(
     }
 }
 
-/// A fresh Editor on [`long`] in window 0, caret at [`CARET`], focus on the
-/// buffer: `(app, view, document)`.
+/// A fresh Editor on [`long`] in window 0, caret at [`CARET`], focus on the buffer.
 fn editor(
     path: &std::path::Path,
 ) -> (
@@ -141,11 +119,7 @@ fn editor(
     (app, view, document)
 }
 
-/// How many whole document rows `app`'s editor shows: what its window
-/// leaves the file under the toolbar, as the host sizes the editor's view
-/// (`App::reconcile_active_editor_viewport`). The window is 24 rows of the
-/// platform's default font, so the count is the platform's: 10 at macOS's
-/// 12 px, 16 at Linux's 15 px. The rows that page or scroll read it.
+/// How many whole document rows `app`'s editor shows.
 fn screen(app: &App) -> usize {
     let wid = WindowId(0);
     let (instance, _) = app.active_native_view(wid).expect("the editor tab");
@@ -160,9 +134,7 @@ fn screen(app: &App) -> usize {
     )
 }
 
-/// What the editor shows after a key, as one line. Fields at their starting
-/// value are left out: the text while it is [`long`], focus while it is on
-/// the buffer, the viewport while line 0 is on top.
+/// What the editor shows after a key, as one line ([`long`]).
 fn seen(
     app: &App,
     view: crate::tab_model::ViewId,
@@ -175,7 +147,6 @@ fn seen(
     let buffer = state.buffer.as_ref().expect("attached editor buffer");
     let mut out = Vec::new();
     if *text != *long() {
-        // The first two lines, where every row's edit lands.
         let head = text.split_inclusive('\n').take(2).collect::<String>();
         out.push(format!("text={:?}", head.replace('\n', "⏎")));
     }
@@ -198,7 +169,6 @@ fn seen(
         out.push("pending".to_string());
     }
     if let Some(hud) = &buffer.prefix_hud {
-        // The keys typed so far, not the list of what they reach.
         let keys = hud.split(" — ").next().unwrap_or(hud);
         out.push(format!("hud={keys}"));
     }
@@ -250,10 +220,7 @@ fn rows(screen: usize) -> Vec<Row> {
             .map(str::len)
             .sum::<usize>()
     };
-    // The document's lines, the empty one after its last newline included.
     let lines = text.matches('\n').count() + 1;
-    // Page Down's page: a screen less two lines. It must move the view and
-    // stop short of the last screen, or the rows below read a clamp.
     let page = screen.saturating_sub(2);
     assert!(
         page > 0 && page <= lines - screen.min(lines),
@@ -263,7 +230,6 @@ fn rows(screen: usize) -> Vec<Row> {
     let mac = cfg!(target_os = "macos");
     let windows = cfg!(windows);
     vec![
-        // Plain keys type, delete, move and submit.
         row(
             "x",
             vec![],
@@ -342,11 +308,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Named(N::Enter), shift),
             r#"text="alpha ⏎beta⏎" dirty sel=7"#,
         ),
-        // A GUI's Escape quits (the region and a C-u argument go, the
-        // status says Quit) and leaves nothing pending, so the key after it
-        // is itself: `Escape x` types x. ESC as Meta (`ESC x` is M-x) is the
-        // terminal face's alone (`Profile::escape_is_meta`), where Alt types
-        // characters. One Escape still closes an open minibuffer.
         row("Escape", vec![], named(N::Escape), r#"sel=6 status="Quit""#),
         row(
             "C-Space Escape drops the region",
@@ -390,9 +351,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Named(N::Tab), shift),
             r#"sel=6 focus=editor/commands-button status="Quit""#,
         ),
-        // Page Down pages the caret with the view, a screen less two lines
-        // (main's scroll-up-command, merged after the table was written; it
-        // used to scroll the view eight lines and leave the caret).
         row(
             "PageDown",
             vec![],
@@ -443,11 +401,6 @@ fn rows(screen: usize) -> Vec<Row> {
             InputEvent::Paste("one\ntwo".to_string(), crate::input::PasteFraming::AtDrain),
             r#"text="alpha one⏎twobeta⏎" dirty sel=13"#,
         ),
-        // CHANGED by the shared input reducer (design D-15): Tab is the
-        // buffer's indent-for-tab-command (column 6 to the next stop at 8),
-        // and focus moves with F6 and Shift+F6, which did nothing before.
-        // A modified Tab still moves focus: Shift+Tab back, and Ctrl+Tab
-        // where no host binding takes it first (`ctrl_tab_still_switches_tabs`).
         row(
             "Tab",
             vec![],
@@ -479,7 +432,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Named(N::F6), shift),
             "sel=6 focus=editor/commands-button",
         ),
-        // The ⌘ shortcuts.
         row(
             "⌘S saves",
             vec![ch('x')],
@@ -517,7 +469,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Character('x'), Modifiers::HYPER),
             "sel=6",
         ),
-        // Chords resolve through the keymap.
         row("C-f", vec![], ctrl('f'), "sel=7"),
         row("C-b", vec![], ctrl('b'), "sel=5"),
         row("C-a", vec![], ctrl('a'), "sel=0"),
@@ -550,8 +501,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Named(N::ArrowRight), Modifiers::ALT),
             "sel=10",
         ),
-        // Off macOS Ctrl+arrows are word motion; on macOS they belong to
-        // Mission Control and the editor leaves them unbound.
         row(
             "C-left",
             vec![],
@@ -572,7 +521,6 @@ fn rows(screen: usize) -> Vec<Row> {
                 "sel=10"
             },
         ),
-        // On Windows C-s saves and M-s searches; elsewhere C-s searches.
         row(
             "the isearch chord",
             vec![],
@@ -606,8 +554,6 @@ fn rows(screen: usize) -> Vec<Row> {
             r#"sel=6 mark status="Mark set""#,
         ),
         row("C-g", vec![], ctrl('g'), r#"sel=6 status="Quit""#),
-        // CHANGED (S5): off macOS C-Backspace is backward-kill-word, the
-        // platform's spelling of macOS's ⌥⌫.
         row(
             "C-Backspace",
             vec![],
@@ -618,7 +564,6 @@ fn rows(screen: usize) -> Vec<Row> {
                 r#"text="beta⏎gamma⏎" dirty sel=0"#
             },
         ),
-        // The P0 commands' keys (slice S5).
         row(
             "M-d kills a word",
             vec![],
@@ -659,8 +604,6 @@ fn rows(screen: usize) -> Vec<Row> {
             "M-> is the buffer's end",
             vec![],
             press(Key::Character('.'), Modifiers::ALT | shift),
-            // The last screen's top: the platform's font decides how many
-            // rows a screen holds (31 on macOS, 25 on the Linux lane).
             format!(
                 r#"sel={} top={} status="Mark set""#,
                 text.len(),
@@ -728,7 +671,6 @@ fn rows(screen: usize) -> Vec<Row> {
             press(Key::Named(N::F5), Modifiers::CTRL),
             "sel=6",
         ),
-        // A pending chord takes the next key, whatever its modifiers.
         row("C-x", vec![], ctrl('x'), "sel=6 pending hud=C-x"),
         row(
             "C-x C-s saves",
@@ -773,7 +715,6 @@ fn rows(screen: usize) -> Vec<Row> {
             "sel=6 pending hud=C-x",
         ),
         row(
-            // CHANGED (D-15): F6 is the host's focus key even mid-sequence.
             "C-x F6",
             vec![ctrl('x')],
             named(N::F6),
@@ -792,7 +733,6 @@ fn rows(screen: usize) -> Vec<Row> {
             r#"sel=6 status="C-x a is not bound""#,
         ),
         row("M-g g", vec![alt('g')], ch('g'), r#"sel=6 mb=goto:"""#),
-        // C-u builds an argument from the digits after it.
         row("C-u", vec![], ctrl('u'), "sel=6 hud=C-u 4"),
         row("C-u 3", vec![ctrl('u')], ch('3'), "sel=6 hud=C-u 3"),
         row("C-u 3 C-f", vec![ctrl('u'), ch('3')], ctrl('f'), "sel=9"),
@@ -803,7 +743,6 @@ fn rows(screen: usize) -> Vec<Row> {
             r#"text="alpha xbeta⏎gamma⏎" dirty sel=7"#,
         ),
         row("C-u C-n", vec![ctrl('u')], ctrl('n'), "sel=37"),
-        // The minibuffer owns the keys while it is open.
         row(
             "M-x",
             vec![],
@@ -889,8 +828,6 @@ fn rows(screen: usize) -> Vec<Row> {
             r#"sel=11..12 status="""#,
         ),
         row(
-            // Refused as every command is while isearch is open (main's
-            // page command, as the PageDown row).
             "isearch PageDown is refused",
             vec![isearch()],
             named(N::PageDown),
@@ -903,8 +840,6 @@ fn rows(screen: usize) -> Vec<Row> {
             r#"sel=6 mb=isearch:"" status="Minibuffer active — Enter accepts; C-g cancels""#,
         ),
         row(
-            // CHANGED (D-15): Tab no longer leaves the buffer for the
-            // toolbar; isearch owns the keys and says so.
             "isearch Tab",
             vec![isearch()],
             named(N::Tab),
@@ -1021,16 +956,13 @@ fn tab_indents_in_editor_buffer() {
         amacs::editor::Profile::Gui(amacs::editor::Platform::HOST)
     );
     let wid = WindowId(0);
-    // Column 6 → 8, then a whole stop → 12.
     assert!(app.native_input_event(wid, &named(NamedKey::Tab)));
     assert!(app.native_input_event(wid, &named(NamedKey::Tab)));
     let text = app.document_store.snapshot(document).unwrap().text;
     assert!(text.starts_with("alpha       beta\n"), "{text:?}");
     let outcome = seen(&app, view, document);
     assert!(outcome.contains(" sel=12"), "{outcome}");
-    // Focus stayed on the buffer: `seen` names focus only when it moved.
     assert!(!seen(&app, view, document).contains("focus="));
-    // One undo takes one indent back.
     assert!(app.native_input_event(wid, &cmd('z')));
     let text = app.document_store.snapshot(document).unwrap().text;
     assert!(text.starts_with("alpha   beta\n"), "{text:?}");
@@ -1056,7 +988,6 @@ fn f6_moves_native_focus() {
             .last_focus
             .clone()
     };
-    // From the buffer, F6 goes on to the next control in the order.
     let buffer = order.iter().position(|key| key.as_str() == "editor/buffer");
     let first = buffer.map_or(0, |at| (at + 1) % order.len());
     assert!(app.native_input_event(wid, &named(NamedKey::F6)));
@@ -1075,7 +1006,6 @@ fn f6_moves_native_focus() {
         "focus keys never edit the buffer"
     );
 
-    // F6 is every native page's focus key, not the Editor's alone.
     assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
     let (_, settings) = app.active_native_view(wid).unwrap();
     let before = app
@@ -1120,8 +1050,6 @@ fn ctrl_tab_still_switches_tabs() {
     let editor_tab = app.windows[&wid].tab_set.active().unwrap().id;
     assert!(app.windows[&wid].tab_set.tabs().len() >= 2);
 
-    // A headless App has no keybindings and no front window; a real one has
-    // the platform's seeded table, and `next_tab` cycles the front window.
     let mut table = std::collections::BTreeMap::new();
     if cfg!(target_os = "macos") {
         table.insert("ctrl+tab".to_string(), "next_tab".to_string());

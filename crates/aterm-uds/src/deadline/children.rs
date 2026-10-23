@@ -219,7 +219,7 @@ impl Run {
     }
 
     /// Started, not yet exited, not given up on.
-    fn running(&self) -> bool {
+    const fn running(&self) -> bool {
         self.child.is_ok() && self.status.is_none() && self.failed.is_none()
     }
 

@@ -739,7 +739,7 @@ fn gpu_unread(driver: &str) -> Why {
 pub type NvidiaBusy = fn(&str) -> Result<u8, Why>;
 
 /// The inert [`NvidiaBusy`] of a fixture root (and of the system root off Linux): never asks NVML, and answers [`Why::NotRead`].
-pub fn no_nvml(_slot: &str) -> Result<u8, Why> {
+pub const fn no_nvml(_slot: &str) -> Result<u8, Why> {
     Err(Why::NotRead)
 }
 
@@ -1274,7 +1274,7 @@ pub struct ThrottleReader {
 impl ThrottleReader {
     /// A reader of `root` that has read nothing.
     #[must_use]
-    pub fn new(root: Root) -> Self {
+    pub const fn new(root: Root) -> Self {
         Self { root, last: None }
     }
 

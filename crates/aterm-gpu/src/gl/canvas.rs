@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's swapchain in a browser: the WebGL2 canvas's drawing buffer,
-//! and the present that posts a frame to it (wasm32; `surface` is the GLX
-//! and EGL twin on Linux).
-//!
-//! A present composes into a stand-in texture the surface owns, then
-//! [`GlCanvasSurface::present`] copies it into the canvas's default
-//! framebuffer with `glBlitFramebuffer`, flipping rows (the default
-//! framebuffer counts rows from the bottom; the arm's textures store their
-//! top row at row 0), exactly as wgpu's WebGL2 backend posted its swapchain
-//! texture. There is no swap: the browser composites the drawing buffer when
-//! the task that drew it returns, and clears it after (no
-//! `preserveDrawingBuffer`), so every present posts a whole frame.
-//!
-//! The canvas's size is the drawing buffer's: the configure and every resize
-//! set the canvas's `width` and `height` at once (which clears it), as
-//! wgpu's surface configure did.
+//! The GL arm's swapchain in a browser: the WebGL2 canvas's drawing buffer, and the present that
+//! posts a frame to it (wasm32; `surface` is the GLX and EGL twin on Linux).
 
 use super::GlPresentError;
 use super::device::GlDevice;
@@ -65,24 +51,21 @@ impl GlCanvasSurface {
         Ok(())
     }
 
-    /// A browser paces presents itself (the host's animation frames); a
-    /// post never waits for the display.
+    /// A browser paces presents itself (the host's animation frames).
     #[inline]
     pub(crate) const fn synced(&self) -> bool {
         false
     }
 
-    /// Move to `width` x `height`: the canvas now (or, if its context cannot
-    /// be reached, at the next present), and the next present composes and
-    /// posts at it.
+    /// Move to `width` x `height`: the canvas now (or, if its context cannot be reached, at the
+    /// next present), and the next present composes and posts at it.
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
         let _ = self.apply_size();
     }
 
-    /// The stand-in at the configured size, minted on `dev` on first use and
-    /// after a resize.
+    /// The stand-in at the configured size, minted on `dev` on first use and after a resize.
     pub(crate) fn standin(&mut self, dev: &GlDevice) -> Result<&GlTexture, String> {
         let fits = self
             .standin
@@ -96,13 +79,8 @@ impl GlCanvasSurface {
         Ok(self.standin.as_ref().expect("minted above"))
     }
 
-    /// Post the stand-in: size the canvas if it moved, then copy the
-    /// stand-in into the drawing buffer with its rows flipped. The drawing
-    /// buffer is the size this sets, so nothing lies past the frame for the
-    /// frame's background (`_fill`, which a window surface clears there) to
-    /// cover. The whole frame is drawn whatever changed (`_damage`, which a
-    /// window posted by readback reads back alone). `Err` names the GL
-    /// failure; a lost context is latched on the device.
+    /// Post the stand-in: size the canvas if it moved, then copy the stand-in into the drawing
+    /// buffer with its rows flipped.
     pub(crate) fn present(
         &mut self,
         dev: &GlDevice,
@@ -122,9 +100,9 @@ impl GlCanvasSurface {
         let fbo = standin.fbo(&cur)?;
         let gl = cur.gl();
         let (w, h) = (tw as i32, th as i32);
-        // SAFETY: the context is current; the stand-in's framebuffer is
-        // complete; the blit is colour-only and NEAREST between equal-sized
-        // rects of two RGBA8 buffers (the drawing buffer is the canvas's).
+        // SAFETY: the context is current; the stand-in's framebuffer is complete; the blit is
+        // colour-only and NEAREST between equal-sized rects of two RGBA8 buffers (the drawing
+        // buffer is the canvas's).
         unsafe {
             (gl.disable)(ffi::GL_SCISSOR_TEST);
             (gl.color_mask)(ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE, ffi::GL_TRUE);

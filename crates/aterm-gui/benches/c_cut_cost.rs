@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The byte arm (`docs/DESIGN-card-engine-2026-10-19.md` §3.6), timed.
-//!
-//! * The shipping holder image read (`holder_image::read`) of three live
-//!   children of this bench: an interactive-shape zsh (a script shell, its
-//!   first argument a flag), `sh /dev/stdin` (a script shell whose absolute
-//!   first argument the launcher check looks up) and `cat` (no shell): µs
-//!   per read at p50/p95/p99 over 4000 reads each, read afresh (an edge's
-//!   read) and given its own last image (the byte arm's re-read of an
-//!   unchanged process, which keeps it).
-//! * `verify perf throughput`'s corpus through the parse stage's batches and
-//!   locked slices without the arm and with it: the corpus as it is; with a
-//!   signed OSC 133 C after the first newline past every 4 KiB; and each of
-//!   those again with the arm reading the live zsh as it owes for a command
-//!   signed before the corpus that stays unresolved (a script printing at
-//!   full speed: one read per batch), every C an accepted one besides (a
-//!   boundary read after each, the arm's most expensive state). Median MB/s
-//!   of seven passes each, alternating.
-//!
-//! A measurement for a person, never a gate: the cut's offsets and the reads
-//! the arm owes are ASSERTED by `holder_image`'s tests.
-//!
-//! `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`
+//! Benchmark for `holder_image::read` and the parse stage's OSC 133 C byte arm.
 
 use aterm_uds::spawnfd::{Child, Stdio, command};
 
@@ -34,8 +13,6 @@ const RUNS: usize = 7;
 const READS: usize = 4000;
 
 fn main() {
-    // Each child blocks reading the pipe this bench holds open, and is
-    // killed by its pid at the end.
     let mut zsh = blocked("/bin/zsh", &["-f"]);
     let mut sh = blocked("/bin/sh", &["/dev/stdin"]);
     let mut cat = blocked("/bin/cat", &[]);
@@ -74,8 +51,7 @@ fn pid(child: &Child) -> i32 {
     i32::try_from(child.id()).expect("a pid")
 }
 
-/// `corpus` with a signed OSC 133 C after the first newline past every `every`
-/// bytes, so no C lands inside another sequence.
+/// `corpus` with a signed OSC 133 C after the first newline past every `every` bytes.
 fn with_cs(corpus: &[u8], every: usize) -> Vec<u8> {
     const C: &[u8] = b"\x1b]133;C;id=0123456789abcdef0123456789abcdef\x07";
     let mut out = Vec::with_capacity(corpus.len() + corpus.len() / every * C.len());

@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `DiskAwait` (`aterm_models_harness::disk_await_model`): on every
-//! reachable state of the model where the wait is parked, the real stepper
-//! (`control::control_disk::decide`) is handed what the state stands for and
-//! must take a step the model enables — met, unmet or stalled — with every
-//! invariant holding after it, or park exactly where the model enables none
-//! of them.
-//!
-//! A state stands for: `free_ok` (every term holds on the reading), `demand`
-//! (the wait holds one), `watch` (0: the watch runs), `beat_old` (its beat is
-//! [`STALL`] old) and `pass` — the last pass for this demand, AS THE REAL
-//! CODE DERIVES IT: 0 none and 1 running adopt no pass; 2 a pass that RAN OUT
-//! (`Applied` with no stop, its search finished) and 3 one stopped for
-//! another reason (a figure it could not read, its search cut short), each
-//! leaving free space below the need, are handed through
-//! `Applied::ran_out` and `disk_board::spent` — the derivation `why=spent`
-//! is answered on, not an input the test picks.
-//!
-//! Negative controls: a stepper that answers `watch-stalled` while the beat is
-//! fresh, and a SPENT RULE that reads only free space after the pass (the
-//! defect `UnmetStopped` stands for), each disagree with the model somewhere,
-//! so a checker that accepts everything fails this test.
+//! Tier-1 for `DiskAwait` (`aterm_models_harness::disk_await_model`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -170,8 +150,6 @@ fn the_real_stepper_takes_only_the_models_answers() {
     let checked =
         conforms(&m, &decide, &crate::disk_board::spent).expect("the real stepper conforms");
     assert!(checked >= 32, "every parked state: {checked}");
-    // The stall is two looks of the watch, not one: a healthy gap between
-    // looks never reads as a stall.
     assert!(STALL >= crate::harness_host::DISK_TICK * 2);
 }
 

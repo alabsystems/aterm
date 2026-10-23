@@ -120,6 +120,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         reset_clock: None,
         reach: Default::default(),
         program: aterm_phase::Program::Claude,
+        seat: Default::default(),
         account: None,
         autopilot: Autopilot::Land,
         login_label: None,

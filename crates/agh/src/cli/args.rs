@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The command line (design §9.1, §9.2): global flags anywhere, the longest verb path, then
-//! the verb's own flags and positionals.
+//! The command line (design §9.1, §9.2).
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -105,8 +104,7 @@ pub struct Invocation {
     pub path: Vec<&'static str>,
     /// The positionals, in order (without REPO under `-R`).
     pub positionals: Vec<String>,
-    /// The verb's own flags in the order given, each use of a Repeat flag separately; the name
-    /// has its dashes (`--asset`).
+    /// The verb's own flags in the order given, each use of a Repeat flag separately.
     pub flags: Vec<(&'static str, Option<String>)>,
     /// The global flags.
     pub global: Global,
@@ -181,9 +179,7 @@ impl Invocation {
     }
 
     /// Positional `i`, which must be there.
-    ///
     /// # Errors
-    ///
     /// Usage `{what} is required`, next `agh help {verb}`.
     pub fn require(&self, i: usize, what: &str) -> Result<&str> {
         self.positional(i)
@@ -195,15 +191,9 @@ impl Invocation {
         Error::usage(why).with_next(help_next(&self.path))
     }
 
-    /// For a verb whose first positional is REPO: `-R` when given, else positional 0, as a
-    /// `RepoArg`, with a target resolved through `router`. A literal `OWNER/NAME` gives
-    /// `Named::Literal(ExplicitTarget::from_argv(text))`; an `@name` gives
-    /// `Named::Target(name)`. Crate-private (design §10.2).
-    ///
+    /// For a verb whose first positional is REPO.
     /// # Errors
-    ///
-    /// Usage, next `agh help {verb}`: `name the repository: OWNER/NAME or @TARGET`; `no target named @{name} in
-    /// agh.toml [targets]`; `RepoArg::parse`'s errors.
+    /// Usage, next `agh help {verb}`.
     pub(crate) fn repo(&self, router: &Router) -> Result<(Slug, Named)> {
         self.named_repo(router)
             .map_err(|e| e.with_next(help_next(&self.path)))
@@ -218,12 +208,8 @@ impl Invocation {
         resolve_repo(text, router)
     }
 
-    /// For a verb whose first positional is CONTENT. With `-R`: the repository from `-R`, and
-    /// positional 0 (when present) read as `ContentRef::parse(text, false)`. Without:
-    /// positional 0 read as `ContentRef::parse(text, true)`.
-    ///
+    /// For a verb whose first positional is CONTENT.
     /// # Errors
-    ///
     /// As `repo`, and `ContentRef::parse`'s errors.
     pub(crate) fn content(&self, router: &Router) -> Result<(Slug, Named, ContentRef)> {
         self.named_content(router)
@@ -253,9 +239,7 @@ impl Invocation {
         Ok((slug, named, at))
     }
 
-    /// The positionals after REPO or CONTENT: all of them under `-R` for a REPO verb, else all
-    /// but the first. Under `-R` a CONTENT verb's positional 0 is its `[@REF][:PATH]` (as
-    /// `content` reads it), so it is skipped too.
+    /// The positionals after REPO or CONTENT.
     #[must_use]
     pub fn rest(&self) -> &[String] {
         let content_first = super::verbs::find(&self.path)
@@ -273,8 +257,8 @@ impl Invocation {
         verb_name(&self.path)
     }
 
-    /// `How { access, anonymous: --anonymous, as_profile: --as, named, no_probe: --no-probe,
-    /// retry: None }`.
+    /// `How { access, anonymous: --anonymous, as_profile: --as, named, no_probe: --no-probe, retry:
+    /// None }`.
     pub(crate) fn how(&self, access: Access, named: Named) -> How {
         let mut how = How::read()
             .anonymous(self.global.anonymous)
@@ -307,8 +291,7 @@ impl Invocation {
 pub enum Parsed {
     /// `agh` alone, or global flags with no verb word and no `--replay`.
     Bare,
-    /// `-h` or `--help`: the words of the verb path (or every word typed, when no verb
-    /// matched).
+    /// `-h` or `--help`: the words of the verb path (or every word typed, when no verb matched).
     Help(Vec<String>),
     /// `--replay PATH` with no verb word: run the tape's own command line (plan §4.6.28).
     ReplayTaped(Global),
@@ -335,16 +318,9 @@ pub fn verb_name(path: &[&str]) -> String {
     }
 }
 
-/// Rule 6 (what a tape cannot hold), for `verb` under `global`: `parse` applies it, and so
-/// does `cli::run` to a bare `--replay`'s taped command line once the tape flags are merged
-/// back in, because that line, parsed alone, carries no tape flag.
-///
+/// Rule 6 (what a tape cannot hold), for `verb` under `global`.
 /// # Errors
-///
-/// Usage, next `agh help {verb}`: under `--record` or `--replay`, `M1's tapes are anonymous:
-/// drop --as` for `--as` or `--profile`; `{verb} cannot be taped: it answers from this
-/// machine, not from GitHub` for a `Local` or `Provision` verb; `release download cannot be
-/// taped in M1: it streams a body`.
+/// Usage, next `agh help {verb}`.
 pub(crate) fn tape_rule(verb: &Verb, global: &Global) -> Result<()> {
     if global.record.is_none() && global.replay.is_none() {
         return Ok(());
@@ -619,7 +595,6 @@ impl Parser {
                     self.global.replay = path;
                 }
             }
-            // `--help` never reaches here: the pre-scan answered it.
             _ => {}
         }
         Ok(())
@@ -681,7 +656,6 @@ impl Parser {
                 at += 1;
             } else if i == 0 && first_optional {
                 // Under -R, CONTENT may be left out: the repository's root at its default
-                // branch.
             } else {
                 return Err(self.usage(format!("{name} is required")));
             }
@@ -694,17 +668,13 @@ impl Parser {
 }
 
 /// Parse `args` (design §9.1 and the plan's rules 1 to 7).
-///
 /// # Errors
-///
 /// As the rules say.
 pub fn parse(args: &[String]) -> std::result::Result<Parsed, ParseError> {
     parse_noting_tapes(args, &mut Vec::new())
 }
 
-/// The indices of `args` that `parse` reads as a tape flag: each `--record` and `--replay`
-/// token, and the next argument when it was taken as the value. A flag's value that only
-/// looks like a tape flag (`-f --record=1`) is not among them, nor is anything after `--`.
+/// The indices of `args` that `parse` reads as a tape flag.
 pub(crate) fn tape_tokens(args: &[String]) -> Vec<usize> {
     let mut at = Vec::new();
     let _ = parse_noting_tapes(args, &mut at);
@@ -767,9 +737,6 @@ fn parse_noting_tapes(
                 });
             }
             if p.global.replay.is_some() {
-                // Rule 6 holds with no verb too. And the tape's own command line carries the
-                // run's flags: cli::run takes only the tape paths from this line, so any other
-                // flag here would be dropped without a word; it is refused instead.
                 if p.global.as_profile.is_some() {
                     return Err(p.usage("M1's tapes are anonymous: drop --as"));
                 }
@@ -816,7 +783,6 @@ fn parse_noting_tapes(
     ))
 }
 
-// The crate-private methods' tests (plan §4.8).
 #[cfg(test)]
 #[path = "args_tests.rs"]
 mod tests;

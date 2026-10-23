@@ -1,35 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The browser lane in the Linux lane's guest (`linux browser`;
-//! `docs/AUDIT-third-party-2026-10-15.md` section 7, "The browser lane", and
-//! `docs/measured/linux-browser-2026-10-20.md`): both web modules drawn by
-//! browsers on Linux, judged as `verify browser` judges them on this Mac.
-//!
-//! The modules are built and bound here, once, by `verify browser-site`
-//! (rustup stable's wasm32 std, the STOCK EXCEPTION `verify browser` already
-//! takes), so the guest's browsers run the module bytes this Mac's lane runs.
-//! The site is copied into the guest, and for each arch the guest builds
-//! aterm-verify with its own stock Rust (STOCK EXCEPTION, as the rest of the
-//! lane: [`crate::linux_guest::RUST`]), fetches that arch's pinned browsers
-//! (`verify provision chrome-headless-shell firefox`, each held to its sha256)
-//! and runs `verify
-//! browser-drive` on the site. Its sessions hold every GPU frame to the CPU
-//! frames and to the wgpu-WebGL recording within the CPU tolerance, with the
-//! negative controls those judges carry, the pages' and the worker's alike:
-//!
-//! - x86_64, under Rosetta: Chrome for Testing's linux64 chrome-headless-shell
-//!   with WebGL2 on SwiftShader, whose code generator there is Subzero, an
-//!   x86 JIT (on Apple silicon it is LLVM's AArch64 back end). Rosetta runs
-//!   the code Subzero emits, so the row exercises SwiftShader's x86 JIT; it
-//!   does not settle what a real x86_64 CPU draws.
-//! - aarch64, natively: Playwright's Firefox for Ubuntu 24.04 under Xvfb
-//!   (Firefox makes its WebGL2 context on an X display even headless; it draws
-//!   on Mesa's llvmpipe): a second engine on a second OS.
-//!
-//! One row per arch, PASS, FAIL or NOT RUN as `browser-drive` answers. Each
-//! arch's frames, timings and browser log are copied to
-//! `$LAB_STATE/linux/browser-<time>/<arch>/`.
+//! Linux guest browser verification lane (`STOCK EXCEPTION`: guest builds `aterm-verify` with
+//! stock Rust).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -50,8 +23,7 @@ pub struct BrowserArgs {
     pub keep_up: bool,
 }
 
-/// `browser [--arch A]... [--keep-build] [--keep-up]`: both arches when none
-/// is named.
+/// Parses `linux browser` command-line arguments.
 ///
 /// # Errors
 /// A usage error.
@@ -88,10 +60,7 @@ pub fn parse(args: &[String]) -> Result<BrowserArgs, Fail> {
     Ok(p)
 }
 
-/// The sessions `browser-drive` runs on `arch` (aterm-verify's session
-/// names), and whether they need an X display: the browsers pinned for
-/// Linux on that arch. Chrome for Testing builds no Linux aarch64 shell,
-/// and Playwright's x86_64 Firefox gave no answer under Rosetta.
+/// Returns the `browser-drive` session names for `arch` and whether they require an X display.
 #[must_use]
 pub const fn sessions(arch: Arch) -> (&'static [&'static str], bool) {
     match arch {
@@ -110,8 +79,7 @@ pub fn row_name(arch: Arch) -> String {
     format!("{} ({}) browser: {what}", arch.name(), arch.runs())
 }
 
-/// The verdict `browser-drive`'s exit status gives: 0 PASS, 3 NOT RUN, and
-/// anything else (1 a row failed, the hang detector's kill) FAIL.
+/// Maps `browser-drive`'s exit status to a [`Verdict`].
 #[must_use]
 pub fn verdict_of(code: Option<i32>) -> Verdict {
     match code {
@@ -121,10 +89,7 @@ pub fn verdict_of(code: Option<i32>) -> Verdict {
     }
 }
 
-/// The lines of `browser-drive`'s output a row keeps: its ladder (`ok`,
-/// `FAIL`, `NOT RUN`), the browser and adapter each session drew on, each
-/// frame's distance from the recording, the negative controls, and what a
-/// failing judge said.
+/// Extracts summary and failure lines from `browser-drive` output.
 #[must_use]
 pub fn detail_of(text: &str) -> String {
     text.lines()
@@ -164,7 +129,6 @@ pub fn cmd_browser(args: &[String]) -> Res {
         .map_err(|e| Fail::die(format!("{}: {e}", results.display())))?;
     let t0 = Instant::now();
     let mut rows = Vec::new();
-    // The site is laid before the VM is taken: building holds no lane.
     let site = results.join("site");
     let laid = lay_site(&site);
     let ok = laid.verdict == Verdict::Pass;
@@ -387,9 +351,7 @@ fn drive(
     Ok(())
 }
 
-/// `browser-drive`'s hang detector: one session's pages answer within a
-/// minute each, and its own waits are one-minute detectors too, so a drive
-/// still running after this is wedged.
+/// Hang-detector timeout in seconds for a `browser-drive` run.
 pub const DRIVE_HANG_SECS: u32 = 900;
 
 /// Copy the guest's `out_dir` (each session's frames, timings and browser

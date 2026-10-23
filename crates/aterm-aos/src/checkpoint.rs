@@ -2,32 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Full-copy checkpoints of a hosted task's state, with their provenance.
-//!
-//! # The law
-//!
-//! A checkpoint is taken only at a step boundary: its owner, the boundary, never captures
-//! between an admitted input and its advance (an `attach` then is refused, and an input
-//! admitted twice breaks the log without a capture, re-anchoring at the next boundary). It
-//! stores the full owned state as its
-//! canonical encoding — a full copy, never a delta — the task identity it ran under, the
-//! log epoch and the input/effect cursors it stands at, the branch and revision of the head
-//! it was taken from, and the digest of the checkpoint it descends from.
-//!
-//! A checkpoint is **immutable** after capture: its fields are private, it has getters only,
-//! and nothing restores, pops or rewrites it in place. Restoring it never destroys it or any
-//! later checkpoint; the boundary that restores one mints a new branch and revision.
-//!
-//! Integrity and authority are separate checks. The encoding is an astream CRC frame around
-//! a versioned body: the CRC detects accidental damage, and [`Checkpoint::decode`] also
-//! re-derives the state digest from the state bytes under the provenance's schema digest and
-//! refuses a mismatch ([`CheckpointFault::StateDigest`]). Neither says the checkpoint belongs
-//! to the task asking: [`Checkpoint::restore`] checks the task, schema and profile against the
-//! identity expected (the code may differ: applying other code to a state is a separately
-//! recorded transition that must meet that code's entry invariants), re-derives the state
-//! digest under the restoring schema's digest and refuses a mismatch
-//! ([`RestoreRefusal::StateDigest`]: an in-memory checkpoint captured under another schema
-//! never reaches decode's check), and refuses a state the schema does not decode
-//! canonically.
 
 use core::fmt;
 
@@ -88,7 +62,7 @@ fn decode_provenance(d: &mut Dec<'_>) -> Result<Provenance, WireFault> {
     })
 }
 
-/// Why bytes are not a checkpoint this build reads. Nothing is returned from them.
+/// Why bytes are not a checkpoint this build reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckpointFault {
     /// The astream frame is incomplete or damaged (its error, rendered).
@@ -101,8 +75,7 @@ pub enum CheckpointFault {
     StateDigest,
     /// The frame holds something other than an Aos checkpoint.
     NotACheckpoint,
-    /// Encoding only: the body of `len` bytes exceeds the `limit` a frame carries. Nothing
-    /// was written.
+    /// Encoding only: the body of `len` bytes exceeds the `limit` a frame carries.
     TooLarge {
         /// The body length.
         len: usize,
@@ -145,14 +118,13 @@ impl From<WireFault> for CheckpointFault {
     }
 }
 
-/// Why a checkpoint's state is not handed to the task asking. The checkpoint is untouched.
+/// Why a checkpoint's state is not handed to the task asking.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RestoreRefusal {
     /// The checkpoint belongs to another task, schema or profile.
     Identity(IdentityMismatch),
-    /// The stored state digest is not the digest of the stored state under the restoring
-    /// schema's digest: the checkpoint was captured under another schema than the one its
-    /// provenance names.
+    /// The stored state digest is not the digest of the stored state under the restoring schema's
+    /// digest: the checkpoint was captured under another schema than the one its provenance names.
     StateDigest {
         /// The digest the checkpoint carries.
         stored: Digest,
@@ -191,9 +163,7 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Captures `state` (as its canonical encoding) with its provenance. The state digest is
-    /// taken under `schema`'s digest; a provenance naming another schema yields a checkpoint
-    /// that [`Checkpoint::decode`] and [`Checkpoint::restore`] both refuse.
+    /// Captures `state` (as its canonical encoding) with its provenance.
     #[must_use]
     pub fn capture<S: Schema>(schema: &S, state: &S::State, provenance: Provenance) -> Checkpoint {
         let state = encode_state(schema, state);
@@ -227,9 +197,7 @@ impl Checkpoint {
         Digest::of(CHECKPOINT_DOMAIN, &[e.as_bytes(), &self.state_digest.0])
     }
 
-    /// The checkpoint's bytes: an astream CRC frame around
-    /// `CHECKPOINT_MAGIC | CHECKPOINT_VERSION | provenance | state digest | state bytes`.
-    /// [`CheckpointFault::TooLarge`] if the body exceeds what a frame carries.
+    /// The checkpoint's bytes.
     pub fn encode(&self) -> Result<Vec<u8>, CheckpointFault> {
         let mut e = Enc::with_capacity(self.state.len().saturating_add(256));
         e.raw(&CHECKPOINT_MAGIC);
@@ -247,8 +215,7 @@ impl Checkpoint {
             })
     }
 
-    /// Reads a checkpoint: the frame and its CRC, the magic, the version, a canonical body
-    /// with nothing after it, and a state digest that is the digest of the state bytes.
+    /// Reads a checkpoint.
     pub fn decode(bytes: &[u8]) -> Result<Checkpoint, CheckpointFault> {
         let (body, consumed) = match decode_frame_slice(bytes) {
             Ok(Some(found)) => found,
@@ -290,15 +257,11 @@ impl Checkpoint {
         })
     }
 
-    /// Validates task/schema/profile against `expect` (the code may differ: applying other
-    /// code is a separately recorded transition), re-derives the state digest under
-    /// `schema`'s digest, and returns the decoded state.
-    ///
+    /// Validates task/schema/profile against `expect` (the code may differ: applying other code is
+    /// a separately recorded transition), re-derives the state digest under `schema`'s digest, and
+    /// returns the decoded state.
     /// # Errors
-    ///
-    /// [`RestoreRefusal::Identity`] (task, schema or profile, in that order),
-    /// [`RestoreRefusal::StateDigest`], or [`RestoreRefusal::Wire`] (the state does not
-    /// decode, or does not re-encode to its own bytes).
+    /// [`RestoreRefusal::Identity`], [`RestoreRefusal::StateDigest`], or [`RestoreRefusal::Wire`].
     pub fn restore<S: Schema>(
         &self,
         schema: &S,
@@ -314,9 +277,6 @@ impl Checkpoint {
         if p.profile != expect.profile {
             return Err(RestoreRefusal::Identity(IdentityMismatch::Profile));
         }
-        // The same integrity check decode makes, under the schema restoring it: a checkpoint
-        // captured under another schema than the one its provenance names is refused here
-        // even when it never went through bytes.
         let derived = state_digest_of(&schema.id().digest, &self.state);
         if derived != self.state_digest {
             return Err(RestoreRefusal::StateDigest {
@@ -327,8 +287,6 @@ impl Checkpoint {
         let mut d = Dec::new(&self.state);
         let state = schema.decode_state(&mut d).map_err(RestoreRefusal::Wire)?;
         d.finish().map_err(RestoreRefusal::Wire)?;
-        // The schema's decoder must be canonical: the state re-encodes to the bytes it came
-        // from, so the restored state is the one the digest names.
         if encode_state(schema, &state) != self.state {
             return Err(RestoreRefusal::Wire(WireFault::NonCanonical {
                 field: "state",

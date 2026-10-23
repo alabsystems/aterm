@@ -1495,7 +1495,16 @@ impl CompanionOwner {
         self.species
     }
 
-    /// Read-only access to the brain for the host's projections; a shared borrow cannot tick it.
+    /// A test's negative control: the pet's letter reader sees none
+    /// ([`PetBrain::set_letters_unseen`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_pet_letters_unseen(&mut self, unseen: bool) {
+        self.pet.set_letters_unseen(unseen);
+    }
+
+    /// Read-only access to the brain for the host's projections; a shared borrow
+    /// cannot tick it.
     #[inline]
     #[must_use]
     pub const fn brain(&self) -> &PetBrain {

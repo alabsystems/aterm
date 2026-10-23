@@ -1558,11 +1558,7 @@ fn a_writers_wait_carries_its_words() {
     );
 }
 
-/// A WORKER'S NEEDS YOU ENTRY IS AN ASK (Autopilot Cruise / Land): the
-/// loop raises `owner=needs kind=ask "<program> needs you: … — carrying on"`
-/// for a report's `NEEDS YOU:` lines, and the classifier reads it as the ask
-/// it is — the border, the pill, `◇`, `❯N` and the menu bar's "needs you" —
-/// with no reader of its own.
+/// Worker reports remain asks without showing a tab-bar pill.
 #[test]
 fn a_workers_needs_you_entry_is_an_ask() {
     let owner = crate::harness_host::NEEDS_ATTENTION_OWNER;
@@ -1859,6 +1855,39 @@ fn a_harness_need_reads_in_its_own_words() {
         moved.harness_ask().map(|a| a.others.clone()),
         Some(vec!["a third thing".to_string()])
     );
+}
+
+#[test]
+fn a_report_carried_from_an_older_host_stays_out_of_the_pill() {
+    let report = harness_entry("claude", "sign the release", 1);
+    for report in [report.as_str(), "agy needs you: sign it (+1 mo"] {
+        let legacy = format!("kind=ask {report}");
+        for owner in [crate::harness_host::NEEDS_ATTENTION_OWNER, "ops"] {
+            // The old host stored kind=ask as text and encoded it in the handoff.
+            let row = format!("{owner} {}", crate::control::pct_encode(&legacy));
+            let (owner, kind, text) = crate::session_timeline::parse_carried_attention(&row)
+                .expect("the old host's carried entry");
+            assert_eq!(kind, None);
+            assert_eq!(text, legacy);
+            let need = of(&NeedFacts {
+                attention: vec![entry(owner, &text, kind)],
+                ..facts()
+            })
+            .need
+            .expect("the carried ask");
+            assert_eq!(need.key, ask_key(&legacy));
+            assert_eq!(
+                crate::presence::need_fact(&need).show_pill,
+                owner != crate::harness_host::NEEDS_ATTENTION_OWNER
+            );
+            if owner == crate::harness_host::NEEDS_ATTENTION_OWNER {
+                let ask = need.harness.expect("the report without its legacy kind");
+                assert!(!ask.first.starts_with("kind="));
+            } else {
+                assert!(need.harness.is_none());
+            }
+        }
+    }
 }
 
 #[test]

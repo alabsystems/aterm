@@ -2679,3 +2679,35 @@ fn a_walls_continuation_in_lands_words_is_the_land_act_a_landing_comes_at() {
     );
     assert_eq!(got, (vec![2; 6], 1, 1, 2 * 6 + 2, 3), "{shares:#?}");
 }
+
+/// A FACT LINE IS NO ACT (the occupancy red-team's F13): a `fact-hold@v1` row typed at a break
+/// counts under no rule and ends no limit wait, while a policy act at the same instant does
+/// both. The negative control reads the fact row as an act
+/// ([`approvals::with_facts_counted`]): it then counts, and the wait ends at it.
+#[test]
+fn a_fact_line_typed_counts_as_no_act_and_ends_no_wait() {
+    let fact_rule = crate::supervise::facts::FactKind::Hold.rule();
+    let wall = row(
+        1_000,
+        "s-1",
+        RULE_WALL_WAIT,
+        Outcome::Waiting,
+        "",
+        "(wall: …)",
+    );
+    let fact = typed(2_000, fact_rule, "the line");
+    let resume = typed(5_000, RULE_LIMIT_RESUME, "go on");
+    let lines = [wall, fact, resume];
+    let acc = fold_ledger(&lines, 0);
+    assert_eq!(
+        (by(&acc, fact_rule), acc.limit_wait_ms, acc.rows),
+        (0, 4_000, 3),
+        "the fact row is a row, and no act"
+    );
+    let counted = approvals::with_facts_counted(|| fold_ledger(&lines, 0));
+    assert_eq!(
+        (by(&counted, fact_rule), counted.limit_wait_ms),
+        (1, 1_000),
+        "read as an act, it counts and ends the wait"
+    );
+}

@@ -1467,6 +1467,30 @@ fn the_status_record_judges_the_launch_witness_by_its_own_count() {
     assert_stamp_rides_last(&record);
 }
 
+/// Half a frame is no screen to stamp: `seq=- hash=-`, with `gen=` as it stands.
+#[test]
+fn half_a_frame_is_no_screen_to_stamp() {
+    let app = crate::App::headless_for_test();
+    let term = app.pool.get(0).expect("live session").term.clone();
+    crate::term_lock(&term).process(b"\x1b[?2026h\x1b[H\x1b[2Jready\x1b[?2026l");
+    crate::term_lock(&term).process(b"\x1b[?2026h\x1b[H\x1b[2Jhalf");
+    let record = app.session_status_record(0).expect("live session");
+    assert!(record.ends_with(" seq=- hash=-"), "{record}");
+    let generation = crate::control::screen_gen(&crate::term_lock(&term)).to_string();
+    assert!(record.contains(&format!(" gen={generation} ")), "{record}");
+
+    crate::term_lock(&term).process(b" and whole\x1b[?2026l");
+    let record = app.session_status_record(0).expect("live session");
+    let (seq, hash) = {
+        let t = crate::term_lock(&term);
+        (t.content_seq(), crate::frame_memo::ScreenText::of(&t).fnv())
+    };
+    assert!(
+        record.ends_with(&format!(" seq={seq} hash={hash:016x}")),
+        "{record}"
+    );
+}
+
 /// `editing=<n>` (amacs §6.7) counts the open `edit` tickets holding the
 /// session, just before the stamp: each ticket's hold adds one, and its
 /// resolve (or an orphan's lapse) takes it away again.

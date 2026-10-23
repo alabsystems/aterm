@@ -1,28 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Disabling desktop alerts spends notification debt without forgetting the
-//! escalation that the menu still shows. Re-enabling cannot replay it.
+//! Formal model of desktop alert notification debt across enable/disable transitions.
 
 use aterm_spec::derive::Model;
 
 /// One session's herald, with two alternating escalation keys/labels.
-/// `label` is the current menu label's identity, `seen` the remembered
-/// escalation key, `pending` projects `owed > 0`, and `notice` is the last
-/// decision's actual notification. `enabled` is the App's configuration,
-/// not a second switch stored by the herald.
-///
-/// `ObserveNewLimited` holds a new transition behind the rate limiter;
-/// `ObserveNewFree`, `Reobserve` and `Tick` have an available rate-limit
-/// slot. `Tick` pays existing debt, while `Reobserve` rereads the same fact.
-/// The model checks cancellation and remembered transitions, not timing or
-/// eventual delivery. Tier-1 drives the genuine GUI herald and config edge.
-///
-/// `Buggy=1` restores three independent defects. `Fault=1` retains debt on
-/// disable, `Fault=2` allows disabled observations to create work, and
-/// `Fault=3` forgets the seen key on disable (replaying it after enable).
-/// The default `Fault=0` includes every defect for per-invariant non-vacuity;
-/// Tier-0 also proves and catches each selected defect independently.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn desktop_alert_debt_model() -> Model {

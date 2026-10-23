@@ -94,7 +94,9 @@ impl Layer {
     }
 }
 
-/// Whether the `--only` word `token` names a row.
+/// Whether the `--only` word `token` names a row: its family, its layer, its id, or an id
+/// it is a prefix of up to a `.` or an `@`. A word holding an `@` names that id alone, so
+/// `develop.checkout@~/aterm` never names `develop.checkout@~/aterm.old` (CV-SELECTS).
 #[must_use]
 pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> bool {
     if token.is_empty() {
@@ -102,9 +104,9 @@ pub fn selects(token: &str, id: &str, family: &str, layer: Option<Layer>) -> boo
     }
     token == family
         || layer.is_some_and(|layer| layer.name() == token)
-        || id
-            .strip_prefix(token)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '@']))
+        || id.strip_prefix(token).is_some_and(|rest| {
+            rest.is_empty() || (!token.contains('@') && rest.starts_with(['.', '@']))
+        })
 }
 
 /// The items `tokens` select ([`selects`]), in composition order, each with its `after` edges
@@ -216,6 +218,9 @@ impl Item for Aside<'_> {
     fn stands_aside(&self) -> Option<StoodAside> {
         Some(self.aside.clone())
     }
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.inner.read_aside()
+    }
 }
 
 /// `items` whose change cannot be made in this run for a reason no retry clears (a store lock that
@@ -303,6 +308,9 @@ impl Item for HeldBack<'_> {
     fn effect(&self) -> Effect {
         self.inner.effect()
     }
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.inner.read_aside()
+    }
 }
 
 /// An item with its `after` edges narrowed to the run it is in ([`select`]).
@@ -368,6 +376,9 @@ impl Item for Narrowed<'_> {
     }
     fn stands_aside(&self) -> Option<StoodAside> {
         self.inner.stands_aside()
+    }
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.inner.read_aside()
     }
 }
 
@@ -788,6 +799,30 @@ mod tests {
         assert!(!selects("", "base.pkg.shims", "pkg", base));
         assert!(selects("develop", "develop.checkout@~/aterm", "git", None));
         assert!(!selects("workstation", "base.pkg.shims", "pkg", None));
+        // A word that names an instance names it alone (its path continuing with `.` or
+        // `@` is another instance). Control: the same id without its `@` still names every
+        // instance, by the prefix rule above.
+        let develop = Some(Layer::Develop);
+        let instance = "develop.checkout@~/aterm";
+        assert!(selects(instance, instance, "checkout", develop));
+        assert!(!selects(
+            instance,
+            "develop.checkout@~/aterm.old",
+            "checkout",
+            develop
+        ));
+        assert!(!selects(
+            instance,
+            "develop.checkout@~/aterm@2",
+            "checkout",
+            develop
+        ));
+        assert!(selects(
+            "develop.checkout",
+            "develop.checkout@~/aterm.old",
+            "checkout",
+            develop
+        ));
     }
 
     /// `--only` keeps what it names, narrows the kept items' edges to the run, and says

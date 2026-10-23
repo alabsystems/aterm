@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The main thread's half of the `doc` verb's read forms (amacs design §7c;
-//! slice A1): which documents the Editor views show, read in one main-loop
-//! turn.
-//!
-//! `control_doc` parses a request on its lane and asks here through the
-//! `inspect` hop (`Wake::InspectApp` carrying an
-//! [`crate::app_control::InspectRequest::Doc`]), so the `doc` verb needs no
-//! `Wake` of its own; the answer goes back on the call's own channel, as
-//! values the lane formats. A document is live while an Editor view shows it,
-//! and its facts are the row `doc ls` prints less what costs more than a
-//! lookup: `disk=` (the answer carries the file and the version the buffer
-//! was read or last saved as, and the lane observes the file), and the line
-//! and column of `cursor=` and `sel=` (the answer carries their byte offsets
-//! and the text they are in, and the lane counts lines). Nothing here reads a
-//! file or walks a text, so neither a slow volume nor a large buffer stalls
-//! the event loop.
+//! The main thread's half of the `doc` verb's read forms (amacs design §7c; slice A1).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -40,32 +25,27 @@ use crate::{App, WindowId};
 pub(crate) enum DocNames {
     /// Its `doc=` id.
     Id(u64),
-    /// The file it is, in each spelling the lane found for the URI asked
-    /// with: as given, the codec's, and the realpath one, which the store
-    /// keys documents by.
+    /// The file it is, in each spelling the lane found for the URI asked with: as given, the
+    /// codec's, and the realpath one, which the store keys documents by.
     Uri(Vec<String>),
 }
 
 /// What a `doc` read asks the main thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DocQuery {
-    /// `doc ls`: every live document, or the one a `uri=` names (its
-    /// spellings, as [`DocNames::Uri`] carries them).
+    /// `doc ls`: every live document, or the one a `uri=` names.
     Ls(Option<Vec<String>>),
     /// `doc read`: one live document's text.
     Read(DocNames),
 }
 
-/// One `doc` read on its way to the main thread, with the channel its answer
-/// goes back on.
+/// One `doc` read on its way to the main thread, with the channel its answer goes back on.
 #[derive(Clone, Debug)]
 pub(crate) struct DocCall {
     pub(crate) query: DocQuery,
     pub(crate) answer: Sender<DocAnswer>,
 }
 
-// Two calls are the same request when they ask the same thing; the channel is
-// where the answer goes, not what is asked.
 impl PartialEq for DocCall {
     fn eq(&self, other: &Self) -> bool {
         self.query == other.query
@@ -88,18 +68,16 @@ pub(crate) enum DocAnswer {
 /// One live document, as `doc ls` lists it.
 #[derive(Debug)]
 pub(crate) struct DocFacts {
-    /// Its row, `disk=` still [`DiskState::Unknown`] and `cursor=`/`sel=`
-    /// still unset: the lane fills them in ([`Self::place`]).
+    /// Its row, `disk=` still [`DiskState::Unknown`] and `cursor=`/`sel=` still unset.
     pub(crate) row: DocRow,
     /// Where the person's caret is; `None` when no view has one.
     pub(crate) caret: Option<Caret>,
-    /// What `disk=` compares; `None` when the document has no file version
-    /// to compare with.
+    /// What `disk=` compares; `None` when the document has no file version to compare with.
     pub(crate) disk: Option<DiskProbe>,
 }
 
-/// The person's caret and selection in one view of a document, as byte
-/// offsets into `text`, the document's text at the row's `seq=`.
+/// The person's caret and selection in one view of a document, as byte offsets into `text`, the
+/// document's text at the row's `seq=`.
 #[derive(Debug)]
 pub(crate) struct Caret {
     pub(crate) view: u64,
@@ -110,8 +88,7 @@ pub(crate) struct Caret {
 }
 
 impl DocFacts {
-    /// Fill in the row's `cursor=` and `sel=` from [`Self::caret`]: a walk
-    /// of the text, so it happens on the lane.
+    /// Fill in the row's `cursor=` and `sel=` from [`Self::caret`].
     pub(crate) fn place(&mut self) {
         let Some(caret) = &self.caret else {
             return;
@@ -146,8 +123,7 @@ pub(crate) struct DocText {
 }
 
 impl App {
-    /// [`crate::app_control::InspectRequest::Doc`]: answer `call` on its own
-    /// channel.
+    /// [`crate::app_control::InspectRequest::Doc`]: answer `call` on its own channel.
     pub(crate) fn answer_doc(&self, call: DocCall) {
         let _ = call
             .answer
@@ -483,17 +459,12 @@ mod tests {
         let mut app = app();
         let session = caller(&mut app);
         let caller_tab = app.windows[&WindowId(0)].tab_set.active_id().unwrap();
-        // The person's own view of the file, with "gamma" selected (line 2,
-        // characters 6 to 10) and the caret at its end.
         let person = open(&mut app, &f);
         let gamma = text.find("gamma").unwrap();
         set_selection(&mut app, person, gamma, gamma + "gamma".len());
-        // A program asks to edit the same file from the caller's tab, and
-        // waits: a fresh view of the same document, beside the caller.
         select(&mut app, caller_tab);
         let (edit, _waiting) = edit_waited(&mut app, session, &f.uri);
         let edit_view = ViewId::from_stored(edit.view);
-        // The person goes back to their own tab.
         let person_tab = tab_of(&app, person);
         select(&mut app, person_tab);
         let doc_id = document_of(&app, person).get();
@@ -526,9 +497,6 @@ mod tests {
             }),
         };
         assert_eq!(listed, vec![row.clone()]);
-        // NEGATIVE CONTROL: a hold through the person's view by a session
-        // this App does not host (one from the caller's reserved block, never
-        // minted) names no ticket here; the map is process-wide.
         let foreign = (
             session + 1_000,
             hold::Hold {
@@ -539,8 +507,6 @@ mod tests {
         hold::set(foreign.0, foreign.1);
         assert_eq!(rows(&doc(&app, "ls"))[0].tickets, vec![edit.ticket]);
         hold::clear(foreign.0, foreign.1.ticket);
-        // `uri=` takes the file in the spelling a client has, and keeps only
-        // it; a file no view shows lists nothing.
         assert_eq!(
             rows(&doc(&app, &format!("ls uri={}", f.uri))),
             vec![row.clone()]
@@ -550,13 +516,11 @@ mod tests {
             rows(&doc(&app, &format!("ls uri={}", other.uri))),
             Vec::new()
         );
-        // A document a Markdown view alone shows is not an Editor's: not listed.
         let markdown = fixture("readme.md", b"# hi\n");
         app.open_document_tab(AppKind::Markdown, &markdown.uri)
             .unwrap();
         assert_eq!(rows(&doc(&app, "ls")), vec![row.clone()]);
 
-        // The edit's own view in front: the person's caret is read there.
         let edit_tab = tab_of(&app, edit_view);
         select(&mut app, edit_tab);
         let in_front = rows(&doc(&app, "ls"));
@@ -569,7 +533,6 @@ mod tests {
         );
         assert_eq!(in_front[0].sel, None, "a caret selects nothing");
 
-        // Typing makes the buffer dirty and moves its sequence on.
         app.dispatch_native_event(
             WindowId(0),
             crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
@@ -581,14 +544,10 @@ mod tests {
         assert!(typed.dirty && typed.seq > row.seq, "{typed:?}");
         assert_eq!(typed.cursor.unwrap().at, Point { line: 1, col: 2 });
 
-        // Another program rewrites the file, then removes it.
         std::fs::write(&f.path, b"rewritten\n").unwrap();
         assert_eq!(rows(&doc(&app, "ls"))[0].disk, DiskState::Changed);
         std::fs::remove_file(&f.path).unwrap();
         assert_eq!(rows(&doc(&app, "ls"))[0].disk, DiskState::Missing);
-        // A file that is gone is still named in the client's spelling
-        // (`/var/…`, the store's key being `/private/var/…`): `amacs --apply`
-        // asks this before it writes a file, and must find the live buffer.
         let gone = rows(&doc(&app, &format!("ls uri={}", f.uri)));
         assert_eq!(
             gone.iter()
@@ -598,8 +557,6 @@ mod tests {
         );
         let read = doc(&app, &format!("read {} lines=1", f.uri));
         assert_eq!(body(&read).0, doc_id, "{read}");
-        // The App goes with the test; its hold is cleared so the map holds
-        // nothing of it.
         hold::clear(session, edit.ticket);
     }
 
@@ -632,8 +589,6 @@ mod tests {
                 snapshot.seq.0
             )
         );
-        // What `amacs --read` prints of the file: the same text, decoded as
-        // admission decodes it, through the same formatter.
         let decoded = crate::native_document_io::Decoded::hold(
             String::from_utf8(bytes.to_vec()).unwrap(),
             false,
@@ -646,8 +601,6 @@ mod tests {
             read,
             format_lines(&decoded.text, snapshot.seq.0, range, DOC_READ_CAP)
         );
-        // The id names the same document, bare or as the row's field, and
-        // a whole read ends with the last line.
         let by_id = doc(&app, &format!("read doc={} lines=1-2", document.get()));
         assert_eq!(body(&by_id).1, read);
         let whole = doc(&app, &format!("read {}", document.get()));
@@ -661,8 +614,6 @@ mod tests {
 
     #[test]
     fn doc_read_caps_at_256k_with_next() {
-        // 12,000 lines of 30 bytes: past the cap, which stops a read before
-        // the line that would cross it and names it in `next=`.
         let text: String = (1..=12_000)
             .map(|n| format!("line {n:05} of the long file\n"))
             .collect();
@@ -703,7 +654,6 @@ mod tests {
             assert!(pages < 10, "paging moves on");
         }
         assert!(pages >= 2, "the file is past one read's cap");
-        // Every line was read once, in order, with its anchor.
         let whole = format_lines(&text, 0, LineRange::ALL, usize::MAX);
         let expected: Vec<&str> = whole.lines().filter(|row| !row.starts_with("--")).collect();
         assert_eq!(rows_read, expected);
@@ -731,7 +681,6 @@ mod tests {
                 format!("read {}", missing.uri),
                 format!("ERR unknown doc {}\n", missing.uri),
             ),
-            // A document only a Markdown view shows has no Editor buffer.
             (
                 format!("read {markdown_doc}"),
                 format!("ERR unknown doc {markdown_doc}\n"),
@@ -760,7 +709,6 @@ mod tests {
         ] {
             assert_eq!(doc(&app, &rest), answer, "doc {rest}");
         }
-        // NEGATIVE CONTROL: the Editor's document reads.
         assert!(doc(&app, &format!("read {known}")).starts_with("OK "));
     }
 }

@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WHOLE-FRAME SWEEP: over every measured screen, a reader judges a frame torn
-//! ([`ScreenReader::frame_torn`]) only where one was caught mid-redraw, and every measured
-//! half-drawn frame is one a turn-end reader takes again rather than judges
-//! (`docs/measured/half-drawn-frame-2026-10-22.md`).
-//!
-//! The half frames are the lab's (`aterm-lab halfdraw scan` of three tabs' casts):
-//!
-//! * Claude Code 2.1.308 (`claude-2.1.308-lab-split-half.txt`): a 1024-byte read ended inside
-//!   its DEC 2026 frame, the composer's bottom rule cut at 109 of 144 cells on the last row
-//!   and its busy footer, drawn UNDER the composer, not reached: idle to the phase, with a
-//!   composer. Torn by its geometry ([`aterm_phase::phase::composer_frame_torn`]).
-//! * agy 1.4.0 (`agy-1.4.0-lab-split-half.txt`) and Gemini CLI 0.46.0
-//!   (`gemini-0.46.0-lab-erase-half.txt`): each erases below before it redraws and draws its
-//!   busy row ABOVE its composer, so a read cut before the busy row holds no composer either
-//!   (the supervisor's `writing`: output still arriving), and a read that reached the composer
-//!   passed the busy row. Their composer finders demand both edges as wide as the other, and
-//!   Muse Code's a footer as the last row drawn: a cut edge is no composer.
-//!
-//! NEGATIVE CONTROL: no other fixture of the four programs reads torn, and each half frame's
-//! whole successor (`*-split-whole`, `*-erase-whole`) is busy with a composer.
+//! THE WHOLE-FRAME SWEEP.
 
 use aterm_phase::{Phase, Program};
 
@@ -70,13 +51,11 @@ fn every_measured_half_frame_is_read_again() {
             .map(|(_, r)| r.clone())
             .unwrap_or_else(|| panic!("{file}: no such fixture"))
     };
-    // Claude Code: idle, a composer, torn.
     let half = rows("claude-2.1.308-lab-split-half.txt");
     let reader = Program::Claude.reader();
     assert_eq!(reader.phase(&half), Phase::Idle);
     assert!(reader.composer(&half).is_some());
     assert!(reader.frame_torn(&half));
-    // agy, Gemini CLI: idle, no composer (`writing`).
     for (program, file) in [
         (Program::Agy, "agy-1.4.0-lab-split-half.txt"),
         (Program::Gemini, "gemini-0.46.0-lab-erase-half.txt"),
@@ -90,7 +69,6 @@ fn every_measured_half_frame_is_read_again() {
         );
         assert!(reader.composer(&half).is_none(), "{file}: nor the composer");
     }
-    // Each whole successor: busy, with its composer.
     for (program, file) in [
         (Program::Claude, "claude-2.1.308-lab-split-whole.txt"),
         (Program::Agy, "agy-1.4.0-lab-split-whole.txt"),
@@ -155,8 +133,6 @@ fn a_composer_edge_cut_short_is_no_whole_frame() {
         };
         let reader = program.reader();
         assert!(reader.composer(whole).is_some(), "{file}: a composer");
-        // The bottom edge: the last row of the composer's edge glyph, cut to 109 cells and
-        // everything under it erased, as a read that split the redraw there shows it.
         let edge = whole
             .iter()
             .rposition(|r| {

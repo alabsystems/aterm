@@ -199,9 +199,9 @@ GOTCHAS
     or notification for a contained tab. `safety` applies resource caps without an OS
     sandbox on every platform.
   * macOS `Operation not permitted` on a protected path is TCC privacy consent: check
-    `aterm doctor`, `aterm ctl privacy`, and `aterm help permissions`.
+    `aterm doctor --read-only`, `aterm ctl privacy`, and `aterm help permissions`.
   * macOS builds/tests stalling on freshly linked binaries need aterm on the Developer
-    Tools list (`aterm doctor`'s `devtools:` row).
+    Tools list (`aterm doctor --read-only`'s `devtools:` row).
   * Rust here defaults to the Trust toolchain (`targo`, `trustc`, `tippy`, `trustfmt`,
     `trustdoc`). Upstream names (`cargo`, `rustc`, `clippy`, `rustfmt`, `rustdoc`,
     `lean`) are rerouted inside a session (`aterm help rust`, `aterm help reroute`).
@@ -512,14 +512,27 @@ CONFIGURATION — `[ai]` in `aterm.toml`
   aterm init --plan                 show planned changes without applying them
   aterm init --check                read-only; exit nonzero if anything needs attention
   aterm init --json                 structured per-setting results and undo commands
-  aterm init --only <id|family>     run only the named base items (e.g. `base.clt`, `shell`)
+  aterm init --only <id|family>     run only the named items (e.g. `base.clt`, `shell`,
+                                    `workstation`, `develop.checkout@~/aterm`)
+  aterm init --develop              this Mac develops aterm: base and develop, no setting
+  aterm init --no-develop           forget the develop profile (its tools stay as cache)
 
 Run as yourself, without sudo. Restores aterm's account links/stubs (works over SSH),
-then applies console workstation settings (Caps Lock as Control, natural scrolling off,
-widgets off, Dock pinned to aterm/System Settings/Safari, Messages & FaceTime signed out,
-rustup minimal profile without offline `rust-docs`). Notification Center's widgets need
-Full Disk Access (aterm's in an aterm tab, else the terminal's): without it they are left
-alone and the row says so; grant it and run `aterm init` again to clear them.
+then, on a bare run or `--only workstation`, applies console workstation settings (Caps
+Lock as Control, natural scrolling off, widgets off, Dock pinned to aterm/System
+Settings/Safari, Messages & FaceTime signed out, rustup minimal profile without offline
+`rust-docs`). Notification Center's widgets need Full Disk Access (aterm's in an aterm
+tab, else the terminal's): without it they are left alone and the row says so; grant
+it and run `aterm init` again to clear them.
+
+Develop: `--develop` in an aterm checkout records it in init.toml's `[develop]` table
+(never a linked worktree; the file's other lines stay byte for byte). Each later run
+fast-forwards a recorded checkout that is clean and on origin's default branch (else
+leaves it as it is, saying why; never a reset, stash, push or hook), checks out
+`vendor/astream` only where that loses nothing (not on a branch of yours, dirty, or at
+a commit whose bump is not committed yet), and runs the checkout's own `targo
+--unverified --locked verify provision` only in a checkout it aligns. Offline, the
+rows stand aside (exit 69); a profile it cannot read is one row and never stops base.
 
 Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
   [github]
@@ -528,9 +541,12 @@ Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
   token_file = "~/.secrets/github-token" # 0600 file; optional token_key = "GH_TOKEN"
 
 Verifies the token, stores it in the login keychain via CLT git's `osxkeychain` helper,
-and clones accessible repositories of `owner` into `~/<repo>` (preserving existing
-checkouts). If no secrets vault is configured, `init` offers to join the ALab vault
-(`http://alab-secrets.local:7484/v1/alab`) or a custom vault URL/path first (`aterm help secrets`).
+and clones accessible repositories of `owner` into `~/<repo>`. A clean existing checkout
+behind GitHub's default branch is fast-forwarded (from origin alone, running no hook);
+any other, or one whose origin cannot be read, is left as it is, saying why, and the
+`[develop]` checkouts are the develop items'. If no secrets vault is configured, `init`
+offers to join the ALab vault (`http://alab-secrets.local:7484/v1/alab`) or a custom
+vault URL/path first (`aterm help secrets`).
 "#,
         ),
     },
@@ -660,6 +676,10 @@ WHAT IT IS
     (`accounts = "early"|"on_limit"`), or takes an eligible reset (`limit_reset`) or
     usage credits (`usage_credits`). On a model-bucket limit, falls back per
     `model_fallback`.
+    A limit that names no reset is retried on a back-off ladder (30 min, 2 h,
+    then every 6 h), after a `Stop` too, while the menu bar says so; a limit holds
+    through aterm's own relaunch of the agent, ends when the screen names another
+    model or account, and Cruise types nothing into it.
   * API, context, login and crash recovery: retries transient API/overload errors
     (`retry_api_errors = true`, `probe_api = true`), runs `/compact` on a context wall
     (`compact_on_context_wall = true`), renews expired logins (`logins = "renew"`),
@@ -872,8 +892,11 @@ OCCASIONAL (recovery and preference)
                              the `rustup` `trust` link and exec roots
   aterm pkg machine [apply | cache [clean]]
                              inspect or apply `[machine]` settings (disables macOS
-                             Universal Control and installs Rosetta 2 on Apple silicon)
-                             or inspect/clean the shared Rust build cache
+                             Universal Control and installs Rosetta 2 on Apple silicon;
+                             apply then removes Rust build-cache folders nothing builds
+                             into any more and pinned tools in the tooling cache nothing
+                             has run for a month) or inspect/clean the shared Rust build
+                             cache (`cache` lists what apply would remove, and why)
   aterm pkg self-uninstall [--dry-run] [--install-dir <dir>]
                              remove what `install.sh` placed (store, app, links, PATH block)
 
@@ -1616,7 +1639,8 @@ fn overview_page() -> String {
                 "configure and manage a lab of Macs over SSH (init | scan | enroll | status | plan | apply | person)"
             }
             crate::Verb::Init => {
-                "configure this macOS login's keyboard, widgets, Dock and messaging accounts"
+                "configure this macOS login's keyboard, widgets, Dock and messaging accounts; \
+                 `--develop` for a checkout's tools"
             }
             crate::Verb::Secrets => {
                 "one credentials file for every machine: the vault, its server and ~/.secrets \
@@ -1646,17 +1670,25 @@ fn overview_page() -> String {
     };
     const HELP_USAGE: &str = "aterm help [topic]";
     const HELP_LINE: &str = "this manual — start here (a deep dive on any verb or tool)";
-    // Column width across the verb signatures and the topic names.
+    // Column width across the verb signatures and the topic names. A signature wider than
+    // `WIDEST` (init's flags) gets a line of its own instead of widening every row.
+    const WIDEST: usize = 40;
     let width = TOPICS
         .iter()
         .map(|t| t.name.len())
         .chain(std::iter::once(HELP_USAGE.len()))
         .chain(crate::Verb::ALL.iter().map(|v| v.usage().len()))
+        .filter(|&len| len <= WIDEST)
         .max()
         .unwrap_or(14);
     let _ = writeln!(s, "  {HELP_USAGE:<width$}  {HELP_LINE}");
     for v in crate::Verb::ALL {
-        let _ = writeln!(s, "  {:<width$}  {}", v.usage(), line(*v));
+        if v.usage().len() > width {
+            let _ = writeln!(s, "  {}", v.usage());
+            let _ = writeln!(s, "  {:<width$}  {}", "", line(*v));
+        } else {
+            let _ = writeln!(s, "  {:<width$}  {}", v.usage(), line(*v));
+        }
     }
     // A topic named after a verb is already listed above: `aterm help <verb>`
     // resolves to it, so a second row would only say the same thing again.
@@ -2010,7 +2042,7 @@ WHAT THE DIAGNOSTIC SUBCOMMANDS COVER
   documents two aterm.toml tables: [privacy] (`auto_accept` is reserved — aterm
   never answers a macOS consent dialog) and [machine], both macOS settings.
   Off macOS, explain-config only names those two; on Windows it documents `shell` and
-  `font_px`, and the shell show-config and `aterm doctor`
+  `font_px`, and the shell show-config and `aterm doctor --read-only`
   report is never the shell the command was typed into: inside an aterm tab it
   is that tab's own shell (`shell_origin=tab`, so a window launched with --shell
   reports that shell), and elsewhere the one a new window spawns, naming the
@@ -2035,10 +2067,11 @@ PROVISION — make this machine able to publish
   aterm ship provision --id <machine-id> --check
       A NO-WRITES audit: the roster, the Trust toolchain and verifiers, the
       rustup front door, the x86 slice, Apple's packaging tools, the Developer
-      ID identity, a live-tested notary credential, `gh` auth and the channel
-      token, then the layers a release host stands on: the base layer
-      (`aterm init --check --only base`), every row a bare `targo --unverified
-      verify provision` lays, macOS's LibreSSL, the publication engine with
+      ID identity, a live-tested notary credential, the channel token (the
+      release's one GitHub identity), then the layers a release host stands on:
+      the base layer (`aterm init --check --only base`), every row a bare
+      `targo --unverified verify provision` lays, macOS's LibreSSL, the
+      publication engine with
       gitleaks, the site checkout and its deploy.sh, and node with
       firebase-tools. It names every gap and the exact fix, and exits non-zero
       while one is open.
@@ -2228,7 +2261,7 @@ LOG
                               the newest ten filed, each with why, the action and when
     aterm exceptions --all    every filed entry in the log's newest MiB, not just
                               the newest ten
-    aterm doctor              its `exceptions:` row says how many are open
+    aterm doctor --read-only  its `exceptions:` row says how many are open
     aterm ctl messages need=later    the same, from a running aterm
 
   aterm help atpkg         updates to the ALab tools, which are a separate thing
@@ -2510,7 +2543,8 @@ DEBUGGER ACCESS (a password dialog, not privacy)
 SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A newly built binary that pauses for seconds before starting is being scanned by
   `syspolicyd` / XProtect (serialized one binary at a time).
-  1. Check `aterm doctor`'s `devtools:` row (or `devtools` in `aterm ctl privacy`).
+  1. Check `aterm doctor --read-only`'s `devtools:` row (or `devtools` in `aterm ctl
+     privacy`).
   2. If `warn` / `unlisted`, tell your operator to enable aterm in System Settings ▸
      Privacy & Security ▸ Developer Tools (`aterm doctor` opens the pane for them).
   3. Tabs adopted across an in-place update (`attribution=adopted`) still trigger scans;
@@ -3258,7 +3292,8 @@ fn rust_page() -> String {
          \x20 * Through atpkg's `targo` shim a build's intermediates land in a `*.noindex` folder,\n\
          \x20   which Spotlight skips: the shared cache, or `<target>/build.noindex` under a target\n\
          \x20   you chose and for `targo trust`. A build that bypasses the shim names its target\n\
-         \x20   `*.noindex` (`target/check.noindex`); `aterm doctor` shows what Spotlight indexes.\n\
+         \x20   `*.noindex` (`target/check.noindex`); `aterm doctor --read-only` shows what\n\
+         \x20   Spotlight indexes.\n\
          \x20 * Never build in a checkout another session is working in — `git worktree add` your own.\n\
          \x20 * Never rebuild a toolchain from source to answer a rustup error: `aterm pkg doctor`,\n\
          \x20   then `aterm pkg repair`.\n\
@@ -4176,7 +4211,7 @@ fn push_macos_walls(s: &mut String) {
          `debugger` row): answered within ~30 s, a parked lldb goes on; later, it fails and its\n  \
          target is killed. A retry or `sudo` is no answer, and bare `DevToolsSecurity` ENABLES\n  \
          developer mode Mac-wide. A new program parked at `_dyld_start` is macOS's first-run\n  \
-         check: see `aterm doctor`'s `devtools:` row.\n",
+         check: see `aterm doctor --read-only`'s `devtools:` row.\n",
     );
 }
 

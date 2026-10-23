@@ -1,78 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HARNESS'S CLOCK: every bounded wait the live upgrade and the relaunch
-//! take — the Claude Code lane's, codex-alab's crash relaunch and the Muse
-//! Code, agy and Gemini CLI lanes' relaunches — and the supervisor loop's own re-decisions, as ONE value, carried on the pass's options
-//! (`upgrade_drive::Opts::timings`) and on the loop
-//! (`supervise::Session::set_timings`).
-//!
-//! WHY A VALUE. A wait bounds something that may not happen: an agent that does
-//! not exit, a shell that never takes its terminal back, a relaunched process
-//! that never registers. The product waits those out at human scale (seconds to
-//! minutes); a test that drives the negative case waited them out too — 15 s for
-//! a stand-in shell that never takes its terminal back, three times over in one
-//! test — and the whole unit suite spent most of its wall time asleep. So the
-//! production values are [`Timings::PRODUCTION`], exactly the constants they
-//! replaced, and a test's options carry [`Timings::FAST`]: the same waits, the
-//! same order, the same verdicts, in milliseconds. A wait for something that
-//! DOES happen ends on its event either way.
-//!
-//! LIVE INSTANCES. A debug build reads the fast-timers development seam
-//! ([`FAST_SEAM`], `aterm_types::dev_seam!`, which a shipped build never
-//! compiles): set, [`Timings::for_build`] is [`Timings::FAST`], so the live
-//! headless suites (`crates/aterm/tests/support/headless_boot.rs`) run their
-//! instances' harness at the test values. The seam is denied for inheritance
-//! (aterm-types' `env_sanitize`), so a nested aterm runs its own clock.
-//!
-//! ONE OR TWO TESTS PER FAMILY KEEP THE PRODUCTION CLOCK, so the production
-//! values are exercised somewhere; every other test runs [`Timings::FAST`].
+//! THE HARNESS'S CLOCK.
 
 use std::time::Duration;
 
-/// The fast-timers development seam: set (to anything) in a debug build, the
-/// harness runs [`Timings::FAST`] (module doc). The one name is aterm-types'
-/// ([`aterm_types::domain::ENV_DEV_FAST_TIMERS`]), whose deny list keeps
-/// it from every child shell.
+/// The fast-timers development seam: set in a debug build, the harness runs [`Timings::FAST`].
 pub const FAST_SEAM: &str = aterm_types::domain::ENV_DEV_FAST_TIMERS;
 
-/// The harness's bounded waits (module doc). Every field is an upper bound on
-/// a wait that ends at once on its event, except [`Self::prompt_drawn`] and
-/// [`Self::fence_every`], which are pauses.
+/// The harness's bounded waits (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timings {
-    /// A signalled agent's exit (`upgrade_wake::wait_exit`, the kernel's exit
-    /// event): past it the step says `wait:exiting`.
+    /// A signalled agent's exit (`upgrade_wake::wait_exit`, the kernel's exit event).
     pub exited: Duration,
-    /// The shell the agent left taking its terminal back, before the step
-    /// says `wait:shell-prompt`.
+    /// The shell the agent left taking its terminal back, before the step says `wait:shell-prompt`.
     pub prompt_back: Duration,
-    /// The pause after the shell took its terminal back, for it to draw its
-    /// prompt before the relaunch line is typed.
+    /// The pause after the shell took its terminal back, for it to draw its prompt before the
+    /// relaunch line is typed.
     pub prompt_drawn: Duration,
-    /// The pause between two fenced tries of a typed line (the relaunch
-    /// line, a continuation, a notice) whose screen moved under its fence.
+    /// The pause between two fenced tries of a typed line whose screen moved under its fence.
     pub fence_every: Duration,
-    /// One step's wait for a relaunched agent to register its conversation; a
-    /// later step waits again, until the restart's stale bound.
+    /// One step's wait for a relaunched agent to register its conversation.
     pub held: Duration,
-    /// [`Self::held`] for a cold restore's relaunch, which releases the one
-    /// sweep lock for other tabs sooner. Longer than [`Self::ended_at_once`],
-    /// so a relaunch that ended as it started is seen to.
+    /// [`Self::held`] for a cold restore's relaunch, which releases the one sweep lock for other
+    /// tabs sooner.
     pub restored_held: Duration,
-    /// How long the shell must hold its terminal, the relaunch line seen to
-    /// run, before the relaunched agent reads as ended as it started.
+    /// How long the shell must hold its terminal, the relaunch line seen to run, before the
+    /// relaunched agent reads as ended as it started.
     pub ended_at_once: Duration,
     /// How often the shell-holds-its-terminal look runs (a `ps` each time).
     pub shell_look: Duration,
     /// The relaunched agent's first idle, under the harness's hand.
     pub first_idle: Duration,
-    /// A relaunched codex-alab's first idle, under the harness's hand
-    /// (`codex_alab_drive`'s hold): its launch probe's window (the contract
-    /// §5, carry-on: the probe's read speaks for the start within 60 s).
+    /// A relaunched codex-alab's first idle, under the harness's hand (`codex_alab_drive`'s hold).
     pub alab_first_idle: Duration,
-    /// A relaunched agent settling (idle, its composer empty) before it is
-    /// told to carry on (the Claude lane's carry-on).
+    /// A relaunched agent settling before it is told to carry on.
     pub carry_settle: Duration,
     /// The Muse Code lane: the relaunched TUI found as the shell's child.
     pub muse_found: Duration,
@@ -86,33 +48,21 @@ pub struct Timings {
     pub agy_found: Duration,
     /// The agy lane: the relaunched TUI's composer drawn.
     pub agy_up: Duration,
-    /// The agy lane: the relaunched TUI holding its conversation's presence
-    /// lock (taken at once with `--conversation`: measured 0.49 s after the
-    /// line's Enter); never held, it started a fresh conversation.
+    /// The agy lane: the relaunched TUI holding its conversation's presence lock.
     pub agy_lock: Duration,
     /// The agy lane: an adopted TUI seen in its tab.
     pub agy_adopt: Duration,
-    /// The Gemini CLI lane: the relaunched parent found as the shell's
-    /// child.
+    /// The Gemini CLI lane: the relaunched parent found as the shell's child.
     pub gemini_found: Duration,
     /// The Gemini CLI lane: the relaunched TUI's composer drawn.
     pub gemini_up: Duration,
-    /// The Gemini CLI lane: the start-time rule naming the relaunched
-    /// process's session (its header lands 542-1108 ms after its child
-    /// starts, measured).
+    /// The Gemini CLI lane: the start-time rule naming the relaunched process's session.
     pub gemini_witness: Duration,
     /// The Gemini CLI lane: an adopted TUI seen in its tab.
     pub gemini_adopt: Duration,
-    /// The supervisor loop: how far off a point whose fenced write the server
-    /// skipped (the screen moved between the judged read and the write) is
-    /// decided again, on the deadline of the loop's own wait.
+    /// The supervisor loop: delay before re-deciding a point whose fenced write was skipped.
     pub redecide_after_skip: Duration,
-    /// The supervisor loop: the lease its claim on a session asks for
-    /// (`meta set supervisor <holder> ttl=<ms>`), renewed while it runs, so a
-    /// loop that dies leaves no claim past it. The test value is LONGER: a
-    /// live test waits for a claim's RELEASE under the hang detector, and a
-    /// lease that could lapse inside that minute would pass a host that never
-    /// released it.
+    /// The supervisor loop: the lease TTL its claim on a session asks for.
     pub claim_ttl: Duration,
 }
 
@@ -146,12 +96,7 @@ impl Timings {
         claim_ttl: Duration::from_secs(90),
     };
 
-    /// The tests' waits: the same bounds in milliseconds where a test drives
-    /// the case that waits one out. The waits on a process's own exit keep
-    /// seconds: a stand-in that is signalled does exit, and on a loaded
-    /// machine its exit can take a while. The claim's lease is the one value
-    /// made longer ([`Self::claim_ttl`]): what a test waits for there is the
-    /// release, which a lapse must never stand in for.
+    /// The tests' waits.
     pub const FAST: Self = Self {
         exited: Duration::from_secs(10),
         prompt_back: Duration::from_millis(300),
@@ -180,9 +125,7 @@ impl Timings {
         claim_ttl: Duration::from_secs(600),
     };
 
-    /// This build's clock: [`Self::FAST`] where the development seam
-    /// ([`FAST_SEAM`]) is set in a debug build, else [`Self::PRODUCTION`]. A
-    /// shipped build never reads the seam.
+    /// This build's clock.
     #[must_use]
     pub fn for_build() -> Self {
         if aterm_types::dev_seam!(FAST_SEAM).is_some() {

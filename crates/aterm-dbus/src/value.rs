@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`Value`]: one D-Bus value of any type the crate speaks, owning its data.
-//!
-//! An array or dict carries its element type, so an empty one still has a
-//! signature; the constructors refuse an element of another type, which keeps
-//! every [`Value`] encodable as its [`Value::type_of`].
-//!
-//! A `Value` is 32 bytes and every decoded value consumed at least one input
-//! byte, while types are shared, not copied ([`Type`]): decoding `n` bytes
-//! allocates O(`n`), about 32`n` for the worst case (`ay`).
+//! [`Value`]: owned D-Bus values and validated path, signature, array, and dict containers.
 
 use crate::error::{Error, Result};
 use crate::names;
@@ -20,6 +12,8 @@ use crate::sig::{self, Type};
 pub struct ObjectPath(String);
 
 impl ObjectPath {
+    /// Validates `path` as a D-Bus object path.
+    ///
     /// # Errors
     ///
     /// [`Error::Invalid`] unless `path` is an object path.
@@ -45,12 +39,13 @@ impl ObjectPath {
     }
 }
 
-/// A validated signature: zero or more complete types. As data it may name
-/// `h`, which [`sig::parse_signature`] refuses for a body or a variant.
+/// A validated D-Bus signature of zero or more complete types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Signature(String);
 
 impl Signature {
+    /// Validates `sig` as a D-Bus data signature.
+    ///
     /// # Errors
     ///
     /// [`Error::Invalid`] for a signature the specification forbids.
@@ -193,8 +188,7 @@ impl Value {
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] when `key` is not a basic type or an entry is not of
-    /// the declared types.
+    /// [`Error::Invalid`] when `key` is not a basic type or an entry does not match `(key, value)`.
     pub fn dict(key: Type, value: Type, entries: Vec<(Value, Value)>) -> Result<Self> {
         if !key.is_basic() {
             return Err(Error::Invalid("dict key is not a basic type"));

@@ -1232,6 +1232,14 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
         "workspace (/directory)",
         "0.46.0",
     ),
+    // The footer's last column head (its value under it: `Auto`, or the
+    // model the person chose), and the banner's login row
+    // (`UserIdentity`: `Authenticated with <authType> /auth`, or `Signed in
+    // with Google: <email> /auth`).
+    lit("gemini.footer.model", "/model", "0.46.0"),
+    lit("gemini.banner.auth", "Authenticated with ", "0.46.0"),
+    lit("gemini.banner.google", "Signed in with Google", "0.46.0"),
+    lit("gemini.banner.auth.tail", " /auth", "0.46.0"),
     lit("gemini.turn.cancelled", "Request cancelled.", "0.46.0"),
     lit("gemini.error.api", "[API Error:", "0.46.0"),
     lit(
@@ -1265,6 +1273,16 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     hint("gemini.question.submit", "Enter to submit", "0.46.0"),
     lit("gemini.usage.title", "Usage limit reached for", "0.46.0"),
     lit("gemini.usage.retry", "Keep trying", "0.46.0"),
+    // The per-model bucket's dialog (bundle: `ProQuotaDialog`, a terminal
+    // quota on a model whose fallback is another): `Switch to <fallback>`
+    // (a template), over `Upgrade for higher limits` under the Google login,
+    // over `Stop` — no `Keep trying` on offer.
+    composed("gemini.usage.switch", "Switch to ", "0.46.0"),
+    lit(
+        "gemini.usage.upgrade",
+        "Upgrade for higher limits",
+        "0.46.0",
+    ),
     lit("gemini.usage.resets", "Access resets at ", "0.46.0"),
     composed("gemini.queued", "Queued (press ↑ to edit):", "0.46.0"),
     lit(

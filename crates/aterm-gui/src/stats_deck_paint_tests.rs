@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The heat table's painter against the spec's scenes
-//! (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §15.3): T-G2, T-G4, T-G7,
-//! T-G8, T-G9, T-G10 and T-G14, and the gallery a person reads beside the
-//! mockups.
+//! Scene and gallery tests for the stats deck heat-table painter.
 
 use super::*;
 use crate::stats_paint::HitKind;
@@ -38,11 +35,9 @@ pub(crate) enum Scene {
     FirstRun,
     /// No disk watch: no level, no lines, no freed.
     HarnessOff,
-    /// T-G4's worst case: every column over, one unread in every row, the
-    /// longest figures and every state clause, 128 cores in one cluster.
+    /// T-G4's worst case.
     Worst,
-    /// §13's worst case: as [`Scene::Worst`], over only where CPU and
-    /// Memory can be.
+    /// Worst-case scene ([`Scene::Worst`]) restricted to valid CPU and memory overflow slots.
     Costly,
 }
 
@@ -59,8 +54,7 @@ impl Rng {
     }
 }
 
-/// Each row's last ten minutes: 60 buckets of heat, oldest first, and
-/// whether each was over (the mockups' story).
+/// Each row's last ten minutes.
 struct Story {
     heat: [Vec<Option<f64>>; 7],
     over: [Vec<bool>; 7],
@@ -191,8 +185,7 @@ fn series(now: f64, capacity: f64) -> Series {
     }
 }
 
-/// A row reading `now` of `cap`, its buckets' heat (shares of `cap`) and
-/// overs from `story` row `i`, the front tab's figure `tab`.
+/// Builds a resource row from `now`, `cap`, `story` row `i`, and front-tab figure `tab`.
 fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig) -> ResourceView {
     let (heat, over) = (&st.heat[i], &st.over[i]);
     let ring: Vec<Cell> = heat
@@ -317,7 +310,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     };
     let f = &mut s.facts;
 
-    // CPU.
     let clusters: Vec<(&str, &str, Vec<f32>)> = if worst {
         vec![("CPU", "", vec![0.97; 128])]
     } else {
@@ -349,7 +341,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
         }
     });
 
-    // GPU.
     let mut gpu = row(12.0, 100.0, &st, 1, not_per_app(), not_per_app());
     if worst {
         gpu.state = Some(State::Warn);
@@ -368,7 +359,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
         ..GpuSample::default()
     });
 
-    // Memory.
     let (now, cap, aterm, tab, cached, swap, pressure) = match sc {
         Scene::Worst | Scene::Costly => (
             1023.9,
@@ -403,7 +393,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
             wired: (4.0 * GIB) as u64,
             compressed: Some((4.0 * GIB) as u64),
             cached: (cached * GIB) as u64,
-            // The classes sum to the capacity.
             free: ((cap - now - cached).max(0.0) * GIB) as u64,
             swap_used: (swap * GIB) as u64,
             swap_total: (swap * GIB) as u64,
@@ -419,7 +408,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
         _ => None,
     };
 
-    // Disk.
     let total = 2_000_000_000_000_u64;
     let (avail, aterm, tab) = match sc {
         Scene::Worst | Scene::Costly => (40_000_000_000_u64, 9_999e6, 9_999e6),
@@ -504,7 +492,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     }
     s.resources[3] = disk;
 
-    // Network.
     let mut net = if worst {
         let mut v = row(9_999e6, 9_999e6, &st, 4, not_per_app(), not_per_app());
         v.second = Some(series(9_999e6, 9_999e6));
@@ -534,7 +521,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
     });
     f.net_read_s = if sc == Scene::FirstRun { 0 } else { 86_400 };
 
-    // Tokens.
     let mut tokens = if worst {
         row(99_900.0, 99_900.0, &st, 5, fig(99_900.0), fig(99_900.0))
     } else {
@@ -559,7 +545,6 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
         });
     }
 
-    // Processes.
     let mut procs = if worst {
         let mut v = row(
             999_999.0,
@@ -668,9 +653,7 @@ struct Swept<'a> {
     laid: Laid,
 }
 
-/// T-G4's sweep over `scenes`: every width at s = 1 and 2, Full and Folded,
-/// in Helvetica Neue's and the test stack's metrics, laid out and not
-/// drawn. `check` answers what is wrong with one deck.
+/// T-G4's sweep over `scenes`.
 fn sweep(scenes: &[Scene], check: impl Fn(&Swept<'_>) -> Vec<String> + Sync) -> Vec<String> {
     let snaps: Vec<(Scene, Snapshot)> = scenes.iter().map(|&sc| (sc, scene(sc))).collect();
     let faces = [
@@ -1123,8 +1106,7 @@ fn texts_in(laid: &Laid, col: Col, y0: f64, y1: f64) -> Vec<String> {
     found.iter().map(|b| b.text.clone()).collect()
 }
 
-/// Rule S on one row: with no Details, its amount slot says its state, at
-/// the first tier that fits.
+/// Rule S on one row: with no Details, its amount slot says its state, at the first tier that fits.
 #[expect(
     clippy::too_many_arguments,
     reason = "one row's words, column and band"
@@ -1227,7 +1209,6 @@ fn state_is_said_in_words_without_details() {
                 .collect();
             match (b.details, b.amount) {
                 (Some(details), _) => {
-                    // Details says the state, kept and first (rule D).
                     for &(r, res) in &ours {
                         let Some(st) = words::state(res, &snap, &MAC) else {
                             continue;
@@ -1256,9 +1237,6 @@ fn state_is_said_in_words_without_details() {
                     }
                 }
                 (None, None) => {
-                    // fslim: the header names the block's worst state, as
-                    // `<Resource> <word>` (Processes names itself by its
-                    // word, "2 stuck").
                     let worst = ours
                         .iter()
                         .filter_map(|&(_, res)| words::state(res, &snap, &MAC).map(|st| (res, st)))
@@ -1307,8 +1285,7 @@ fn row_hit(res: Resource, bar: Bar) -> Option<HitKind> {
     Some(HitKind::Row(Instrument::of(res), bar))
 }
 
-/// Every column of a row names the row; its aterm and Tab cells name their
-/// scope; its band runs half the gap to each neighbour (§11.1, §11.2).
+/// Every column of a row names the row.
 #[expect(clippy::too_many_arguments, reason = "one row's columns and band")]
 fn check_row(
     hits: &[Hit],
@@ -1331,7 +1308,6 @@ fn check_row(
             "{at}: {res:?} at {x}"
         );
     }
-    // A band's edges round to the nearest device pixel.
     let x = cols.first().map_or(0.0, |c| c.x + 1.0);
     let inset = 0.6 / s;
     for y in [top - gap / 2.0 + inset, top + rows.cell + gap / 2.0 - inset] {
@@ -1431,7 +1407,6 @@ fn hit_map() {
             "{at}"
         );
     }
-    // fslim: a state label in the header names its row.
     let w = folded_width(BlockKind::Slim, &m);
     let laid = laid(Scene::Trouble, w, 2.0, DeckForm::Folded, &m, true);
     let head = laid.head.as_ref().expect("a header");

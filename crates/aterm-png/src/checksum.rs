@@ -30,7 +30,7 @@ impl Crc32 {
 
     /// Fold `bytes` into the running CRC (astream-wire's slicing-by-8 fold).
     #[inline]
-    pub(crate) fn update(&mut self, bytes: &[u8]) {
+    pub(crate) const fn update(&mut self, bytes: &[u8]) {
         self.0 = crc32_ieee_update(self.0, bytes);
     }
 

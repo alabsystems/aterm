@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Additive complete-stdout capture for consumers that replace data or admit an inventory.
-//! The older diagnostic capture keeps its tail/grace semantics unchanged.
+//! Complete-stdout capture for child processes with bounded output.
 
 use super::{
     DRAIN_GRACE, ExitWait, Grace, OUTPUT_KEEP, PipeEnd, RunError, drain, pipe_end, reap_within,
@@ -55,8 +54,7 @@ impl std::error::Error for CompleteOutputError {
     }
 }
 
-/// Run with closed stdin and require complete stdout, as
-/// [`output_until_complete_stdout_from`]. Stderr remains a bounded diagnostic tail.
+/// Runs `cmd` with closed stdin and requires complete stdout up to [`OUTPUT_KEEP`] bytes.
 ///
 /// # Errors
 /// A child refusal or stdout whose EOF, read or size cannot be vouched for.
@@ -67,21 +65,7 @@ pub fn output_until_complete_stdout(
     output_until_complete_stdout_from(cmd, Stdio::null(), deadline)
 }
 
-/// Run to the existing child deadline with supplied stdin. Success proves stdout reached
-/// EOF without a read error and without discarding any byte, with at most [`OUTPUT_KEEP`]
-/// bytes (exactly that many is admitted). No partial stdout is returned on refusal.
-///
-/// Child group/deadline handling matches [`super::output_until_from`], except that a
-/// refusal waits at most one 60-second reserve to reap after killing. On Unix the
-/// dropped spawnfd handle hands a child still unsettled to the existing reaper;
-/// returning a refusal does not certify child or descendant exit. After child exit,
-/// stdout may finish for the existing [`DRAIN_GRACE`]; an open descendant-held stream is a
-/// refusal, not a complete empty/short result. Past the grace a pipe no descendant holds is
-/// read on ([`Grace`]). Stderr deliberately keeps the older
-/// diagnostic tail behavior; this API does not certify stderr completeness.
-///
-/// As in the older capture, a reader still blocked after grace can outlive the call on
-/// its own owned stream and bounded buffer. This API does not establish descendant exit.
+/// Runs `cmd` with `stdin` until `deadline`, requiring complete stdout up to [`OUTPUT_KEEP`].
 ///
 /// # Errors
 /// [`CompleteOutputError`] for the child's refusal, stdout read failure, overflow or
@@ -162,7 +146,6 @@ pub fn output_until_complete_stdout_from(
 }
 
 /// Kill as the diagnostic path does, then use the existing bounded reap loop.
-/// This reserve is cleanup containment, not a required child response time.
 fn end_bounded(child: &mut Child) {
     #[cfg(unix)]
     super::children::kill_group(child);
@@ -195,8 +178,6 @@ impl CompleteDrain {
 }
 
 /// The same bounded read loop the strict child path uses, over an injected Read in tests.
-/// Continue consuming overflow to EOF so the child's pipe is not left blocked by the cap;
-/// the overflow flag is sticky and no retained prefix can be returned as complete.
 fn read_stdout(mut stream: impl Read) -> Result<Vec<u8>, CompleteOutputError> {
     let mut bytes = Vec::new();
     let mut too_large = false;
@@ -221,7 +202,6 @@ fn read_stdout(mut stream: impl Read) -> Result<Vec<u8>, CompleteOutputError> {
     }
 }
 
-// wasm32 never links aterm-uds; the census's wasm closure scans it anyway (OB-12).
 #[cfg(not(target_arch = "wasm32"))]
 fn drain_stdout(
     pipe: Option<PipeEnd>,

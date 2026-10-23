@@ -29,7 +29,7 @@ pub enum Reject {
 impl Reject {
     /// The `reason=` token this refusal is recorded under.
     #[must_use]
-    pub fn token(self) -> &'static str {
+    pub const fn token(self) -> &'static str {
         match self {
             Reject::Malformed => "malformed",
             Reject::NotHosted => "not-hosted",

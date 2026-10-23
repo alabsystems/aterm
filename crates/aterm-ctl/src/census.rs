@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The unreached-instance census: aterm windows and headless instances of this user that no
-//! control socket in the rendezvous directory reaches. `aterm doctor` prints it; nothing is
-//! stopped.
-//!
-//! An instance is a process named `aterm` or `aterm-…` started in window mode (`--headless` or
-//! `--window` before any `-e` payload, the `aterm-gui` name, or a bare app-bundle launch), and
-//! not a verb (`aterm ctl …`) or a forced `--session`. A bare `aterm` in a terminal is a
-//! session, serves no socket, and is not counted.
-//!
-//! An instance is reached when the rendezvous walk ([`crate::local_instances`]) publishes its
-//! pid: an `aterm-<pid>.sock`, or a `graph/` entry naming it. A foreign instance (a private
-//! `--control-sock`, published through its graph entry) counts as reached. When the census
-//! cannot look (no process table, an unreadable rendezvous directory) it says so, never "none".
+//! Unreached-instance census comparing live `aterm` processes with [`crate::local_instances`].
 
 use std::collections::BTreeSet;
 
@@ -28,8 +16,7 @@ pub struct ProcRow {
     pub uid: u32,
     /// Its age, as `ps`'s POSIX `etime` spells it: `[[dd-]hh:]mm:ss`.
     pub etime: String,
-    /// The program: on macOS `ps`'s `comm` is the path it was started by (it may
-    /// hold spaces); on Linux it is the kernel's short task name.
+    /// The program: on macOS `ps`'s `comm` is the path it was started by (it may hold spaces).
     pub program: String,
     /// The whole command line, arguments joined by spaces.
     pub command: String,
@@ -44,17 +31,14 @@ pub struct Unreached {
     pub age: String,
     /// Its command line, as `ps` printed it.
     pub command: String,
-    /// Started with its control socket switched off (`--no-control-sock`,
-    /// `--control-sock 0|off`): unreachable by its own launch, not by accident.
+    /// Started with its control socket switched off (`--no-control-sock`, `--control-sock 0|off`).
     pub socketless: bool,
 }
 
-/// The census: how many instances were counted, and which of them nothing
-/// reaches.
+/// The census: how many instances were counted, and which of them nothing reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Census {
-    /// The rendezvous directory that was read, for the words: an instance is
-    /// "reached" only relative to it.
+    /// The rendezvous directory that was read, for the words.
     pub dir: String,
     /// Window and headless instances of this user, reached or not.
     pub instances: usize,
@@ -65,8 +49,7 @@ pub struct Census {
 /// Take the census of this machine, now.
 ///
 /// # Errors
-/// The rendezvous directory or the process table could not be read; never an
-/// empty census standing in for "could not look".
+/// Returns an error if the rendezvous directory or process table cannot be read.
 #[cfg(unix)]
 pub fn window_census() -> Result<Census, String> {
     let (outcome, targets) = crate::inspect_fleet();
@@ -76,15 +59,10 @@ pub fn window_census() -> Result<Census, String> {
     census_of(&table, std::process::id(), &published, dir)
 }
 
-/// What the rendezvous walk says is published: the directory's words and the
-/// pids it names, pure over [`crate::inspect_fleet`]'s answer.
-///
-/// A directory that does not exist is an answer: nothing has published there,
-/// so every instance is unreached.
+/// What the rendezvous walk says is published ([`crate::inspect_fleet`]).
 ///
 /// # Errors
-/// The directory could not be resolved or read; nothing is known about what
-/// is published, and the census is not taken.
+/// Returns an error if the rendezvous directory cannot be resolved or read.
 #[cfg(any(unix, test))]
 fn published_in(
     outcome: crate::DirOutcome,
@@ -118,9 +96,7 @@ pub fn window_census() -> Result<Census, String> {
     Err("macOS and Linux only".to_string())
 }
 
-/// The census over an explicit process table, the caller's own pid (whose row
-/// names the user to count for) and the published pids; pure, so every
-/// classification is table-testable.
+/// Computes the census over an explicit process table, caller pid, and published pids.
 ///
 /// # Errors
 /// `own_pid` has no row in `table`, so the user to count for is unknown.
@@ -170,9 +146,6 @@ fn window_args(row: &ProcRow) -> Option<Vec<&str>> {
     if base != "aterm" && !base.starts_with("aterm-") {
         return None;
     }
-    // The arguments: what follows the program on the command line. On macOS the
-    // command line starts with `comm` verbatim (spaces included); elsewhere
-    // `comm` is a short name, and the first word of the command line is argv[0].
     let rest = match row.command.strip_prefix(row.program.as_str()) {
         Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => r,
         _ => row
@@ -180,7 +153,6 @@ fn window_args(row: &ProcRow) -> Option<Vec<&str>> {
             .split_once(char::is_whitespace)
             .map_or("", |(_, r)| r),
     };
-    // Everything after `-e`/`--command`/`--` is a child command's argv, not ours.
     let args: Vec<&str> = rest
         .split_whitespace()
         .take_while(|a| !matches!(*a, "-e" | "--command" | "--"))
@@ -189,15 +161,12 @@ fn window_args(row: &ProcRow) -> Option<Vec<&str>> {
     let window = base == "aterm-gui"
         || args.iter().any(|a| matches!(*a, "--headless" | "--window"))
         || (in_bundle && args.is_empty());
-    // A verb (`aterm ctl …`) and a forced session take no window, whatever else
-    // the line says.
     let verb = args.first().is_some_and(|a| !a.starts_with('-'));
     let session = args.contains(&"--session");
     (window && !verb && !session).then_some(args)
 }
 
-/// Whether `args` switched the control socket off — the same decision the
-/// instance itself made ([`socket_directive`]).
+/// Whether `args` switched the control socket off ([`socket_directive`]).
 fn socket_off(args: &[&str]) -> bool {
     let value = args
         .iter()
@@ -240,12 +209,10 @@ fn age_words(secs: u64) -> String {
     }
 }
 
-/// The process table, from two `ps` reads joined by pid: the program column
-/// and the command line can both hold spaces, so each is the last column of
-/// its own read. A process present in only one read is skipped.
+/// The process table, from two `ps` reads joined by pid.
 ///
 /// # Errors
-/// `ps` could not be run, or printed nothing a row could be read from.
+/// Returns an error if `ps` fails or produces no parseable rows.
 #[cfg(unix)]
 fn process_table() -> Result<Vec<ProcRow>, String> {
     let identity = ps(&["-o", "pid=", "-o", "uid=", "-o", "etime=", "-o", "comm="])?;
@@ -260,7 +227,6 @@ fn process_table() -> Result<Vec<ProcRow>, String> {
 /// One `ps -A -ww` read with the given columns, as text.
 #[cfg(unix)]
 fn ps(columns: &[&str]) -> Result<String, String> {
-    // By path first: a doctor run under a scrubbed PATH still finds it.
     let program = ["/bin/ps", "/usr/bin/ps"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
@@ -329,9 +295,7 @@ mod tests {
         }
     }
 
-    /// A reduced process table: a user's app, a long-lived orphan, a test
-    /// binary whose name starts with `aterm`, a session, a client verb, another
-    /// user's instance, and the doctor itself.
+    /// A reduced process table.
     fn table() -> Vec<ProcRow> {
         vec![
             row(
@@ -386,7 +350,6 @@ mod tests {
                 socketless: false,
             }]
         );
-        // Publish the orphan too and the census is clean — the count is unchanged.
         let both = BTreeSet::from([7641, 67548]);
         let census = census_of(&table(), 100, &both, "/run/aterm".into()).expect("census");
         assert_eq!((census.instances, census.unreached.len()), (2, 0));
@@ -418,12 +381,10 @@ mod tests {
         assert!(!is_window("aterm", "aterm pkg doctor --window"));
         assert!(!is_window("aterm-link", "aterm-link serve --fleet f"));
         assert!(!is_window("zsh", "zsh -c aterm --headless"));
-        // A program path with spaces (macOS `comm`): the arguments start after it.
         assert!(is_window(
             "/Users//a/Library/Application Support/aterm/bin/aterm",
             "/Users//a/Library/Application Support/aterm/bin/aterm --headless"
         ));
-        // Linux: `comm` is the short task name; argv[0] is the command's first word.
         assert!(is_window("aterm", "/usr/local/bin/aterm --headless"));
 
         let socketless = |command: &str| {

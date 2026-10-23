@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The reader half of the font oracle: what a font reader answers for a face,
-//! written as text. One file, two readers:
-//!
-//! - `tests/font_oracle/recorder` (outside the workspace) includes it with
-//!   `font` naming the registry `ttf_parser`, the reader the TF.1 corpus was
-//!   recorded from, and replays the corpus with it;
-//! - aterm-render's `tests/font_oracle.rs` and aterm-font's
-//!   `tests/reader_oracle.rs` include it with `font` naming `aterm_font`,
-//!   which replaced ttf-parser in the renderer (TF.5 of
-//!   docs/AUDIT-third-party-2026-10-15.md), and hold it to the same lines.
-//!
-//! aterm-font is carved from ttf-parser and keeps its names, so every call
-//! here resolves in both; its outline sink trait is `OutlineSink`, which the
-//! including module re-exports as `OutlineBuilder`. The including module
-//! provides `font` and `corpus` (the std-only half, `corpus.rs`); this file
-//! names nothing else but `std`.
+//! The reader half of the font oracle: what a font reader answers for a face, written as text.
 
 use super::corpus::{BLOCK, Fnv, escape, pin, probe_chars, tag_str};
 use super::font;
@@ -24,8 +9,8 @@ use super::font;
 #[path = "layout.rs"]
 mod layout_digest;
 
-/// The glyphs of printable ASCII and Latin-1 through the face's Unicode cmap,
-/// deduplicated, `.notdef` dropped: the pair set the `kern` answers sweep.
+/// The glyphs of printable ASCII and Latin-1 through the face's Unicode cmap, deduplicated,
+/// `.notdef` dropped: the pair set the `kern` answers sweep.
 pub(crate) fn latin_gids(face: &font::Face) -> Vec<u16> {
     let mut gids: Vec<u16> = (0x20u32..=0x7E)
         .chain(0xA0..=0xFF)
@@ -88,14 +73,13 @@ impl font::OutlineBuilder for OutlineDigest<'_> {
     }
 }
 
-/// What an outline call answers for one glyph: the glyph's outline, routed
-/// into the digest's sink, and its box.
+/// What an outline call answers for one glyph: the glyph's outline, routed into the digest's sink,
+/// and its box.
 pub(crate) type Outline<'f> = dyn Fn(&font::Face<'_>, font::GlyphId, &mut dyn font::OutlineBuilder) -> Option<font::Rect>
     + 'f;
 
-/// The `outline.<start>` answer for glyphs `start..end`: each glyph id, the
-/// segment stream `outline` sends, and its box. `read` outlines directly; a
-/// test can route every outline through another sink first.
+/// The `outline.<start>` answer for glyphs `start..end`: each glyph id, the segment stream
+/// `outline` sends, and its box.
 pub(crate) fn outline_block(
     face: &font::Face<'_>,
     start: u32,
@@ -209,9 +193,6 @@ impl<'a> font::colr::Painter<'a> for PaintDigest<'_> {
         self.h.bytes(b"/layer");
     }
     fn push_transform(&mut self, t: font::Transform) {
-        // At 16.16, the COLR table's own precision: a rotate or skew reaches
-        // here through sin/cos/tan, which two platforms' libms may round an
-        // ulp apart.
         self.h.bytes(b"xf");
         for v in [t.a, t.b, t.c, t.d, t.e, t.f] {
             self.h.i32((v * 65536.0).round() as i32);
@@ -238,10 +219,7 @@ fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or("-".to_string(), |v| v.to_string())
 }
 
-/// What ttf-parser answers for face `index` of `bytes` at `coords`, as
-/// `(query, answer)` pairs. At the default instance (`coords` empty) every
-/// query is answered; at any other instance only the ones a variation can
-/// move (metrics, normalized coordinates, advances, bounds, outlines, COLR).
+/// What ttf-parser answers for face `index` of `bytes` at `coords`, as `(query, answer)` pairs.
 pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut face = match font::Face::parse(bytes, index) {
@@ -344,8 +322,6 @@ pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(
             out.push(("fvar".to_string(), axes.join(" ")));
         }
 
-        // cmap: each subtable's own enumeration, then the face-level lookup
-        // (which picks the subtable) over the Unicode coverage plus the probes.
         if let Some(cmap) = tables.cmap {
             for (i, sub) in cmap.subtables.into_iter().enumerate() {
                 use font::cmap::Format;
@@ -412,7 +388,6 @@ pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(
             format!("n={varied} fnv={}", hv.hex()),
         ));
 
-        // The legacy kern table, over every pair of the face's Latin glyphs.
         if let Some(kern) = tables.kern {
             let gids = latin_gids(&face);
             for (i, sub) in kern.subtables.into_iter().enumerate() {
@@ -472,8 +447,6 @@ pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(
             ));
         }
 
-        // Bitmap glyphs: every sbix strike whole, then the face-level lookup
-        // (sbix, bdat, EBDT, CBDT in that order) at a few sizes.
         if let Some(sbix) = tables.sbix {
             for i in 0..sbix.strikes.len() {
                 let Some(strike) = sbix.strikes.get(i) else {
@@ -520,7 +493,6 @@ pub(crate) fn read(bytes: &[u8], index: u32, coords: &[([u8; 4], f32)]) -> Vec<(
         }
     }
 
-    // Instance-dependent answers.
     let b = |v: i16| v.to_string();
     out.push((
         "metrics".to_string(),

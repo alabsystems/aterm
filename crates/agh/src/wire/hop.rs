@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The one redirect hop (design §11.4): a fresh request to an allowlisted CDN origin, with
-//! no credential.
+//! The one redirect hop (design §11.4): a fresh request to an allowlisted CDN origin, with no
+//! credential.
 
 use crate::error::{Error, Kind, Result, Sub};
 #[cfg(any(test, debug_assertions))]
@@ -11,17 +11,7 @@ use crate::wire::door;
 use crate::wire::{Endpoints, Origin, WireRequest};
 
 /// Rebuild `original` for the `Location` it was redirected to.
-/// - Only GET and HEAD hop. Any other method → Conflict, `Sub::Moved { to: location }`, why
-///   `a {METHOD} is never redirected`.
-/// - `location` must parse (`Origin::parse`), and its origin must equal one of
-///   `endpoints.asset_hosts()` exactly. Otherwise → CouldNotRun, `Sub::Protocol`, why
-///   `the redirect leaves the asset hosts: {origin}`.
-/// - The new request copies only the `Accept` header (the original's value) and sets
-///   `User-Agent: {user_agent}`. Its `auth` is `None`, its body `Empty`, and its method, limit
-///   and deadlines are the original's.
-///
 /// # Errors
-///
 /// As above.
 #[cfg_attr(
     any(test, debug_assertions),
@@ -49,7 +39,6 @@ pub fn rebuild(
     }
     let leaves =
         |origin: &str| Error::protocol(format!("the redirect leaves the asset hosts: {origin}"));
-    // An unparsable Location is never echoed: it may carry userinfo or a signed query.
     let Some((origin, path_and_query)) = Origin::parse(location) else {
         return Err(leaves(
             "a Location that does not parse as an http(s) URL with a plain host",

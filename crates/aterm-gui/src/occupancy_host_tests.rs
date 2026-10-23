@@ -643,3 +643,140 @@ fn a_slot_holder_counts_for_the_tab_whose_tree_holds_it() {
         "the same known holder still counts"
     );
 }
+
+/// A board looked at `unix_ms` with `free` usable slots of four, its holders
+/// in the tabs `slot_tabs`.
+fn board_with(j: &mut Judged, unix_ms: i64, free: u16, slot_tabs: Option<Vec<u64>>) {
+    let slots = SlotsView::Read {
+        n: 4,
+        held: 4 - free,
+        free,
+        pending: 0,
+        unknown: 0,
+        discounted: 0,
+    };
+    let sessions = [(7, "a".to_string()), (9, "b".to_string())];
+    step(
+        j,
+        &at(unix_ms, slots, Pressure::Normal, None, slot_tabs),
+        unix_ms,
+        &sessions,
+    );
+}
+
+/// THE MACHINE'S PACE: six lines in any hour across every session, the
+/// seventh held; a line an hour old no longer counts. A nudge needs no slot.
+#[test]
+fn the_machine_paces_six_lines_an_hour_across_its_sessions() {
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 0, None);
+    for n in 0..MACHINE_LINES_PER_HOUR {
+        let sid = format!("s-{n}");
+        let at = NOW + i64::try_from(n).unwrap() * MIN_MS;
+        assert_eq!(j.pace(&sid, RuleId::WaitNudge, NOW, at), PaceGrant::Granted);
+    }
+    let late = NOW + 10 * MIN_MS;
+    assert_eq!(
+        j.pace("s-new", RuleId::WaitNudge, NOW, late),
+        PaceGrant::Machine
+    );
+    // CONTROL: an hour after the first line, one more goes.
+    assert_eq!(
+        j.pace("s-new", RuleId::WaitNudge, NOW, NOW + 60 * MIN_MS),
+        PaceGrant::Granted
+    );
+}
+
+/// THE RESERVATION: one free slot reserves for one session's `hold-room`
+/// line; the next session waits until the reservation's ten minutes pass,
+/// or until the reserving session's tab is seen holding a slot.
+#[test]
+fn one_free_slot_is_reserved_for_one_line() {
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 1, None);
+    assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
+    assert_eq!(
+        j.pace("b", RuleId::HoldRoom, NOW, NOW + 1_000),
+        PaceGrant::Reserved
+    );
+    // A nudge takes no slot.
+    assert_eq!(
+        j.pace("b", RuleId::WaitNudge, NOW, NOW + 2_000),
+        PaceGrant::Granted
+    );
+    // Past the reservation's ten minutes (the board looked again), the slot
+    // is free for the other.
+    let past = NOW + RESERVE_MS;
+    board_with(&mut j, past, 1, None);
+    assert_eq!(j.pace("b", RuleId::HoldRoom, NOW, past), PaceGrant::Granted);
+    // The build it was for took its slot: released at the look that saw it.
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 1, None);
+    assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
+    board_with(&mut j, NOW + MIN_MS, 1, Some(vec![7]));
+    assert_eq!(
+        j.pace("b", RuleId::HoldRoom, NOW, NOW + MIN_MS),
+        PaceGrant::Granted
+    );
+    // NEGATIVE CONTROL: a look that sees another tab's holder releases
+    // nothing.
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 1, None);
+    assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
+    board_with(&mut j, NOW + MIN_MS, 1, Some(vec![9]));
+    assert_eq!(
+        j.pace("b", RuleId::HoldRoom, NOW, NOW + MIN_MS),
+        PaceGrant::Reserved
+    );
+}
+
+/// THE OLDEST HOLD FIRST: a younger hold that asks when a slot frees waits
+/// for an older one already waiting; the older takes it. An older hold that
+/// stopped asking keeps no one waiting.
+#[test]
+fn the_oldest_hold_takes_a_freed_slot_first() {
+    let older = NOW - 5 * 60 * MIN_MS;
+    let younger = NOW - 3 * 60 * MIN_MS;
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 0, None);
+    assert_eq!(
+        j.pace("old", RuleId::HoldRoom, older, NOW),
+        PaceGrant::Reserved
+    );
+    let freed = NOW + MIN_MS;
+    board_with(&mut j, freed, 1, None);
+    assert_eq!(
+        j.pace("young", RuleId::HoldRoom, younger, freed),
+        PaceGrant::Reserved,
+        "an older hold waits"
+    );
+    assert_eq!(
+        j.pace("old", RuleId::HoldRoom, older, freed + 1_000),
+        PaceGrant::Granted
+    );
+    // CONTROL: the older hold stopped asking; the younger takes the slot.
+    let mut j = Judged::default();
+    board_with(&mut j, NOW, 0, None);
+    assert_eq!(
+        j.pace("old", RuleId::HoldRoom, older, NOW),
+        PaceGrant::Reserved
+    );
+    let later = NOW + ASK_KEEP_MS + 1;
+    board_with(&mut j, later, 1, None);
+    assert_eq!(
+        j.pace("young", RuleId::HoldRoom, younger, later),
+        PaceGrant::Granted
+    );
+}
+
+/// A board that no longer speaks for now proves no slot: a slot rule's line
+/// waits; the same board fresh lets it go.
+#[test]
+fn a_stale_board_reserves_no_slot() {
+    let stale = NOW + 2 * i64::try_from(STALE_AFTER.as_millis()).unwrap();
+    for (at, grant) in [(stale, PaceGrant::Reserved), (NOW, PaceGrant::Granted)] {
+        let mut j = Judged::default();
+        board_with(&mut j, NOW, 2, None);
+        assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, at), grant, "{at}");
+    }
+}

@@ -2,21 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! headless-lifeline: every throwaway `--headless` instance a test, example,
-//! bench or dev tool starts holds a lifeline.
+//! headless-lifeline: every throwaway `--headless` instance and `aterm link
+//! broker` a test, example, bench or dev tool starts holds a lifeline.
 //!
-//! An instance only its launcher's `Drop` ends outlives a launcher that is
-//! SIGKILLed or timed out. The launch hands the instance the far end of a FIFO
-//! the launcher holds (`--lifeline-fd`, `aterm_uds::lifeline`), and the
-//! instance quits when the launcher goes.
+//! An instance or a broker only its launcher's `Drop` ends outlives a launcher
+//! that is SIGKILLed or timed out. The launch hands the child the far end of a
+//! FIFO the launcher holds (`--lifeline-fd`, `aterm_uds::lifeline`), and the
+//! child ends when the launcher goes.
 //!
 //! Lexically, per file:
-//! * a Rust launch is an `.arg(…)`/`.args([…])` naming `"--headless"`, or an
-//!   `.args([` broken one element to a line with `"--headless"` among them; the
-//!   file is armed when it holds at least as many arm calls handed a `&mut`
-//!   command (`launch_isolation::lifeline`, `Lifeline::arm`, `arm_for_process`,
-//!   a local `arm_lifeline`) as unwaived launches, since a `Command` is often
-//!   built in one function and armed in its caller;
+//! * a Rust launch is an `.arg(…)`/`.args([…])` naming `"--headless"` or the
+//!   broker verb's consecutive `"link", "broker"`, or an `.args([` broken one
+//!   element to a line with `"--headless"`, or a `"link",` line then a
+//!   `"broker"` one, among them; the file is armed when it holds at least as
+//!   many arm calls handed a `&mut` command (`launch_isolation::lifeline`,
+//!   `Lifeline::arm`, `arm_for_process`, a local `arm_lifeline`) as unwaived
+//!   launches, since a `Command` is often built in one function and armed in
+//!   its caller;
 //! * a shell launch (in a script, or a script a Rust string holds) is a program
 //!   word (`"$B"`, `$A`, `${GUI}`, a path ending in an aterm name), bare flags,
 //!   then `--headless`; it is armed when its logical line carries
@@ -26,23 +28,24 @@
 //!
 //! Any launch is waived by a `NO LIFELINE …: <reason>` comment on its line or
 //! in the eight above (an instance meant to outlive its launcher, a stand-in
-//! that is no aterm). A launch spelled another way (the flag in a variable, a
-//! `format!`ed command line) is not seen.
+//! that is no aterm, a broker run that ends before it serves). A launch spelled
+//! another way (the flag in a variable, a `format!`ed command line, a broker
+//! started from a script) is not seen.
 
 use super::{Finding, Rule, Script, SourceFile, Tree, is_word};
 
 pub(super) const HEADLESS_LIFELINE: Rule = Rule {
     id: "headless-lifeline",
-    why: "a --headless instance its launcher only ends in a Drop outlives a SIGKILLed or \
-          timed-out launcher, holding a shell for as long as the machine runs; arm a lifeline \
-          (aterm_uds::lifeline, launch_isolation::lifeline) or write a `NO LIFELINE …: <reason>` \
-          waiver",
+    why: "a --headless instance or an `aterm link broker` its launcher only ends in a Drop \
+          outlives a SIGKILLed or timed-out launcher, holding a shell or a socket for as long as \
+          the machine runs; arm a lifeline (aterm_uds::lifeline, launch_isolation::lifeline, \
+          the fabric suites' spawn_broker) or write a `NO LIFELINE …: <reason>` waiver",
     scope: &[],
     check: headless_lifeline,
 };
 
 /// Is `rel` a launcher's source: a crate's tests, examples or benches, or a
-/// dev tool that starts instances?
+/// dev tool that starts instances or brokers (verify, release, the lab)?
 fn launcher_source(rel: &str) -> bool {
     let Some(rest) = rel.strip_prefix("crates/") else {
         return false;
@@ -53,6 +56,7 @@ fn launcher_source(rel: &str) -> bool {
         || in_crate.starts_with("benches/")
         || rel.starts_with("crates/aterm-verify/src/")
         || rel.starts_with("crates/aterm-release/src/")
+        || rel.starts_with("crates/aterm-lab/src/")
 }
 
 /// The launch every live headless suite boots through. A read that does not
@@ -64,7 +68,7 @@ const ANCHOR_LAUNCH_FILE: &str = "crates/aterm/tests/support/headless_boot.rs";
 fn headless_lifeline(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     let mut anchored = false;
     for file in tree.corpus.under(&["crates/"]) {
-        if launcher_source(&file.rel) && file.mentions(&["--headless"]) {
+        if launcher_source(&file.rel) && file.mentions(&["--headless", BROKER_WORD]) {
             anchored |= file.rel == ANCHOR_LAUNCH_FILE;
             out.extend(lifeline_findings(file));
         }
@@ -211,9 +215,7 @@ fn lifeline_findings(file: &SourceFile) -> Vec<Finding> {
                 i + 1,
                 "unarmed shell launch (no --lifeline-fd, no NO LIFELINE waiver)".to_string(),
             ));
-        } else if (arg_names_headless(line) || (was_in && line.contains("\"--headless\"")))
-            && !waived(i)
-        {
+        } else if (arg_names_launch(line) || (was_in && broken_launch(&text, i))) && !waived(i) {
             sites.push(i);
         }
     }
@@ -223,14 +225,27 @@ fn lifeline_findings(file: &SourceFile) -> Vec<Finding> {
                 HEADLESS_LIFELINE.id,
                 i + 1,
                 format!(
-                    "unarmed rust launch ({} --headless launch(es), {arms} lifeline arm call(s) \
-                     in the file)",
+                    "unarmed rust launch ({} --headless or link broker launch(es), {arms} \
+                     lifeline arm call(s) in the file)",
                     sites.len()
                 ),
             ));
         }
     }
     out
+}
+
+/// The word that opens the broker verb's launch: a file without it starts no broker.
+const BROKER_WORD: &str = "\"broker\"";
+
+/// Line `i` of an `.args([` array broken one element to a line launches an instance or a
+/// broker: it is `"--headless"`, or `"broker"` right below a `"link",`.
+fn broken_launch(text: &[&str], i: usize) -> bool {
+    let line = text[i];
+    line.contains("\"--headless\"")
+        || (line.trim_start().starts_with(BROKER_WORD)
+            && i > 0
+            && text[i - 1].trim() == "\"link\",")
 }
 
 /// `NO LIFELINE …: <reason>`, the reason at least ten characters.
@@ -258,14 +273,25 @@ fn arms_a_lifeline(line: &str) -> bool {
         })
 }
 
-/// `.arg(…)` or `.args(…)` whose parenthesis holds `"--headless"` before it closes.
-fn arg_names_headless(line: &str) -> bool {
+/// `.arg(…)` or `.args(…)` whose parenthesis holds `"--headless"`, or the broker verb's
+/// `"link", "broker"`, before it closes.
+fn arg_names_launch(line: &str) -> bool {
     [".arg(", ".args("].iter().any(|open| {
         line.match_indices(open).any(|(at, _)| {
             let inner = &line[at + open.len()..];
             let inner = inner.split(')').next().unwrap_or(inner);
-            inner.contains("\"--headless\"")
+            inner.contains("\"--headless\"") || names_broker(inner)
         })
+    })
+}
+
+/// `"link", "broker"`: the broker verb's two words, consecutive in one list.
+fn names_broker(list: &str) -> bool {
+    list.match_indices("\"link\"").any(|(at, word)| {
+        list[at + word.len()..]
+            .trim_start()
+            .strip_prefix(',')
+            .is_some_and(|rest| rest.trim_start().starts_with(BROKER_WORD))
     })
 }
 
@@ -429,7 +455,17 @@ mod tests {
             (
                 "an array trustfmt broke",
                 "fn launch(root: &Path) -> Child {\n    let mut cmd = Command::new(env!(\"CARGO_BIN_EXE_aterm\"));\n    cmd.args([\n        \"--no-reroute\",\n        \"--headless\",\n        \"--control-sock\",\n    ])\n    .stdin(Stdio::null());\n    cmd.spawn().expect(\"launch\")\n}\n",
-                ":5:unarmed rust launch (1 --headless launch(es), 0 lifeline arm call(s)",
+                ":5:unarmed rust launch (1 --headless or link broker launch(es), 0 lifeline arm call(s)",
+            ),
+            (
+                "a broker started on one line",
+                "fn serve(sock: &str, log: &str) -> Child {\n    let mut cmd = aterm_uds::spawnfd::command(ATERM);\n    cmd.args([\"link\", \"broker\", sock, log]).stdin(Stdio::null());\n    cmd.spawn().expect(\"broker\")\n}\n",
+                ":3:unarmed rust launch (1 --headless or link broker launch(es), 0 lifeline arm call(s)",
+            ),
+            (
+                "a broker array trustfmt broke",
+                "fn serve(sock: &str) -> Child {\n    Command::new(ATERM)\n        .args([\n            \"link\",\n            \"broker\",\n            sock,\n        ])\n        .spawn()\n        .expect(\"broker\")\n}\n",
+                ":5:unarmed rust launch (1 --headless or link broker launch(es), 0 lifeline arm call(s)",
             ),
             (
                 "a script inside a Rust string",
@@ -439,12 +475,12 @@ mod tests {
             (
                 "a second launch beside one arm",
                 "fn first(root: &Path) -> (Child, Lifeline) {\n    cmd.args([\"--headless\", \"--no-reroute\"]);\n    let lifeline = launch_isolation::lifeline(&mut cmd, root);\n}\n\nfn second(root: &Path) -> Child {\n    // launch_isolation::lifeline(&mut cmd, root);\n    cmd.arg(\"--headless\").stdin(Stdio::null());\n}\n",
-                ":8:unarmed rust launch (2 --headless launch(es), 1 lifeline arm call(s)",
+                ":8:unarmed rust launch (2 --headless or link broker launch(es), 1 lifeline arm call(s)",
             ),
             (
                 "a test whose Drop is its only teardown",
                 "fn headless(tmp: &Path) -> Command {\n    let mut cmd = Command::new(env!(\"CARGO_BIN_EXE_aterm\"));\n    cmd.args([\"--headless\", launch_isolation::NO_REROUTE])\n        .stdin(Stdio::null());\n    cmd\n}\n",
-                ":3:unarmed rust launch (1 --headless launch(es), 0 lifeline arm call(s)",
+                ":3:unarmed rust launch (1 --headless or link broker launch(es), 0 lifeline arm call(s)",
             ),
             (
                 "a flag before the headless one, in a script",
@@ -482,8 +518,13 @@ mod tests {
                      #[test]\nfn held() {\n    let mut cmd = headless(&root);\n    let lifeline = launch_isolation::lifeline(&mut cmd, &root);\n}\n\
                      fn sibling(tmp: &Path) -> Child {\n    cmd.arg(\"--headless\")\n        .arg(\"--control-sock\");\n    arm_lifeline(&mut cmd, tmp);\n}\n\
                      fn rosetta(u: &Path, scratch: &Path) -> Result<(Child, Lifeline), String> {\n    instance.args([\"--headless\", \"--cpu\"]);\n    let lifeline =\n        aterm_uds::lifeline::Lifeline::arm(&mut instance, scratch).map_err(|e| e.to_string())?;\n}\n\
-                     fn broken_array(root: &Path) -> (Child, Lifeline) {\n    cmd.args([\n        \"--headless\",\n        \"--control-sock\",\n    ]);\n    let lifeline = launch_isolation::lifeline(&mut cmd, root);\n}\n";
-        assert!(launches("crates/aterm/tests/a.rs", armed).is_empty());
+                     fn broken_array(root: &Path) -> (Child, Lifeline) {\n    cmd.args([\n        \"--headless\",\n        \"--control-sock\",\n    ]);\n    let lifeline = launch_isolation::lifeline(&mut cmd, root);\n}\n\
+                     fn spawn_broker(dir: &Path, args: &[&str]) -> BrokerChild {\n    cmd.args([\"link\", \"broker\"]).args(args);\n    let lifeline = aterm_uds::lifeline::Lifeline::arm(&mut cmd, dir).expect(\"arm\");\n}\n";
+        let found = launches("crates/aterm/tests/a.rs", armed);
+        assert!(
+            found.is_empty(),
+            "an armed launch read as unarmed: {found:?}"
+        );
 
         let names_only = "fn boot() {\n    eprintln!(\"SKIP: cannot launch aterm --headless\");\n    // cmd.arg(\"--headless\");\n}\n\
                           fn is_the_daemon(line: &str) -> bool {\n    line.contains(\"aterm-gui --headless\") && !line.contains(\"--help\")\n}\n\
@@ -491,7 +532,9 @@ mod tests {
                           fn a_client_then_a_check(sock: &Path) {\n    ctl.args([\n        \"ctl\",\n        \"status\",\n    ]);\n    let flags = [\n        \"--headless\",\n        \"--no-reroute\",\n    ];\n}\n\
                           const SCRIPT: &str = r#\"\nF=$1 S=$2/s.sock\n# NO LIFELINE on purpose: \"$F\" is a stand-in that is no aterm.\n\"$F\" --headless --control-sock \"$S\" &\n\"#;\n\
                           const ARMED: &str = r#\"\n\"$A\" --headless --lifeline-fd 0 &\n\"$A\" --headless \\\n    --lifeline-fd 3 &\n\"$A\" --headless --help\n\"#;\n\
-                          const USAGE: &str = \"usage: aterm [--cpu] [--headless]\";\n";
+                          const USAGE: &str = \"usage: aterm [--cpu] [--headless]\";\n\
+                          fn a_job_and_a_report(v: &Value) {\n    job(&[\n        BIN,\n        \"link\",\n        \"broker\",\n    ]);\n    let guarded = v[\"broker\"][\"guarded\"].as_bool();\n    let ls = [\"link\", \"ls\"];\n}\n\
+                          fn broker_run(args: &[&str]) {\n    // NO LIFELINE on purpose: every argv here ends the broker before it serves\n    cmd.args([\"link\", \"broker\"]).args(args);\n}\n";
         let found = launches("crates/aterm/tests/b.rs", names_only);
         assert!(found.is_empty(), "CRIES WOLF: {found:?}");
     }
@@ -541,6 +584,10 @@ mod tests {
         assert!(launcher_source(
             "crates/aterm-verify/src/perf/arena/start.rs"
         ));
+        assert!(
+            launcher_source("crates/aterm-lab/src/codex_alab_proof.rs"),
+            "the lab is a dev tool that starts instances and a broker"
+        );
         assert!(!launcher_source("crates/aterm-gui/src/lib.rs"));
         assert!(!launcher_source("apps/aterm-mac/tests/x.rs"));
     }

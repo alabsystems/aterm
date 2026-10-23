@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The footer's per-frame pass on one Claude Code pane, as a fixture: a real
-//! engine, a real frame through the capture route's splices, the real key and
-//! splice (`App::claude_footer_fp`, `App::splice_claude_footer`). Its cost is
-//! ASSERTED by `claude_footer_cost_tests.rs` (allocations and work, frame by
-//! frame) and MEASURED by the `footer_pass_cost` bench ([`footer_pass_cost`]:
-//! the pass's time, optimized). Compiled for the tests and under the
-//! `bench-support` feature only.
+//! Per-frame Claude Code footer pass fixture ([`footer_pass_cost`]).
 
 use super::*;
 
@@ -25,8 +19,7 @@ pub(crate) const BYPASS: &str = "  \u{23F5}\u{23F5} bypass permissions on (shift
 /// The last turn's done row, the status row over the composer.
 pub(crate) const DONE: &str = "\u{273B} Baked for 4s \u{b7} done 2:41 PM";
 
-/// What a screen shows under the transcript: the status row, the draft's
-/// rows in the composer and the rows under its bottom rule.
+/// What a screen shows under the transcript.
 #[derive(Clone, Copy)]
 pub(crate) struct Live<'a> {
     pub(crate) status: &'a str,
@@ -41,16 +34,13 @@ pub(crate) const AT_REST: Live<'static> = Live {
 };
 
 impl Live<'_> {
-    /// The row the composer's bottom rule is on.
+    /// Row index of the composer's bottom rule.
     pub(crate) fn bottom(&self) -> usize {
         usize::from(ROWS) - 1 - self.under.len()
     }
 }
 
-/// A Claude Code screen `ROWS` × `COLS` well into a conversation: the
-/// transcript (Claude's `⏺` messages, continued at column two, a blank
-/// between), the status row, a blank, the composer between its rules — its
-/// caret row and any further draft rows — and the rows under it.
+/// A Claude Code screen `ROWS` × `COLS` well into a conversation.
 pub(crate) fn screen(live: &Live<'_>) -> Vec<String> {
     let (rows, cols) = (usize::from(ROWS), usize::from(COLS));
     let rule = "\u{2500}".repeat(cols);
@@ -75,8 +65,7 @@ pub(crate) fn screen(live: &Live<'_>) -> Vec<String> {
     s
 }
 
-/// Paint `rows` into `session`'s terminal, the rules in Claude's gray, the
-/// caret on the composer.
+/// Paint `rows` into `session`'s terminal, the rules in Claude's gray, the caret on the composer.
 pub(crate) fn feed(app: &App, session: u64, rows: &[String]) {
     let mut out = String::from("\x1b[2J");
     for (i, row) in rows.iter().enumerate() {
@@ -100,8 +89,7 @@ pub(crate) fn bytes(app: &App, session: u64, bytes: &[u8]) {
     crate::term_lock(&term).process(bytes);
 }
 
-/// The facts a long-running session shows: model, effort, path, branch and
-/// usage, its build and owner.
+/// The facts a long-running session shows.
 pub(crate) fn facts() -> FooterFacts {
     FooterFacts {
         model: Some("Opus 5.5".into()),
@@ -140,12 +128,7 @@ pub(crate) fn publish(app: &App, session: u64, facts: FooterFacts) {
     assert!(timeline.set_claude_footer(4242, None, Some(facts)));
 }
 
-/// A card drawer (`program` of build `version`, from the managed store)
-/// takes the front of `session` as group `pgid`: its image published and
-/// the engine's holder fence cut to it (card engine §3.7-§3.8), so a launch
-/// card it paints from here — a full clear first, or under its cut — is its
-/// own: decorated, and kept for the footer's open facts. Its token. The
-/// tests' alone: the bench's pane judges no card.
+/// Transitions `session` to foreground card drawer `program` (`version`, `pgid`).
 #[cfg(test)]
 pub(crate) fn drawer(app: &App, session: u64, pgid: i32, program: &str, version: &str) -> u64 {
     use atpkg::image::{ImageBuild, ImageSource, ProgramTag};
@@ -183,8 +166,7 @@ pub(crate) fn drawer(app: &App, session: u64, pgid: i32, program: &str, version:
     token
 }
 
-/// The window: one Claude Code pane `ROWS` × `COLS` showing `live`, `facts`
-/// published, two frames drawn (every buffer grown).
+/// Builds a single-pane Claude Code window (`ROWS` by `COLS`) showing `live` and `facts`.
 pub(crate) fn glass_with(live: &Live<'_>, facts: FooterFacts) -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -203,16 +185,13 @@ pub(crate) fn probe_glass() -> (App, WindowId, u64) {
     glass_with(&AT_REST, facts())
 }
 
-/// Extract the frame and prepend the strip, as the capture route does —
-/// what a frame whose grid moved does before the footer's pass.
+/// Extract the frame and prepend the strip, as the capture route does.
 pub(crate) fn refill(app: &mut App, wid: WindowId) {
     app.capture_words(wid, Instant::now());
     app.splice_tab_strip(wid);
 }
 
-/// The footer's pass: its repaint key and its splice. The key's and the
-/// splice's work alone — the frame's extraction is [`refill`]'s, and the
-/// layout the frame's own.
+/// The footer's pass: its repaint key and its splice ([`refill`]).
 pub(crate) fn pass(app: &mut App, wid: WindowId) -> u64 {
     let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
     pass_on(app, wid, &plan, route)
@@ -272,9 +251,7 @@ pub(crate) fn spinner(app: &App, session: u64, i: usize) {
     );
 }
 
-/// The window's harness host, for the harness's chips to be drawn: one that
-/// supervises nothing, shut down when the guard drops (a failing test's
-/// included).
+/// The window's harness host, for the harness's chips to be drawn.
 pub(crate) struct Hosted(crate::harness_host::HostHandle);
 
 impl Drop for Hosted {
@@ -314,13 +291,7 @@ enum Pointer {
     Fact,
 }
 
-/// THE PROBE: for each kind of frame — at rest, a keystroke into the
-/// composer, a row Claude streams, a spinner's tick, and at rest with a
-/// harness host and the pointer on Autopilot's chip, whose title a hovered
-/// frame builds, or on the branch fact, drawn lit with its title in the
-/// block's slot — `passes` footer passes timed (the frame's change and its
-/// extraction outside the timing), after a warm-up that grows every buffer
-/// the change grows.
+/// THE PROBE: for each kind of frame.
 #[cfg(feature = "bench-support")]
 pub(crate) fn footer_pass_cost(passes: usize) -> Vec<PassCost> {
     let kinds: [(&'static str, Option<Change>, Pointer); 6] = [

@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLOSED SUMMARY (design §5.1, phase 2A): what a host's closed-session
-//! index keeps of a closed session's log once its skeleton has gone, at most
-//! a kilobyte of text, and the read-only log `log` and `brief` answer from.
-//!
-//! ```text
-//! slog-sum v=1 ep=<e> base=<b> first=<f> last=<l> lost=<n> newest_lost=<m>
-//! r <record>                  (the session's close, then its open)
-//! hole <lo> <hi>              (newest first; the oldest past the room raise `first`)
-//! fold …                      (Fold::snapshot's lines, by priority)
-//! ```
-//!
-//! Every line is chosen by priority within the budget: the header (the
-//! log's accounting), the session's close (how it ended) and open, the
-//! overlaps a cursor's count must leave out, then the fold's head, totals,
-//! the session's closed node, the phases, the needs, the newest closed run,
-//! turn and step, the claims; a `fold f` line only beside its owner. A record
-//! left out counts as an eviction does (in `lost=` and `newest_lost=`), and
-//! an overlap left out raises `first=` past it (the log then accounts only
-//! from there, as past [`super::MAX_HOLES`]), so a reader's `since=` cursor
-//! is told exactly what it was told of the closed log, or reset.
+//! THE CLOSED SUMMARY (design §5.1, phase 2A).
 
 use std::collections::VecDeque;
 
@@ -47,7 +28,6 @@ fn fold_rank(line: &str) -> Option<u8> {
         "need" => 4,
         "last" => 5,
         "verdict" | "label" => 6,
-        // A closed session tracks no open node.
         _ => return None,
     })
 }
@@ -93,7 +73,6 @@ fn fold_within<'a>(
                 continue;
             }
             fold.push((i, line));
-            // Its fields with it, before any line ranked after it.
             let Some(owner) = fold_owner(line) else {
                 continue;
             };
@@ -111,10 +90,7 @@ fn fold_within<'a>(
 }
 
 impl Log {
-    /// This closed log as a summary within [`CLOSED_SUMMARY_BYTES`] (lines
-    /// joined by newlines), chosen by priority (this module's order). Meant
-    /// of a closed session's log; of an open one it keeps what it can and
-    /// says none of its open nodes.
+    /// This closed log as a summary within [`CLOSED_SUMMARY_BYTES`], chosen by priority.
     #[must_use]
     pub fn closed_summary(&self) -> String {
         let session = |op: Op| {
@@ -123,8 +99,6 @@ impl Log {
                 .find(|e| e.rec.node == Node::SESSION && e.rec.op == op)
         };
         let mut room = CLOSED_SUMMARY_BYTES;
-        // The header at its widest, reserved first: its numbers are known
-        // only once the rest is chosen.
         let head_room =
             "slog-sum v=1 ep= base= first= last= lost= newest_lost=".len() + 2 * 10 + 4 * 20;
         room = room.saturating_sub(head_room + 1);
@@ -139,13 +113,9 @@ impl Log {
                 }
             }
         }
-        // A closed session waits for no turn: no mail latch, no waiting mail.
         let snap = self.fold.closed_snapshot();
         let mut fold: Vec<(usize, &str)> = Vec::new();
-        // How it ended first: the fold's head, totals and the session's close.
         fold_within(&snap, 0..=2, &mut fold, &mut room);
-        // Then the overlaps, newest first; past the room, the oldest go and
-        // the summary accounts only from after them.
         let mut holes: Vec<(u64, u64, super::GapWhy)> = Vec::new();
         let mut first = self.first_seq;
         for &(lo, hi, why) in self.holes.iter().rev() {
@@ -157,9 +127,7 @@ impl Log {
             }
         }
         holes.reverse();
-        // Then the rest of the fold.
         fold_within(&snap, 3..=6, &mut fold, &mut room);
-        // In the snapshot's own order: owners before their fields.
         fold.sort_by_key(|(i, _)| *i);
         let kept: Vec<u64> = recs.iter().map(|(s, _)| *s).collect();
         let shed = self.ring.iter().filter(|e| !kept.contains(&e.rec.seq));
@@ -188,12 +156,8 @@ impl Log {
         out
     }
 
-    /// The read-only log a [`Log::closed_summary`] wrote: its accounting, its
-    /// records, its overlaps and its fold, the session closed. Only a read is
-    /// meant of it, never an append.
-    ///
+    /// The read-only log a [`Log::closed_summary`] wrote.
     /// # Errors
-    ///
     /// A [`CarryError`] for a summary this build does not read.
     pub fn from_closed_summary(text: &str) -> Result<Log, CarryError> {
         if text.len() > 4 * CLOSED_SUMMARY_BYTES {
@@ -265,7 +229,6 @@ impl Log {
         } else {
             Fold::from_snapshot(&fold_lines).map_err(CarryError::Fold)?
         };
-        // A closed session holds nothing open, so its fold tracks nothing.
         fold.agrees_with_open(&[]).map_err(CarryError::Fold)?;
         let mut log = Log::with_limits(ep, Limits::SESSION);
         log.base_ep = base;
@@ -287,7 +250,6 @@ impl Log {
             log.session_bytes = log.session_bytes.saturating_add(bytes);
             log.heap = log.heap.saturating_add(super::entry_heap(&rec));
             log.bump_chain(Node::SESSION, true);
-            // A summary is text: it holds no process-clock reading (6F-1).
             log.ring.push_back(super::Entry {
                 rec: rec.into(),
                 bytes,

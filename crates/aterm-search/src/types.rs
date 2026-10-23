@@ -43,15 +43,6 @@ impl SearchMatch {
 }
 
 /// A set of search matches plus a signal for whether they are exhaustive.
-///
-/// The trigram index evicts the oldest lines once the cache cap is exceeded
-/// (see [`SearchIndex::results_may_be_incomplete`]). When that has happened, a
-/// plain `Vec<SearchMatch>` silently omits matches in evicted scrollback with
-/// no signal to the caller. `SearchResults` carries that signal alongside the
-/// matches so a consumer (e.g. the future `cmd_search`) can tell the AI that
-/// results are truncated and report the still-searchable line range.
-///
-/// [`SearchIndex::results_may_be_incomplete`]: crate::SearchIndex::results_may_be_incomplete
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchResults {
     /// The matches found, in the order produced by the search call.
@@ -59,19 +50,8 @@ pub struct SearchResults {
     /// True if eviction has dropped lines, so `matches` may be incomplete.
     pub incomplete: bool,
     /// The oldest line still retained in the index.
-    ///
-    /// Matches below this line have been evicted. When `incomplete` is false
-    /// this is 0 and the full indexed range was searched.
     pub lowest_retained_line: usize,
-    /// How many lines were not searched to their end: a regex scan that could
-    /// not finish the line within its scan budget (a line long enough, for a
-    /// pattern costly enough, that the scan stopped part-way: a soft-wrapped run
-    /// of megabytes, say), or a line whose text was read only up to a byte bound
-    /// ([`LineCells::is_truncated`](crate::LineCells::is_truncated): aterm-core
-    /// reads the first MiB of a stored history line). The matches found before
-    /// that point are in `matches`; any after it on that line are missing. A line
-    /// both apply to counts once. Non-zero implies `incomplete`. Always 0 for a
-    /// literal search over lines read whole.
+    /// How many lines were not searched to their end.
     pub cut_short_lines: usize,
 }
 
@@ -92,8 +72,8 @@ impl SearchResults {
         }
     }
 
-    /// Record `lines` lines not searched to their end, which makes the results
-    /// incomplete when there are any.
+    /// Record `lines` lines not searched to their end, which makes the results incomplete when
+    /// there are any.
     #[inline]
     #[must_use]
     pub const fn with_cut_short_lines(mut self, lines: usize) -> Self {
@@ -111,16 +91,8 @@ impl SearchResults {
     }
 }
 
-/// An ascending, deduplicated set of line numbers, stored as `u32` offsets
-/// from a base line so a frame costs four bytes a line however large the line
-/// numbers are.
-///
-/// Line numbers are absolute terminal rows, which pass `u32::MAX` in a
-/// long-lived tab (R15 content-1), so a frame cannot hold them as `u32`
-/// directly. It carries its own base rather than borrowing an index's: an
-/// index re-keys itself as its window moves, and a frame handed out by one
-/// index state must still name the same lines when it comes back
-/// ([`SearchIndex::search_literal_narrowed`](crate::SearchIndex::search_literal_narrowed)).
+/// An ascending, deduplicated set of line numbers, stored as `u32` offsets from a base line so a
+/// frame costs four bytes a line however large the line numbers are.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineFrame {
     /// The line offset 0 stands for.
@@ -189,9 +161,7 @@ pub enum SearchDirection {
     Backward,
 }
 
-/// One directed point-search: where it starts, which way it walks, and how
-/// its edges behave. Bundled so every point-navigation entry point shares one
-/// vocabulary instead of a growing positional-flag tail.
+/// One directed point-search: where it starts, which way it walks, and how its edges behave.
 #[derive(Debug, Clone, Copy)]
 pub struct DirectedFind {
     /// Absolute `(line, col)` anchor the walk measures from.
@@ -200,8 +170,8 @@ pub struct DirectedFind {
     pub direction: SearchDirection,
     /// Whether a match exactly at the anchor qualifies.
     pub inclusive: bool,
-    /// Whether to retry from the opposite buffer edge when the directional
-    /// suffix/prefix has no match.
+    /// Whether to retry from the opposite buffer edge when the directional suffix/prefix has no
+    /// match.
     pub wrap: bool,
 }
 

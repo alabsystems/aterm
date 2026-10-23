@@ -114,7 +114,7 @@ impl Anchor {
     /// Whether any master is pinned.
     #[inline]
     #[must_use]
-    pub fn is_armed(&self) -> bool {
+    pub const fn is_armed(&self) -> bool {
         !self.masters.is_empty()
     }
 

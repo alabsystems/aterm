@@ -4,22 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A keyboard grab is not a focus change. On X11 a window manager holds its shortcuts as passive
-//! key grabs (on GNOME: Super+Space, Alt+Tab, Print, every media key gsd-media-keys grabs,
-//! each detent of a volume knob), and while one is active the focused window gets FocusOut with
-//! a grab mode, then FocusIn with an ungrab mode, though the focus never moved. Upstream took
-//! each pair for a real one: aterm then wrote `ESC[O` `ESC[I` to a program that asked for focus
-//! reports, ended a drag-selection, closed its menus and unfocused the input context, which
-//! cancels a composition (the desk audit, GNOME 46 on Xorg, 2026-10-22). xterm ignores them.
-//! A focus that moves while the keyboard is grabbed (an Alt+Tab that switches windows) is
-//! still a change.
-//!
-//! The events are XI2 focus events the server would send, handed to the event processor's
-//! handlers for a window of the backend: grabbing the desk's keyboard and moving its focus is
-//! not a test's to do. The negative control: without `is_grab_focus_change`'s checks, the grab
-//! pair reports `Focused(false)` and `Focused(true)`.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! A keyboard grab is not a focus change.
 
 use super::ffi::XIFocusInEvent;
 use super::Window;
@@ -50,7 +35,6 @@ fn a_keyboard_grab_is_not_a_focus_change() {
         Window::new(target, WindowAttributes::default().with_visible(false)).expect("an X11 window")
     };
     let focus = |mode: i32| {
-        // SAFETY: a plain C struct; every pointer in it stays null and the handlers read none.
         let mut event: XIFocusInEvent = unsafe { std::mem::zeroed() };
         event.event = window.id().0 as _;
         event.mode = mode;

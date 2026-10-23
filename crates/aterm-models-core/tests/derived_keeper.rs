@@ -16,7 +16,7 @@ use aterm_spec::walk::{only, walk};
 use aterm_spec::{interp, verify};
 
 #[test]
-fn pty_keeper_custody_proves_and_catches() {
+fn pty_keeper_custody_fires_every_committed_move() {
     let model = pty_keeper_custody_model();
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
@@ -52,11 +52,6 @@ fn pty_keeper_custody_proves_and_catches() {
     assert!(
         committed.contains(&"LinkDrops"),
         "a live window's link dropping is an event the committed keeper survives"
-    );
-    verify::prove_and_catch_scalar(
-        &model,
-        "pty keeper custody: one reader, offers only with no live holder, closed tabs \
-         never handed on, no relaunch after quit, loss only with a keeper fault",
     );
 }
 
@@ -312,7 +307,7 @@ fn pty_keeper_custody_the_defects_are_caught_on_every_invariant() {
 }
 
 #[test]
-fn keeper_relaunch_brake_proves_and_catches() {
+fn keeper_relaunch_brake_fires_every_committed_move() {
     let model = keeper_relaunch_brake_model();
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
@@ -327,10 +322,6 @@ fn keeper_relaunch_brake_proves_and_catches() {
     ] {
         assert!(committed.contains(&action), "{action}: {committed:?}");
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "keeper relaunch brake: never after a quit, never a storm, a hold only when spent",
-    );
 }
 
 /// The brake as a person meets it: three relaunches, then a hold that only a
@@ -394,7 +385,7 @@ fn keeper_relaunch_brake_the_defects_are_caught_on_every_invariant() {
 }
 
 #[test]
-fn keeper_death_judgement_proves_and_catches() {
+fn keeper_death_judgement_fires_every_committed_move() {
     let model = keeper_death_judgement_model();
     let committed: Vec<&str> = interp::fired_actions(&model).into_iter().collect();
     for action in [
@@ -413,11 +404,6 @@ fn keeper_death_judgement_proves_and_catches() {
     ] {
         assert!(committed.contains(&action), "{action}: {committed:?}");
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "keeper death judgement: a clean quit never resurrected, a crash never closed as a \
-         quit, an orphan never listed after its shell died",
-    );
 }
 
 /// The ends a person meets, judged by name.
@@ -527,7 +513,7 @@ const COMPANION_ACTIONS: [&str; 10] = [
 ];
 
 #[test]
-fn keeper_companion_custody_proves_and_catches() {
+fn keeper_companion_custody_fires_every_committed_move() {
     let model = keeper_companion_custody_model();
     let committed = interp::fired_actions(&model);
     for action in COMPANION_ACTIONS {
@@ -536,11 +522,6 @@ fn keeper_companion_custody_proves_and_catches() {
             "{action} fires at the committed configuration: {committed:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &model,
-        "keeper companion custody: an exact offer carries the dead reader's own region, no \
-         region to an old window, none after a release, none after two poisoned restores",
-    );
 }
 
 /// Each defect breaks the invariant written for it, alone (the plan's mutant table), and holds

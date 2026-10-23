@@ -1,39 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What an X11 client says on the wire, read from an `xtrace` log: the
-//! baseline's `x11.wire.*` lines (X11-TRACE, `docs/LINUX-RUNTIME-LANE.md`,
-//! "The X11 wire").
-//!
-//! The lane held X11 behaviour, not X11 requests: WC8-CARVE's review found a
-//! commit (104dad2238) that had dropped the two `_NET_WM_STATE` REMOVE
-//! messages every X11 window sends after it is made, which no screen's
-//! pixels or replies showed. The Wayland screens already keep their wire's
-//! words (`header.requests`, `touch.wire`, read from `WAYLAND_DEBUG`); this
-//! is X11's: a second aterm-gui started through `xtrace` (a proxy display that
-//! logs every request, reply, event and error), driven through a start, a
-//! typed echo, a resize and the person's quit, and its log summed up into
-//! lines that hold no ids, timing or counts, only what was asked:
-//!
-//! - `x11.wire.requests`: every request kind, once, sorted (`ChangeProperty`,
-//!   `XInputExtension:XISelectEvents`);
-//! - `x11.wire.atoms`: the atoms interned, by name, sorted, and how many;
-//! - `x11.wire.selects`: the events selected, on which window (`root`, the
-//!   client's own `window`, `none` for window 0), core and XI2 by name;
-//! - `x11.wire.messages`: the client messages sent (`SendEvent`), in order,
-//!   with `_NET_WM_STATE`'s action and atoms by name;
-//! - `x11.wire.errors`: the X errors the server answered, by the request
-//!   they answered.
-//!
-//! Traced at WC8-CARVE's base (6e0ceb69c3) and at main (1be2d78bac), these
-//! lines differ exactly where the carve meant them to: the root's raw XI2
-//! events (a06dcfbb0a) and 14 atoms (db9da71119, 6a6777e2b3)
-//! (`docs/measured/linux-x11-gone-2026-10-21.md`).
+//! Summarizes X11 requests, atoms, selections, client messages, and errors from an `xtrace` log.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The display `xtrace` offers the traced aterm-gui, past the lane's own
-/// (Xvfb's `:91`, Xwayland's `:92`).
+/// Display `xtrace` exposes to the traced client.
 pub const PROXY: &str = ":93";
 
 /// What the traced aterm-gui is typed, and the echo it must show.
@@ -46,9 +18,7 @@ pub fn unit_name() -> String {
     format!("{}xtrace", crate::linux_guest::UNIT_PREFIX)
 }
 
-/// `xtrace`'s argv: [`PROXY`] relayed to `display` (no authority copied: the
-/// lane's servers take none), every line to `log` as it comes, and kept up
-/// after its client goes, until its unit is stopped.
+/// Builds the `xtrace` argv relaying [`PROXY`] to `display` and logging to `log`.
 #[must_use]
 pub fn proxy_argv(display: &str, log: &str) -> Vec<String> {
     ["xtrace", "-d", display, "-D", PROXY, "-n", "-k", "-o", log]
@@ -204,7 +174,6 @@ pub fn summary(log: &str) -> Vec<(&'static str, String)> {
             continue;
         }
         if let Some(at) = line.find("Reply to InternAtom: atom=") {
-            // `atom=0xf2("_NET_WM_STATE_ABOVE")`
             let rest = &line[at + "Reply to InternAtom: atom=".len()..];
             if let Some((n, name)) = rest.split_once("(\"")
                 && let Some(n) = hex(n)
@@ -214,7 +183,6 @@ pub fn summary(log: &str) -> Vec<(&'static str, String)> {
             continue;
         }
         if let Some(at) = line.find(":Error ") {
-            // `001:>:000f:Error 3=Window: major=2, …, seq=000f`
             let what = line[at + ":Error ".len()..]
                 .split(':')
                 .next()

@@ -3785,12 +3785,12 @@ impl App {
         fenced_screen_now(session, &rows, || lights::read_screen(&rows))
     }
 
-    /// `session`'s screen and whether its composer is empty.
+    /// `session`'s screen and whether its composer is empty; `None` while Claude's frame is unfinished.
     pub(crate) fn claude_composer_now(&self, session: u64) -> Option<(Screen, bool)> {
         let (rows, cursor, dim_col2) = {
             let entry = self.pool.get(session)?;
             let t = crate::term_lock(&entry.term);
-            if t.grid().display_offset() > 0 {
+            if t.grid().display_offset() > 0 || crate::frame_unfinished_now(&t) {
                 return None;
             }
             let rows: Vec<String> = (0..usize::from(t.rows()))
@@ -3818,10 +3818,11 @@ impl App {
     }
 
     /// `session`'s live screen copied out of its engine, its rows as text.
+    /// `None` while Claude's DEC 2026 frame is unfinished: the event loop never waits for its close.
     fn claude_rows_now(&self, session: u64) -> Option<Vec<String>> {
         let entry = self.pool.get(session)?;
         let t = crate::term_lock(&entry.term);
-        if t.grid().display_offset() > 0 {
+        if t.grid().display_offset() > 0 || crate::frame_unfinished_now(&t) {
             return None;
         }
         Some(
@@ -5606,6 +5607,67 @@ mod gesture_tests {
         frame(&mut app, wid);
         click(&mut app, wid, Light::Mode);
         assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "plan: one press");
+    }
+
+    /// A TOGGLE IS NEVER DECIDED ON HALF A FRAME: refused as not shown, nothing pressed.
+    #[test]
+    fn a_toggle_is_never_decided_on_half_a_frame() {
+        let (mut app, wid, session, mut reader) = app();
+        publish_facts(&app, session);
+        draw_claude(&app, session, PLAN);
+        frame(&mut app, wid);
+        feed(
+            &app,
+            session,
+            "\x1b[?2026h\x1b[22;1H\x1b[2K\u{276F} ".as_bytes(),
+        );
+        let term = app.pool.get(session).expect("session").term.clone();
+        assert!(
+            term_lock(&term).frame_unfinished_at(Instant::now()),
+            "precondition: the frame is unfinished"
+        );
+        app.toggle_claude_light(wid, session, Light::Mode);
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "nothing pressed on half a frame"
+        );
+        let s = &app.windows[&wid].claude_lights.sessions[&session];
+        assert!(s.pending.is_none(), "no toggle began");
+        assert!(
+            matches!(s.refused, Some((Light::Mode, super::Refusal::NotShown, _))),
+            "refused as not on screen"
+        );
+        feed(
+            &app,
+            session,
+            format!("\x1b[24;1H\x1b[2K{AUTO}\x1b[22;3H\x1b[?2026l").as_bytes(),
+        );
+        app.toggle_claude_light(wid, session, Light::Mode);
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "the whole frame: auto stays auto"
+        );
+        redraw_mode_row(&app, session, PLAN);
+        app.toggle_claude_light(wid, session, Light::Mode);
+        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB, "plan: one press");
+    }
+
+    /// THE UPGRADE NOTE'S COMPOSER IS READ OFF A WHOLE FRAME: half a frame is no composer.
+    #[test]
+    fn the_upgrade_notes_composer_is_read_off_a_whole_frame() {
+        let (app, _wid, session, _reader) = app();
+        draw_claude(&app, session, PLAN);
+        feed(&app, session, "\x1b[22;3Hhello".as_bytes());
+        let draft = || app.claude_composer_now(session).map(|(_, empty)| empty);
+        assert_eq!(draft(), Some(false), "precondition: a draft");
+        feed(
+            &app,
+            session,
+            "\x1b[?2026h\x1b[22;1H\x1b[2K\u{276F} ".as_bytes(),
+        );
+        assert_eq!(draft(), None, "half a frame is no composer");
+        feed(&app, session, "hello\x1b[?2026l".as_bytes());
+        assert_eq!(draft(), Some(false), "the whole frame's draft");
     }
 
     /// AT REST NO LIGHT IS DRAWN (owner, 2026-09-27: "I don't want to show

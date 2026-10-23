@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cell extras: the rare attributes the packed 8-byte `Cell` cannot hold
-//! (hyperlinks, combining marks, grapheme clusters, truecolor, underline colour,
-//! inline images), kept in a side table (`CellExtras`) keyed by cell position.
+//! Cell extras: rare attributes kept in a side table (`CellExtras`) keyed by cell position.
 
 use aterm_alloc::SmallVec;
 use std::sync::Arc;
@@ -43,11 +41,6 @@ mod extra_flags {
 }
 
 /// Hyperlink data: URL and optional ID from OSC 8 sequences.
-///
-/// One allocation instead of two `Option<Arc<str>>` fields keeps `CellExtra` 24
-/// bytes smaller. Held by `Arc`: the bulk writer builds one payload per OSC 8
-/// run and each covered cell takes a refcount bump; every single-cell mutator
-/// goes through `Arc::make_mut`, so the sharing is unobservable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HyperlinkData {
     /// Hyperlink URL (OSC 8).
@@ -57,15 +50,9 @@ pub(crate) struct HyperlinkData {
     pub id: Option<Arc<str>>,
 }
 
-// The image types live in aterm-types: history (`aterm_scrollback::ImageSpan`)
-// must hold the same `Arc` a live cell does, and aterm-scrollback sits below
-// this crate, so a type defined here could reach it only by copying (defeating
-// the renderer's pointer-keyed decode cache and the memory budget).
 pub use aterm_types::{ImageData, ImageFormat, ImageScaling, KittyPlacementTag, SourceRect};
 
-/// A single cell's reference into a placed [`ImageData`]: `cell_row`/`cell_col`
-/// name the tile of the image's `rows`×`cols` footprint this cell paints
-/// (0-indexed from the top-left).
+/// A single cell's reference into a placed [`ImageData`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
     /// The shared image this cell belongs to.
@@ -74,16 +61,12 @@ pub struct ImageRef {
     pub cell_row: u16,
     /// Column of this cell within the image footprint (0-indexed).
     pub cell_col: u16,
-    /// Which Kitty placement stamped this cell, or `None` for every image that
-    /// is not a Kitty placement (iTerm2, sixel, host rasters). Kitty's delete
-    /// selectors address placements by this tag, so no Kitty command can erase
-    /// a picture another protocol drew.
+    /// Which Kitty placement stamped this cell, or `None` for non-Kitty placements.
     pub kitty: Option<KittyPlacementTag>,
 }
 
 impl ImageRef {
-    /// Where this layer stacks among the images sharing its cell, lowest
-    /// first ([`aterm_types::layer_order`]).
+    /// Where this layer stacks among the images sharing its cell, lowest first.
     #[must_use]
     #[inline]
     pub fn draw_key(&self) -> (i32, u32, u32) {
@@ -91,43 +74,29 @@ impl ImageRef {
     }
 }
 
-/// Most image layers one cell holds: a placement stacked past it pushes the
-/// lowest layer out (a DoS bound — each layer is a boxed ref per covered cell).
+/// Maximum image layers one cell holds.
 pub const MAX_IMAGE_LAYERS: usize = 16;
 
-/// The attributes a cell needs rarely and the packed 8-byte `Cell` cannot hold:
-/// hyperlinks (OSC 8), underline colour (SGR 58/59), truecolor fg/bg, combining
-/// marks, complex characters (non-BMP, grapheme clusters) and inline images.
-///
-/// A Kitty Unicode placeholder needs no field of its own: it is its character,
-/// combining marks and colours, decoded at render time.
-///
-/// Allocated only for cells that carry some extra.
+/// Rare cell attributes stored outside the packed 8-byte `Cell`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CellExtra {
     /// Bitflags: bits 0-2 track color presence, bits 3-15 for extended flags.
     flags: u16,
-
     /// Packed RGB: underline in bytes 0-2, fg in 3-5, bg in 6-8, each valid only
     /// while its HAS_* bit is set.
     colors: [u8; 9],
-
     /// Indexed underline color, resolved from the live palette at render time
     /// so OSC 4 changes apply. `HAS_UNDERLINE_COLOR` is clear while it is set.
     underline_color_idx: Option<u8>,
-
     /// Hyperlink URL and optional ID (OSC 8) in one allocation, shared by every
     /// cell of a run (see [`HyperlinkData`]); `None` costs nothing (niche).
     hyperlink: Option<Arc<HyperlinkData>>,
-
     /// Complex character string (non-BMP, grapheme clusters), used when the
     /// cell is COMPLEX. Boxed so the common path pays an 8-byte niche pointer,
     /// not a 16-byte fat pointer.
     complex_char: Option<Box<Arc<str>>>,
-
     /// Zero-width combining characters (inline up to two).
     combining: SmallVec<char, 2>,
-
     /// The inline images covering this cell, bottom layer first (never empty
     /// when present): one for an iTerm2 or sixel image, which owns its cells;
     /// Kitty placements stack in [`ImageRef::draw_key`] order. Boxed: 8 bytes
@@ -170,14 +139,12 @@ impl CellExtra {
         self.hyperlink.as_ref().map(|data| &data.url)
     }
 
-    /// Set the hyperlink URL, clearing the ID (both come from one OSC 8
-    /// sequence; `set_hyperlink_id` sets the new one).
+    /// Set the hyperlink URL, clearing the ID.
     #[inline]
     pub fn set_hyperlink(&mut self, url: Option<Arc<str>>) {
         match url {
             Some(url) => {
                 if let Some(data) = &mut self.hyperlink {
-                    // Copy-on-write: the payload may be shared across an OSC 8 run.
                     let data = Arc::make_mut(data);
                     data.url = url;
                     data.id = None; // Clear stale ID from previous hyperlink
@@ -209,7 +176,6 @@ impl CellExtra {
     #[inline]
     pub fn set_hyperlink_id(&mut self, id: Option<Arc<str>>) {
         if let Some(data) = &mut self.hyperlink {
-            // Copy-on-write: the payload may be shared with the rest of the run.
             Arc::make_mut(data).id = id;
         }
     }
@@ -260,12 +226,6 @@ impl CellExtra {
     }
 
     /// Set the underline color from packed u32 format (0xTT_XXXXXX).
-    ///
-    /// Type byte TT determines interpretation:
-    /// - `0x01`: RGB color — stores `[R, G, B]` from the low 24 bits.
-    /// - `0x02`: Indexed palette color — stores the palette index, resolved
-    ///   from the live palette at draw time so OSC 4 changes apply.
-    /// - Other: treated as RGB.
     #[inline]
     pub const fn set_underline_color_u32(&mut self, color: Option<u32>) {
         match color {
@@ -287,13 +247,7 @@ impl CellExtra {
         }
     }
 
-    /// The underline colour in packed `0xTT_XXXXXX` form, the inverse of
-    /// [`set_underline_color_u32`](Self::set_underline_color_u32): `0x02_0000II`
-    /// for an indexed colour (so it re-resolves against the live palette after a
-    /// round trip), `0x01_RRGGBB` for RGB, `None` when no SGR 58 colour is set.
-    ///
-    /// Scrollback and the wide-spacer mirror carry this form, so a colour is
-    /// not flattened to RGB across either boundary.
+    /// The underline colour in packed `0xTT_XXXXXX` form.
     #[must_use]
     #[inline]
     pub const fn underline_color_u32(&self) -> Option<u32> {
@@ -306,8 +260,7 @@ impl CellExtra {
         Some(0x01_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
     }
 
-    /// Whether the underline color is an indexed palette color, which the
-    /// renderer resolves from the live palette.
+    /// Whether the underline color is an indexed palette color.
     #[must_use]
     #[inline]
     pub const fn is_underline_color_indexed(&self) -> bool {
@@ -367,8 +320,7 @@ impl CellExtra {
         &self.combining
     }
 
-    /// Add a combining character (e.g. 'e' + U+0301 = 'é'), up to
-    /// [`Self::MAX_COMBINING`].
+    /// Add a combining character up to [`Self::MAX_COMBINING`].
     #[inline]
     pub fn add_combining(&mut self, c: char) {
         if self.combining.len() < Self::MAX_COMBINING {
@@ -379,12 +331,7 @@ impl CellExtra {
     /// Maximum combining characters per cell (prevents DoS).
     pub const MAX_COMBINING: usize = 16;
 
-    /// Strip the character-bearing fields: combining marks and the
-    /// complex-char string.
-    ///
-    /// Keeps SGR colours, hyperlinks, flags and images. DECSERA's selective wipe
-    /// uses it: the cell becomes a space but keeps its truecolor/underline
-    /// overflow, without stale marks leaking into copy, search or render.
+    /// Strip combining marks and the complex-char string.
     #[inline]
     pub fn clear_char_marks(&mut self) {
         self.combining.clear();
@@ -417,7 +364,6 @@ impl CellExtra {
         self.image = None;
         self.underline_color_idx = None;
         self.flags &= extra_flags::HAS_FG_RGB | extra_flags::HAS_BG_RGB;
-        // Bytes 0-2 belong to the underline colour just dropped.
         self.colors[..3].fill(0);
         self.has_data()
     }
@@ -431,8 +377,7 @@ impl CellExtra {
             .map_or(&[], |layers| layers.as_slice())
     }
 
-    /// The inline images covering this cell, bottom layer first, for an edit
-    /// that keeps each layer's [`ImageRef::draw_key`] (a Kitty frame swap).
+    /// Mutable slice of inline images covering this cell, bottom layer first.
     #[inline]
     pub fn images_mut(&mut self) -> &mut [ImageRef] {
         self.image
@@ -447,8 +392,7 @@ impl CellExtra {
         self.images().last()
     }
 
-    /// Make `image` the cell's only image (`None`: no image) — an iTerm2 or
-    /// sixel image owns the cells it covers.
+    /// Make `image` the cell's only image (`None`: no image).
     #[inline]
     pub fn set_image(&mut self, image: Option<ImageRef>) {
         self.image = image.map(|image| {
@@ -458,9 +402,7 @@ impl CellExtra {
         });
     }
 
-    /// Add `image` as a layer, in [`ImageRef::draw_key`] order (after the
-    /// layers it ties with), keeping at most [`MAX_IMAGE_LAYERS`]: the lowest
-    /// layer goes first.
+    /// Add `image` as a layer in [`ImageRef::draw_key`] order, keeping at most [`MAX_IMAGE_LAYERS`].
     pub fn stack_image(&mut self, image: ImageRef) {
         let layers = self.image.get_or_insert_with(Box::default);
         let key = image.draw_key();
@@ -494,13 +436,10 @@ impl CellExtra {
         }
     }
 
-    /// Calculate memory used by this extra. Saturating throughout, as in
-    /// `Grid::memory_used`: exact whenever the sum fits, `usize::MAX` otherwise.
+    /// Calculate memory used by this extra.
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
-        // Upper bound: the URL is counted per cell though a run shares it;
-        // over-reporting is the safe direction for a memory budget.
         let hyperlink_mem = self.hyperlink.as_ref().map_or(0, |data| {
             std::mem::size_of::<HyperlinkData>()
                 .saturating_add(data.url.len())
@@ -509,7 +448,6 @@ impl CellExtra {
                 }))
         });
         let complex_char_mem = self.complex_char.as_ref().map_or(0, |s| {
-            // The box holds the fat pointer; the string bytes are behind the Arc.
             std::mem::size_of::<Arc<str>>().saturating_add(s.len())
         });
         let combining_mem = if self.combining.spilled() {
@@ -519,8 +457,6 @@ impl CellExtra {
         } else {
             0 // Inline storage, already counted in base
         };
-        // The image payload is shared via Arc (counted once at the source, not
-        // per covered cell); each cell pays only its boxed layer refs.
         let image_mem = self.image.as_ref().map_or(0, |layers| {
             std::mem::size_of::<SmallVec<ImageRef, 1>>().saturating_add(if layers.spilled() {
                 layers
@@ -537,9 +473,7 @@ impl CellExtra {
     }
 }
 
-/// Uniform extras for a contiguous column range, applied to a whole ASCII run in
-/// one pass by [`CellExtras::set_range_uniform`] instead of per-cell
-/// `get_or_create`.
+/// Uniform extras for a contiguous column range.
 pub struct UniformExtras<'a> {
     /// Foreground RGB (true-color).
     pub fg_rgb: Option<[u8; 3]>,
@@ -555,9 +489,7 @@ pub struct UniformExtras<'a> {
     pub hyperlink_id: Option<&'a Arc<str>>,
 }
 
-/// The SGR 58 parameter for an underline colour in the packed `0xTT_XXXXXX`
-/// form of [`CellExtra::underline_color_u32`]: `58:5:I` for an indexed colour,
-/// else `58:2::R:G:B`. DECRQSS and the screen serializer both encode with it.
+/// Encode a packed `0xTT_XXXXXX` underline colour as an SGR 58 parameter.
 #[must_use]
 pub fn underline_color_sgr(packed: u32) -> String {
     if (packed >> 24) & 0xFF == 0x02 {

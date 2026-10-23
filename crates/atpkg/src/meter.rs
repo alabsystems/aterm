@@ -101,7 +101,7 @@ fn display_name(name: &str) -> &str {
 }
 
 /// The spinner's glyph for `frame`.
-fn spinner(frame: usize, utf8: bool) -> char {
+const fn spinner(frame: usize, utf8: bool) -> char {
     const BRAILLE: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     const ASCII: [char; 4] = ['|', '/', '-', '\\'];
     if utf8 {

@@ -586,7 +586,7 @@ enum Stored {
 }
 
 impl Stored {
-    fn word(self) -> &'static str {
+    const fn word(self) -> &'static str {
         match self {
             Stored::None => "none",
             Stored::Pending => "pending",
@@ -1186,7 +1186,7 @@ fn missing(config: &Config) -> Error {
     ))
 }
 
-fn quiet(report: &Report) -> bool {
+const fn quiet(report: &Report) -> bool {
     report.written.is_empty()
         && report.removed.is_empty()
         && report.moved_aside.is_empty()
@@ -1647,7 +1647,7 @@ impl Approval {
 
     /// Whether the approver reads `request` at all: every one on an open vault, only one that
     /// carries a proof on a vault with a password.
-    fn reads(self, request: &Request) -> bool {
+    const fn reads(self, request: &Request) -> bool {
         match self {
             Approval::Password => request.proof.is_some(),
             Approval::Open => true,
@@ -2394,7 +2394,7 @@ impl std::fmt::Debug for Admin {
 
 impl Admin {
     /// The version this was opened at.
-    pub fn seq(&self) -> u64 {
+    pub const fn seq(&self) -> u64 {
         self.seq
     }
 }

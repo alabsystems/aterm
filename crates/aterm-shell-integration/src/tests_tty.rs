@@ -391,14 +391,16 @@ fn spawn_pty_shell(
     dir: &Path,
     extra: &[(&str, &str)],
 ) -> LiveShell {
-    let mut sh = spawn_pty_shell_unwaited(shell, program, fx, dir, extra);
+    let mut sh = spawn_pty_shell_unwaited(&[], shell, program, fx, dir, extra);
     sh.wait_for_after("\x1b]133;A", 0);
     sh
 }
 
-/// [`spawn_pty_shell`], returned as soon as it is spawned.
+/// [`spawn_pty_shell`], returned as soon as it is spawned, with `under` (a program and its
+/// words, such as `sandbox-exec -p …`) started on the pty in the shell's place to run it.
 #[cfg(unix)]
 fn spawn_pty_shell_unwaited(
+    under: &[&str],
     shell: ShellType,
     program: &str,
     fx: &LiveFixture,
@@ -409,7 +411,8 @@ fn spawn_pty_shell_unwaited(
         env_add,
         argv_override,
     } = injection_for(shell, dir).expect("injection");
-    let mut argv: Vec<String> = vec![program.to_owned()];
+    let mut argv: Vec<String> = under.iter().map(|word| (*word).to_owned()).collect();
+    argv.push(program.to_owned());
     if let Some(over) = argv_override {
         argv.extend(over.into_iter().skip(1));
     }
@@ -1551,6 +1554,94 @@ fn an_integrated_bash_reports_the_line_as_typed() {
         sh.transcript()
     );
     sh.finish();
+}
+
+/// The seatbelt profile the bash of
+/// [`an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_block`] runs
+/// under: no write in `/tmp`, `/var/tmp` or the per-user folders, so with `$TMPDIR` unset and
+/// `/` its working folder, bash finds no folder to make a temporary file in.
+#[cfg(target_os = "macos")]
+const NO_TEMP_FOLDER: &str = "(version 1)(allow default)(deny file-write* \
+     (subpath \"/private/tmp\") (subpath \"/private/var/tmp\") (subpath \"/private/var/folders\"))";
+
+/// An integrated bash with no folder it can make a temporary file in runs every line typed
+/// with its block (633;E as typed, 133;C, 133;D) and prints no `function_substitute: cannot
+/// open anonymous file for output`. bash 5.3 keeps a `${ ...; }` substitution's output in a
+/// memfd only where the kernel takes the `MFD_NOEXEC_SEAL` bash asks for (Linux 6.3+), else
+/// in a file in such a folder: a Git Bash whose `/tmp` went away (ATERM-KI-1020-3), a
+/// read-only container on an older Linux. macOS gives bash no memfd, so this shell is that
+/// one, twice: its rc names Linux (`OSTYPE=linux-gnu`), and the read cannot take the
+/// system's name for a memfd; then its rc loads the integration and sets PS0's hook as a
+/// loader of v0.107.0-v0.108.0 wrote it, `${ __aterm_ps0; }`, and the wrapper loads the
+/// integration again in place, as a running shell takes a newer build (only a 5.3 loader
+/// wrote that PS0, so the rc sets it only on 5.3 or later). bash before 5.3 gets no PS0 hook
+/// from the integration and forks every read, so there this checks only the blocks: macOS's
+/// 3.2, which `verify test` runs, cannot fail it, and the substance needs `ATERM_TEST_BASH`
+/// naming a bash 5.3 or later, which nothing provisions yet.
+/// NEGATIVE CONTROLS (2026-10-22, bash 5.3.20): with the bare `${ ...; }` read 720456ef9b
+/// gave Linux, each line of the first start printed that error twice and had no block; with
+/// the rewrite of an older PS0 gated on `__aterm_fresh_load`, the second start ran no line.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_block() {
+    need_pty_script();
+    let sandbox = "/usr/bin/sandbox-exec";
+    let taken = aterm_uds::spawnfd::command(sandbox)
+        .args(["-p", NO_TEMP_FOLDER, "/bin/sh", "-c"])
+        .arg("test ! -w /tmp && test ! -w /var/tmp")
+        .output();
+    if !taken.as_ref().is_ok_and(|out| out.status.success()) {
+        aterm_spec::host::could_not_run(format!(
+            "bash with no writable temp folder: {sandbox} takes no folder away here (inside \
+             another sandbox?): {taken:?}"
+        ));
+    }
+    for (start, rc) in [
+        ("naming Linux", "OSTYPE=linux-gnu\n"),
+        (
+            "in place over v0.108.0's PS0",
+            ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n\
+             if (( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 503 )); then \
+             PS0='${ __aterm_ps0; }'; fi\n",
+        ),
+    ] {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(fx.home.join(".bashrc"), format!("unset TMPDIR\ncd /\n{rc}"))
+            .expect(".bashrc");
+        let mut sh = spawn_pty_shell_unwaited(
+            &[sandbox, "-p", NO_TEMP_FOLDER],
+            ShellType::Bash,
+            bash_shell(),
+            &fx,
+            &dir,
+            &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
+        );
+        sh.wait_for_after("\x1b]133;A", 0);
+        for (line, status) in [
+            ("echo a$((40+2))", "0"),
+            ("false", "1"),
+            ("true | cat", "0"),
+        ] {
+            let from = sh.type_at_prompt(format!("{line}\r").as_bytes());
+            let end = sh.wait_for_after("\x1b]133;A", from);
+            let text = stdout_between(&sh, from, end);
+            let marks = [
+                format!(
+                    "\x1b]633;E;{};id={REKEY_OLD}\x07",
+                    line.replace(' ', "\\x20")
+                ),
+                format!("\x1b]133;C;id={REKEY_OLD}\x07"),
+                format!("\x1b]133;D;{status};id={REKEY_OLD}\x07"),
+            ];
+            assert!(
+                !text.contains("function_substitute") && marks.iter().all(|m| text.contains(m)),
+                "bash ({start}): `{line}` ran without its block {marks:?}\n{}",
+                sh.transcript()
+            );
+        }
+        sh.finish();
+    }
 }
 
 /// An ARRAY PROMPT_COMMAND (bash 5.1+ runs every element, aterm's first): the

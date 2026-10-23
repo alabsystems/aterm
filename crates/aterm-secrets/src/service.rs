@@ -20,7 +20,7 @@ pub enum Job {
 
 impl Job {
     /// The launchd label / systemd unit stem.
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Job::Subscriber => "systems.alab.aterm-secrets",
             Job::Server => "systems.alab.aterm-secrets-server",
@@ -28,7 +28,7 @@ impl Job {
     }
 
     /// One line naming the job: a systemd unit's `Description`.
-    pub fn description(self) -> &'static str {
+    pub const fn description(self) -> &'static str {
         match self {
             Job::Subscriber => "aterm secrets subscriber (aterm secrets watch)",
             Job::Server => "aterm secrets server (aterm secrets serve)",

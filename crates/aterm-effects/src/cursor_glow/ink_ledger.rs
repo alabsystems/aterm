@@ -164,7 +164,41 @@ impl InkLedger {
         }
     }
 
-    /// Distance in pixels from a cell's vertical centre to the nearest edge of `band`.
+    /// The brightest light laid so far on any band of text cell `(row, col)`,
+    /// per channel in `add_sat` levels: `None` for an idle ledger or a cell
+    /// it does not hold (off every line, or the caret's own).
+    pub(super) fn laid_peak(&self, (row, col): (i32, i32)) -> Option<[f32; 3]> {
+        if !self.on {
+            return None;
+        }
+        let at = self.slot(row, col)?;
+        Some(
+            self.laid[at..at + Self::BANDS]
+                .iter()
+                .fold([0.0f32; 3], |m, b| {
+                    [m[0].max(b[0]), m[1].max(b[1]), m[2].max(b[2])]
+                }),
+        )
+    }
+
+    /// Add `light` (premultiplied, `add_sat` levels) under the letters of
+    /// text cell `(row, col)`, over what already lies there: a light that
+    /// burns beneath the ink (the dark flame kept in its row), so every
+    /// later light over that letter spends from what it left.
+    pub(super) fn add_under(&mut self, (row, col): (i32, i32), light: u32) {
+        if !self.on {
+            return;
+        }
+        let Some(cell) = self.cell(row, col) else {
+            return;
+        };
+        let g = self.under[cell];
+        let ch = |sh: u32| (((g >> sh) & 0xff) + ((light >> sh) & 0xff)).min(255);
+        self.under[cell] = (ch(16) << 16) | (ch(8) << 8) | ch(0);
+    }
+
+    /// How far band `band` of a cell `ch` px tall lies from the cell's middle
+    /// row of pixels (a streak sample's axis), at its nearest point.
     #[inline]
     pub(super) const fn band_reach(ch: f32, band: usize) -> f32 {
         let h = ch / Self::BANDS as f32;
@@ -1019,6 +1053,115 @@ impl CursorGlow {
         };
         self.ink_ledger.admit_masked(quads, range, floor)
     }
+
+    /// Keep a caret light that spreads round the caret (the typing glow on
+    /// a dark page) off the ink of the rows above and below the caret's:
+    /// toward a cell of another row that holds a letter or a ground other
+    /// than the page `page` (a prompt's bar, a selection), each additive
+    /// quad of `quads[range]` eases down from its whole strength
+    /// [`Self::NEIGHBOUR_EASE_IN`] of a row inside the caret row's edge to
+    /// nothing [`Self::NEIGHBOUR_HOLD_Y`] of a row past it, one smooth
+    /// falloff across the edge (a hold that began at the edge stood the
+    /// glow's full strength against a cut there, a grey box with hard
+    /// horizontal edges), and recovers its whole strength over
+    /// [`Self::NEIGHBOUR_HOLD_X`] of a cell off the inked cells; over air it
+    /// is whole. So the glow lights the caret's own line and the page round
+    /// it, never a band of fog over the prompt's bar or the line above. A
+    /// row the frame did not hand over is air, as the glow always drew it.
+    /// Returns a print of what it cut.
+    pub fn hold_off_neighbour_ink(
+        &self,
+        quads: &mut [GlowQuad],
+        caret: Option<(u16, u16)>,
+        geom: Geom,
+        page: u32,
+    ) -> u64 {
+        let Some((cr, _)) = caret else {
+            return 0;
+        };
+        let view = self.text_view();
+        let page = page & 0x00FF_FFFF;
+        let (cw, ch) = (geom.cw as f32, geom.ch as f32);
+        let (ox, oy) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
+        let (top, bot) = (oy + f32::from(cr) * ch, oy + f32::from(cr + 1) * ch);
+        let (fx, fy, fi) = (
+            (cw * Self::NEIGHBOUR_HOLD_X).max(1.0),
+            (ch * Self::NEIGHBOUR_HOLD_Y).max(1.0),
+            (ch * Self::NEIGHBOUR_EASE_IN).max(1.0),
+        );
+        #[cfg(test)]
+        let fi = if self.neighbour_hold_hard { 1e-3 } else { fi };
+        let smooth = |k: f32| {
+            let k = k.clamp(0.0, 1.0);
+            k * k * (3.0 - 2.0 * k)
+        };
+        let inked = |row: i32, col: i32| {
+            row >= 0
+                && view.knows_row(row)
+                && (view.covers_cell(row, col)
+                    || self.frame_text.pair(row, col).is_some_and(|(ink, ground)| {
+                        ink.is_some() || !super::emit::reads_as_page(ground, page)
+                    }))
+        };
+        let cr = i32::from(cr);
+        let mut print = 0u64;
+        for q in quads.iter_mut().filter(|q| q.alpha == 0 && q.h > 0) {
+            let ym = f32::from(q.y) + 0.5 * f32::from(q.h);
+            // The nearer edge of the caret row and how far inside it the
+            // quad stands (negative past it), and the row across that edge
+            // (the quad's own, once past it).
+            let (inside, across) = if ym < 0.5 * (top + bot) {
+                (ym - top, cr - 1)
+            } else {
+                (bot - ym, cr + 1)
+            };
+            let row = if inside < 0.0 {
+                ((ym - oy) / ch).floor() as i32
+            } else {
+                across
+            };
+            let hold = smooth((inside + fy) / (fi + fy));
+            if hold >= 1.0 {
+                continue;
+            }
+            let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));
+            let (c_lo, c_hi) = (
+                ((x0 - fx - ox) / cw).floor() as i32,
+                ((x1 + fx - ox) / cw).floor() as i32,
+            );
+            let near = (c_lo.max(0)..=c_hi)
+                .filter(|&c| inked(row, c))
+                .map(|c| {
+                    let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
+                    (a - x1).max(x0 - b).max(0.0)
+                })
+                .fold(f32::INFINITY, f32::min);
+            if !near.is_finite() {
+                continue;
+            }
+            let share = hold + (1.0 - hold) * smooth(near / fx);
+            if share >= 1.0 {
+                continue;
+            }
+            q.color = scale_rgb(q.color, share);
+            q.color2 = scale_rgb(q.color2, share);
+            print = print.rotate_left(7)
+                ^ ((u64::from(q.x) << 32) | (u64::from(q.y) << 16) | (share * 255.0) as u64);
+        }
+        print
+    }
+
+    /// How far into an inked row next to the caret's a caret light keeps
+    /// any of its strength, as a share of the row's height, and how far off
+    /// an inked cell it takes to recover, as a share of a cell's width
+    /// ([`Self::hold_off_neighbour_ink`]).
+    pub(super) const NEIGHBOUR_HOLD_Y: f32 = 0.12;
+    /// See [`Self::NEIGHBOUR_HOLD_Y`].
+    pub(super) const NEIGHBOUR_HOLD_X: f32 = 0.45;
+    /// How far inside the caret row's edge a caret light begins easing
+    /// down toward an inked row across it, as a share of the row's height
+    /// ([`Self::hold_off_neighbour_ink`]).
+    pub(super) const NEIGHBOUR_EASE_IN: f32 = 0.35;
 }
 
 /// Over-ink contrast tier for lights emitted after the aurora ([`CursorGlow::admit_over_ink`]).

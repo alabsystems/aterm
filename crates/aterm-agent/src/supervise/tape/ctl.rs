@@ -1,34 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CONTROL LANE'S DOOR: [`TapedCtl`] wraps a loop's transport, so every
-//! request the loop sends and every reply it gets back crosses its [`Fx`] as
-//! one round trip.
-//!
-//! It wraps the TRANSPORT, not the session's own `call`: the session's
-//! requests that skip `Session::call` — the claim's renewal and release
-//! (`meta set|unset supervisor`), the worker's `who` — still go through the
-//! one transport the session holds, so they are taped by construction, and no
-//! new bypass can be written that is not. An older build's teller lane (the
-//! removed `aterm drive watch`'s `story`, its own client) crossed a door of
-//! its own ([`super::doors::TELLER`]), so a reader of its tapes still tells
-//! its replies, which no decision read, from the loop's.
-//!
-//! The door also closes the tape's open frame where a reader of a live tape
-//! needs it on disk: before a WAIT (`await …`: an idle loop's tape is on disk
-//! while it waits, which may be for hours) and after an ACT (a key, a send,
-//! a post, a badge, a signal, a restart: what the loop acted on is on disk
-//! before anything that follows). A live loop's door does neither: `Fx`
-//! does nothing for a frame it does not keep.
-//!
-//! In a live run (no `--tape`) the wrapper is a pass-through: the request's
-//! bytes are never built and nothing is locked.
+//! Control lane transport wrappers for recording and replaying supervision tapes.
 
 use super::frame::Hint;
 use crate::supervise::fx::Fx;
 use crate::supervise::{Ctl, CtlReply, Interrupter};
 
-/// A transport whose round trips cross a door ([module docs](self)).
+/// A transport whose round trips cross a door.
 pub(crate) struct TapedCtl<'c, C: Ctl + ?Sized> {
     inner: &'c mut C,
     fx: Fx,
@@ -36,8 +15,7 @@ pub(crate) struct TapedCtl<'c, C: Ctl + ?Sized> {
 }
 
 impl<'c, C: Ctl + ?Sized> TapedCtl<'c, C> {
-    /// `inner`'s round trips, through `fx` at `door` ([`super::doors::CTL`] for the
-    /// loop's lane).
+    /// Wraps `inner`'s round trips through `fx` at `door`.
     pub(crate) fn new(inner: &'c mut C, fx: Fx, door: &'static str) -> Self {
         Self { inner, fx, door }
     }
@@ -65,19 +43,14 @@ impl<C: Ctl + ?Sized> Ctl for TapedCtl<'_, C> {
     }
 }
 
-/// A REPLAY's control lane: every request answered from the tape through a
-/// replaying [`Fx`] at `door`, checked there against the recorded one. It
-/// holds no transport at all — no socket, no client, no stand-in — so a
-/// replay cannot reach a live session by construction, and it has no
-/// [`Interrupter`]: nothing it waits on can be cut short, because nothing it
-/// waits on is real.
+/// A replay's control lane that answers every request from the tape.
 pub(crate) struct ReplayCtl {
     fx: Fx,
     door: &'static str,
 }
 
 impl ReplayCtl {
-    /// The lane at `door` of a replay whose door is `fx`.
+    /// Creates the lane at `door` for a replay whose door is `fx`.
     ///
     /// # Panics
     ///
@@ -107,15 +80,12 @@ fn words<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
     args.iter().copied().filter(|a| !a.starts_with('@'))
 }
 
-/// A wait: `await …`.
+/// Returns whether `args` is an `await` command.
 pub(crate) fn is_wait(args: &[&str]) -> bool {
     words(args).next() == Some("await")
 }
 
-/// An ACT the loop takes on the session: a request that writes into the
-/// worker or its badge ([`crate::supervise::run::is_write`]: a key, a send, a
-/// turn, a paste, a post, an attention write), a signal, or a restart. A
-/// claim's renewal, a read and a wait are not.
+/// Returns whether `args` is an action that modifies the session or its process.
 pub(crate) fn is_act(args: &[&str]) -> bool {
     crate::supervise::run::is_write(args)
         || matches!(words(args).next(), Some("signal" | "restart"))

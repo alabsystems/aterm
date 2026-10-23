@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH COMMIT THIS RUNNING CUTTER IS, judged once, as the process starts.
-//!
-//! A cutter judges a release by the rules compiled into it, so it acts for a commit only
-//! as that commit's own build ([`crate::gates::own_cutter`]). Cargo writes a dep-info file
-//! beside every binary it links (`target/<profile>/aterm-release.d`) naming each
-//! first-party source the binary was compiled from. At its start this process is the
-//! build of the checkout those sources sit in, at that checkout's `HEAD`, when:
-//!
-//! 1. that checkout is the one rustc compiled this crate in ([`BUILT_IN`]): cargo hands a
-//!    checkout the binary another one linked into a target directory they share whenever
-//!    its own files are older than that binary, and rewrites the dep-info to name it;
-//! 2. no checkout source the dep-info names changed after the link (cargo's own freshness
-//!    rule, so a binary built from an edit and run after the edit was reverted is refused:
-//!    the revert is newer than the link);
-//! 3. the checkout's cutter sources ([`SOURCE_INPUTS`]) are clean against its `HEAD`.
-//!
-//! The verdict is the start's because a release moves its clone to the commit it cuts: a
-//! binary started at another commit stays that commit's build and re-runs as the new
-//! one's (`release.rs`). Manifests and the lock file are not in the dep-info, so a binary
-//! run directly after a manifest-only change is not seen; `targo --unverified ship` is a
-//! `targo run`, which relinks first. Only this crate records where it was compiled, so
-//! checkouts that share a target directory never build the cutter there
-//! (`publish/pre-promote` builds in its own).
+//! Cutter binary provenance and freshness verification at process start.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -372,7 +350,6 @@ mod tests {
             format!("{}: {}\n", escaped(&exe), escaped(&work.join(OWN_MAIN))),
         )
         .unwrap();
-        // Linked after its source, as cargo links.
         let source_time = fs::metadata(work.join(OWN_MAIN))
             .unwrap()
             .modified()
@@ -394,7 +371,6 @@ mod tests {
     fn a_fresh_build_of_a_clean_checkout_is_its_heads_cutter() {
         let b = built();
         assert_eq!(judged(&b), Ok(b.head.clone()));
-        // a doc is not a cutter source: editing one changes nothing
         fs::write(b.work.join("README.md"), "edited\n").unwrap();
         assert_eq!(judged(&b), Ok(b.head.clone()));
     }
@@ -433,7 +409,6 @@ mod tests {
 
     /// Cargo hands a checkout the binary another one linked into a shared target directory
     /// and rewrites the dep-info to name it: only where rustc compiled the crate tells.
-    /// The same checkout under another spelling (a symlinked path) is the same checkout.
     #[test]
     fn a_binary_compiled_in_another_checkout_refuses_until_it_is_cleaned() {
         let b = built();

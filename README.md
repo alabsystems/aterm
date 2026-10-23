@@ -137,6 +137,9 @@ targo --unverified build --locked -p aterm
 ./target/debug/aterm --window
 ```
 
+Running the tests also needs `targo --unverified verify provision` (or `aterm
+init --develop`).
+
 A source build is not the signed release and is not enrolled for updates. The
 crates are not on crates.io. The crates.io `aterm`, the X11 `aterm` in MacPorts
 and the aterm.ai/aterm.io domains are unrelated projects.

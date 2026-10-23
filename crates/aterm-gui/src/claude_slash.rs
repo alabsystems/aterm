@@ -141,7 +141,7 @@ pub(crate) enum SlashRefusal {
     NotReady,
     /// The probe `/` never read back: vim NORMAL mode takes keys as motions.
     Vim,
-    /// The screen moved between the read and the write, twice.
+    /// The screen moved between the read and the write, twice, or Claude's frame was unfinished.
     Moved,
     /// The person typed since the press began.
     Person,
@@ -578,13 +578,23 @@ fn slash_holds(ctx: &crate::SessionCtx) -> Option<SlashRefusal> {
 }
 
 impl App {
-    /// `session`'s engine read once ([`EngineRead`]): `None` for a gone session or a view scrolled into history.
+    /// `session`'s engine read once ([`EngineRead`]): `None` for a gone session, a view scrolled into history, or a frame Claude has not finished.
     pub(crate) fn slash_engine_read(&self, session: u64) -> Option<EngineRead> {
-        let entry = self.pool.get(session)?;
+        self.slash_engine_look(session).ok()
+    }
+
+    /// [`Self::slash_engine_read`], or why there is none: [`SlashRefusal::Covered`] for a gone
+    /// session or a scrolled view, [`SlashRefusal::Moved`] while Claude's DEC 2026 frame is
+    /// unfinished. The event loop never waits for the close: a press in flight reads again at its next poll.
+    fn slash_engine_look(&self, session: u64) -> Result<EngineRead, SlashRefusal> {
+        let entry = self.pool.get(session).ok_or(SlashRefusal::Covered)?;
         let human = entry.ctx.human_input.seq();
         let t = crate::term_lock(&entry.term);
         if t.grid().display_offset() > 0 {
-            return None;
+            return Err(SlashRefusal::Covered);
+        }
+        if crate::frame_unfinished_now(&t) {
+            return Err(SlashRefusal::Moved);
         }
         let rows: Vec<String> = (0..usize::from(t.rows()))
             .map(|r| crate::claude_lights::row_text(&t, r))
@@ -598,7 +608,7 @@ impl App {
                     .is_some_and(|cell| cell.flags().contains(aterm_core::grid::CellFlags::DIM))
             })
             .collect();
-        Some(EngineRead {
+        Ok(EngineRead {
             rows,
             cursor: (usize::from(cursor.row), usize::from(cursor.col)),
             dim,
@@ -664,6 +674,7 @@ impl App {
                 guard_at_cursor: true,
                 ..InputFence::default()
             },
+            crate::ReadOn::EventLoop,
             None,
         )
     }
@@ -727,9 +738,7 @@ impl App {
         }
         let probe = InputEvent::KeySequence(b"/".to_vec());
         for attempt in 0..2 {
-            let read = self
-                .slash_engine_read(session)
-                .ok_or(SlashRefusal::Covered)?;
+            let read = self.slash_engine_look(session)?;
             let caret = crate::reader_guard::read_or_none(
                 session,
                 "Claude Code live screen",

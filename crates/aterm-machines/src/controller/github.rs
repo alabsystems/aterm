@@ -158,7 +158,7 @@ fn failure(method: RestMethod, endpoint: &str, answer: &GithubResponse) -> Strin
 
 /// The keys the machine user holds: `(id, key type, base64 body)`, every page read.
 fn listed(sys: &dyn System, session: &Session) -> Result<Vec<(u64, String, String)>, String> {
-    let values = github_pages::all(KEYS, KEYS_PER_PAGE, |endpoint| {
+    let values = github_pages::all(github_pages::API, KEYS, KEYS_PER_PAGE, |endpoint| {
         let answer = session.send(sys, RestMethod::Get, endpoint, None)?;
         if answer.status != 200 {
             return Err(failure(RestMethod::Get, "/user/keys", &answer));

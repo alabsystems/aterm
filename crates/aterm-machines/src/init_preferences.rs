@@ -21,8 +21,9 @@ const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
 const HIDUTIL: &str = "/usr/bin/hidutil";
 /// The apps the Dock pins, in order, each at its path, with its bundle identifier and label.
-/// aterm's path is its usual one: [`dock_apps_available`] pins the copy in the account's
-/// `~/Applications` when no aterm is in `/Applications` ([`aterm_paths`]).
+/// aterm's path is its usual one: [`dock_apps_available`] pins the copy this process runs
+/// from when aterm is in both `/Applications` and the account's `~/Applications`, else the
+/// one copy there is ([`aterm_candidates`]).
 const DOCK_APPS: [(&str, &str, &str); 3] = [
     ("/Applications/aterm.app", "com.aterm.aterm", "aterm"),
     (
@@ -1593,32 +1594,46 @@ mod tests {
         ));
     }
 
+    /// An app the Dock pins beside aterm that is missing, or another app at its path, leaves
+    /// the Dock as it was and says which, on a Dock the row can read. Negative controls:
+    /// `installed_app` accepting any bundle identifier pins the impostor; skipping the
+    /// other apps' check in `dock_apps_available` pins the missing Safari.
     #[test]
     fn missing_or_wrong_installed_dock_apps_cannot_be_reported_configured() {
         let who = user("alice", 501);
-        for wrong_identity in [false, true] {
-            let sys = Fake::root();
-            if wrong_identity {
-                let cmd = Cmd::new("/usr/bin/plutil")
-                    .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", "--"])
-                    .arg("/Applications/aterm.app/Contents/Info.plist")
-                    .as_user(&who);
-                sys.on(&cmd.display(), Ran::ok("com.example.another-app"));
-                installed_dock_apps(&sys, &who);
+        let safari = DOCK_APPS[2].0;
+        for (identity, expected) in [
+            (None, format!("Safari is not installed at {safari}")),
+            (
+                Some("com.example.another-app"),
+                format!("{safari} is not the requested Safari application"),
+            ),
+        ] {
+            let (sys, desk) = desktop_with(&who, Desk::before(), false);
+            for (path, bundle, _) in &DOCK_APPS[..2] {
+                installed_at(&sys, &who, path, bundle);
             }
-            let item = desktop(&who, DesktopKind::Dock);
-            let rows = crate::engine::run(
-                &[Box::new(item)],
-                crate::model::Mode::Apply,
+            if let Some(bundle) = identity {
+                installed_at(&sys, &who, safari, bundle);
+            }
+            let run = pass(
                 &sys,
-                &ctx(std::slice::from_ref(&who)),
-                &mut crate::engine::NoJournal,
+                selected_desktop_items(&who, &[Setting::Dock]),
+                Mode::Apply,
             );
-            assert_eq!(rows[0].outcome, crate::model::Outcome::Unknown);
+            assert_eq!(run.rows[0].outcome, Outcome::Unknown, "{:?}", run.rows);
+            assert_eq!(
+                run.rows[0].why.as_deref(),
+                Some(format!("{expected}; Dock left untouched").as_str())
+            );
+            let desk = desk.lock().unwrap();
             assert!(
-                sys.calls()
+                !desk
+                    .events
                     .iter()
-                    .all(|call| !call.contains(" write ") && !call.contains("killall"))
+                    .any(|e| e.starts_with("write ") || e.starts_with("kill ")),
+                "{:?}",
+                desk.events
             );
         }
     }
@@ -1659,6 +1674,15 @@ mod tests {
                 None,
                 None,
                 Err(format!("aterm is not installed at {usual_path} or {own}")),
+            ),
+            (
+                Some("com.example.another-app"),
+                None,
+                None,
+                Err(format!(
+                    "no aterm to pin ({usual_path} is not the requested aterm application, \
+                     nothing at {own})"
+                )),
             ),
             (
                 None,
@@ -1748,6 +1772,39 @@ mod tests {
             "file:///System/Applications/System%20Settings.app/",
             "the URL the Dock itself writes for a space"
         );
+    }
+
+    /// An `~/Applications` that is a link (to a folder on another volume) is matched by
+    /// where it leads, as [`System::running_app`] reads the running copy: the account's own
+    /// aterm is the running one and is pinned, and a pin spelled through the link's target
+    /// is the same app, so the row converges. Negative controls: comparing raw paths in
+    /// `aterm_candidates` pins `/Applications`; in `same_apps`, the target's pin reads as
+    /// drift.
+    #[test]
+    fn an_applications_folder_reached_through_a_link_still_pins_the_running_copy() {
+        let who = user("alice", 501);
+        let own = "/Users//alice/Applications/aterm.app";
+        let real = "/Volumes/Apps/alice/aterm.app";
+        let pins_at = |aterm: &str| {
+            let mut apps = usual_dock_apps();
+            apps[0].0 = aterm.to_owned();
+            dock_apps(&apps)
+        };
+        let (mut sys, desk) = desktop_of(&who, Desk::before());
+        installed_at(&sys, &who, own, DOCK_APPS[0].1);
+        sys.link("/Users//alice/Applications", "/Volumes/Apps/alice");
+        sys.running_app = Some(PathBuf::from(real));
+        let run = pass(
+            &sys,
+            selected_desktop_items(&who, &[Setting::Dock]),
+            Mode::Apply,
+        );
+        assert_eq!(run.rows[0].outcome, Outcome::Changed, "{:?}", run.rows);
+        let desk = desk.lock().unwrap();
+        let now = desk.read(DOCK, "persistent-apps").unwrap();
+        assert!(same_apps(&Fake::root(), now, &pins_at(own)), "{now:?}");
+        assert!(same_apps(&sys, &pins_at(real), &pins_at(own)));
+        assert!(!same_apps(&sys, &pins_at(real), &pins_at(DOCK_APPS[0].0)));
     }
 
     #[test]
@@ -2158,8 +2215,8 @@ mod tests {
         desktop_with(who, desk, true)
     }
 
-    /// `desk`, run by a fake acting as `who`, the Dock's three apps installed or none of
-    /// them (aterm in `~/Applications`, or a dev build).
+    /// `desk`, run by a fake acting as `who`, the Dock's three apps installed at their usual
+    /// paths or none of them (no aterm in either folder, as with only a dev build).
     fn desktop_with(who: &User, desk: Desk, dock_apps: bool) -> (Fake, Arc<Mutex<Desk>>) {
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2253,12 +2310,13 @@ mod tests {
     ];
 
     /// The owner's Mac, 2026-10-21 23:01 to 02:24: each unattended pass wrote the desktop
-    /// aterm not at `/Applications/aterm.app` (install.sh's `~/Applications`, a dev build):
-    /// the Dock cannot pin it, so its row reads Unknown, saying why, and nothing of the Dock
-    /// is backed up, written or owed, while the widget and desktop rows still apply through
-    /// the snapshot guard and relaunch each reader once. A 2026-10-22 VM run of a dev build
-    /// applied no Mac setting at all. Negative control: `?` on an item's snapshot in
-    /// `Workstation::preference_changes` refuses the whole pass.
+    /// with no aterm the Dock could pin (then any not at `/Applications/aterm.app`; now none
+    /// in `/Applications` or `~/Applications`, as with only a dev build): its row reads
+    /// Unknown, saying why, and nothing of the Dock is backed up, written or owed, while the
+    /// widget and desktop rows still apply through the snapshot guard and relaunch each
+    /// reader once. A 2026-10-22 VM run of a dev build applied no Mac setting at all.
+    /// Negative control: `?` on an item's snapshot in `Workstation::preference_changes`
+    /// refuses the whole pass.
     #[test]
     fn a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply() {
         let who = user("alice", 501);
@@ -2280,9 +2338,11 @@ mod tests {
             "{:?}",
             run.rows
         );
-        assert!(
-            run.rows[2].why.as_deref().is_some_and(
-                |why| why.contains("aterm is not installed at /Applications/aterm.app")
+        assert_eq!(
+            run.rows[2].why.as_deref(),
+            Some(
+                "aterm is not installed at /Applications/aterm.app or \
+                 /Users//alice/Applications/aterm.app; Dock left untouched"
             ),
             "{:?}",
             run.rows[2]

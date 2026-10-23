@@ -199,7 +199,7 @@ pub enum Deferred {
 
 impl Deferred {
     /// When the view is laid after all — the clause every line that names one ends on.
-    fn once(&self) -> &'static str {
+    const fn once(&self) -> &'static str {
         match self {
             Deferred::InUse(_) => "once that process has exited",
             Deferred::Unknown => "once the process table can be read",
@@ -1095,7 +1095,7 @@ impl Attached {
     /// Whether this attach changed the filesystem (what a silent pass reports).
     #[must_use]
     /// Whether this attach modified the filesystem.
-    pub fn changed(&self) -> bool {
+    pub const fn changed(&self) -> bool {
         matches!(
             self,
             Attached::Created { .. }

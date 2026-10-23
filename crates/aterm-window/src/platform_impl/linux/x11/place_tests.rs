@@ -4,23 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A position given to a window before its first map is where it appears. An X11 window manager
-//! places a new window itself unless its normal hints say its position was chosen (ICCCM
-//! 4.1.2.3, USPosition or PPosition); mutter (GNOME 46 on Xorg) mapped a window moved while
-//! unmapped at its own first-fit spot, so aterm's restored first window appeared there and
-//! jumped to its saved place a frame later (the desk audit, 2026-10-22). The test moves a hidden
-//! window, reads the hint the server holds, shows the window and, where a window manager runs,
-//! waits for it to frame the window and for the frame to stand where the window was put (the
-//! client's place on the root less `_NET_FRAME_EXTENTS`' left and top). The geometry is the
-//! server's: the window's own `outer_position` reads frame extents it caches from events, and
-//! nothing pumps this loop. With no window manager the window stays where it was moved, which
-//! the test reads once it is mapped.
-//!
-//! The negative control: without the hint in `set_outer_position`, the flag reads clear, and
-//! under mutter (with that assertion also taken out) the frame stands at mutter's spot, so the
-//! wait for its place ends the test.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! X11 tests that a position given to a window before its first map is kept via `USPosition`.
 
 use std::time::{Duration, Instant};
 

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Fx layers in a composed split, and the residency-hint seam
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §4.4).
-//!
-//! A producer authors a pane's layers pane-local; the projection places each
-//! one by its offset and clip alone ([`PaneFxPlacement`]), so its light lands
-//! at the pane's corner, stays inside the pane's box, registers the same in
-//! either space, and survives the tab strip's prepend.
+//! Fx layers in a composed split, and the residency-hint seam.
 
 use std::sync::Arc;
 
@@ -40,8 +34,6 @@ fn split_app() -> (App, WindowId, Vec<PaneRect>) {
     app.tab_strip_rows = 1;
     let sid = app.split_active_stub_tab(wid);
     app.windows.get_mut(&wid).expect("window").focused = true;
-    // No cursor: it draws over the Over slot, and the focused pane's sits on
-    // its top-left cell, where the placement law is read.
     for s in [0, sid] {
         let term = app.pool.get(s).expect("pane session").term.clone();
         crate::term_lock(&term).process(b"\x1b[?25l");
@@ -135,10 +127,6 @@ fn changed(a: &Frame, b: &Frame) -> Vec<(usize, usize)> {
 /// Grid-space twin is byte for byte the Window-space layer; installing the
 /// same layers twice installs them once; and with no pane they are
 /// withdrawn.
-///
-/// CONTROLS, rendered here: the layer placed but left unclipped lights the
-/// sibling pane; the probe installed unplaced lights another cell; a second
-/// install appended instead of replaced draws different pixels.
 #[test]
 fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
     let (mut app, wid, panes) = split_app();
@@ -171,7 +159,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
     let (cwi, chi) = (i32::try_from(cw).unwrap(), i32::try_from(ch).unwrap());
     for (i, pane) in panes.iter().enumerate() {
         let sibling = &panes[1 - i];
-        // The pane's box of cells in window pixels, from its own rect.
         let cell_box = |p: &PaneRect| {
             let x0 = pad + usize::from(p.col_off) * cw;
             let y0 = grid_top + (strip + usize::from(p.row_off)) * ch;
@@ -182,8 +169,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
         };
         let (bx, by) = cell_box(pane);
         let (sx, sy) = cell_box(sibling);
-        // Three cells past the pane on every side: past the divider into
-        // the sibling, were it not cut to the box.
         let wide = (
             -3 * cwi,
             -3 * chi,
@@ -231,7 +216,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
             "CONTROL pane {i}: unclipped, the light reaches the sibling pane"
         );
 
-        // A one-cell probe at the pane-local origin lights the pane's corner cell.
         let probe = pane_layer(12, (0, 0, cw as u16, ch as u16), FxSpace::Window);
         let corner_cell = |(x, y): &(usize, usize)| {
             (bx.start..bx.start + cw).contains(x) && (by.start..by.start + ch).contains(y)
@@ -252,7 +236,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
             "CONTROL pane {i}: unplaced, the probe lights another cell"
         );
 
-        // A retained scratch projected again installs each layer once.
         let twice = frame_with(&mut app, wid, &base, Some(pane), |dst, clip| {
             project(dst, clip, std::slice::from_ref(&window));
             project(dst, clip, std::slice::from_ref(&window));
@@ -270,7 +253,6 @@ fn a_panes_fx_layers_land_at_its_corner_and_stay_in_its_box() {
         );
     }
 
-    // With no pane (a projection whose clip is gone) the layers are withdrawn.
     let mut dst = base.clone();
     let window = pane_layer(10, (0, 0, 8, 8), FxSpace::Window);
     let clip = app.composed_cursor_effect_clip(
@@ -400,10 +382,6 @@ fn queued_hints_ride_the_next_present_through_a_dropped_one() {
 /// a composed window has its own repaint gate (`redraw_compose`), and a
 /// hint-only frame must pass it too, or the hints would wait in the queue
 /// until something else moved.
-///
-/// The negative control is a mutation (run by hand, recorded in the lane
-/// report): dropping the queued-hint clause from the compose gate proves the
-/// hint-only frame unchanged and fails this test.
 #[test]
 fn queued_hints_ride_a_split_windows_next_present() {
     use crate::scripted_redraw_fixture::scripted_app;
@@ -411,7 +389,6 @@ fn queued_hints_ride_a_split_windows_next_present() {
     let mut app = scripted_app();
     app.split_active_stub_tab(wid);
     assert!(app.windows[&wid].is_split(), "the window composes");
-    // A fresh split presents twice before its key settles.
     app.redraw_window(wid);
     app.redraw_window(wid);
     let proved = |app: &App| app.windows[&wid].redraws_proved_unchanged;

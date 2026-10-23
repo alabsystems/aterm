@@ -1,40 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A main-thread control verb is refused at once while the main thread is
-//! stalled, and only then: the heartbeat's writer against its reader.
+//! Formal model for refusing main-thread control verbs only while the main thread is stalled.
 
 use aterm_spec::derive::Model;
 
-/// The writer/reader contract behind `ERR main thread stalled <N>s; retry`, which spares a verb
-/// that needs a stuck main thread from waiting out its whole reply deadline. The writer is the
-/// watchdog's beat (`beat_into`), stamping the heartbeat's time on every root entry; the reader
-/// is `main_stall`, which a control worker asks before posting a hop to the main thread. The
-/// hop count `call_main` keeps (`control_media::Hops`) and `metrics reset` are the other actors.
-///
-/// Time is in ticks of half the bar (`Bar = 2`). `quiet` is the ground truth, ticks since the
-/// main thread last entered a root; `stamp`/`stamp_age` are what the writer left the reader.
-/// `waiting` is a worker awaiting its hop's reply, `hop` that hop while not yet taken (what
-/// `Hops` counts), `waited` how long it has waited. `root` is 0 at the idle park
-/// (`AboutToWait`), 1 at a work root, 2 at a designed freeze (startup, a dialog, the update
-/// handoff). `Answer` takes the hop and answers in the same turn; `Take` takes it and queues
-/// the reply (`settings set`, answered later by the config worker), and `Reply` is that reply.
-/// `Probe` records the reader's verdict (`refused`) and the truth (`stalled`): a work root with
-/// no beat for the bar, or the idle park with an untaken hop that has waited the bar with no
-/// beat. A taken hop whose worker awaits a queued reply waits on the config worker, not on the
-/// main thread.
-///
-/// * `NeverRefusesAMovingMainThread`: a refusal only when stalled.
-/// * `RefusesAStalledMainThread`: a stall is always refused.
-///
-/// `Buggy = 1` admits one of three defects. `MutateCensusStamp` reads the turn census's open
-/// stamp, which `metrics reset` zeroes, as the heartbeat's time, so a reset under a stall reads
-/// as a thread that never beat. `MutateHeartbeatOnly` judges a waiting hop on the heartbeat's
-/// age alone, so verbs arriving after an idle longer than the bar look stalled.
-/// `MutateCountsUntilReply` counts a hop until its reply rather than until it is taken, so a
-/// slow `settings set` makes a healthy idle thread refuse other verbs. Tier-1: aterm-gui's
-/// `main_stall_conforms_to_the_stall_refusal_model` drives the real `beat_into`,
-/// `TurnLedger::reset`, `Hops`, `take_hop` and `main_stall` in lockstep and replays all three.
+/// Returns the formal model for main-thread stall refusal.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn main_thread_stall_refusal_model() -> Model {

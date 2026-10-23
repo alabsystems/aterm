@@ -49,8 +49,6 @@ impl Host {
         self.glow.observe_print_anchor_glyph(anchor, glyph);
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
-        // The caret row's neighbours, as `EffectsPipeline::cursor_step` feeds them: the classifiers
-        // that read the row above (a soft-wrapped caret, a lifted word) need them.
         let r = usize::from(c.row);
         let rows = usize::from(self.term.rows());
         if r > 0 {
@@ -449,8 +447,6 @@ fn a_two_or_three_row_motion_with_a_press_in_flight_is_judged_at_once() {
                     h.key(*b);
                 }
                 if old_print {
-                    // Print at the future landing, then return to the unchanged
-                    // composer in a separate frame before the key is pressed.
                     h.program(format!("\x1b[{};29H.\x1b[21;11H", to_row + 1).as_bytes());
                 }
                 h.now += Duration::from_millis(90);
@@ -619,7 +615,6 @@ fn a_foreign_row_park_s_return_is_paid_by_every_press_in_flight() {
                 .note_typed_expected(h.now, 1, false, TypedClass::Glyph, char::from(key));
         }
     };
-    // (keys pressed before the park, keys pressed during it, the return's text)
     let cases: [(&[u8], &[u8], &[u8]); 3] = [
         (b"i", b"j", b"ij"),
         (b"ijk", b"", b"ijkl"),

@@ -104,7 +104,7 @@ impl Service {
 
     /// The platform's supervisor.
     #[must_use]
-    pub fn default_here() -> Self {
+    pub const fn default_here() -> Self {
         if cfg!(target_os = "macos") {
             Service::Launchd
         } else if cfg!(target_os = "linux") {
@@ -114,7 +114,7 @@ impl Service {
         }
     }
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Service::Launchd => "launchd",
             Service::Systemd => "systemd",
@@ -1598,7 +1598,7 @@ pub(crate) struct Out {
 }
 
 impl Out {
-    pub(crate) fn new(dry_run: bool) -> Self {
+    pub(crate) const fn new(dry_run: bool) -> Self {
         Self {
             dry_run,
             changed: 0,

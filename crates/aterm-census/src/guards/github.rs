@@ -9,9 +9,10 @@
 //!   `crates/agh/src/wire/door.rs`, so no other code of agh can build it past the
 //!   Router; elsewhere, a Bearer header beside a GitHub API origin is a credential
 //!   sent around agh.
-//! * `gh-spawn`: a `gh` child process, the lanes agh replaces milestone by
-//!   milestone; each file that still spawns one carries a cap the migration
-//!   lowers.
+//! * `gh-spawn`: a `gh` child process. None is left in shipped code: agh replaced
+//!   the reads, and the release's and the producer's writes are REST through curl
+//!   (`aterm_update_core::github_rest`, init-system S15); the one cap is agh's tape
+//!   door const, which spawns nothing.
 //! * `agh-fx`: agh's clocks, sleeps, sockets and round trips cross its one
 //!   effect seam (`crates/agh/src/fx/`), so a tape holds every one of them and a
 //!   replay never answers one from the real world; aterm-http's client is built
@@ -47,8 +48,9 @@ pub(super) const GITHUB_AUTH_DOOR: Rule = Rule {
 
 pub(super) const GH_SPAWN: Rule = Rule {
     id: "gh-spawn",
-    why: "a `gh` child process outside the caps the agh migration lowers: GitHub is read \
-          through agh (`aterm agh`), whose identity routing `gh` does not have",
+    why: "a `gh` child process: GitHub is read through agh (`aterm agh`) and written through \
+          the REST lane (`aterm_update_core::github_rest`), and `gh` has neither's identity \
+          routing",
     scope: &[],
     check: gh_spawn,
 };
@@ -79,31 +81,20 @@ const GITHUB_API_HOSTS: &[&str] = &["api.github.com", "uploads.github.com"];
 /// The files outside agh that still build a GitHub credential header, each with its cap and
 /// why.
 const AUTH_HEADER_CAPS: &[(&str, usize)] = &[
-    // The curl upload lane's header file; M3 deletes it.
-    ("crates/aterm-release/src/publish.rs", 1),
+    // The REST lane the release and the producer write through (init-system S15): the one
+    // header line `Token::header_line` builds, written to curl's stdin, never its argv.
+    ("crates/aterm-update-core/src/github_rest.rs", 1),
     // The machines controller's REST door for its machine user's SSH-key writes, which agh
     // M1's GET-only transport refuses (init-system S14); agh design §16.4 step 5a
     // (`users().keys()`) moves them into agh and deletes it.
     ("crates/aterm-machines/src/port/github_rest.rs", 1),
 ];
 
-/// The files that still spawn `gh`, each with its cap (design §16.8's table, derived again
-/// from a `verify census` run on M1's tree).
+/// The files whose shipped lines spell a `gh` spawn, each with its cap: none spawns one since
+/// init-system S15 (design §16.8's table, emptied by the REST lane).
 const GH_SPAWN_CAPS: &[(&str, usize)] = &[
     // `DOOR_GH`, the tape door named `gh`: a const the rule's shape reads, which spawns nothing.
     ("crates/agh/src/fx/mod.rs", 1),
-    // `GhCli`; M2's swap deletes it.
-    ("crates/atpkg-publish/src/host/gh.rs", 1),
-    // The channel reads; M3.
-    ("crates/aterm-release/src/gates.rs", 2),
-    // M3.
-    ("crates/aterm-release/src/provision.rs", 1),
-    // M3.
-    ("crates/aterm-release/src/publish.rs", 3),
-    // M3.
-    ("crates/aterm-release/src/release_steps.rs", 3),
-    // M3.
-    ("crates/aterm-release/src/site/world.rs", 1),
 ];
 
 /// Each clock read, sleep or round trip agh makes only through `Fx`, its shape, and what it is.
@@ -574,24 +565,30 @@ mod tests {
     }
 
     #[test]
-    fn the_publish_lane_holds_one_bearer_header_and_no_more() {
+    fn the_rest_lane_holds_one_bearer_header_and_no_more() {
         let origin = "const API: &str = \"https://uploads.github.com\";\n";
         let one = format!("{origin}let h = \"{HEADER}: token x\";\n");
         let two = format!("{one}let g = \"{HEADER}: token y\";\n");
-        let publish = "crates/aterm-release/src/publish.rs";
+        let lane = "crates/aterm-update-core/src/github_rest.rs";
         assert_eq!(
-            spots(&run(&GITHUB_AUTH_DOOR, &[(publish, &one)])),
+            spots(&run(&GITHUB_AUTH_DOOR, &[(lane, &one)])),
             Vec::<String>::new()
         );
         assert_eq!(
-            spots(&run(&GITHUB_AUTH_DOOR, &[(publish, &two)])),
-            [format!("{publish}:3")]
+            spots(&run(&GITHUB_AUTH_DOOR, &[(lane, &two)])),
+            [format!("{lane}:3")]
+        );
+        // The release's own file lost its cap with its curl header file (S15): one is found.
+        let publish = "crates/aterm-release/src/publish.rs";
+        assert_eq!(
+            spots(&run(&GITHUB_AUTH_DOOR, &[(publish, &one)])),
+            [format!("{publish}:2")]
         );
     }
 
     #[test]
     fn a_gh_child_is_found_past_its_files_cap() {
-        let gh_rs = "crates/atpkg-publish/src/host/gh.rs";
+        let gh_rs = "crates/agh/src/fx/mod.rs";
         let found = run(
             &GH_SPAWN,
             &[
@@ -605,12 +602,24 @@ mod tests {
                     gh_rs,
                     "let c = command(\"gh\");\nlet d = command(\"gh\");\n",
                 ),
+                // The producer's and the release's gh lanes are gone (S15), and their caps
+                // with them: one spawn there is found.
+                (
+                    "crates/atpkg-publish/src/host/gh.rs",
+                    "let c = command(\"gh\");\n",
+                ),
+                (
+                    "crates/aterm-release/src/publish.rs",
+                    "let c = command(\"gh\");\n",
+                ),
             ],
         );
         assert_eq!(
             spots(&found),
             [
                 format!("{gh_rs}:2"),
+                "crates/aterm-release/src/publish.rs:1".to_string(),
+                "crates/atpkg-publish/src/host/gh.rs:1".to_string(),
                 "crates/x/src/spawn.rs:1".to_string(),
                 "crates/x/src/spawn.rs:2".to_string(),
                 "crates/x/src/spawn.rs:3".to_string(),
@@ -624,10 +633,7 @@ mod tests {
             &GH_SPAWN,
             &[
                 ("crates/x/src/assert.rs", "assert_eq!(x, \"gh\");\n"),
-                (
-                    "crates/atpkg-publish/src/host/gh.rs",
-                    "let c = command(\"gh\");\n",
-                ),
+                ("crates/agh/src/fx/mod.rs", "let c = command(\"gh\");\n"),
                 ("crates/x/tests/t.rs", "let c = command(\"gh\");\n"),
                 (
                     "crates/aterm-census/src/guards/x.rs",

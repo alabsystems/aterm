@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A HEADLESS INSTANCE'S `SIGTERM` IS A QUIT, against a real `aterm
-//! --headless`. The 2026-10-16 real-login run stopped its two instances with
-//! `kill -TERM <pid>` (how a harness or a person stops one) and found no quit
-//! path ran: the workers' task files stayed under `<state>/tasks/` (the spawn
-//! help says a quit removes them), the crash markers stayed, and the
-//! `subscribe @* events,sessions` watchers got no `EVENT * bye quit` and
-//! waited out their 30 s successor window. Now the signal runs the quit the
-//! Quit verb runs (`owned_endpoint::arm_orderly_quit`), and the process still
-//! dies of the signal, so its parent reads the status it always did.
-//!
-//! NEGATIVE CONTROL: the same world ended by `SIGKILL`, which no process can
-//! act on, leaves the task file and the crash marker where they were — so the
-//! assertions about their removal are about the quit, not about files that
-//! were never there.
-//!
-//! Every wait is a one-minute hang detector. A machine that refuses the
-//! headless instance is COULD NOT RUN ([`headless_boot::boot_with`]).
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs`,
-//! the state seam (`ATERM_STATE_HOME`), the window harness on with the
-//! stand-in `claude` (the only one on the instance's PATH, its login shell's
-//! included: [`headless_boot::boot_with`] proves it) as its worker.
+//! A HEADLESS INSTANCE'S `SIGTERM` IS A QUIT, against a real `aterm --headless`.
 
 #![cfg(unix)]
 
@@ -69,8 +49,6 @@ fn boot(tag: &str) -> Instance {
                     "PATH",
                     format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()),
                 )
-                // Development seams (a debug build): the state root, so the
-                // task file and the crash marker are where this test looks.
                 .env("ATERM_STATE_HOME", tmp.join("state"))
                 .env("ATERM_LOG", "info");
         },
@@ -87,7 +65,6 @@ fn spawn_worker(inst: &Instance, manager: &str) -> PathBuf {
     cmd.env("ATERM_PARENT_SESSION_ID", manager)
         .current_dir(inst.tmp.join("work"))
         .stdin(Stdio::piped());
-    // Asked again while the instance has not yet accepted it, or answers it busy: nothing was sent.
     let out = headless_boot::until_served(|| {
         let mut child = cmd.spawn().expect("spawn aterm ctl");
         child
@@ -173,8 +150,6 @@ fn sigterm_quits_a_headless_instance_as_the_quit_verb_does() {
     let (_, manager) = boot_session(&inst);
     let task_file = spawn_worker(&inst, &manager);
     assert!(!markers(&inst).is_empty(), "the crash marker is armed");
-    // A watcher as the run's: the client's own `subscribe`, its pushes on
-    // stdout, attached before the signal.
     let watcher = headless_boot::subscribed(&inst, &["@*", "events,sessions"]);
     until_watched(&inst, &manager, 1);
 

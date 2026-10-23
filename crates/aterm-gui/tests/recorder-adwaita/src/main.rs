@@ -1,35 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The client frame's oracle recorder (L-HEADER-LW7 of
-//! docs/AUDIT-third-party-2026-10-15.md, lw5-button-layout-shadow), built
-//! outside the aterm workspace (see Cargo.toml): sctk-adwaita 0.10.1's own
-//! `buttons.rs`, `config.rs`, `theme.rs` and `shadow.rs` (MIT, Copyright (c)
-//! 2022 Bartłomiej Maryńczak, copied from the registry by build.rs) answer,
-//! and aterm-gui's `client_frame` is held to the committed rows.
-//!
-//!   layout   for a `button-layout` value (or none: no portal), what
-//!            `config::get_button_layout_config` read through `dbus-send`
-//!            and where `Buttons` put each button once the compositor's
-//!            capabilities (`update_buttons(maximize, minimize)`) filtered
-//!            them, read back by `find_button` across an 800 px header
-//!   shadow   the alpha `Shadow::draw` paints across each border part (the
-//!            parts sctk-adwaita placed outside the window), at scale 1 and
-//!            2, focused and not, along the part's middle line from the
-//!            window outward
-//!   size     the frame's sizes in logical px (theme.rs, shadow.rs)
-//!
-//! `record planes` prints the other recording instead, for aterm-window's
-//! carved shadow (crates/aterm-window/tests/recorded/
-//! sctk-adwaita-0.10.1-shadow.tsv):
-//!
-//!   plane    every pixel `Shadow::draw` paints into one border part's
-//!            buffer (premultiplied RGBA, as tiny-skia lays it out), as an
-//!            FNV-1a 64 of the bytes, beside its alpha summed and the
-//!            buffer's size, for a window's size, scale and focus
-//!
-//! A row is tab-separated: its kind, then `name=value` fields in a fixed
-//! order; `-` for none.
+//! Oracle recorder for `sctk-adwaita` 0.10.1 button layouts, shadow profiles, and border planes.
 
 #![allow(dead_code, unused_imports, mismatched_lifetime_syntaxes, clippy::all)]
 
@@ -85,8 +57,7 @@ mod smithay_client_toolkit {
     }
 }
 
-/// pointer.rs's `Location`, as it is defined there (pointer.rs itself
-/// needs the frame's whole state machine).
+/// Pointer location within the client-side decoration frame.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum Location {
     #[default]
@@ -154,7 +125,6 @@ fn read_config(value: Option<&str>, fake_dir: &std::path::Path) -> Option<(Strin
     let path = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs = vec![fake_dir.to_path_buf()];
     dirs.extend(std::env::split_paths(&path));
-    // The child `config.rs` spawns inherits both (the recorder is one thread).
     std::env::set_var("PATH", std::env::join_paths(dirs).expect("PATH"));
     match value {
         Some(v) => std::env::set_var("RECORDER_BUTTON_LAYOUT", v),

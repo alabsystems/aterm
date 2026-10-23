@@ -1132,6 +1132,53 @@ fn an_uninstall_quits_the_caffeine_mug_and_removes_its_files() {
         );
         drop(held);
     }
+
+    // A successful sudo preflight says nothing about a later helper-specific refusal.
+    // Drive the actual caller's bundle removal with injected command results only.
+    let a = Account::new("caffeine-mediated-help-refused");
+    let app = a.home().join("Applications/aterm.app");
+    bundle(&app, None);
+    let aterm = app.join("Contents/MacOS/aterm");
+    exe(&aterm, "#!/bin/sh\nexit 99\n");
+    let image = std::fs::read(&aterm).expect("the helper");
+    let support = a.home().join("Library/Application Support/aterm");
+    let state = support.join("caffeine.state");
+    write(&state, "mode=on\n");
+    let preflight = as_account_argv(501, Path::new(TRUE), &[]);
+    let help = as_account_argv(501, &aterm, &["help", "caffeine"]);
+    let mut calls = Vec::new();
+    let mut failed = Vec::new();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let ok =
+        self_uninstall_with_caffeine(&a.places, None, false, &mut out, &mut err, |s, p, dirs| {
+            failed = sweep_caffeine_with(
+                s,
+                p,
+                dirs,
+                || Some((501, 20)),
+                |program, args| {
+                    assert_eq!(program, Path::new(SUDO));
+                    calls.push(args.to_vec());
+                    if args == preflight.as_slice() {
+                        0
+                    } else {
+                        assert_eq!(args, help.as_slice());
+                        1
+                    }
+                },
+            );
+            failed.clone()
+        });
+    assert_eq!(calls, [preflight, help]);
+    assert_eq!(
+        failed.as_slice(),
+        std::slice::from_ref(&app),
+        "the unconfirmed helper needs its app"
+    );
+    assert!(!ok, "a partial sweep reports what it kept");
+    assert!(app.is_dir(), "the actual caller kept the helper's bundle");
+    assert_eq!(std::fs::read(aterm).expect("kept helper"), image);
+    assert_eq!(std::fs::read_to_string(state).expect("state"), "mode=on\n");
 }
 
 /// A root sweep of an account's own home asks the Caffeine helpers as that account (sudo

@@ -28,7 +28,7 @@ pub enum Kind {
 
 impl Kind {
     #[must_use]
-    pub fn word(self) -> &'static str {
+    pub const fn word(self) -> &'static str {
         match self {
             Kind::Formula => "formula",
             Kind::Cask => "cask",

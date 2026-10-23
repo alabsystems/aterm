@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The macOS `sudo` askpass password sheet (`docs/DESIGN-sudo-askpass-2026-10-15.md`
-//! §3.5), modelled on the pastejacking sheet. A window-attached `NSAlert` with
-//! an `NSSecureTextField`, raised only on the asking session's already-active
-//! tab — it never selects a tab or makes a window key. The owner's keystrokes
-//! go to AppKit's secure field, never aterm's input seam; the password is read
-//! once, boxed in a scrubbed `Secret`, and sent back to the waiting helper.
+//! macOS `sudo` askpass password sheet attached to the asking session's active window.
 
 use std::sync::mpsc::Sender;
 use std::time::Instant;
@@ -17,16 +12,12 @@ use crate::appkit::{self, MainThread};
 use crate::askpass::AskpassAnswer;
 use crate::{App, Wake};
 
-/// How many askpass sheets are open process-wide. `hwkey` refuses while this is
-/// nonzero, so a synthesized key event cannot reach the secure field.
 /// Whether any askpass sheet is open (read by `hwkey`).
 pub(crate) fn sheets_open() -> bool {
     crate::askpass::PROMPT_INPUT.with_post(|| ()).is_err()
 }
 
-/// One outstanding password sheet: its id, the session it is about, the
-/// retained secure field, the alert panel (held so a close can end it), and the
-/// channel back to the waiting helper. Dropping it lowers the open count.
+/// One outstanding password sheet and the channel back to the waiting helper.
 pub(crate) struct AskpassSheet {
     pub id: u64,
     ticket: std::sync::Arc<crate::askpass::AskpassTicket>,
@@ -42,9 +33,6 @@ pub(crate) struct AskpassSheet {
 
 impl Drop for AskpassSheet {
     fn drop(&mut self) {
-        // The input fence is the last field dropped, after the secure field is
-        // cleared and its sheet has ended. An answered sheet has no parent, so
-        // completion and cancellation cannot end it twice.
         unsafe {
             if let Some(empty) = appkit::nsstring("") {
                 appkit::send_v_id(self.field.id(), sel!(setStringValue:), empty.id());
@@ -62,9 +50,7 @@ impl Drop for AskpassSheet {
 }
 
 impl App {
-    /// Attribute, gate, and raise the sheet — or reply a refusal on the
-    /// request's own channel. Never steals focus: refuses `not-frontmost`
-    /// unless the session's tab is already the active one.
+    /// Attribute, gate, and raise the askpass sheet, or reply with a refusal.
     pub(crate) fn present_askpass_sheet(&mut self, request: crate::askpass::AskpassRequest) {
         let crate::askpass::AskpassRequest {
             ticket,
@@ -80,8 +66,6 @@ impl App {
             return;
         }
 
-        // Attribute to one of THIS instance's local sessions, by kernel
-        // ancestry from sudo's parent. The env is never consulted.
         let sessions: Vec<(u64, i32)> = self.pool.iter().map(|s| (s.id, s.pid)).collect();
         let session = crate::consent_observer::session_of_pid(
             attribute_from,
@@ -94,9 +78,6 @@ impl App {
             return;
         };
 
-        // Resolve the hosting window first: the decline backoff is keyed per
-        // WINDOW (design O5), so opening a new tab (a new session) cannot escape
-        // the quiet window.
         let Some(wid) = self.window_of_session(session) else {
             let _ = reply.send(AskpassAnswer::Refused(
                 "no window hosts that session".into(),
@@ -123,8 +104,6 @@ impl App {
             ));
             return;
         }
-        // The secrets vault's join sheet gives the window up: a second sheet would queue
-        // unseen behind it until sudo's deadline. The join is asked again after.
         self.withdraw_secrets_sheet_window(wid);
         self.build_askpass_sheet(wid, session, &command, &invoker, ticket, reply);
     }
@@ -149,8 +128,6 @@ impl App {
         let Some(proxy) = self.proxy.clone() else {
             return refuse(reply, "no event loop");
         };
-        // `-window` is +0 and nil for a view not yet in a window; retain a real
-        // one for the sheet's lifetime.
         let ns_window = self
             .windows
             .get(&wid)
@@ -184,7 +161,6 @@ impl App {
             return refuse(reply, "could not build the sheet text");
         };
 
-        // The completion handler posts the answer id; the App reads the field.
         let completion = move |response: isize| {
             let _ = proxy.send_event(Wake::AskpassAnswered {
                 id,
@@ -198,7 +174,6 @@ impl App {
             return refuse(reply, "could not build the sheet handler");
         };
 
-        // `mtm` is the main-thread witness the whole path stands on.
         let _: MainThread = mtm;
 
         // SAFETY: `+[NSAlert new]` is +1, adopted by `Obj::from_owned`.
@@ -234,10 +209,6 @@ impl App {
             if !ticket.is_live(Instant::now()) {
                 return Err("request expired or withdrawn");
             }
-            // Reservation above waits for an admitted event pair to finish and
-            // refuses every later pair. Remove already queued key events before
-            // the secure field can become first responder. This only reads the
-            // application's existing singleton after a real window was proved.
             let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
             if past.is_null() {
                 return Err("could not establish the key-queue deadline");
@@ -245,9 +216,6 @@ impl App {
             let mode = Id::from_ptr(aterm_objc::cf::kCFRunLoopDefaultMode.cast_mut().cast());
             let next: unsafe extern "C-unwind" fn(Id, Sel, usize, Id, Id, aterm_objc::Bool) -> Id =
                 aterm_objc::checked_msg();
-            // Unlike discardEvents(..., nil), nextEvent's nil-empty result and
-            // expired deadline are documented. Refuse an overloaded queue
-            // instead of attaching a field before all earlier keys are gone.
             let mut drained = false;
             for _ in 0..16_384 {
                 if next(
@@ -273,7 +241,6 @@ impl App {
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
             appkit::send_v_id(alert.id(), sel!(setAccessoryView:), field.id());
-            // First button added is the default (Return).
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), allow.id());
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), cancel.id());
             let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
@@ -294,8 +261,6 @@ impl App {
                 ns_window.id(),
                 handler.as_block_ptr(),
             );
-            // NSAlert can auto-focus its accessory. Clear that editable focus;
-            // the monitor discards keys until the owner clicks this field.
             let _ = appkit::send_bool_id(panel.id(), sel!(makeFirstResponder:), Id::NIL);
             Ok((panel, keys))
         });
@@ -318,8 +283,7 @@ impl App {
         });
     }
 
-    /// The sheet was answered: read the secure field (once), reply with the
-    /// boxed secret or a cancel, update the backoff, and clear the field.
+    /// Read the answered secure field once, reply with the secret or cancel, and update backoff.
     pub(crate) fn answer_askpass_sheet(&mut self, id: u64, proceed: bool) {
         if self.askpass_sheet.as_ref().is_none_or(|s| s.id != id) {
             return;
@@ -350,8 +314,6 @@ impl App {
             let _ = sheet.reply.send(AskpassAnswer::Cancel);
             self.askpass_backoff.on_cancel(sheet.window.0, now);
         }
-        // Drop clears the field and ends any remaining native sheet before
-        // releasing synthetic input admission.
     }
 
     pub(crate) fn withdraw_askpass_sheet(&mut self, id: u64) {
@@ -373,9 +335,7 @@ impl App {
     }
 }
 
-/// Extract directly into guarded UTF-16 and UTF-8 buffers. No ordinary Rust
-/// String or Vec ever owns the field's plaintext, including malformed input.
-/// The secrets vault's join sheet reads its password the same way.
+/// Extract the secure field's text directly into guarded UTF-16 and UTF-8 buffers.
 pub(crate) fn read_secure_field(field: &Obj) -> Option<aterm_uds::sudo::Secret> {
     // SAFETY: the caller owns this retained NSSecureTextField on the main
     // thread. Its NSString is borrowed through this synchronous read; the exact

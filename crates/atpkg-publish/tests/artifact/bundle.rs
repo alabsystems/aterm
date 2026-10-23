@@ -154,7 +154,6 @@ fn ino(p: &Path) -> (u64, u64) {
 
 #[test]
 fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
-    crate::shared::need_compressor();
     let w = world("bundle-trust");
     let t = tools();
     let out = bundle::pack_bundle_with(&w.ctx, &w.request(), &t).expect("packed");
@@ -213,7 +212,6 @@ fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
 
 #[test]
 fn relative_output_paths_keep_the_staged_toolchain_reachable_from_the_hello_crate() {
-    crate::shared::need_compressor();
     let w = world("bundle-relative-out");
     // A path relative to this process's folder that reaches a private scratch
     // folder (`..` up to the root, then the scratch's whole path): relative, as the
@@ -310,7 +308,6 @@ fn a_refused_compiler_or_closure_stops_the_pack_before_relocation() {
 
 #[test]
 fn retired_entrypoints_leave_the_stage_and_never_the_seal() {
-    crate::shared::need_compressor();
     let w = world("bundle-retired");
     for name in RETIRED_BINS {
         put_exe(&w.seal.join("bin").join(name), &native(name));
@@ -811,7 +808,6 @@ fn trust_mc(w: &World) -> (BundleRequest, PathBuf) {
 
 #[test]
 fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() {
-    crate::shared::need_compressor();
     let w = world("bundle-trust-mc");
     let (req, hs) = trust_mc(&w);
     let mut t = FakeTools::new(SEAL_TRIPLE);
@@ -902,7 +898,6 @@ fn a_store_built_hello_sysroot_that_cannot_be_leased_refuses_the_pack() {
 
 #[test]
 fn skipping_trust_mcs_hello_keeps_its_admission_sysroot_in_either_flag_order() {
-    crate::shared::need_compressor();
     let w = world("bundle-trust-mc-skip");
     let (request, hs) = trust_mc(&w);
     for flags in [
@@ -965,7 +960,6 @@ fn skipping_trust_mcs_hello_keeps_its_admission_sysroot_in_either_flag_order() {
 
 #[test]
 fn the_version_and_target_are_derived_from_what_is_packed() {
-    crate::shared::need_compressor();
     let w = world("bundle-derive");
     let t = tools();
     assert_eq!(
@@ -1008,7 +1002,6 @@ fn the_version_and_target_are_derived_from_what_is_packed() {
 
 #[test]
 fn a_dirty_checkout_is_refused_or_stamped_and_never_uploaded() {
-    crate::shared::need_compressor();
     let w = world("bundle-dirty");
     put(&w.src.join("uncommitted"), b"change");
     let err = bundle::pack_bundle_with(&w.ctx, &w.request(), &tools()).expect_err("dirty");
@@ -1042,7 +1035,6 @@ fn an_upload_that_cannot_sign_is_refused_before_the_stage() {
 
 #[test]
 fn a_signed_upload_is_verified_by_the_client_and_staged() {
-    crate::shared::need_compressor();
     let w = world("bundle-upload");
     let mut req = w.request();
     req.signing = Signing::MachineKey;
@@ -1089,7 +1081,6 @@ fn live_switch(w: &World) {
 /// the checker.
 #[test]
 fn a_seed_mint_seal_ships_its_lineage_stamped_over_the_shipped_bytes() {
-    crate::shared::need_compressor();
     let w = world("bundle-lineage");
     live_switch(&w);
     seed_mint(&w.seal, SEAL_COMMIT);
@@ -1149,7 +1140,6 @@ fn a_seed_mint_seal_ships_its_lineage_stamped_over_the_shipped_bytes() {
 
 #[test]
 fn a_trust_bundles_hello_compiles_against_its_staged_root() {
-    crate::shared::need_compressor();
     let w = world("bundle-hello-staged");
     let mut req = w.request();
     req.hello = HelloGate::default();
@@ -1185,7 +1175,6 @@ fn a_trust_bundles_hello_compiles_against_its_staged_root() {
 /// `store/trust/current`) still stages, freezes, stamps and records the admitted build.
 #[test]
 fn a_sysroot_link_repointed_after_admission_still_packs_the_admitted_build() {
-    crate::shared::need_compressor();
     let w = world("bundle-repoint");
     live_switch(&w);
     seed_mint(&w.seal, SEAL_COMMIT);
@@ -1225,7 +1214,6 @@ fn a_sysroot_link_repointed_after_admission_still_packs_the_admitted_build() {
 
 #[test]
 fn the_switch_is_read_from_the_trust_repo_the_context_names() {
-    crate::shared::need_compressor();
     let w = world("bundle-trust-repo");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
     std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");

@@ -1413,6 +1413,32 @@ fn served_on_loopback_it_answers_gemini_as_the_modes_say() {
         key.contains("PerDay") && !key.contains("QUOTA_EXHAUSTED"),
         "the control: {key}"
     );
+    // the account's Pro bucket (`code_assist_pro`): the router's side request
+    // routed to the Pro model while it stands, the turn Code Assist's 429
+    let side_answer = |p: &str| -> String {
+        let side = post("/v1beta/models/gemini-3.1-flash-lite:generateContent", p);
+        assert_eq!(side.status(), 200);
+        let answer = J::parse(&String::from_utf8_lossy(side.body())).unwrap();
+        parts(&answer)[0]
+            .get("text")
+            .and_then(J::as_str)
+            .unwrap()
+            .to_string()
+    };
+    let classifier = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"responseJsonSchema":{"type":"object","properties":{"reasoning":{"type":"string"},"model_choice":{"type":"string","enum":["flash","pro"]}},"required":["reasoning","model_choice"]}}}"#;
+    control(&port, &format!("/__mode?m=limit:code_assist_pro:{future}")).unwrap();
+    assert_eq!(side_answer(router), r#"{"complexity_score":100}"#);
+    assert!(side_answer(classifier).contains(r#""model_choice":"pro""#));
+    let bucket = String::from_utf8_lossy(post(stream, turn).body()).into_owned();
+    assert!(bucket.contains("\"QUOTA_EXHAUSTED\""), "{bucket}");
+    // NEGATIVE CONTROLS: the account's own limit routes to flash, and so
+    // does the bucket's once its reset has passed
+    control(&port, &format!("/__mode?m=limit:code_assist:{future}")).unwrap();
+    assert_eq!(side_answer(router), r#"{"complexity_score":10}"#);
+    assert!(side_answer(classifier).contains(r#""model_choice":"flash""#));
+    let past = crate::util::now_secs() - 1;
+    control(&port, &format!("/__mode?m=limit:code_assist_pro:{past}")).unwrap();
+    assert_eq!(side_answer(router), r#"{"complexity_score":10}"#);
 
     std::fs::write(
         &tool_file,

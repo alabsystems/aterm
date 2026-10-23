@@ -1,28 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! `oracle-052`: crates/aterm-windows-sys-052, the windows-sys 0.52 facade
-//! ring reads on aarch64 Windows (WB.1, docs/AUDIT-third-party-2026-10-15.md),
-//! against the registry windows-sys 0.52.0, on both Windows triples. Its
-//! reference workspace is the crate's `tests/oracle/`: no patch table, so its
-//! `windows-sys = "=0.52.0"` reaches the registry, and `under-test/` names the
-//! facade's own `src/lib.rs` under a second package name.
-//!
-//! Per triple:
-//! 1. conformance: `cargo check` of the conformance crate, whose const-asserts
-//!    hold the facade's types, sizes, alignments, constant and fn signature to
-//!    the registry crate's;
-//! 2. import: a call through each side (`probe-*`) references the same
-//!    symbols, each resolved from the same DLLs: the facade's rlib bundles its
-//!    raw-dylib import members, and upstream's build script names the
-//!    directory of `windows.0.52.0.lib`;
-//! 3. NEGATIVE CONTROLS: each `plant-*` feature swaps the facade for a copy
-//!    with one planted mismatch, which conformance (an error from the
-//!    conformance crate's own compiler unit) or the import comparison must
-//!    catch.
-//!
-//! STOCK EXCEPTION as `oracle`: stock Cargo/RUSTC with the Windows std;
-//! nothing is linked or run. A build or inspection that fails decides
-//! nothing, and is never a caught plant.
+//! `oracle-052`.
 use crate::oracle::{
     FROZEN, Runner, System, artifacts, nm, referenced, rejected_by, required, tail, words,
 };
@@ -250,8 +228,7 @@ fn show(imports: &Imports) -> String {
         .join(", ")
 }
 
-/// The oracle over the reference workspace in `root`, building in `target`:
-/// exit 0 pass, 1 a finding, 3 could not run.
+/// The oracle over the reference workspace in `root`, building in `target`.
 pub fn gate(root: &Path, tools: &Tools, target: &Path) -> Result<u8> {
     let mut runner = System;
     let ws = root.join(WORKSPACE);
@@ -260,7 +237,6 @@ pub fn gate(root: &Path, tools: &Tools, target: &Path) -> Result<u8> {
         for triple in TRIPLES {
             println!("== {triple} (STOCK EXCEPTION: Windows std, compile/import oracle only)");
             if !conforms(&mut runner, tools, &ws, target, triple, None)? {
-                // Every probe compiles the same asserts, so nothing more builds.
                 findings.push(format!(
                     "{triple} conformance: the facade differs from windows-sys 0.52.0 (its \
                      import and plants were not judged)"

@@ -278,7 +278,7 @@ impl Buffer {
 }
 
 /// The lines of `text`, through `starts` when it indexes them.
-fn lines_of<'a>(text: &'a str, starts: Option<&'a [usize]>) -> EditorLines<'a> {
+const fn lines_of<'a>(text: &'a str, starts: Option<&'a [usize]>) -> EditorLines<'a> {
     match starts {
         Some(starts) => EditorLines::indexed(text, starts),
         None => EditorLines::scanning(text),
@@ -349,7 +349,7 @@ pub(crate) fn host_error(path: &Path, error: &DocumentHostError) -> String {
 }
 
 /// Why the buffer's store refused a step on the buffer, in a person's words.
-fn store_words(error: &DocumentError) -> &'static str {
+const fn store_words(error: &DocumentError) -> &'static str {
     match error {
         DocumentError::UnknownDocument | DocumentError::UnknownView => "the buffer is gone",
         DocumentError::Closing | DocumentError::CloseNotReady => "the buffer is closing",
@@ -361,7 +361,7 @@ fn store_words(error: &DocumentError) -> &'static str {
 }
 
 /// What an engine error says in the echo area.
-fn error_text(error: &EditorError) -> &'static str {
+const fn error_text(error: &EditorError) -> &'static str {
     match error {
         EditorError::NothingToUndo => "No further undo information",
         EditorError::NothingToRedo => "No further redo information",

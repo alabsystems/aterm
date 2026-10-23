@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FIFO lifeline descriptor watched by `aterm --headless` so it exits with its launcher.
+//! FIFO lifeline descriptor watched by `aterm --headless` and `aterm link broker` so each exits with its launcher.
 
 #![cfg(unix)]
 
@@ -21,7 +21,6 @@ pub const STDIN: RawFd = 0;
 
 /// Command builder capable of wiring the lifeline reader to stdin and appending [`FLAG`].
 pub trait LifelineCommand {
-    /// Place `far` at stdin and append the matching `--lifeline-fd 0` arguments.
     /// Place `far` at stdin and append the matching `--lifeline-fd 0` arguments.
     fn set_lifeline(&mut self, far: File);
 }
@@ -243,15 +242,62 @@ pub fn wait_for_cut(lifeline: OwnedFd) -> Cut {
 /// [`wait_for_cut`]'s loop over any reader, so each answer a read can give is
 /// driven deterministically in a test.
 fn read_until_cut(mut lifeline: impl io::Read, gap: Duration) -> Cut {
+    loop {
+        if let Some(cut) = look(&mut lifeline) {
+            return cut;
+        }
+        std::thread::sleep(gap);
+    }
+}
+
+/// One look at a lifeline: read what is there, discarding bytes, until a read
+/// would block (`None`: the launcher still holds it), answers end-of-file, or
+/// fails.
+fn look(mut lifeline: impl io::Read) -> Option<Cut> {
     let mut buf = [0_u8; 64];
     loop {
         match lifeline.read(&mut buf) {
-            Ok(0) => return Cut::Closed,
+            Ok(0) => return Some(Cut::Closed),
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(gap),
-            Err(e) => return Cut::Failed(e),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+            Err(e) => return Some(Cut::Failed(e)),
         }
+    }
+}
+
+/// A lifeline read at the wakes of a loop that already wakes on its own (the
+/// broker's poll), so watching it costs no thread: its descriptor is made
+/// non-blocking once, and each [`OnWake::cut`] reads what is there and returns.
+/// A cut is seen at the first wake after it, never sooner.
+#[derive(Debug)]
+pub struct OnWake(File);
+
+impl OnWake {
+    /// Watch `lifeline` (from [`adopt`]) at each wake.
+    ///
+    /// # Errors
+    /// Its status flags could not be read or set.
+    pub fn new(lifeline: OwnedFd) -> io::Result<Self> {
+        let file = File::from(lifeline);
+        let fd = file.as_raw_fd();
+        // SAFETY: `F_GETFL` only reads the status-flag word of the descriptor
+        // `file` keeps open.
+        let flags = unsafe { fcntl(fd, F_GETFL) };
+        if flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above; the third argument is the new status-flag word.
+        if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(file))
+    }
+
+    /// How the lifeline ended, once it has: `None` while the launcher holds it.
+    /// Never blocks.
+    pub fn cut(&mut self) -> Option<Cut> {
+        look(&mut self.0)
     }
 }
 
@@ -270,8 +316,14 @@ type Mode = u32;
 
 /// `fcntl(2)`'s descriptor-flag getter; 1 on every supported Unix.
 const F_GETFD: i32 = 1;
-/// `fcntl(2)`'s status-flag getter; 3 on every supported Unix.
+/// `fcntl(2)`'s status-flag getter and setter; 3 and 4 on every supported Unix.
 const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+/// `O_NONBLOCK`, which differs: 0x0004 on Darwin, 0x0800 on Linux.
+#[cfg(target_vendor = "apple")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(not(target_vendor = "apple"))]
+const O_NONBLOCK: i32 = 0x0800;
 /// The access-mode bits of the status flags, and the read-only mode: 3 and 0 on
 /// every supported Unix.
 const O_ACCMODE: i32 = 3;
@@ -284,13 +336,6 @@ mod tests {
     use std::os::fd::AsFd as _;
     use std::process::Command;
 
-    /// `fcntl(2)`'s status-flag setter (4 on every supported Unix) and
-    /// `O_NONBLOCK`, which differs: 0x0004 on Darwin, 0x0800 on Linux.
-    const F_SETFL: i32 = 4;
-    #[cfg(target_vendor = "apple")]
-    const O_NONBLOCK: i32 = 0x0004;
-    #[cfg(not(target_vendor = "apple"))]
-    const O_NONBLOCK: i32 = 0x0800;
     const FD_CLOEXEC: i32 = 1;
 
     /// A private scratch directory for one test's FIFO.
@@ -377,6 +422,75 @@ mod tests {
             "{cut:?}"
         );
         assert_eq!(failing.calls, 2);
+    }
+
+    /// One look answers at once: bytes and an interrupt are read past, a read
+    /// that would block is a lifeline still held (`None`, after exactly those
+    /// calls), and end-of-file or a failed read is the cut. NEGATIVE CONTROL: the
+    /// held answer — a look that took a would-block for a cut would end a broker
+    /// whose launcher lives.
+    #[test]
+    fn a_look_answers_at_once_and_only_end_of_file_or_a_failure_is_a_cut() {
+        let mut held = Script {
+            answers: [
+                Ok(2),
+                Err(io::ErrorKind::Interrupted.into()),
+                Err(io::ErrorKind::WouldBlock.into()),
+            ]
+            .into(),
+            calls: 0,
+        };
+        assert!(look(&mut held).is_none(), "a held lifeline is no cut");
+        assert_eq!(held.calls, 3, "the look ended before the would-block");
+
+        let mut closed = Script {
+            answers: [Ok(0)].into(),
+            calls: 0,
+        };
+        assert!(matches!(look(&mut closed), Some(Cut::Closed)));
+
+        let mut failing = Script {
+            answers: [Err(io::Error::other("EIO"))].into(),
+            calls: 0,
+        };
+        let cut = look(&mut failing);
+        assert!(
+            matches!(&cut, Some(Cut::Failed(e)) if e.to_string() == "EIO"),
+            "{cut:?}"
+        );
+    }
+
+    /// [`OnWake`] reads a real lifeline without blocking: not cut at any wake
+    /// while the launcher's end lives, cut (end-of-file) once it is dropped. Its
+    /// descriptor is checked non-blocking before any look, so a watch that would
+    /// block fails here instead of hanging the binary in `read(2)`.
+    #[test]
+    fn a_lifeline_read_on_wake_is_cut_only_after_the_launcher_lets_go() {
+        let dir = scratch("on-wake");
+        let (lifeline, far) = Lifeline::open(&dir).expect("open a lifeline");
+        let mut watch = OnWake::new(far.into()).expect("watch it on wake");
+        // SAFETY: `F_GETFL` reads the status flags of the descriptor `watch` keeps open.
+        let flags = unsafe { fcntl(watch.0.as_raw_fd(), F_GETFL) };
+        assert_eq!(flags & O_NONBLOCK, O_NONBLOCK, "a watch never blocks");
+        assert!(watch.cut().is_none(), "a held lifeline is not cut");
+        assert!(watch.cut().is_none(), "nor at the next wake");
+        lifeline.cut();
+        // End-of-file may lag the cut: a spawn on another test thread holds
+        // copies of every descriptor until its exec. The deadline is a hang
+        // detector.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let cut = loop {
+            if let Some(cut) = watch.cut() {
+                break cut;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no cut seen after the launcher let go"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(cut, Cut::Closed), "{cut:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// While the held end lives, the far end is not at end-of-file (a

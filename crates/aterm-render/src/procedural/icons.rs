@@ -41,7 +41,7 @@ pub fn band_icon_coverage(
     if cell_w < 2 || cell_h < 2 {
         return buf;
     }
-    let shape = Shape::fit(cell_w, cell_h, m, spill, icon.is_glass_mark());
+    let shape = Shape::fit(cell_w, cell_h, m, spill, icon);
     for y in 0..cell_h {
         for x in 0..w {
             let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -71,8 +71,9 @@ struct Shape {
 }
 
 impl Shape {
-    /// `mark`'s room is its own cell's width, edge to edge, on either raster.
-    fn fit(cell_w: usize, cell_h: usize, m: IconMetrics, spill: bool, mark: bool) -> Self {
+    /// A glass mark's room is its own cell's width, edge to edge, on either raster.
+    fn fit(cell_w: usize, cell_h: usize, m: IconMetrics, spill: bool, icon: BandIcon) -> Self {
+        let mark = icon.is_glass_mark();
         let (fw, fh) = (cell_w as f32, cell_h as f32);
         let cap = if m.cap.is_finite() && m.cap > 1.0 {
             m.cap.min(fh)
@@ -97,23 +98,43 @@ impl Shape {
             .min(cy - top - 1.5)
             .min(span * 0.5 - 0.5 - clear)
             .max(1.0);
-        let t = stem
-            .round()
-            .clamp(1.0, (half0 * STROKE_SHARE).round().max(1.0));
-        let cx = ox
-            + if (t as u32) % 2 == 1 {
-                (fw * 0.5).floor() + 0.5
-            } else {
-                (fw * 0.5).round()
-            };
-        let at = if mark { cx - ox } else { cx };
-        let room = (at.min(span - at) - clear).max(1.0);
-        let half = half0.min(room - 0.5).max(1.0);
         let disc = if m.disc.is_finite() && m.disc > 1.0 {
             m.disc.max((cap * 0.6).floor())
         } else {
             cap
         };
+        let ring = (disc * 0.5).max(1.0);
+        let t = stem
+            .round()
+            .clamp(1.0, (half0 * STROKE_SHARE).round().max(1.0));
+        let crisp = |odd: bool| {
+            ox + if odd {
+                (fw * 0.5).floor() + 0.5
+            } else {
+                (fw * 0.5).round()
+            }
+        };
+        let room_at = |cx: f32| {
+            let at = if mark { cx - ox } else { cx };
+            let room = (at.min(span - at) - clear).max(1.0);
+            (room, half0.min(room - 0.5).max(1.0))
+        };
+        // The ring family (every mark but `⤓`'s stem) has its sides on pixel
+        // boundaries about either centre, so it takes the one that draws it larger
+        // (the cell's middle on a tie), never the stroke's: a bold stroke of the
+        // cell's other parity cut it a pixel under the regular one.
+        let cx = if mark && icon != BandIcon::ToBar {
+            let size = |cx: f32| {
+                let (room, half) = room_at(cx);
+                ring_radius(ring, half, room, cx.fract())
+            };
+            let odd = !cell_w.is_multiple_of(2);
+            let (mid, off) = (crisp(odd), crisp(!odd));
+            if size(off) > size(mid) { off } else { mid }
+        } else {
+            crisp((t as u32) % 2 == 1)
+        };
+        let (room, half) = room_at(cx);
         Shape {
             cx,
             cy,
@@ -122,7 +143,7 @@ impl Shape {
             room,
             bot: cy + half,
             top,
-            ring: (disc * 0.5).max(1.0),
+            ring,
             tall: (cap * 0.5).min(cy - top - 1.5).max(half),
         }
     }
@@ -434,13 +455,10 @@ impl Shape {
         }
     }
 
-    /// what the room leaves the icon.
+    /// The ring family's radius ([`ring_radius`]) and centre row: the face's `●` on the
+    /// capitals' centre line, its sides and its top on pixel boundaries.
     fn mark_frame(&self) -> (f32, f32) {
-        let frac = self.cx.fract();
-        let face = (self.ring - frac - 0.5).ceil();
-        let r = (face.min((self.half - frac).round()) + frac)
-            .min(self.room)
-            .max(1.0);
+        let r = ring_radius(self.ring, self.half, self.room, self.cx.fract());
         let top = (self.cy - r).round();
         (r, top + r)
     }
@@ -479,6 +497,14 @@ impl Shape {
         let (x, y) = self.p(0.0, v);
         (px - x).hypot(py - y) - r
     }
+}
+
+/// The ring family's radius about a centre `frac` (`0` or `0.5`) past a pixel edge: the
+/// face's `●`'s half height `ring` held to `half` and `room`, a diameter of the other
+/// parity rounded a half pixel down.
+fn ring_radius(ring: f32, half: f32, room: f32, frac: f32) -> f32 {
+    let face = (ring - frac - 0.5).ceil();
+    (face.min((half - frac).round()) + frac).min(room).max(1.0)
 }
 
 /// The signed distance to the axis-aligned box `[x0, x1) × [y0, y1)`.
@@ -1019,7 +1045,8 @@ mod tests {
         }
     }
 
-    /// pixel down at a centre on a pixel edge.
+    /// A `●` well under the capitals never closes `○` or `⊘`: the family is never under three
+    /// fifths of the capitals, in whole pixels (Andale Mono's bold `●` at 16 px keeps its 7).
     #[test]
     fn a_small_disc_never_closes_the_rings() {
         let cells = [
@@ -1117,44 +1144,54 @@ mod tests {
             y1 - y0
         );
     }
-    /// disc]`, and whether the face's stem, unheld, leaves the drawn ring no clear pixel.
+
+    /// Bold faces whose `●` is well under their capitals, measured at 1x: `[cell w, cell h,
+    /// baseline, cap, stem, head, disc]`, and whether a ring the face's stem wide, unheld, in
+    /// the drawn `●` has no clear pixel.
     const BOLD_FACES: [(&str, [f32; 7], bool); 10] = [
         ("Menlo 11", [7.0, 13.0, 10.0, 8.0, 1.576, 1.0, 7.0], false),
         (
             "Andale Mono 13",
             [8.0, 15.0, 12.0, 9.0, 1.718, 2.0, 7.0],
-            true,
+            false,
         ),
         (
             "Andale Mono 14",
             [8.0, 16.0, 13.0, 10.0, 1.659, 2.0, 7.0],
-            true,
+            false,
         ),
         (
             "Andale Mono 15",
             [9.0, 17.0, 14.0, 11.0, 2.063, 2.0, 7.0],
-            true,
+            false,
         ),
         (
             "Andale Mono 27",
             [16.0, 30.0, 24.0, 19.0, 4.055, 3.0, 13.0],
             false,
         ),
-        ("PT Mono 12", [7.0, 13.0, 10.0, 8.0, 1.561, 0.0, 6.0], false),
-        ("PT Mono 14", [8.0, 16.0, 13.0, 10.0, 1.820, 1.0, 7.0], true),
+        ("PT Mono 12", [7.0, 13.0, 10.0, 8.0, 1.561, 0.0, 6.0], true),
+        (
+            "PT Mono 14",
+            [8.0, 16.0, 13.0, 10.0, 1.820, 1.0, 7.0],
+            false,
+        ),
         (
             "PT Mono 16",
             [10.0, 18.0, 14.0, 11.0, 2.078, 1.0, 7.0],
-            true,
+            false,
         ),
         (
             "Courier New 15",
             [9.0, 17.0, 12.0, 9.0, 1.502, 1.0, 7.0],
-            true,
+            false,
         ),
         ("SF Mono 12", [7.0, 14.0, 12.0, 9.0, 1.639, 1.0, 9.0], false),
     ];
-    /// stem alone: SF Mono's bold `○` at 24 px is its 3-pixel stem, heavier than its regular.
+
+    /// A bold `○` keeps at least four clear pixels inside `●` on each measured face, spilled
+    /// and in a cell of its own. NEGATIVE CONTROLS: on PT Mono 12 (a 6-pixel `●`) a ring the
+    /// face's stem wide closes, and with room the stroke is the face's stem (SF Mono 24 px).
     #[test]
     fn a_bold_ring_stays_open_on_the_measured_faces() {
         let hollow = |disc: &[u8], ring: &[u8], w: usize| {

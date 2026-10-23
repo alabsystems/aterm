@@ -46,6 +46,9 @@ ring = { workspace = true }
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
+# GitHub's JSON: the publishers' REST lane (src/github_rest.rs) and its listing reader
+# (src/github_pages.rs); the updater lanes read none.
+aterm-json = { workspace = true }
 # `aterm_uds::spawnfd::command` builds every child: no descriptor above stdio leaks, and on
 # Windows a console-less caller gives its curl and certutil children a windowless console.
 aterm-uds = { workspace = true }
@@ -64,8 +67,8 @@ aterm-digest = { workspace = true }
 [dev-dependencies]
 # Exclusive private directories for file-hash fixtures, removed on drop.
 aterm-tempfile = { workspace = true }
-# The Linux binary-identity round-trip test; the library writes no JSON.
-aterm-json = { workspace = true }
+# The loopback GitHub the REST lane's tests run real curl against (src/github_rest_tests.rs).
+agh-fake = { workspace = true }
 # The roster tests sign synthetic fixtures, which needs ring's `alloc`; default features in
 # the test build only, so the normal build still proves the no-alloc verify path.
 ring = { workspace = true, features = ["default"] }

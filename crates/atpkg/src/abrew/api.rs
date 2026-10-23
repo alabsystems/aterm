@@ -27,7 +27,7 @@ pub struct Api {
 
 impl Api {
     #[must_use]
-    pub fn new(prefix: Prefix) -> Api {
+    pub const fn new(prefix: Prefix) -> Api {
         Api {
             prefix,
             writable: true,
@@ -37,7 +37,7 @@ impl Api {
     /// A cache-read-only client: fetches parse in memory and nothing is
     /// created on disk (dry runs must leave no prefix behind).
     #[must_use]
-    pub fn read_only(prefix: Prefix) -> Api {
+    pub const fn read_only(prefix: Prefix) -> Api {
         Api {
             prefix,
             writable: false,

@@ -1249,7 +1249,7 @@ impl<'a, M> FlatMapSerializeTupleVariantAsMapValue<'a, M>
 where
     M: SerializeMap + 'a,
 {
-    fn new(map: &'a mut M) -> Self {
+    const fn new(map: &'a mut M) -> Self {
         FlatMapSerializeTupleVariantAsMapValue {
             map,
             fields: Vec::new(),
@@ -1292,7 +1292,10 @@ impl<'a, M> FlatMapSerializeStructVariantAsMapValue<'a, M>
 where
     M: SerializeMap + 'a,
 {
-    fn new(map: &'a mut M, name: &'static str) -> FlatMapSerializeStructVariantAsMapValue<'a, M> {
+    const fn new(
+        map: &'a mut M,
+        name: &'static str,
+    ) -> FlatMapSerializeStructVariantAsMapValue<'a, M> {
         FlatMapSerializeStructVariantAsMapValue {
             map,
             name,

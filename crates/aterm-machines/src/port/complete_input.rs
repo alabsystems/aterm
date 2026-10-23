@@ -33,7 +33,7 @@ pub(super) fn admit(cmd: &Cmd) -> Result<(), RunFailed> {
 pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
     admit(cmd)?;
     let (program, args) = live.argv(cmd)?;
-    let mut command = fixed_command(&program, &args, &live.child_env(cmd));
+    let mut command = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
     let (reader, writer) =
         io::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
     nonblocking(&writer).map_err(|_| RunFailed::Spawn("input pipe configuration failed".into()))?;

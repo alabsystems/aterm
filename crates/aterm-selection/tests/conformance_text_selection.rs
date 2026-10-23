@@ -1,17 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `TextSelectionLifecycle`
-//! (`aterm_models_core::text_selection_lifecycle_model`): the REAL
-//! `TextSelection` calls, driven from every state the model reaches, against
-//! the model's transitions.
-//!
-//! The driver binds each model action to one call at a fixed point — `Start`
-//! presses at [`PRESS`], `Update` drags to [`DRAG`], `Extend` shift-clicks at
-//! [`SHIFT_CLICK`] — so the far anchor's position names the call that put it
-//! there. [`project`] reads the real selection onto the model's variables,
-//! and the observer half (`pre`, `last`, `moved`) from the call just made and
-//! the selection before it.
+//! Tier-1 for `TextSelectionLifecycle` (`aterm_models_core::text_selection_lifecycle_model`): the
+//! REAL `TextSelection` calls, driven from every state the model reaches, against the model's
+//! transitions.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -69,10 +61,9 @@ fn end(anchor: SelectionAnchor) -> i64 {
     }
 }
 
-/// PROJECTION (`conformance_text_selection::project`, named by the
-/// `#[refines]` anchors on the five calls): the selection onto `phase` and
-/// `end`, and the last call — `action` made on `before` — onto the observer
-/// `pre`, `last` and `moved`. `None` is the fresh selection, before any call.
+/// PROJECTION (`conformance_text_selection::project`, named by the `#[refines]` anchors on the five
+/// calls): the selection onto `phase` and `end`, and the last call — `action` made on `before` —
+/// onto the observer `pre`, `last` and `moved`.
 pub fn project(selection: &TextSelection, step: Option<(&TextSelection, &str)>) -> State {
     let (pre, last, moved) = match step {
         None => (0, 0, 0),
@@ -96,7 +87,6 @@ pub fn project(selection: &TextSelection, step: Option<(&TextSelection, &str)>) 
 
 /// Every action sequence up to [`MAX_DEPTH`] on the real selection in lockstep
 /// with the model: the projection equals the model state after every call.
-/// Returns every step taken as `(prev, next, action)`.
 fn lockstep(model: &Model) -> Vec<(State, State, &'static str)> {
     fn walk(
         model: &Model,
@@ -241,7 +231,6 @@ fn a_dropped_phase_check_is_rejected() {
             "a forged {action} {changes:?} from {prev:?} must be rejected"
         );
     }
-    // The real calls from those states are the committed ones.
     let (after, _) = observed(&["Start", "Complete", "Update"]);
     assert_eq!((after["phase"], after["end"], after["moved"]), (2, 0, 0));
     let (after, _) = observed(&["Complete"]);

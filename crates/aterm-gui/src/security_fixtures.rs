@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! NAMED SECURITY POSTURES, one catalog for the unit tests and for a development
-//! build's `security-posture` verb ([`crate::security_posture`]), so a capture of
-//! a headless instance and a unit assertion show the same MACOS ACCESS block.
-//!
-//! The block's data comes from the windowed macOS host's probes (TCC, `tccutil`,
-//! the image anchor, the claimant census); a headless instance publishes none, so
-//! without a staged posture the block could not be seen on any running aterm
-//! (s-24). Every posture here is pure data — nothing in this module reaches the
-//! OS — and covers one branch of the card: a grant, a denial with folders macOS
-//! stopped asking for, a rebuilt identity, a broken anchor, other copies with a
-//! Trash plan, a copy without `tccutil` or a usable bundle id, a warm-up running.
-//! The one exception is the reset subject: a [`ResetSubject`] is minted only by
-//! reading a bundle's `Info.plist` (HYG-3), so [`fixture_subject`] writes a
-//! scratch bundle once and reads it back. A staged posture's gestures are
-//! inert, so that subject never reaches a `tccutil` argv.
-//!
-//! Compiled into tests and development builds only.
+//! NAMED SECURITY POSTURES, one catalog for the unit tests and for a development build's
+//! `security-posture` verb ([`crate::security_posture`]), so a capture of a headless instance and a
+//! unit assertion show the same MACOS ACCESS block.
 
 use aterm_containment::FdaScope;
 use aterm_containment::consent::{
@@ -28,7 +14,6 @@ use crate::native_settings::{DevToolsFacts, MacosAccess, MacosAccessRow};
 
 /// The fixture copy's reset subject, `com.example.fixture`: read once from a
 /// exclusively owned scratch bundle, the only way a [`ResetSubject`] exists.
-/// Its guard remains alive through the read and removes only its own tree.
 fn fixture_subject() -> Option<ResetSubject> {
     static SUBJECT: std::sync::OnceLock<Option<ResetSubject>> = std::sync::OnceLock::new();
     SUBJECT
@@ -50,9 +35,8 @@ fn fixture_subject() -> Option<ResetSubject> {
         .clone()
 }
 
-/// The base posture: an installed copy with the healthy anchor, Full Disk Access
-/// `fda`, a designated requirement of class `dr`, and the measured `scope` of a
-/// grant.
+/// The base posture: an installed copy with the healthy anchor, Full Disk Access `fda`, a
+/// designated requirement of class `dr`, and the measured `scope` of a grant.
 pub(crate) fn access(fda: FdaState, dr: DrClass, scope: FdaScope) -> MacosAccess {
     MacosAccess {
         enabled: true,
@@ -99,9 +83,8 @@ pub(crate) fn access(fda: FdaState, dr: DrClass, scope: FdaScope) -> MacosAccess
     }
 }
 
-/// A census with the running copy (Developer ID when `running_stable`, else
-/// ad hoc), an ad-hoc `.rollback` beside it and a Developer-ID copy from
-/// another team.
+/// A census with the running copy (Developer ID when `running_stable`, else ad hoc), an ad-hoc
+/// `.rollback` beside it and a Developer-ID copy from another team.
 pub(crate) fn census(running_stable: bool) -> aterm_containment::consent::Claimants {
     use aterm_containment::consent::{Claimant, Claimants, Enumeration, classify_dr};
     let copy = |path: &str, dr_text: &str, signing: &'static str, team: Option<&str>| Claimant {

@@ -5,9 +5,9 @@
 //! authorize a run or replace its durable record of work already performed.
 
 use super::{
-    Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row,
-    Selection, Stage, ensure_person_scope, execute, item_rows, observe_read_only, readiness_row,
-    rows_ready, state_root,
+    Action, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row, Selection,
+    Stage, ensure_person_scope, execute, item_rows, observe_read_only, readiness_row, rows_ready,
+    state_root,
 };
 use aterm_secrets::client::{self, Membership, Paths, Status};
 use aterm_secrets::service::{self, Job, State};
@@ -20,28 +20,80 @@ trait InitialCheckHost {
     fn repositories(&mut self) -> Result<Vec<Row>, String>;
 }
 
-struct LiveCheck;
+#[derive(Default)]
+struct LiveCheck {
+    workstation: Option<Result<Vec<Row>, String>>,
+    spotlight: Option<Result<Vec<Row>, String>>,
+    permissions: Option<Result<Vec<Row>, String>>,
+    vault: Option<Result<Vec<Row>, String>>,
+}
+
+impl LiveCheck {
+    fn prefetch(root: &Path, plan: &Plan) -> Self {
+        let ws_selected = Stage::Workstation.selected(plan);
+        let sp_selected = Stage::Spotlight.selected(plan);
+        let perm_selected = Stage::Permissions.selected(plan);
+        let vault_selected = Stage::Secrets.selected(plan);
+        let ws_sel = plan.selection.workstation();
+        std::thread::scope(|s| {
+            let ws = ws_selected.then(|| {
+                s.spawn(move || {
+                    execute(&mut NativeHost::selected(ws_sel), root, Action::Check)
+                        .map(|report| report.rows)
+                })
+            });
+            let sp = sp_selected.then(|| {
+                s.spawn(|| {
+                    aterm_machines::init::run_initial_spotlight(
+                        &aterm_machines::port::Live::new(),
+                        &LiveInitial::live().context()?,
+                        aterm_machines::model::Mode::Plan,
+                    )
+                    .map(item_rows)
+                })
+            });
+            let perm =
+                perm_selected.then(|| s.spawn(|| LiveInitial::live().read_permissions(false)));
+            let vault = vault_selected.then(|| s.spawn(|| current_vault_rows(plan)));
+            Self {
+                workstation: ws.map(|h| h.join().expect("workstation check thread")),
+                spotlight: sp.map(|h| h.join().expect("spotlight check thread")),
+                permissions: perm.map(|h| h.join().expect("permissions check thread")),
+                vault: vault.map(|h| h.join().expect("vault check thread")),
+            }
+        })
+    }
+}
 
 impl InitialCheckHost for LiveCheck {
     fn workstation(&mut self, root: &Path, selected: Selection) -> Result<Vec<Row>, String> {
-        execute(&mut NativeHost::selected(selected), root, Action::Check).map(|report| report.rows)
+        self.workstation.take().unwrap_or_else(|| {
+            execute(&mut NativeHost::selected(selected), root, Action::Check)
+                .map(|report| report.rows)
+        })
     }
 
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
-        aterm_machines::init::run_initial_spotlight(
-            &aterm_machines::port::Live::new(),
-            &LiveInitial::live().context()?,
-            aterm_machines::model::Mode::Plan,
-        )
-        .map(item_rows)
+        self.spotlight.take().unwrap_or_else(|| {
+            aterm_machines::init::run_initial_spotlight(
+                &aterm_machines::port::Live::new(),
+                &LiveInitial::live().context()?,
+                aterm_machines::model::Mode::Plan,
+            )
+            .map(item_rows)
+        })
     }
 
     fn permissions(&mut self) -> Result<Vec<Row>, String> {
-        LiveInitial::live().permissions()
+        self.permissions
+            .take()
+            .unwrap_or_else(|| LiveInitial::live().read_permissions(false))
     }
 
     fn vault(&mut self, plan: &Plan) -> Result<Vec<Row>, String> {
-        current_vault_rows(plan)
+        self.vault
+            .take()
+            .unwrap_or_else(|| current_vault_rows(plan))
     }
 
     fn repositories(&mut self) -> Result<Vec<Row>, String> {
@@ -202,7 +254,8 @@ pub fn check_initial_setup(plan: &Plan) -> Result<Report, String> {
 pub fn check_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Report> {
     observe_read_only(state_root(), |root| {
         ensure_person_scope()?;
-        Ok(check_with(&mut LiveCheck, root, plan))
+        let mut live = LiveCheck::prefetch(root, plan);
+        Ok(check_with(&mut live, root, plan))
     })
 }
 

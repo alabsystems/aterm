@@ -1,31 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lane-bus wlhide <listen> <server> <rule>...`: a Wayland compositor that
-//! offers less than the one it is made of. A proxy listening on the socket
-//! path `<listen>` carries each client to the compositor socket `<server>`
-//! ([`crate::relay`], descriptors included) and edits the globals the
-//! compositor announces on every registry the client makes:
-//!
-//! * `hide:<interface>`: the global is never announced (nor its removal), so
-//!   the client runs as under a compositor without it (sway without
-//!   `zxdg_decoration_manager_v1`: client-side decorations);
-//! * `cap:<interface>=<version>`: announced at most at `<version>`, so the
-//!   client binds that version or older (sway's `wl_compositor` at 5, a
-//!   compositor older than `wl_surface.preferred_buffer_scale`).
-//!
-//! `-` as the only rule changes nothing (the lane's control). Every rule a
-//! proxy applied is said on stderr as it applies, so the lab reads that the
-//! client saw the edited compositor.
-//!
-//! The wire, from the Wayland protocol (wayland.freedesktop.org, "Wire
-//! Format"): each message is a 32-bit object id, then a 32-bit word whose
-//! upper 16 bits are the message's size in bytes (header included, a
-//! multiple of 4) and lower 16 its opcode, then the arguments in host byte
-//! order. `wl_display.get_registry` is request 1 of object 1, its new id the
-//! one argument; on that registry, event 0 is `global(name: uint,
-//! interface: string, version: uint)` (a string is its length with the NUL,
-//! then the bytes padded to 4) and event 1 `global_remove(name: uint)`.
+//! `lane-bus wlhide <listen> <server> <rule>...`: a Wayland compositor that offers less than the
+//! one it is made of.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -251,7 +228,6 @@ mod tests {
         stream.extend(global(3, "wl_shm", 1));
         stream.extend(msg(2, 1, &2u32.to_ne_bytes()));
         stream.extend(msg(2, 1, &3u32.to_ne_bytes()));
-        // Not a registry: object 5's event 0 passes untouched.
         stream.extend(msg(5, 0, &[1, 2, 3, 4]));
         let out = through(&mut ev, &stream);
         let mut want = global(1, "wl_compositor", 5);

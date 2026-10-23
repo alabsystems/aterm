@@ -390,8 +390,9 @@ fn prior_requests<'a>(
 }
 
 /// Build-prefix references left in a staged keg: placeholders in text
-/// files and, on macOS, Mach-O dependency paths still naming the build
-/// prefix.
+/// files and Mach-O load commands still naming the build prefix, read in house
+/// ([`crate::macho::load_names`]): `otool`'s `/usr/bin` shim raises Apple's
+/// install dialog on a Mac without the developer tools.
 fn linkage_leftovers(staged: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(dir: &Path, out: &mut Vec<String>) {
@@ -415,24 +416,8 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
                 out.push(format!("{} (placeholder)", path.display()));
                 continue;
             }
-            if cfg!(target_os = "macos")
-                && matches!(
-                    bytes.get(..4),
-                    Some([0xFE, 0xED, 0xFA, 0xCF])
-                        | Some([0xCF, 0xFA, 0xED, 0xFE])
-                        | Some([0xCA, 0xFE, 0xBA, 0xBE])
-                )
-                && let Ok(o) = fetch::run_capture("otool", &["-L", &path.to_string_lossy()])
-            {
-                for line in String::from_utf8_lossy(&o.stdout).lines().skip(1) {
-                    let dep = line.trim().split(" (").next().unwrap_or("").trim();
-                    if dep.starts_with("/opt/homebrew/")
-                        || dep.starts_with("/usr/local/Cellar/")
-                        || dep.starts_with("/usr/local/opt/")
-                    {
-                        out.push(format!("{} -> {dep}", path.display()));
-                    }
-                }
+            if cfg!(target_os = "macos") {
+                out.extend(macos_leftovers(&path, &bytes));
             }
         }
     }
@@ -440,24 +425,42 @@ fn linkage_leftovers(staged: &Path) -> Vec<String> {
     out
 }
 
-/// `otool -l` LC_RPATH paths, in load order.
-#[cfg(target_os = "macos")]
-fn rpaths_from_otool(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_rpath = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with("cmd ") {
-            in_rpath = line == "cmd LC_RPATH";
-        } else if in_rpath && let Some(rest) = line.strip_prefix("path ") {
-            out.push(rest.split(" (offset").next().unwrap_or(rest).to_string());
-            in_rpath = false;
-        }
+/// What [`linkage_leftovers`] lists for the file `path` holding `bytes`
+/// on macOS: each install name or loaded dylib of a Mach-O ([`is_mach_o`]:
+/// 32- or 64-bit, thin or universal) that names a Homebrew build prefix, and
+/// the file itself when it opens as one but its load commands cannot be read
+/// exactly (the scan fails closed: real Homebrew pours it). A Java class
+/// file, which shares the universal magic, and a universal static archive's
+/// slices load nothing.
+fn macos_leftovers(path: &Path, bytes: &[u8]) -> Vec<String> {
+    if !is_mach_o(bytes) {
+        return Vec::new();
     }
-    out
+    let names = match crate::macho::load_names(bytes) {
+        Ok(names) => names.once(),
+        Err(why) => {
+            return vec![format!(
+                "{}: its load commands could not be checked ({why})",
+                path.display()
+            )];
+        }
+    };
+    names
+        .id
+        .iter()
+        .chain(&names.loads)
+        .filter(|dep| {
+            dep.starts_with("/opt/homebrew/")
+                || dep.starts_with("/usr/local/Cellar/")
+                || dep.starts_with("/usr/local/opt/")
+        })
+        .map(|dep| format!("{} -> {dep}", path.display()))
+        .collect()
 }
 
-#[cfg(target_os = "macos")]
+/// Whether `bytes` open a Mach-O abrew reads the load commands of: thin
+/// 32- or 64-bit in either byte order, or universal with a 32- or 64-bit
+/// arch table, a Java class file (`CAFEBABE` too) excepted.
 fn is_mach_o(bytes: &[u8]) -> bool {
     matches!(
         bytes.get(..4),
@@ -466,18 +469,69 @@ fn is_mach_o(bytes: &[u8]) -> bool {
             | Some([0xFE, 0xED, 0xFA, 0xCE])
             | Some([0xCE, 0xFA, 0xED, 0xFE])
             | Some([0xCA, 0xFE, 0xBA, 0xBE])
-    )
+            | Some([0xCA, 0xFE, 0xBA, 0xBF])
+    ) && !crate::macho::is_java_class(bytes)
+}
+
+/// The `install_name_tool` arguments that move a Mach-O's placeholder
+/// names (`names`, its [`crate::macho::LoadNames`]) to this prefix: `-id`
+/// for its install name, `-change` per loaded dylib and `-rpath` per run
+/// path that `relocate` rewrites, each name once however many slices carry
+/// it. Empty when nothing names a placeholder.
+///
+/// # Errors
+/// The slices of a universal file name different install names, which one
+/// `-id` cannot move.
+#[cfg(target_os = "macos")]
+fn relocation_args(
+    names: &crate::macho::LoadNames,
+    relocate: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    let names = names.once();
+    let mut args: Vec<String> = Vec::new();
+    match names.id.as_slice() {
+        [] => {}
+        [id] => {
+            if let Some(new) = relocate(id) {
+                args.extend(["-id".into(), new]);
+            }
+        }
+        ids => {
+            return Err(format!(
+                "its slices name {} different install names",
+                ids.len()
+            ));
+        }
+    }
+    for dep in names.loads {
+        if let Some(new) = relocate(&dep) {
+            args.extend(["-change".into(), dep, new]);
+        }
+    }
+    for rpath in names.rpaths {
+        if let Some(new) = relocate(&rpath) {
+            args.extend(["-rpath".into(), rpath, new]);
+        }
+    }
+    Ok(args)
 }
 
 /// Relocate a staged `:any` bottle payload from placeholder paths
-/// to this prefix, brew's two pour-time passes with the system
-/// Mach-O tools: install names / dylib ids / rpaths rewritten by
-/// `install_name_tool`, placeholders in NUL-free (text) files
-/// replaced as bytes, and every modified binary ad-hoc re-signed
-/// (`codesign`, metadata preserved) since the edits invalidate
-/// its signature.
+/// to this prefix, brew's two pour-time passes: install names / dylib ids /
+/// rpaths rewritten by `install_name_tool`, placeholders in NUL-free (text)
+/// files replaced as bytes, and every modified binary ad-hoc re-signed
+/// (`codesign`, metadata preserved) since the edits invalidate its signature.
+/// `install_name_tool` is the developer directory's own
+/// ([`super::machine::DeveloperDir::tool`]), never the `/usr/bin` shim, which
+/// raises Apple's install dialog on a Mac without the developer tools: with
+/// none, a Mach-O that needs relocating delegates before anything runs.
 #[cfg(target_os = "macos")]
-fn relocate_staged(prefix: &Prefix, f: &Formula, staged: &Path) -> Result<(), InstallError> {
+fn relocate_staged(
+    prefix: &Prefix,
+    f: &Formula,
+    staged: &Path,
+    install_name_tool: Option<&Path>,
+) -> Result<(), InstallError> {
     use std::os::unix::fs::MetadataExt;
     let passthrough = |what: String| {
         InstallError::PassThrough(format!(
@@ -549,40 +603,19 @@ fn relocate_staged(prefix: &Prefix, f: &Formula, staged: &Path) -> Result<(), In
         }
         let shown = path.to_string_lossy().into_owned();
         if is_mach_o(&bytes) {
-            let mut args: Vec<String> = Vec::new();
-            let out =
-                fetch::run_capture("otool", &["-D", &shown]).map_err(|e| passthrough(e.clone()))?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(id) = text.lines().nth(1).map(str::trim)
-                && let Some(new) = relocate_name(id, &pairs)
-            {
-                args.push("-id".into());
-                args.push(new);
-            }
-            let out =
-                fetch::run_capture("otool", &["-L", &shown]).map_err(|e| passthrough(e.clone()))?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().skip(1) {
-                let dep = line.trim().split(" (").next().unwrap_or("").trim();
-                if let Some(new) = relocate_name(dep, &pairs) {
-                    args.push("-change".into());
-                    args.push(dep.to_string());
-                    args.push(new);
-                }
-            }
-            let out =
-                fetch::run_capture("otool", &["-l", &shown]).map_err(|e| passthrough(e.clone()))?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            for rpath in rpaths_from_otool(&text) {
-                if let Some(new) = relocate_name(&rpath, &pairs) {
-                    args.push("-rpath".into());
-                    args.push(rpath);
-                    args.push(new);
-                }
-            }
+            let names = crate::macho::load_names(&bytes)
+                .map_err(|e| passthrough(format!("{shown}: {e}")))?;
+            let mut args = relocation_args(&names, |name| relocate_name(name, &pairs))
+                .map_err(|e| passthrough(format!("{shown}: {e}")))?;
             if args.is_empty() {
                 continue;
             }
+            let Some(install_name_tool) = install_name_tool else {
+                return Err(passthrough(format!(
+                    "{shown} needs install_name_tool, and no developer tools are installed"
+                )));
+            };
+            let install_name_tool = install_name_tool.to_string_lossy();
             let mode = meta.permissions();
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -590,7 +623,7 @@ fn relocate_staged(prefix: &Prefix, f: &Formula, staged: &Path) -> Result<(), In
             }
             args.push(shown.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let out = fetch::run_capture("install_name_tool", &refs)
+            let out = fetch::run_capture(&install_name_tool, &refs)
                 .map_err(|e| passthrough(e.clone()))?;
             if !out.status.success() {
                 return Err(passthrough(format!(
@@ -711,12 +744,13 @@ fn install_one(
     if f.bottle_for(&Machine::this().bottle_tags())
         .is_some_and(|b| b.cellar == ":any")
     {
-        relocate_staged(prefix, f, &poured)?;
+        let install_name_tool = super::machine::DeveloperDir::this().tool("install_name_tool");
+        relocate_staged(prefix, f, &poured, install_name_tool.as_deref())?;
     }
     let leftovers = linkage_leftovers(&poured);
     if !leftovers.is_empty() {
         return Err(InstallError::PassThrough(format!(
-            "{} bottle still references its build prefix ({}); needs Homebrew relocation",
+            "{} bottle may still reference its build prefix ({}); needs Homebrew relocation",
             f.name,
             leftovers.first().cloned().unwrap_or_default()
         )));
@@ -2635,15 +2669,81 @@ mod tests {
         assert!(prefix.bin().join("other").exists());
     }
 
+    /// A placeholder dylib's install name, loads and run paths become the
+    /// `install_name_tool` arguments that move them to this prefix, each name
+    /// once however many slices carry it; `@loader_path` and libSystem stay.
+    /// NEGATIVE CONTROL: a file naming no placeholder needs no arguments, and
+    /// slices with different install names are refused (one `-id` cannot
+    /// move both).
     #[cfg(target_os = "macos")]
     #[test]
-    fn rpaths_parse_from_otool_load_commands() {
-        let text = "\
-Load command 10\n      cmd LC_LOAD_DYLIB\n      name @@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib (offset 24)\nLoad command 11\n      cmd LC_RPATH\n      cmdsize 48\n      path @@HOMEBREW_PREFIX@@/lib (offset 12)\nLoad command 12\n      cmd LC_RPATH\n      cmdsize 40\n      path @loader_path/../lib (offset 12)\n";
-        assert_eq!(
-            rpaths_from_otool(text),
-            ["@@HOMEBREW_PREFIX@@/lib", "@loader_path/../lib"]
+    fn relocation_moves_every_placeholder_name_the_load_commands_carry() {
+        use crate::macho::fixtures::{
+            ID_DYLIB, LOAD_DYLIB, dylib_command, fat, other_command, rpath_command, thin,
+        };
+        let placeholder = |id: &str| {
+            thin(
+                &[
+                    dylib_command(ID_DYLIB, id, true),
+                    other_command(0x1B, 24, true),
+                    dylib_command(
+                        LOAD_DYLIB,
+                        "@@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib",
+                        true,
+                    ),
+                    rpath_command("@@HOMEBREW_PREFIX@@/lib", true),
+                    dylib_command(LOAD_DYLIB, "/usr/lib/libSystem.B.dylib", true),
+                    rpath_command("@loader_path/../lib", true),
+                ],
+                true,
+            )
+        };
+        let relocate = |name: &str| -> Option<String> {
+            [
+                ("@@HOMEBREW_CELLAR@@", "/p/Cellar"),
+                ("@@HOMEBREW_PREFIX@@", "/p"),
+            ]
+            .iter()
+            .find_map(|(old, new)| name.strip_prefix(old).map(|rest| format!("{new}{rest}")))
+        };
+        let id = "@@HOMEBREW_PREFIX@@/opt/x/lib/libx.1.dylib";
+        let want = [
+            "-id",
+            "/p/opt/x/lib/libx.1.dylib",
+            "-change",
+            "@@HOMEBREW_CELLAR@@/xz/1/lib/liblzma.5.dylib",
+            "/p/Cellar/xz/1/lib/liblzma.5.dylib",
+            "-rpath",
+            "@@HOMEBREW_PREFIX@@/lib",
+            "/p/lib",
+        ];
+        for bytes in [
+            placeholder(id),
+            fat(&[placeholder(id), placeholder(id)], false),
+        ] {
+            let names = crate::macho::load_names(&bytes).unwrap();
+            assert_eq!(relocation_args(&names, relocate).unwrap(), want);
+        }
+        let system = thin(
+            &[dylib_command(
+                LOAD_DYLIB,
+                "/usr/lib/libSystem.B.dylib",
+                true,
+            )],
+            true,
         );
+        let names = crate::macho::load_names(&system).unwrap();
+        assert!(relocation_args(&names, relocate).unwrap().is_empty());
+        let split = fat(
+            &[
+                placeholder(id),
+                placeholder("@@HOMEBREW_PREFIX@@/opt/y/lib/liby.dylib"),
+            ],
+            false,
+        );
+        let names = crate::macho::load_names(&split).unwrap();
+        let refused = relocation_args(&names, relocate).unwrap_err();
+        assert!(refused.contains("2 different install names"), "{refused}");
         assert_eq!(
             replace_bytes(
                 b"a@@HOMEBREW_PREFIX@@/b@@HOMEBREW_PREFIX@@",
@@ -2652,6 +2752,166 @@ Load command 10\n      cmd LC_LOAD_DYLIB\n      name @@HOMEBREW_CELLAR@@/xz/1/li
             ),
             b"a/p/b/p".to_vec()
         );
+    }
+
+    /// `:any` relocation runs the developer directory's own
+    /// `install_name_tool`, never the `/usr/bin` shim, which raises Apple's
+    /// install dialog on a Mac without the developer tools: with none, a
+    /// bottle whose Mach-O carries a placeholder name is handed to real
+    /// Homebrew before anything runs, its bytes untouched. NEGATIVE CONTROL:
+    /// with a tool given, that tool runs on the file with the names'
+    /// arguments (a stand-in that records them and refuses, so nothing is
+    /// signed), and a bottle with no placeholder Mach-O needs no tool at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn relocation_without_the_developer_tools_delegates_before_running_anything() {
+        use crate::macho::fixtures::{ID_DYLIB, LOAD_DYLIB, dylib_command, thin};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(&tmp.path().join("prefix"));
+        let f = Formula {
+            name: "demo".into(),
+            ..Formula::default()
+        };
+        let staged = tmp.path().join("staged");
+        let lib = staged.join("lib/libx.1.dylib");
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        let bytes = thin(
+            &[
+                dylib_command(ID_DYLIB, "@@HOMEBREW_PREFIX@@/opt/x/lib/libx.1.dylib", true),
+                dylib_command(LOAD_DYLIB, "/usr/lib/libSystem.B.dylib", true),
+            ],
+            true,
+        );
+        std::fs::write(&lib, &bytes).unwrap();
+        match relocate_staged(&prefix, &f, &staged, None) {
+            Err(InstallError::PassThrough(why)) => assert!(
+                why.contains("needs install_name_tool, and no developer tools are installed"),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(&lib).unwrap(), bytes, "nothing changed");
+
+        let argv = tmp.path().join("argv");
+        let stand_in = tmp.path().join("bin/install_name_tool");
+        std::fs::create_dir_all(stand_in.parent().unwrap()).unwrap();
+        std::fs::write(
+            &stand_in,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\necho 'stand-in refuses' >&2\nexit 1\n",
+                argv.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+        match relocate_staged(&prefix, &f, &staged, Some(&stand_in)) {
+            Err(InstallError::PassThrough(why)) => {
+                assert!(why.contains("install_name_tool: stand-in refuses"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let root = prefix.root.display();
+        assert_eq!(
+            std::fs::read_to_string(&argv).expect("the given tool ran"),
+            format!("-id {root}/opt/x/lib/libx.1.dylib {}\n", lib.display())
+        );
+
+        std::fs::write(
+            &lib,
+            thin(
+                &[dylib_command(
+                    LOAD_DYLIB,
+                    "/usr/lib/libSystem.B.dylib",
+                    true,
+                )],
+                true,
+            ),
+        )
+        .unwrap();
+        assert!(relocate_staged(&prefix, &f, &staged, None).is_ok());
+    }
+
+    /// The leftover scan reads a Mach-O's install name and loads in house:
+    /// one naming a Homebrew build prefix is listed once however many slices
+    /// load it, a 32-bit one too, and one that opens as a Mach-O but cannot
+    /// be read is listed as unchecked (the scan fails closed). NEGATIVE
+    /// CONTROL: a libSystem-only program, placeholder-free text, a Java class
+    /// file (`CAFEBABE` with a class version) and a universal static archive
+    /// list nothing.
+    #[test]
+    fn the_leftover_scan_reads_load_commands_without_otool() {
+        use crate::macho::fixtures::{
+            ID_DYLIB, LOAD_DYLIB, archive, dylib_command, dylib_command32, fat, thin, thin32,
+        };
+        let p = Path::new("/k/bin/tool");
+        let homebrew = thin(
+            &[
+                dylib_command(LOAD_DYLIB, "/usr/lib/libSystem.B.dylib", true),
+                dylib_command(LOAD_DYLIB, "/opt/homebrew/opt/xz/lib/liblzma.5.dylib", true),
+            ],
+            true,
+        );
+        assert_eq!(
+            macos_leftovers(p, &homebrew),
+            ["/k/bin/tool -> /opt/homebrew/opt/xz/lib/liblzma.5.dylib"]
+        );
+        assert_eq!(
+            macos_leftovers(p, &fat(&[homebrew.clone(), homebrew.clone()], true)),
+            ["/k/bin/tool -> /opt/homebrew/opt/xz/lib/liblzma.5.dylib"],
+            "a universal file's slices are listed once"
+        );
+        let id = thin(
+            &[dylib_command(
+                ID_DYLIB,
+                "/usr/local/opt/x/lib/libx.dylib",
+                false,
+            )],
+            false,
+        );
+        assert_eq!(
+            macos_leftovers(p, &id),
+            ["/k/bin/tool -> /usr/local/opt/x/lib/libx.dylib"]
+        );
+        let watch = thin32(
+            &[dylib_command32(
+                LOAD_DYLIB,
+                "/opt/homebrew/opt/xz/lib/liblzma.5.dylib",
+                false,
+            )],
+            false,
+        );
+        assert_eq!(
+            macos_leftovers(p, &watch),
+            ["/k/bin/tool -> /opt/homebrew/opt/xz/lib/liblzma.5.dylib"],
+            "a 32-bit Mach-O is read too"
+        );
+        let mut truncated = homebrew.clone();
+        truncated.truncate(40);
+        let listed = macos_leftovers(p, &truncated);
+        assert!(
+            listed.len() == 1
+                && listed[0].starts_with("/k/bin/tool: its load commands could not be checked ("),
+            "{listed:?}"
+        );
+        assert!(
+            macos_leftovers(p, &fat(&[archive(), archive()], false)).is_empty(),
+            "a universal static archive loads nothing"
+        );
+        let clean = thin(
+            &[dylib_command(
+                LOAD_DYLIB,
+                "/usr/lib/libSystem.B.dylib",
+                true,
+            )],
+            true,
+        );
+        assert!(macos_leftovers(p, &clean).is_empty());
+        assert!(macos_leftovers(p, b"#!/bin/sh\necho /opt/homebrew/bin\n").is_empty());
+        let class = [0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52, 0, 0];
+        assert!(crate::macho::is_java_class(&class));
+        assert!(macos_leftovers(p, &class).is_empty());
+        assert!(!crate::macho::is_java_class(&fat(&[clean], false)));
     }
 
     #[test]

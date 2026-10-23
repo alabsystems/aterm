@@ -7,8 +7,7 @@ use crate::restore::{
     WindowLayout,
 };
 
-/// `layout_digest` keyed on the wire rather than a struct (`seamless::layout_wire_digest`), so a
-/// test can stand in for an older parent's digest using only that build's bytes.
+/// `layout_digest` keyed on the wire rather than a struct (`seamless::layout_wire_digest`).
 fn wire_digest(wire: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(LAYOUT_PROOF_DOMAIN);
@@ -17,8 +16,7 @@ fn wire_digest(wire: &str) -> [u8; 32] {
     hasher.finalize()
 }
 
-/// The digest of a re-serialization of the parsed layout: the counterfactual the child must not
-/// compute.
+/// The digest of a re-serialization of the parsed layout.
 fn child_digest_of_wire(wire: &str) -> Option<[u8; 32]> {
     layout_digest(&RestoreManifest::from_toml(wire)?)
 }
@@ -150,8 +148,6 @@ fn layout_digest_equality_is_exactly_wire_fixed_pointness() {
     }
 }
 
-// ---- screen side -------------------------------------------------------
-
 fn live_checkpoint() -> aterm_core::terminal::TerminalCheckpoint {
     let mut t = aterm_core::terminal::Terminal::new(24, 80);
     t.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~/aterm % cargo test");
@@ -177,14 +173,9 @@ fn lowering_the_carry_to_zero_cures_a_shape_refusal() {
         .grid
         .clone();
 
-    // DECSET 1049: the primary, scrollback and all, is parked in `alt_grid`, the slot the wire
-    // allows exactly `rows` records.
     t.process(b"\x1b[?1049h");
     t.process(b"a full-screen app draws here");
 
-    // The blob an older producer put in the inactive slot: the saved primary projected at the
-    // carry bound (`rows + min(scrollback, 256)` records), taken from this terminal before it
-    // switched so the shape is real.
     let mut carried = t.checkpoint_carry(256).expect("parser is Ground");
     carried.alt_grid = Some(parked_primary);
 
@@ -245,8 +236,6 @@ fn same_build_parent_and_child_screen_digests_agree() {
     let cp = live_checkpoint();
     let parent = screen_digest(&[(0, cp.clone())]).expect("parent screen digest");
 
-    // Exactly the child's path: meta JSON off the wire → CheckpointMeta →
-    // into_checkpoint → screen_digest_refs.
     let carry = ScreenCarry {
         schema: ScreenCarry::SCHEMA,
         meta: aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
@@ -388,7 +377,6 @@ fn the_prompts_pending_cwd_crosses_the_meta_wire() {
         t
     };
 
-    // A signing shell, a key-bound program's report landed at its prompt.
     let signed_report = format!(
         "\x1b]633;P;AtermCwd=file://host/home/me;id={hex}\x07\x1b]7;file://host/home/me\x07"
     )
@@ -418,7 +406,6 @@ fn the_prompts_pending_cwd_crosses_the_meta_wire() {
         "a stray at the adopted prompt of a signing shell is dropped"
     );
 
-    // A shell that does not sign: the stray it left held lands at its next A.
     let unsigned_report = b"\x1b]7;file://host/home/me\x07";
     let mut t = gated();
     prompt(&mut t, unsigned_report);
@@ -685,7 +672,6 @@ fn the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest() {
             "{state}: the adopted engine finishes the queued tail as one engine does"
         );
 
-        // A producer from before the key: parses, and adopts with none of it.
         let mut value: aterm_json::Value = aterm_json::from_str(&meta).expect("json");
         value
             .as_object_mut()
@@ -826,8 +812,6 @@ fn the_required_meta_keys_are_frozen() {
     );
 }
 
-// ---- build / commit identity -------------------------------------------
-
 /// The child proves with its own `build_info::build_number()` and `build_info::git_commit()`; the
 /// parent expects the apply ticket's `target_build`/`target_commit`. Any disagreement breaks the
 /// proof.
@@ -838,15 +822,12 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     let (ld, sd) = ([1u8; 32], [2u8; 32]);
     let base = adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
 
-    // (i) the swap did not take: the child is the old binary.
     let stale_build = adoption_proof(nonce, 1_784_825_157, "7bf23bbe1234", &ld, &sd, &ids).unwrap();
     assert_ne!(base, stale_build, "build number mismatch breaks the proof");
 
-    // (ii) a `-dirty` working tree on either side.
     let dirty = adoption_proof(nonce, 1_784_869_524, "7bf23bbe1234-dirty", &ld, &sd, &ids).unwrap();
     assert_ne!(base, dirty, "`-dirty` breaks the proof");
 
-    // (iii) 40-hex, 12-hex and mixed case all normalize together.
     let long = adoption_proof(
         nonce,
         1_784_869_524,
@@ -858,16 +839,12 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
     .unwrap();
     assert_eq!(base, long, "commit length/case normalization is symmetric");
 
-    // (iv) an unstamped build cannot prove in a release binary: `unknown` is admitted only
-    // under debug_assertions, a property of the binary that no environment variable widens.
     let unknown = adoption_proof(nonce, 1_784_869_524, "unknown", &ld, &sd, &ids);
     assert_eq!(
         unknown.is_ok(),
         cfg!(debug_assertions),
         "`unknown` commit is release-fatal (no proof is ever emitted)"
     );
-    // The refusal names the commit, never the session set. `unknown-dirty` is refused by every
-    // build, this debug test binary included; the start asks the same gate before it launches.
     let unstamped = adoption_proof(nonce, 1_784_869_524, "unknown-dirty", &ld, &sd, &ids);
     assert_eq!(
         unstamped,
@@ -885,10 +862,6 @@ fn child_build_and_commit_must_equal_the_parents_expectation_exactly() {
 /// [`adoption_proof`] against itself: a changed domain string, a reordered field, a dropped length
 /// prefix or a different [`normalize_commit`] keeps every self-consistent test green while the two
 /// builds compute different digests (an `AdoptionMismatch`; see [`adoption_proof`]).
-///
-/// The input holds down what is easiest to change by accident: an unsorted identity set (the sort
-/// is hashed) and a 40-hex uppercase commit (the fold-and-truncate to 12 is hashed too). If this
-/// fails, ask whether the edit was meant to break the wire at all.
 #[test]
 fn the_v1_adoption_digest_is_frozen_to_this_exact_vector() {
     const FROZEN: &str = "9f32e4a273bbb14fb95b80b90788b41fce5cbfbc9fff94051934eb9b7d78ccbd";

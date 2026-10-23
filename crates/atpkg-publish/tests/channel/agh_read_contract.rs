@@ -3,12 +3,18 @@
 // Author: Andrew Yates
 
 //! The read contract (docs/DESIGN-agh-2026-10-19.md §10.3): one set of cases, run unchanged
-//! against [`FakeHost`] and against [`AghHost`] over agh-fake, so the release host agh will
-//! become answers every read the lanes make exactly as the host their tests drive. Then what
-//! only AghHost does: its M2 refusals, its anonymous reads, the absent writer, one owner per
-//! host and ambiguous drafts.
+//! against [`FakeHost`], against [`AghHost`] over agh-fake, and against [`RestHost`] (the
+//! production host, REST over curl) over agh-fake, so the hosts the lanes run on answer every
+//! read the lanes make exactly as the host their tests drive. Then what only AghHost does: its
+//! M2 refusals, its anonymous reads, the absent writer, one owner per host and ambiguous
+//! drafts.
 //!
-//! Unix only: the AghHost world writes its token into a private file (`aterm_uds::private_file`).
+//! RestHost runs every case but the two of the download host (`probe_public`,
+//! `fetch_public`): those go through aterm-update-core's anonymous download-host lane, which
+//! takes only an `https` URL, so a loopback web origin is refused before anything is sent.
+//!
+//! Unix only: the AghHost and RestHost worlds write their tokens into private files
+//! (`aterm_uds::private_file`).
 
 #![cfg(unix)]
 
@@ -23,9 +29,11 @@ use agh::retry::RetryPolicy;
 use agh::wire::Endpoints;
 use agh::wire::http::HttpTransport;
 use agh_fake::{AssetSpec, Change, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec};
+use aterm_update_core::github_rest::Origins;
 use atpkg_publish::channel::{DOWNLOAD_ATTEMPTS, download_retried};
 use atpkg_publish::host::agh::AghHost;
 use atpkg_publish::host::fake::FakeHost;
+use atpkg_publish::host::rest::RestHost;
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 
 use super::scratch;
@@ -59,6 +67,10 @@ trait World {
     fn download_attempts(&self) -> usize;
     /// The warning lines the host wrote, where it keeps them.
     fn warnings(&self) -> Option<Vec<String>>;
+    /// The host's download-host probes reach this world's web origin.
+    fn probes_public(&self) -> bool {
+        true
+    }
 }
 
 /// [`FakeHost`], with slug `fixture-dev/packs`.
@@ -333,6 +345,51 @@ impl AghWorld {
     }
 }
 
+/// Lay release `tag` of [`SLUG`] on `fake`, with these assets.
+fn put_on(fake: &FakeGithub, tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &[u8])]) {
+    let at = "2026-10-01T00:00:00Z";
+    let spec = if draft {
+        ReleaseSpec::draft(tag, at)
+    } else {
+        ReleaseSpec::published(tag, at)
+    };
+    let id = fake.add_release(SLUG, spec.prerelease(prerelease));
+    for (name, bytes) in assets {
+        fake.add_asset(id, AssetSpec::uploaded(name, bytes));
+    }
+}
+
+/// Every authenticated asset download on `fake` answers an HTTP 500 from now on.
+fn fail_downloads_on(fake: &FakeGithub) {
+    fake.fault_always(
+        Match::api(ASSETS).method("GET"),
+        Fault::Status {
+            status: 500,
+            body: String::new(),
+            headers: vec![],
+        },
+    );
+}
+
+/// A draft of `tag` on `fake`: a prerelease, as the race loser's create always makes it (a
+/// draft prerelease) and as FakeHost lists its stray drafts.
+fn stray_draft_on(fake: &FakeGithub, tag: &str) {
+    fake.add_release(
+        SLUG,
+        ReleaseSpec::draft(tag, "2026-10-02T00:00:00Z").prerelease(true),
+    );
+}
+
+/// The authenticated asset downloads `fake` has seen.
+fn download_attempts_on(fake: &FakeGithub) -> usize {
+    fake.seen()
+        .iter()
+        .filter(|s| {
+            s.origin == FakeOrigin::Api && s.method == "GET" && s.path_and_query.starts_with(ASSETS)
+        })
+        .count()
+}
+
 /// `config::parse`, `config::validate` (with `config::file_id`), then the Router.
 fn router(text: &str, home: &Path) -> Router {
     let parsed = agh::config::parse(text).unwrap_or_else(|f| panic!("{}: {}", f.rule, f.what));
@@ -353,57 +410,104 @@ impl World for AghWorld {
     }
 
     fn put(&self, tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &[u8])]) {
-        let at = "2026-10-01T00:00:00Z";
-        let spec = if draft {
-            ReleaseSpec::draft(tag, at)
-        } else {
-            ReleaseSpec::published(tag, at)
-        };
-        let id = self.fake.add_release(SLUG, spec.prerelease(prerelease));
-        for (name, bytes) in assets {
-            self.fake.add_asset(id, AssetSpec::uploaded(name, bytes));
-        }
+        put_on(&self.fake, tag, draft, prerelease, assets);
     }
 
     fn fail_downloads(&self) {
-        self.fake.fault_always(
-            Match::api(ASSETS).method("GET"),
-            Fault::Status {
-                status: 500,
-                body: String::new(),
-                headers: vec![],
-            },
-        );
+        fail_downloads_on(&self.fake);
     }
 
     fn hide(&self) {
         self.fake.apply(Change::Hide { slug: SLUG.into() });
     }
 
-    /// A prerelease, as the race loser's create always makes it (`gh release create
-    /// --prerelease`) and as FakeHost lists its stray drafts.
     fn put_stray_draft(&self, tag: &str) {
-        self.fake.add_release(
-            SLUG,
-            ReleaseSpec::draft(tag, "2026-10-02T00:00:00Z").prerelease(true),
-        );
+        stray_draft_on(&self.fake, tag);
     }
 
     fn download_attempts(&self) -> usize {
-        self.fake
-            .seen()
-            .iter()
-            .filter(|s| {
-                s.origin == FakeOrigin::Api
-                    && s.method == "GET"
-                    && s.path_and_query.starts_with(ASSETS)
-            })
-            .count()
+        download_attempts_on(&self.fake)
     }
 
     fn warnings(&self) -> Option<Vec<String>> {
         Some(self.host.warnings())
     }
+}
+
+/// [`RestHost`] over agh-fake, as `fixture-dev-bot` (push on the repository).
+struct RestWorld {
+    fake: FakeGithub,
+    host: RestHost,
+    _dir: aterm_tempfile::TempDir,
+}
+
+impl RestWorld {
+    fn new() -> RestWorld {
+        let fake = FakeGithub::start();
+        let dir = scratch("rest-contract");
+        let tokens = dir.path().join("tokens");
+        aterm_uds::private_file::create_private_dir(&tokens).expect("the token directory");
+        let secret = agh_fake::token("dev");
+        fake.add_token(&secret, "fixture-dev-bot");
+        aterm_uds::private_file::write_private(
+            &tokens,
+            "dev.token",
+            format!("{secret}\n").as_bytes(),
+        )
+        .expect("the token file");
+        fake.add_repo(SLUG, RepoSpec::public().push("fixture-dev-bot"));
+        let ports = fake.ports();
+        let origins = Origins::loopback(ports.api, ports.uploads, ports.web, ports.cdn);
+        let git_base = origins.web.clone();
+        let host = RestHost::at(Some(tokens.join("dev.token")), origins, git_base);
+        RestWorld {
+            fake,
+            host,
+            _dir: dir,
+        }
+    }
+}
+
+impl World for RestWorld {
+    fn host(&self) -> &dyn ReleaseHost {
+        &self.host
+    }
+
+    fn put(&self, tag: &str, draft: bool, prerelease: bool, assets: &[(&str, &[u8])]) {
+        put_on(&self.fake, tag, draft, prerelease, assets);
+    }
+
+    fn fail_downloads(&self) {
+        fail_downloads_on(&self.fake);
+    }
+
+    fn hide(&self) {
+        self.fake.apply(Change::Hide { slug: SLUG.into() });
+    }
+
+    fn put_stray_draft(&self, tag: &str) {
+        stray_draft_on(&self.fake, tag);
+    }
+
+    fn download_attempts(&self) -> usize {
+        download_attempts_on(&self.fake)
+    }
+
+    fn warnings(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    fn probes_public(&self) -> bool {
+        false
+    }
+}
+
+/// `case` against a fresh [`RestWorld`], then the fake's own violations (a credential at the
+/// web or CDN origin, a missing API version or user agent among them), which must be none.
+fn on_rest(case: fn(&dyn World)) {
+    let w = RestWorld::new();
+    case(&w);
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
 /// `case` against a fresh [`AghWorld`], then the fake's own violations (a credential at the
@@ -471,6 +575,11 @@ fn releases_agh() {
     on_agh(case_releases);
 }
 
+#[test]
+fn releases_rest() {
+    on_rest(case_releases);
+}
+
 // --- 2. release ----------------------------------------------------------------------
 
 fn case_release(w: &dyn World) {
@@ -488,6 +597,11 @@ fn release_fake() {
 #[test]
 fn release_agh() {
     on_agh(case_release);
+}
+
+#[test]
+fn release_rest() {
+    on_rest(case_release);
 }
 
 // --- 3. download ---------------------------------------------------------------------
@@ -529,6 +643,11 @@ fn download_agh() {
     on_agh(case_download);
 }
 
+#[test]
+fn download_rest() {
+    on_rest(case_download);
+}
+
 // --- 4. not visible ------------------------------------------------------------------
 
 fn case_not_visible(w: &dyn World) {
@@ -552,7 +671,9 @@ fn case_not_visible(w: &dyn World) {
     );
     // A repository this identity cannot see is private or gone, so the download host serves
     // nothing for it either.
-    assert_eq!(w.host().probe_public(&slug(), "v1", "a.bin"), Probe::Absent);
+    if w.probes_public() {
+        assert_eq!(w.host().probe_public(&slug(), "v1", "a.bin"), Probe::Absent);
+    }
 }
 
 #[test]
@@ -563,6 +684,11 @@ fn not_visible_fake() {
 #[test]
 fn not_visible_agh() {
     on_agh(case_not_visible);
+}
+
+#[test]
+fn not_visible_rest() {
+    on_rest(case_not_visible);
 }
 
 // --- 5. attempts ---------------------------------------------------------------------
@@ -590,6 +716,11 @@ fn attempts_fake() {
 #[test]
 fn attempts_agh() {
     on_agh(case_attempts);
+}
+
+#[test]
+fn attempts_rest() {
+    on_rest(case_attempts);
 }
 
 // --- 6. probe_public -----------------------------------------------------------------
@@ -709,6 +840,11 @@ fn race_fake() {
 #[test]
 fn race_agh() {
     on_agh(case_race);
+}
+
+#[test]
+fn race_rest() {
+    on_rest(case_race);
 }
 
 // --- FakeHost alone ------------------------------------------------------------------

@@ -683,6 +683,56 @@ impl PetBrain {
         })
     }
 
+    /// Whether the console's last observation holds a command still running
+    /// (shell integration's executing block).
+    pub(super) fn console_executing(&self) -> bool {
+        self.console.world.as_ref().is_some_and(|world| {
+            world
+                .anchors()
+                .iter()
+                .flatten()
+                .any(|a| a.state == BlockState::Executing)
+        })
+    }
+
+    /// The last observed letterform ([`crate::pet_world::PetWorld::letter_at`])
+    /// among the cells `[a, b)` of `row`: `Some(Some(col))`, `Some(None)` where
+    /// the map certifies none, and `None` where it covers none of them. An
+    /// unobserved cell inside a covered run reads as no letter: the law that
+    /// asks keeps its body off what it saw, never off what it guessed.
+    pub(super) fn observed_last_letter(&self, row: f32, a: f32, b: f32) -> Option<Option<usize>> {
+        if !self.console.presentable
+            || !row.is_finite()
+            || row < 0.0
+            || !a.is_finite()
+            || !b.is_finite()
+            || b <= a
+        {
+            return None;
+        }
+        #[cfg(any(test, debug_assertions))]
+        if self.letters_unseen {
+            return None;
+        }
+        let world = self.console.world.as_ref()?;
+        let (first, end) = (a.max(0.0).floor() as usize, b.ceil() as usize);
+        if end <= first || end - first > crate::pet_world::MAX_WORLD_COLS {
+            return None;
+        }
+        let r = row.round() as usize;
+        let mut seen = false;
+        let mut last = None;
+        for c in first..end {
+            if let Some(letter) = world.letter_at(r, c) {
+                seen = true;
+                if letter {
+                    last = Some(c);
+                }
+            }
+        }
+        seen.then_some(last)
+    }
+
     /// Exact locomotion occupancy where the map covers the whole footprint.
     pub(super) fn observed_ink_overlaps(&self, col: f32, row: f32, width: f32) -> Option<bool> {
         let (a, b) = (col + INK_PAD, col + width - INK_PAD);

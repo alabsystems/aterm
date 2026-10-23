@@ -96,7 +96,7 @@ pub enum ModeState {
 }
 
 impl ModeState {
-    fn from_code(code: u32) -> Option<Self> {
+    const fn from_code(code: u32) -> Option<Self> {
         Some(match code {
             0 => Self::NotRecognized,
             1 => Self::Set,
@@ -170,7 +170,7 @@ impl Default for Decoder {
 
 impl Decoder {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: State::Ground,
             seq: Vec::new(),
@@ -227,13 +227,13 @@ impl Decoder {
 
     /// When [`Self::flush`] next has something to resolve.
     #[must_use]
-    pub fn deadline(&self) -> Option<Instant> {
+    pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
     /// How long what the decoder holds waits for more bytes: `None` when it holds
     /// nothing.
-    fn wait(&self) -> Option<Duration> {
+    const fn wait(&self) -> Option<Duration> {
         match self.state {
             State::Ground => None,
             State::Paste { .. } => Some(PASTE_TIMEOUT),
@@ -635,7 +635,7 @@ fn alt_key(c: char) -> Event {
     }
 }
 
-fn named(key: NamedKey, mods: Modifiers) -> Event {
+const fn named(key: NamedKey, mods: Modifiers) -> Event {
     Event::Key {
         key: Key::Named(key),
         mods,
@@ -1220,7 +1220,7 @@ fn code_key(code: u32) -> Option<Key> {
 
 /// The letter-final CSI keys: the cursor keys, Home, End and keypad Begin, and F1-F4
 /// (xterm's modified forms; kitty's unmodified F1, F2 and F4 too).
-fn csi_letter_key(fin: u8) -> Option<NamedKey> {
+const fn csi_letter_key(fin: u8) -> Option<NamedKey> {
     Some(match fin {
         b'A' => NamedKey::ArrowUp,
         b'B' => NamedKey::ArrowDown,
@@ -1239,7 +1239,7 @@ fn csi_letter_key(fin: u8) -> Option<NamedKey> {
 
 /// The `CSI n ~` keys: xterm's numbers as aterm's legacy encoder writes them (F13-F24
 /// on from 25), with the rxvt and VT220 Home and End (1, 4, 7, 8) and F1-F4 (11-14).
-fn tilde_key(n: u32) -> Option<NamedKey> {
+const fn tilde_key(n: u32) -> Option<NamedKey> {
     use NamedKey::*;
     Some(match n {
         1 | 7 => Home,
@@ -1278,7 +1278,7 @@ fn tilde_key(n: u32) -> Option<NamedKey> {
 
 /// The SS3 keys: F1-F4, the application-mode cursor keys, Home and End, and the
 /// application keypad.
-fn ss3_key(fin: u8) -> Option<NamedKey> {
+const fn ss3_key(fin: u8) -> Option<NamedKey> {
     use NamedKey::*;
     Some(match fin {
         b'A' => ArrowUp,

@@ -51,7 +51,8 @@ fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
     note
 }
 
-/// The release's child rules for a step that runs in this process — the after-cut step's site sync: every child it starts, git's included, is started as [`Real::spawn_forwarded`] starts a step's (none once interrupted, a session of its own with git's prompt off, the interrupt handed to it, noted while it runs).
+/// The release's child rules for a step that runs in this process — the after-cut step's site sync and its GitHub reads: every child it starts, git's and the REST lane's curl included ([`crate::github::Launched`]), is started as [`Real::spawn_forwarded`] starts a step's (none once interrupted, a session of its own with git's prompt off, the interrupt handed to it, noted while it runs).
+#[derive(Clone, Debug)]
 pub(crate) struct StepChildren {
     /// Where the running child is noted, and under which step; `None` on a dry run.
     pub(crate) noted: Option<(PathBuf, Step)>,
@@ -1322,22 +1323,10 @@ impl Real {
         }
     }
 
-    /// The published release `tag` as GitHub serves it, through the authenticated `gh`
-    /// (a release tool never spends the anonymous API budget every install shares).
+    /// The published release `tag` as GitHub's API serves it to the release token.
     fn release_json(&self, slug: &str, tag: &str) -> Result<aterm_json::Value, String> {
-        let out = self
-            .output_forwarded(
-                command("gh").args(["api", &format!("repos/{slug}/releases/tags/{tag}")]),
-            )
-            .map_err(|e| format!("cannot run gh: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "could not read {slug} {tag} through gh ({}; gh auth status)",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        aterm_json::from_str(&String::from_utf8_lossy(&out.stdout))
-            .map_err(|e| format!("the release JSON of {tag} is not JSON: {e}"))
+        self.github_read(&format!("repos/{slug}/releases/tags/{tag}"))
+            .map_err(|e| format!("could not read {slug} {tag} from GitHub's API ({e})"))
     }
 
     /// The evergreen pointer as github.com serves a stranger: the first hop of
@@ -1385,21 +1374,32 @@ impl Real {
     /// (through the authenticated `gh`).
     fn site_tag(&self, slug: &str) -> Result<String, String> {
         let list = self
-            .output_forwarded(
-                command("gh").args(["api", &format!("repos/{slug}/releases?per_page=30")]),
-            )
-            .map_err(|e| format!("cannot run gh: {e}"))?;
-        if !list.status.success() {
-            return Err(format!(
-                "the release list for {slug} could not be read through gh ({})",
-                String::from_utf8_lossy(&list.stderr).trim()
-            ));
-        }
-        let catalog = crate::site::releases::parse_releases(&String::from_utf8_lossy(&list.stdout))
+            .github_read(&format!("repos/{slug}/releases?per_page=30"))
+            .map_err(|e| {
+                format!("the release list for {slug} could not be read from GitHub's API ({e})")
+            })?;
+        let catalog = crate::site::releases::parse_releases(&list.to_string())
             .map_err(|e| format!("the release list for {slug} is not release JSON ({e})"))?;
         crate::site::releases::elect_mac(&catalog, slug, &mut Vec::new())
             .map(|(mac, _)| mac.tag)
             .map_err(|e| format!("the site could not tell which release to link on {slug} ({e})"))
+    }
+
+    /// The release's child rules for a child of the running step that this process starts
+    /// itself ([`StepChildren`]): noted under the step on a real run.
+    fn step_children(&self) -> StepChildren {
+        StepChildren {
+            noted: (!self.scratch_logs).then(|| (self.release.clone(), self.step)),
+        }
+    }
+
+    /// The JSON GitHub's REST API answers at `path` ([`crate::github::get_via`]), each curl
+    /// under the release's child rules ([`StepChildren`]: a session of its own, the interrupt
+    /// handed to it, noted while it runs), and nothing asked once an interrupt is caught.
+    fn github_read(&self, path: &str) -> Result<aterm_json::Value, String> {
+        let spawn: std::sync::Arc<dyn aterm_update_core::github_rest::Spawn> =
+            std::sync::Arc::new(crate::github::Launched(self.step_children()));
+        crate::github::get_via(Some(&spawn), path).map_err(|e| e.to_string())
     }
 
     /// `ship site --latest`, in this process: its transcript into the step's log (and the
@@ -1440,9 +1440,8 @@ impl Real {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .filter(|k| clears(k) || launcher_env(k))
                 .collect(),
-            launch: std::rc::Rc::new(StepChildren {
-                noted: (!self.scratch_logs).then(|| (self.release.clone(), self.step)),
-            }),
+            launch: std::rc::Rc::new(self.step_children()),
+            github: std::sync::Arc::new(crate::github::Launched(self.step_children())),
         };
         let opts = crate::site::Options {
             latest: true,
@@ -3138,7 +3137,7 @@ impl Backend for Real {
             ));
         }
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
-        let gates: [(&str, crate::ledger::Result<()>); 4] = [
+        let gates: [(&str, crate::ledger::Result<()>); 3] = [
             (
                 "changelog",
                 crate::gates::changelog_gate_at(&git, commit, version).map(|_| ()),
@@ -3151,15 +3150,18 @@ impl Backend for Real {
                 "handoff policy",
                 crate::gates::handoff_policy_gate_at(&git, commit, version).map(|_| ()),
             ),
-            (
-                "locked metadata",
-                crate::gates::locked_metadata_gate(&self.repo),
-            ),
         ];
         for (name, outcome) in gates {
             if let Err(e) = outcome {
                 blocks.push(cut_refusal(name, &e.to_string()));
             }
+        }
+        if let Err(error) = crate::gates::locked_metadata_gate(&self.repo) {
+            let refusal = cut_refusal("locked metadata", &error.to_string());
+            blocks.push(match error {
+                crate::gates::LockedMetadataError::Unavailable(_) => refusal.could_not_run(),
+                crate::gates::LockedMetadataError::Lockfile(_) => refusal,
+            });
         }
         let path = std::env::var_os("PATH").unwrap_or_default();
         let gitleaks = std::env::split_paths(&path).any(|d| d.join("gitleaks").is_file());
@@ -3437,10 +3439,11 @@ impl Backend for Real {
         let mut problems = match read(self, &tag) {
             Ok(rel) => release_shape(&rel, version),
             Err(why) => {
-                return Err(
-                    Refusal::new(why, format!("{RELEASE_COMMAND} again when gh answers"))
-                        .could_not_run(),
-                );
+                return Err(Refusal::new(
+                    why,
+                    format!("{RELEASE_COMMAND} again when GitHub answers"),
+                )
+                .could_not_run());
             }
         };
         problems.extend(pointer_verdict(
@@ -3454,7 +3457,7 @@ impl Backend for Real {
                         "{why}, so the release the site would link is unknown and cannot be \
                          shape-checked — the site was NOT touched"
                     ),
-                    format!("{RELEASE_COMMAND} again when gh answers"),
+                    format!("{RELEASE_COMMAND} again when GitHub answers"),
                 )
                 .could_not_run());
             }
@@ -3472,7 +3475,7 @@ impl Backend for Real {
                 Err(why) => {
                     return Err(Refusal::new(
                         why,
-                        format!("{RELEASE_COMMAND} again when gh answers"),
+                        format!("{RELEASE_COMMAND} again when GitHub answers"),
                     )
                     .could_not_run());
                 }
@@ -3493,19 +3496,11 @@ impl Backend for Real {
 
     fn latest(&mut self) -> Result<String, String> {
         let slug = self.slug();
-        let out = self
-            .output_forwarded(command("gh").args([
-                "api",
-                &format!("repos/{slug}/releases/latest"),
-                "--jq",
-                ".tag_name",
-            ]))
-            .map_err(|e| format!("cannot run gh: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        let release = self.github_read(&format!("repos/{slug}/releases/latest"))?;
+        release["tag_name"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("{slug}'s latest release names no tag_name"))
     }
 }
 

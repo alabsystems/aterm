@@ -4246,7 +4246,8 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
             "moving" => "the screen's rows moved during the search; search again",
             "changed" => "the terminal changed while the search ran",
             "older" => DEPTH,
-            word if word.starts_with("screen_first=") => continue,
+            // Where the screen was, and whether its frame was whole: neither is a cause.
+            word if word.starts_with("screen_first=") || word.starts_with("frame=") => continue,
             _ => "the server reported an unrecognized search completeness cause",
         };
         if !note.is_empty() {
@@ -4262,6 +4263,19 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
         });
     }
     Some(note)
+}
+
+/// The stderr note for a line-framed reply read on an unfinished DEC 2026 frame (`frame=open`).
+pub const FRAME_OPEN_NOTE: &str = "the program's frame was unfinished at the read (frame=open): \
+                                   its rows may be half a redraw; `await frame` and read again";
+
+/// [`FRAME_OPEN_NOTE`] when a header shown nowhere else carries `frame=open` after its count.
+#[must_use]
+pub fn frame_open_note(tail: &str) -> Option<&'static str> {
+    tail.split_whitespace()
+        .skip(1)
+        .any(|word| word == "frame=open")
+        .then_some(FRAME_OPEN_NOTE)
 }
 
 const MAX_STREAM_LINES: usize = 200_000;
@@ -5241,6 +5255,8 @@ fn exchange_on(
             msg.push_str(verb);
             msg.push_str(": no results)");
             stderr_line(&msg)?;
+        } else if !turn_verdict && let Some(note) = frame_open_note(tail) {
+            stderr_line(note)?;
         }
         match print_payload(&mut reader, count) {
             Err(e) if turn_verdict && !is_stdout_closed(&e) => {

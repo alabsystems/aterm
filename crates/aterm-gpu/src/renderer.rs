@@ -93,7 +93,7 @@ macro_rules! impl_pod_zeroable {
             ),
         );
         const _: fn($t) = |v: $t| {
-            fn is_pod<T: ::aterm_bits::Pod>(_: &T) {}
+            const fn is_pod<T: ::aterm_bits::Pod>(_: &T) {}
             let $t { $($f: _),+ } = v;
             $({ let f: $ft = v.$f; is_pod(&f); })+
         };
@@ -2514,7 +2514,7 @@ pub(crate) enum FrameRes<'a> {
 
 impl FrameRes<'_> {
     #[inline]
-    fn view(&self, srgb: bool) -> crate::device_layer::FrameView<'_> {
+    const fn view(&self, srgb: bool) -> crate::device_layer::FrameView<'_> {
         match self {
             #[cfg(wgpu_arm)]
             Self::Wgpu(r) => {
@@ -2750,7 +2750,7 @@ pub(crate) struct MetalFxBind {
 #[cfg(target_os = "macos")]
 impl MetalFrameRig {
     #[inline]
-    fn uniforms(&self) -> crate::device_layer::FrameUniforms<'_> {
+    const fn uniforms(&self) -> crate::device_layer::FrameUniforms<'_> {
         crate::device_layer::FrameUniforms::Metal {
             buf: &self.uniform,
             vertex_slot: self.uniform_vertex_slot,
@@ -2943,7 +2943,7 @@ pub(crate) struct FxHazard {
 #[cfg(target_os = "macos")]
 impl FxHazard {
     #[inline]
-    fn parked(&mut self, ns: u64) {
+    const fn parked(&mut self, ns: u64) {
         #[cfg(any(test, debug_assertions))]
         {
             self.park_ns = self.park_ns.saturating_add(ns);
@@ -3042,17 +3042,17 @@ impl MetalArmLive {
     }
 
     #[inline]
-    fn layer(&self) -> crate::device_layer::DeviceHandle<'_> {
+    const fn layer(&self) -> crate::device_layer::DeviceHandle<'_> {
         crate::device_layer::DeviceHandle::Metal(&self.mint)
     }
 
     #[inline]
-    fn current_slot(&self) -> &ArmFrameSlot {
+    const fn current_slot(&self) -> &ArmFrameSlot {
         &self.frame_slots[self.cur_slot]
     }
 
     #[inline]
-    fn current_slot_mut(&mut self) -> &mut ArmFrameSlot {
+    const fn current_slot_mut(&mut self) -> &mut ArmFrameSlot {
         &mut self.frame_slots[self.cur_slot]
     }
 
@@ -3157,7 +3157,7 @@ impl MetalArmLive {
     }
 
     #[inline]
-    fn advance_submit_b_slot(&mut self) {
+    const fn advance_submit_b_slot(&mut self) {
         self.submit_b_idx = (self.submit_b_idx + 1) % ARM_SUBMIT_B_SLOTS;
     }
 
@@ -3211,7 +3211,7 @@ impl MetalArmLive {
     }
 
     #[inline]
-    fn take_present_seq(&mut self) -> u64 {
+    const fn take_present_seq(&mut self) -> u64 {
         let seq = self.present_seq;
         self.present_seq = seq.wrapping_add(1);
         seq
@@ -3771,7 +3771,7 @@ pub(crate) enum BlitTestTarget {
 
 #[cfg(wgpu_arm)]
 impl BlitTestTarget {
-    fn wgpu(self) -> wgpu::TextureFormat {
+    const fn wgpu(self) -> wgpu::TextureFormat {
         match self {
             Self::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
             #[cfg(all(test, target_os = "macos"))]
@@ -4179,7 +4179,7 @@ impl GpuSurface {
 
     #[cfg(target_os = "macos")]
     #[inline]
-    fn neutral_config(&self) -> (u32, u32, crate::device_layer::TexelFormat) {
+    const fn neutral_config(&self) -> (u32, u32, crate::device_layer::TexelFormat) {
         #[cfg(wgpu_arm)]
         {
             let f = crate::device_layer::TexelFormat::from_wgpu(self.config.format)
@@ -4757,7 +4757,7 @@ impl WindowGpu {
 
     /// Record winit's `WindowEvent::Occluded` state (see `occluded_hint`).
     #[inline]
-    pub fn set_occluded_hint(&mut self, occluded: bool) {
+    pub const fn set_occluded_hint(&mut self, occluded: bool) {
         self.occluded_hint = occluded;
     }
 
@@ -4770,7 +4770,7 @@ impl WindowGpu {
 
     /// Mark the frontend's next presents as a capture's (`on`), or no longer (`!on`).
     #[inline]
-    pub fn set_capture_present(&mut self, on: bool) {
+    pub const fn set_capture_present(&mut self, on: bool) {
         self.capture_present = on;
     }
 
@@ -4823,7 +4823,7 @@ impl WindowGpu {
 
     /// Consume this surface-present attempt's acquire measurement exactly once.
     #[inline]
-    pub fn take_acquire_wait_sample_ns(&mut self) -> Option<u64> {
+    pub const fn take_acquire_wait_sample_ns(&mut self) -> Option<u64> {
         self.acquire_wait_sample_ns.take()
     }
 
@@ -4836,7 +4836,7 @@ impl WindowGpu {
 
     /// Consume this surface-present attempt's queue measurement exactly once.
     #[inline]
-    pub fn take_acquire_queue_sample_ns(&mut self) -> Option<u64> {
+    pub const fn take_acquire_queue_sample_ns(&mut self) -> Option<u64> {
         self.acquire_queue_sample_ns.take()
     }
 
@@ -4849,7 +4849,7 @@ impl WindowGpu {
 
     /// Consume this present attempt's GPU-park measurement once.
     #[inline]
-    pub fn take_gpu_park_sample_ns(&mut self) -> Option<u64> {
+    pub const fn take_gpu_park_sample_ns(&mut self) -> Option<u64> {
         self.gpu_park_sample_ns.take()
     }
 
@@ -4865,7 +4865,7 @@ impl WindowGpu {
     }
 
     #[inline]
-    fn begin_surface_present(&mut self) {
+    const fn begin_surface_present(&mut self) {
         self.acquire_wait_sample_ns = None;
         self.acquire_queue_sample_ns = None;
         self.gpu_park_sample_ns = None;
@@ -4882,33 +4882,36 @@ impl WindowGpu {
     }
 
     #[inline]
-    fn record_surface_acquire(&mut self, waited_ns: u64) {
+    const fn record_surface_acquire(&mut self, waited_ns: u64) {
         self.last_acquire_wait_ns = waited_ns;
         self.acquire_wait_sample_ns = Some(waited_ns);
     }
 
     #[cfg(target_os = "macos")]
     #[inline]
-    fn record_surface_acquire_queue(&mut self, queued_ns: u64) {
+    const fn record_surface_acquire_queue(&mut self, queued_ns: u64) {
         self.last_acquire_queue_ns = queued_ns;
         self.acquire_queue_sample_ns = Some(queued_ns);
     }
 
     /// Record the screen's raw EDR maximum for this window.
     #[inline]
-    pub fn set_edr_max(&mut self, v: f32) {
+    pub const fn set_edr_max(&mut self, v: f32) {
         self.edr_max = v;
     }
 
     /// Record the Windows scRGB reference-white scale (`SDRwhite_nits / 80`), clamped to `>= 1.0`.
     #[inline]
-    pub fn set_sdr_white_scale(&mut self, v: f32) {
+    pub const fn set_sdr_white_scale(&mut self, v: f32) {
         self.sdr_white_scale = if v.is_finite() { v.max(1.0) } else { 1.0 };
     }
 
     /// Record the colour-space tag the compositor uses for this window's presented texture.
     #[inline]
-    pub fn set_capture_color_space(&mut self, color_space: crate::video_tap::CaptureColorSpace) {
+    pub const fn set_capture_color_space(
+        &mut self,
+        color_space: crate::video_tap::CaptureColorSpace,
+    ) {
         self.capture_color_space = color_space;
     }
 
@@ -5025,7 +5028,7 @@ impl WindowGpu {
     }
 
     #[inline]
-    fn advance_resident_input_epoch(&mut self) {
+    const fn advance_resident_input_epoch(&mut self) {
         self.resident_input_epoch = self.resident_input_epoch.saturating_add(1);
     }
 
@@ -5933,7 +5936,7 @@ use aterm_render::bloom::{BLOOM_DOWNSCALE, BLOOM_RADIUS, BLOOM_STRENGTH};
 
 /// The chroma radius paired with a white blur `radius`, used by every uniform write site.
 #[inline]
-pub(crate) fn bloom_chroma_radius(radius: f32) -> f32 {
+pub(crate) const fn bloom_chroma_radius(radius: f32) -> f32 {
     aterm_render::bloom::chroma_radius(radius)
 }
 
@@ -6294,7 +6297,7 @@ pub(crate) struct EffectPipelines {
 
 #[cfg(wgpu_arm)]
 impl EffectPipelines {
-    fn new(shader: wgpu::ShaderModule, layouts: CellLayouts, targets: TargetFormats) -> Self {
+    const fn new(shader: wgpu::ShaderModule, layouts: CellLayouts, targets: TargetFormats) -> Self {
         Self {
             shader,
             layouts,
@@ -6989,7 +6992,7 @@ impl GpuRenderer {
     /// The active coverage blend mode (off the wrapped CPU face).
     #[must_use]
     #[inline]
-    pub fn text_blending(&self) -> aterm_render::TextBlending {
+    pub const fn text_blending(&self) -> aterm_render::TextBlending {
         self.cpu.text_blending()
     }
 
@@ -7060,7 +7063,7 @@ impl GpuRenderer {
     /// The configured default-background opacity (off the wrapped CPU face).
     #[must_use]
     #[inline]
-    pub fn background_opacity(&self) -> f32 {
+    pub const fn background_opacity(&self) -> f32 {
         self.cpu.background_opacity()
     }
 
@@ -7073,7 +7076,7 @@ impl GpuRenderer {
     /// The configured cursor-fill opacity (off the wrapped CPU face).
     #[must_use]
     #[inline]
-    pub fn cursor_opacity(&self) -> f32 {
+    pub const fn cursor_opacity(&self) -> f32 {
         self.cpu.cursor_opacity()
     }
 
@@ -7244,7 +7247,7 @@ impl GpuRenderer {
     /// Whether the wrapped CPU generation is sealed against later font I/O.
     #[must_use]
     #[inline]
-    pub fn admitted_font_sources_sealed(&self) -> bool {
+    pub const fn admitted_font_sources_sealed(&self) -> bool {
         self.cpu.admitted_font_sources_sealed()
     }
 
@@ -7405,14 +7408,14 @@ impl GpuRenderer {
     /// Test seam, the fx hazard drill's control.
     #[doc(hidden)]
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
-    pub fn set_fx_palette_shared_for_test(&mut self, on: bool) {
+    pub const fn set_fx_palette_shared_for_test(&mut self, on: bool) {
         self.fx_palette_shared_seam = on;
     }
 
     /// Test seam.
     #[doc(hidden)]
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
-    pub fn fail_fx_staging_for_test(&mut self, on: bool) {
+    pub const fn fail_fx_staging_for_test(&mut self, on: bool) {
         self.fx_fail_seam = on;
     }
 
@@ -7522,7 +7525,7 @@ impl GpuRenderer {
     /// Set the pass-economy ablation (the `ATERM_GPU_ABLATE_UNORM` seam's programmatic twin, for the effects perf lane and tests).
     #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
     #[inline]
-    pub fn set_unorm_ablation(&mut self, ablation: UnormAblation) {
+    pub const fn set_unorm_ablation(&mut self, ablation: UnormAblation) {
         self.ablation = ablation;
     }
 
@@ -7602,13 +7605,13 @@ impl GpuRenderer {
 
     /// Cell size (pixels), straight from the CPU renderer so geometry matches.
     #[inline]
-    pub fn cell_size(&self) -> (usize, usize) {
+    pub const fn cell_size(&self) -> (usize, usize) {
         self.cpu.cell_size()
     }
 
     /// Interior padding (px per edge), delegated to the inner CPU renderer.
     #[inline]
-    pub fn pad(&self) -> usize {
+    pub const fn pad(&self) -> usize {
         self.cpu.pad()
     }
 
@@ -7620,7 +7623,7 @@ impl GpuRenderer {
 
     /// Chrome headroom (px above the padded grid), delegated to the inner CPU renderer.
     #[inline]
-    pub fn head(&self) -> usize {
+    pub const fn head(&self) -> usize {
         self.cpu.head()
     }
 
@@ -7651,7 +7654,7 @@ impl GpuRenderer {
     /// The chrome bleed in force, read from the inner CPU renderer.
     #[must_use]
     #[inline]
-    pub fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
+    pub const fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
         self.cpu.chrome_bleed()
     }
 
@@ -7664,7 +7667,7 @@ impl GpuRenderer {
 
     /// Padded pixel size of a `rows`×`cols` grid (`cols·cell_w + 2·pad`, etc.).
     #[inline]
-    pub fn frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
+    pub const fn frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
         self.cpu.frame_size(rows, cols)
     }
 
@@ -7752,7 +7755,7 @@ impl GpuRenderer {
     /// Integration-suite spelling of [`Self::disarm_metal_for_test`].
     #[doc(hidden)]
     #[cfg(all(target_os = "macos", wgpu_arm))]
-    pub fn disarm_metal_for_oracle(&mut self) {
+    pub const fn disarm_metal_for_oracle(&mut self) {
         self.metal_armed = false;
     }
 
@@ -8327,7 +8330,7 @@ impl GpuRenderer {
 
     /// Enable/disable the cursor-comet bloom (default on), read each present.
     #[inline]
-    pub fn set_bloom(&mut self, on: bool) {
+    pub const fn set_bloom(&mut self, on: bool) {
         self.enable_bloom = on;
     }
 
@@ -8340,14 +8343,14 @@ impl GpuRenderer {
 
     /// Set the bloom tunables (`cursor_trail_bloom_strength`/`_radius`).
     #[inline]
-    pub fn set_bloom_params(&mut self, strength: f32, radius: f32) {
+    pub const fn set_bloom_params(&mut self, strength: f32, radius: f32) {
         self.bloom_strength = strength;
         self.bloom_radius = radius;
     }
 
     /// Enable/disable the heat shimmer (config `cursor_fire_shimmer`, default on).
     #[inline]
-    pub fn set_shimmer(&mut self, on: bool) {
+    pub const fn set_shimmer(&mut self, on: bool) {
         self.enable_shimmer = on;
     }
 
@@ -8361,7 +8364,7 @@ impl GpuRenderer {
     /// Test hook.
     #[doc(hidden)]
     #[inline]
-    pub fn set_shimmer_phase_for_test(&mut self, phase: Option<f32>) {
+    pub const fn set_shimmer_phase_for_test(&mut self, phase: Option<f32>) {
         self.shimmer_phase_pin = phase;
     }
 
@@ -8377,7 +8380,7 @@ impl GpuRenderer {
     }
 
     #[inline]
-    fn shimmer_live(&self, input: &RenderInput) -> bool {
+    const fn shimmer_live(&self, input: &RenderInput) -> bool {
         self.enable_shimmer && !input.fire_patch.is_empty() && !input.cursor_glow_add.is_empty()
     }
 
@@ -8402,18 +8405,18 @@ impl GpuRenderer {
 
     /// Mirror the frontend's `background_material != none` knob.
     #[inline]
-    pub fn set_backdrop_margins(&mut self, on: bool) {
+    pub const fn set_backdrop_margins(&mut self, on: bool) {
         self.backdrop_margins = on;
     }
 
     #[inline]
-    fn backdrop_margins_active(&self) -> bool {
+    const fn backdrop_margins_active(&self) -> bool {
         self.backdrop_margins && self.ctx.visual_swapchain
     }
 
     /// Set the SDR glow-boost strength (`cursor_glow_sdr_boost`, 0..=1; 0 disables).
     #[inline]
-    pub fn set_sdr_glow_boost(&mut self, strength: f32) {
+    pub const fn set_sdr_glow_boost(&mut self, strength: f32) {
         self.sdr_glow_boost = strength;
     }
 
@@ -11442,7 +11445,7 @@ impl GpuRenderer {
 
     #[cfg(wgpu_arm)]
     #[inline]
-    fn surface_usage(caps: &wgpu::SurfaceCapabilities) -> (wgpu::TextureUsages, bool) {
+    const fn surface_usage(caps: &wgpu::SurfaceCapabilities) -> (wgpu::TextureUsages, bool) {
         let copyable = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         (wgpu::TextureUsages::RENDER_ATTACHMENT, copyable)
     }
@@ -11556,7 +11559,7 @@ impl GpuRenderer {
 
     #[cfg(wgpu_arm)]
     #[inline]
-    fn present_alpha_mode(opacity: f32, post_mult: bool) -> wgpu::CompositeAlphaMode {
+    const fn present_alpha_mode(opacity: f32, post_mult: bool) -> wgpu::CompositeAlphaMode {
         if post_mult && aterm_render::vibrancy::is_translucent(opacity) {
             wgpu::CompositeAlphaMode::PostMultiplied
         } else {
@@ -11980,7 +11983,7 @@ impl GpuRenderer {
 
     #[cfg(not(windows))]
     #[cfg(wgpu_arm)]
-    fn surface_output_hdr_enabled(_surface: &wgpu::Surface) -> bool {
+    const fn surface_output_hdr_enabled(_surface: &wgpu::Surface) -> bool {
         false
     }
 
@@ -12029,7 +12032,7 @@ impl GpuRenderer {
 
     #[cfg(target_os = "macos")]
     #[cfg(wgpu_arm)]
-    fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
+    const fn tag_swapchain_scrgb(_surface: &wgpu::Surface) -> bool {
         true
     }
 
@@ -12491,7 +12494,7 @@ impl GpuRenderer {
         );
         let po = win.present_offscreen.as_ref().expect("dims read above");
         let scratch = win.shift_scratch.as_ref().expect("just ensured").wgpu();
-        fn rect(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+        const fn rect(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
                 mip_level: 0,
@@ -12621,7 +12624,7 @@ impl GpuRenderer {
         let (Some(off), Some(ap)) = (win.offscreen.as_ref(), win.apron_tex.as_ref()) else {
             return;
         };
-        fn at(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+        const fn at(tex: &wgpu::Texture, y: u32) -> wgpu::TexelCopyTextureInfo<'_> {
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
                 mip_level: 0,
@@ -14078,7 +14081,7 @@ impl GpuRenderer {
 
     /// Test helper: reset one window's SDR glow-boost envelope.
     #[doc(hidden)]
-    pub fn reset_glow_ease_for_test(&self, win: &mut WindowGpu) {
+    pub const fn reset_glow_ease_for_test(&self, win: &mut WindowGpu) {
         win.sdr_glow_level = 0.0;
         win.sdr_glow_level_at = None;
     }

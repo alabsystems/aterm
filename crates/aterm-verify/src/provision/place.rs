@@ -1,24 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How a row reaches its directory: a scratch of its own under the tooling cache (the
-//! browsers' too, renamed into the browser cache at the end), a download into an empty
-//! directory of its own held to its pin before anything reads it, the vetted unpack, a
-//! tree whose every link stays inside it, the stamp, then one rename into place. Ordinary
-//! failures drop the scratch. A copied program's unproven start retains its actual image
-//! and tree, including on unwind; a completed stdout
-//! response permits ordinary cleanup again. Automatic tooling reclaim keeps retained
-//! or interrupted `.provision-*` scratches: age does not establish that execution ended.
-
 use std::path::{Path, PathBuf};
 
 use atpkg::extract::{Container, ExtractOptions, SymlinkPolicy};
 
 use super::{Host, Spawn, Stamp};
 
-/// The prefix of every row's scratch under a cache root
-/// ([`aterm_uds::host::TOOLING_SCRATCH`]), which the reclaim's tooling pass reads as
-/// unfinished.
+/// The prefix of every row's scratch under a cache root.
 pub const SCRATCH_PREFIX: &str = aterm_uds::host::TOOLING_SCRATCH;
 
 /// The most an unpacked tree may hold: twice the largest any row has measured (pwsh's
@@ -112,9 +101,6 @@ fn file_name(url: &str) -> String {
 
 /// Download `url` into a new empty directory of the scratch and hold it to its pin: the
 /// size, then the sha256. The path of the checked file.
-///
-/// # Errors
-/// The download failed, or the file is not the pin's (nothing has read it then).
 pub(super) fn fetch_checked(
     host: &dyn Host,
     scratch: &Scratch,
@@ -220,9 +206,6 @@ pub(super) fn is_executable(path: &Path) -> bool {
 /// Refuse `tree` if any link in it points outside it, to nothing, or round a loop, each
 /// resolved the way the kernel will follow it (`ditto` and `unzip` lay whatever links a
 /// zip holds). Nothing in the tree is read but its names and links.
-///
-/// # Errors
-/// The first such link, by its path in the tree.
 pub(super) fn links_within(tree: &Path) -> Result<(), String> {
     let root = std::fs::canonicalize(tree)
         .map_err(|e| format!("could not resolve {}: {e}", tree.display()))?;

@@ -2,7 +2,35 @@
 // Copyright 2026 Andrew Yates
 
 //! THE VITALS HOST: the one probe thread that reads the machine for the stats Deck (`crate::stats_deck`), and the loop's side of it.
+//!
+//! THE SPLIT SET (`docs/DESIGN-resource-details-2026-10-20.md` §3.1–§3.2,
+//! §5.1): what `sys why` and the Deck's cause clause split the busy CPU by
+//! (`aterm_vitals::explain`), read on macOS beside a whole reading: each
+//! swept process's resource coalition (in the sweep), every coalition's
+//! counters, each swept process's birth (kept only while its known kernel
+//! start and name agree), each coalition lead's current identity (an exec
+//! can keep its pid, birth and short name; a refused read replaces the last
+//! identity with unknown) and the machine's timeline (`kern.waketime`
+//! each time, the rest when it moved). The sweep, the coalitions and the
+//! cores' ticks are read back to back, so each end of a window reads them
+//! together. A reading that reads it is a SPLIT TICK, and only some are
+//! ([`split_due`]): the bars' reading while a window in view shows them, as
+//! the Deck or the Sill ([`Request::deck`]), every [`SPLIT_EVERY`] (every
+//! [`SPLIT_EVERY_LENS`] while a lens is open), and a worker's pull while a
+//! `sys why` arms the split ([`SPLIT_ARMED`]), which pulls a cold pair when
+//! the last split tick is missing or too old for a window
+//! ([`SplitReader::cold`]), so its reply has a window. The jobs engine's
+//! readings (an edge, the disk watch's look, its demand, a delegated sweep),
+//! a hidden deck's machine counters, the Fleet Monitor tab's readings with no
+//! bars in view and every other pull read none, and nothing arms a timer for
+//! one: with no bars in view and no `sys why`, no coalition is read. The lane
+//! is decided once, on this thread, by the kernel's own self-check
+//! ([`SplitReader::new`]), and goes off for good where the model finds a read
+//! misread (`aterm_vitals::explain`); Linux and Windows have none, and a unit
+//! test's reader has the inert arm ([`CoalProbe::INERT`]), as its thermal
+//! probe has.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +43,7 @@ use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage};
 use aterm_sysprobe::jobs::RunState;
 use aterm_sysprobe::volumes::VolumeKey;
 use aterm_vitals::Peaks;
+use aterm_vitals::explain::{CoalLane, CoalSample, CoalUsage, LeadIdentity, TimelineSample};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
     LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
@@ -24,6 +53,7 @@ use aterm_vitals::sys::Machine;
 
 use crate::disk_board::{Clock, DiskFactsRaw, Shelf};
 use crate::disk_where::Where;
+use crate::occupancy_host::Arming;
 use crate::sys_host::PaneFact;
 
 /// A reading a second while a focused window shows the Deck.
@@ -57,6 +87,33 @@ pub(crate) const MIN_WINDOW: Duration = Duration::from_millis(250);
 pub(crate) const LAYOUT_EVERY: Duration = Duration::from_millis(250);
 /// The job events the hand-over keeps for the loop before the oldest go.
 const JOB_EVENTS_CAP: usize = 256;
+/// The bars' reading reads the split set at most this often: the split's
+/// window (module docs, THE SPLIT SET)…
+pub(crate) const SPLIT_EVERY: Duration = Duration::from_secs(5);
+/// …or this often while a lens is open (a cadence of at most
+/// [`crate::stats_lens::LENS_PERIOD`]).
+pub(crate) const SPLIT_EVERY_LENS: Duration = Duration::from_secs(1);
+/// The longest window a split reads: the model's one limit, past which a
+/// base only starts the next window.
+pub(crate) const SPLIT_WINDOW_MAX: Duration =
+    Duration::from_nanos(aterm_vitals::explain::WINDOW_MAX_NS);
+/// How far inside [`SPLIT_WINDOW_MAX`] the last split tick must be for an
+/// armed pull to read once ([`SplitReader::cold`]): the model measures the
+/// window between the two readings' stamps, each taken after its sweep, so
+/// a base a hair inside the limit when the pull looks is past it by then.
+pub(crate) const SPLIT_COLD_MARGIN: Duration = Duration::from_secs(1);
+/// The development seam (`aterm_types::dev_seam!`) that reads a recorded
+/// scene of `aterm_vitals::explain::fixtures` in place of the machine:
+/// `spotlight` (RD's 10:32 moment) or `calm` ([`WhyFixture`]). Only a debug
+/// build has the scenes; a `dev-seams` build without debug assertions warns
+/// that it reads the machine.
+const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
+
+/// THE PULLS THAT ASK FOR THE SPLIT: while one is armed (a `sys why`), a
+/// worker's pull reads the split set ([`split_due`]), twice when its last
+/// split tick is missing or too old for a window ([`Source::split_cold`]).
+/// It logs no edge: the slots' are `lab slot-lane`'s to count.
+pub(crate) static SPLIT_ARMED: Arming = Arming::new();
 
 /// HOW SOON A WHOLE READING IS DUE AGAIN with no window showing the bars,
 /// after one that gave `view` (design §6.1, kind 3): the engine's cadence
@@ -225,6 +282,16 @@ pub(crate) struct Request {
     pub(crate) machine_only: bool,
     /// The stuck engine looks at this reading even inside its own cadence.
     pub(crate) jobs_now: bool,
+    /// A control worker's pull ([`Msg::Pull`]; the thread sets it): it reads
+    /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]).
+    pub(crate) pull: bool,
+    /// A window in view shows the bars, as the Deck or the Sill (the Fleet
+    /// Monitor tab alone shows none): only then is the bars' reading a split
+    /// tick ([`split_due`]). The Sill draws no cause clause, but a close-up
+    /// opens from it as from the Deck, and a close-up's causes are the
+    /// episodes already open.
+    /// Every request the loop sends says it as of then, a layout's too.
+    pub(crate) deck: bool,
     /// Every agent session's token totals, each session once.
     pub(crate) tokens: Vec<TokenRow>,
     /// The front tab's plan usage, while current.
@@ -773,6 +840,12 @@ trait Source {
     fn machine(&self) -> Option<&Machine> {
         None
     }
+    /// Whether a pull now reads twice for the split's window: a `sys why`
+    /// arms the split and the last split tick is missing or too old for a
+    /// window ([`SplitReader::cold`]); a stand-in reads no split.
+    fn split_cold(&self) -> bool {
+        false
+    }
 }
 
 impl Source for Reader {
@@ -790,6 +863,10 @@ impl Source for Reader {
 
     fn machine(&self) -> Option<&Machine> {
         Some(&self.machine)
+    }
+
+    fn split_cold(&self) -> bool {
+        self.split.cold(Instant::now())
     }
 }
 
@@ -865,27 +942,8 @@ fn run(
             // A pull before the loop's first layout: this process is the root.
             req.self_pid = std::process::id();
         }
-        let cold = last_whole.is_none_or(|t| t.elapsed() > COLD_AFTER);
         let snap = if asked.pull {
-            let mut pull = req.clone();
-            pull.machine_only = false;
-            pull.jobs_now = false;
-            pull.cadence_ms =
-                duration_ms(if cold { COLD_PAIR } else { COLD_AFTER }).max(req.cadence_ms);
-            let warm = cold.then(|| {
-                let warm = source.reading(&pull);
-                std::thread::sleep(COLD_PAIR);
-                warm
-            });
-            if let Some(t) = last_whole.filter(|_| !cold) {
-                // A window under the floor is noise: wait out the rest.
-                std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
-            }
-            let mut snap = source.reading(&pull);
-            if let Some(warm) = warm {
-                keep_warm_events(warm, &mut snap);
-            }
-            snap
+            pull(&mut source, &req, last_whole)
         } else {
             source.reading(&req)
         };
@@ -904,6 +962,41 @@ fn run(
         }
     }
     peaks.keep(source.model().peaks(), Instant::now(), true);
+}
+
+/// A worker's pull ([`Msg::Pull`]) with the layout `req` holds, the thread's
+/// last whole reading at `last_whole`. It is whole, and its rates span the
+/// pull's own interval: its first reading at least [`MIN_WINDOW`] after the
+/// last, then a second [`COLD_PAIR`] on when it is cold (no whole reading
+/// within [`COLD_AFTER`], or a `sys why` arms a split whose last tick is
+/// missing or too old for a window, [`Source::split_cold`], judged after
+/// that wait). The gap rule takes the pair's spacing, or the longest a warm
+/// pull waits, as its cadence.
+fn pull(source: &mut impl Source, req: &Request, last_whole: Option<Instant>) -> Snapshot {
+    if let Some(t) = last_whole {
+        // A window under the floor is noise: wait out the rest, a pair's
+        // first reading too (cold for the split alone, the last whole
+        // reading can be a few ms old).
+        std::thread::sleep(MIN_WINDOW.saturating_sub(t.elapsed()));
+    }
+    let cold = last_whole.is_none_or(|t| t.elapsed() > COLD_AFTER) || source.split_cold();
+    let mut pull = req.clone();
+    pull.machine_only = false;
+    // A pull keeps the engine's cadence, whatever the held request asked of
+    // it.
+    pull.jobs_now = false;
+    pull.pull = true;
+    pull.cadence_ms = duration_ms(if cold { COLD_PAIR } else { COLD_AFTER }).max(req.cadence_ms);
+    let warm = cold.then(|| {
+        let warm = source.reading(&pull);
+        std::thread::sleep(COLD_PAIR);
+        warm
+    });
+    let mut snap = source.reading(&pull);
+    if let Some(warm) = warm {
+        keep_warm_events(warm, &mut snap);
+    }
+    snap
 }
 
 /// `d` in whole ms, saturating.
@@ -1024,6 +1117,493 @@ fn os_family() -> &'static str {
     }
 }
 
+/// WHETHER A WHOLE READING `req` AT `now` IS A SPLIT TICK, the last having
+/// read at `last` (module docs, THE SPLIT SET): a pull's only while a `sys
+/// why` arms the split (`armed`), at least [`MIN_WINDOW`] after the last;
+/// otherwise only the bars' while a window in view shows them
+/// ([`Request::deck`]; no engine's reading: an edge, the disk watch's look,
+/// its demand or a delegated sweep, [`Request::jobs_now`]), every
+/// [`SPLIT_EVERY`], or every [`SPLIT_EVERY_LENS`] at a lens's cadence, within
+/// half the cadence so a reading a hair early is not put off a whole period.
+/// The first is due at once, and a base too old for a window only starts the
+/// next one (`aterm_vitals::explain::split::CoalBase::window_after`). PURE.
+pub(crate) fn split_due(last: Option<Instant>, req: &Request, armed: bool, now: Instant) -> bool {
+    let since = last.map(|t| now.saturating_duration_since(t));
+    if req.pull {
+        return armed && since.is_none_or(|s| s >= MIN_WINDOW);
+    }
+    if !req.deck || req.jobs_now || req.machine_only {
+        return false;
+    }
+    let every = if req.cadence_ms <= duration_ms(crate::stats_lens::LENS_PERIOD) {
+        SPLIT_EVERY_LENS
+    } else {
+        SPLIT_EVERY
+    };
+    let slack = Duration::from_millis(u64::from(req.cadence_ms) / 2);
+    since.is_none_or(|s| s + slack >= every)
+}
+
+/// THE COALITION LANE'S READERS (module docs, THE SPLIT SET): the kernel's
+/// ([`Self::KERNEL`]), or the inert arm a unit test's reader gets
+/// ([`Self::INERT`]), as its [`ThermalProbe`] is; a test hands its own
+/// stand-ins.
+#[derive(Clone, Copy)]
+pub(crate) struct CoalProbe {
+    /// The launch self-check, asked of this process
+    /// ([`aterm_sysprobe::coalitions::self_check`]).
+    pub(crate) self_check: fn(u32) -> Result<u64, &'static str>,
+    /// The process sweep, each process's coalition read in it where the
+    /// options ask ([`aterm_sysprobe::processes_with`]): the kernel's in
+    /// every arm, so a test's stand-in can count what a reading asks.
+    pub(crate) sweep: fn(aterm_sysprobe::SweepOpts) -> Option<aterm_sysprobe::Sweep>,
+    /// Every coalition's counters ([`aterm_sysprobe::coalitions::coalitions`]).
+    pub(crate) coalitions: fn() -> Option<aterm_sysprobe::coalitions::CoalitionRead>,
+    /// A process's short name and birth, unix ms, from its kernel record
+    /// ([`aterm_sysprobe::kproc::record`]).
+    pub(crate) birth: fn(u32) -> Option<(String, i64)>,
+    /// Every process's, by pid, in one read of the table
+    /// ([`aterm_sysprobe::kproc::records`]): cheaper than [`Self::birth`]
+    /// past [`BIRTHS_AT_ONCE`] pids.
+    pub(crate) births: fn() -> Option<Births>,
+    /// A process's image and signature ([`aterm_sysprobe::identity::identity`]).
+    pub(crate) identity: fn(u32) -> Option<aterm_sysprobe::identity::Identity>,
+    /// The machine's timeline ([`aterm_sysprobe::timeline::timeline`]).
+    pub(crate) timeline: fn() -> Option<aterm_sysprobe::timeline::Timeline>,
+    /// When the machine last woke ([`aterm_sysprobe::timeline::waketime_ms`]).
+    pub(crate) waketime_ms: fn() -> Option<i64>,
+}
+
+impl CoalProbe {
+    /// The kernel's readers (macOS; every other platform's lane answers
+    /// none and fails the self-check `unsupported`).
+    pub(crate) const KERNEL: Self = Self {
+        self_check: aterm_sysprobe::coalitions::self_check,
+        sweep: aterm_sysprobe::processes_with,
+        coalitions: aterm_sysprobe::coalitions::coalitions,
+        birth: |pid| aterm_sysprobe::kproc::record(pid).and_then(name_and_birth),
+        births: || {
+            Some(
+                aterm_sysprobe::kproc::records()?
+                    .into_iter()
+                    .filter_map(|r| Some((r.pid, name_and_birth(r)?)))
+                    .collect(),
+            )
+        },
+        identity: aterm_sysprobe::identity::identity,
+        timeline: aterm_sysprobe::timeline::timeline,
+        waketime_ms: aterm_sysprobe::timeline::waketime_ms,
+    };
+
+    /// The inert arm: no OS lane, nothing read but the sweep.
+    pub(crate) const INERT: Self = Self {
+        self_check: |_| Err("unsupported"),
+        sweep: aterm_sysprobe::processes_with,
+        coalitions: || None,
+        birth: |_| None,
+        births: || None,
+        identity: |_| None,
+        timeline: || None,
+        waketime_ms: || None,
+    };
+}
+
+/// The births a split tick reads in one read of the process table
+/// ([`CoalProbe::births`]) rather than one record each: past this many pids
+/// not yet read, the table is cheaper (m22, 2026-10-22, a debug build: 0.36
+/// ms for 680 records against about 6 µs a record).
+pub(crate) const BIRTHS_AT_ONCE: usize = 64;
+
+/// Each process's kernel `p_comm` and start, unix ms, by pid
+/// ([`CoalProbe::births`]).
+pub(crate) type Births = HashMap<u32, (String, i64)>;
+
+/// A kernel record's `p_comm` and start, unix ms ([`CoalProbe::KERNEL`]).
+fn name_and_birth(r: aterm_sysprobe::kproc::Record) -> Option<(String, i64)> {
+    let ms = i64::try_from(r.start_s)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(i64::from(r.start_us / 1000))?;
+    Some((r.comm, ms))
+}
+
+/// Whether a kernel record's `p_comm` `record` names the process the sweep
+/// named `swept`: the sweep's short info holds 15 bytes of it, the record 16
+/// (`MAXCOMLEN`), so a 16-byte name is swept cut by one, decoded as the
+/// record's first 15 bytes are (a letter the cut splits a U+FFFD); any other
+/// name is swept whole. PURE.
+fn names_the_same(record: &str, swept: &str) -> bool {
+    /// The most of `p_comm` the short info holds (`MAXCOMLEN - 1`).
+    const SHORT: usize = 15;
+    record == swept
+        || record
+            .as_bytes()
+            .get(..SHORT)
+            .is_some_and(|cut| String::from_utf8_lossy(cut) == swept)
+}
+
+/// One swept process's birth as read ([`SplitReader::births`]), with the
+/// sweep's name and kernel start for its pid then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Birth {
+    name: String,
+    start: Option<u64>,
+    ms: i64,
+}
+
+/// THE SPLIT SET'S HOST SIDE (module docs): the lane the self-check found,
+/// when the last split tick read, and what is read once and kept.
+pub(crate) struct SplitReader {
+    probe: CoalProbe,
+    /// The lane, from the launch self-check.
+    lane: CoalLane,
+    /// Whether pid 1 read as Apple's (the code-signing reads read as the
+    /// readers hold them): without it every lead's voucher is unknown.
+    vouches: bool,
+    /// The pulls that arm the split: [`SPLIT_ARMED`], or a test's own.
+    armed: &'static Arming,
+    /// When the last split tick read.
+    last: Option<Instant>,
+    /// Each swept process's birth, by pid: kept while the sweep's name and
+    /// known kernel start agree; read again with no start, after either
+    /// moves, or after a split tick over [`SPLIT_WINDOW_MAX`] after the last.
+    /// Gone when the pid leaves the sweep.
+    births: HashMap<u32, Birth>,
+    /// The `kern.waketime` the timeline was last read at; `None` until one
+    /// read.
+    wake_seen: Option<Option<i64>>,
+    /// The timeline as read then.
+    timeline: Option<TimelineSample>,
+}
+
+impl SplitReader {
+    /// `probe`'s lane, from its self-check of this process (and whether pid
+    /// 1 reads as Apple's), the split armed by `armed`. Run once, on the
+    /// probe thread: the answer is a field, never a lazy static.
+    pub(crate) fn new(probe: CoalProbe, armed: &'static Arming) -> Self {
+        let lane = match (probe.self_check)(std::process::id()) {
+            Ok(_) => CoalLane::On,
+            Err("unsupported") => CoalLane::Unsupported,
+            Err(missed) => {
+                aterm_log::warn!(
+                    "system vitals: the coalitions lane is off: its self-check missed ({missed})"
+                );
+                CoalLane::Off
+            }
+        };
+        let vouches = lane.on()
+            && (probe.identity)(1)
+                .is_some_and(|i| i.voucher() == aterm_sysprobe::identity::Voucher::Apple);
+        if lane.on() && !vouches {
+            aterm_log::warn!(
+                "system vitals: launchd's signature does not read as Apple's: every \
+                 coalition lead's voucher reads unknown"
+            );
+        }
+        Self {
+            probe,
+            lane,
+            vouches,
+            armed,
+            last: None,
+            births: HashMap::new(),
+            wake_seen: None,
+            timeline: None,
+        }
+    }
+
+    /// Whether the whole reading `req` at `now` is a split tick
+    /// ([`split_due`]): never with the lane off.
+    fn due(&self, req: &Request, now: Instant) -> bool {
+        self.lane.on() && split_due(self.last, req, self.armed.armed(), now)
+    }
+
+    /// Whether a pull at `now` must read twice for a window: a `sys why`
+    /// arms the split, and the last split tick is missing or, within
+    /// [`SPLIT_COLD_MARGIN`], older than a window can be
+    /// ([`SPLIT_WINDOW_MAX`]).
+    fn cold(&self, now: Instant) -> bool {
+        self.lane.on()
+            && self.armed.armed()
+            && self.last.is_none_or(|t| {
+                now.saturating_duration_since(t) + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX
+            })
+    }
+
+    /// The split tick at `now` of `sample`, whose sweep is its processes, and
+    /// `read`, the coalitions read beside its cores: each swept process's
+    /// birth, each selected lead's current identity, and the timeline.
+    /// With no sweep, no split tick (the model needs both ends).
+    fn fill(
+        &mut self,
+        sample: &mut Sample,
+        read: aterm_sysprobe::coalitions::CoalitionRead,
+        now: Instant,
+    ) {
+        let Some(procs) = sample.procs.as_mut() else {
+            return;
+        };
+        if self
+            .last
+            .is_some_and(|t| now.saturating_duration_since(t) > SPLIT_WINDOW_MAX)
+        {
+            // No cached birth spans a long gap, even where the next sweep
+            // supplies the same name and start token.
+            self.births.clear();
+        }
+        let swept: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+        self.births.retain(|pid, _| swept.contains(pid));
+        let mut unread = Vec::new();
+        for (i, p) in procs.iter_mut().enumerate() {
+            p.birth_ms = self.known(p);
+            if p.birth_ms.is_none() {
+                unread.push(i);
+            }
+        }
+        // Many to read (the first tick, a build's storm): the whole table.
+        let table = (unread.len() > BIRTHS_AT_ONCE)
+            .then(self.probe.births)
+            .flatten();
+        for i in unread {
+            procs[i].birth_ms = self.read_birth(&procs[i], table.as_ref());
+        }
+        let born: HashMap<u32, i64> = procs
+            .iter()
+            .filter_map(|p| Some((p.pid, p.birth_ms?)))
+            .collect();
+        let members: Vec<(u32, u64, i64)> = procs
+            .iter()
+            .filter_map(|p| Some((p.pid, p.coalition?, p.birth_ms?)))
+            .collect();
+        for (_, pid) in aterm_vitals::explain::leads(&members) {
+            let Some(&birth) = born.get(&pid) else {
+                continue;
+            };
+            // The short name is not an image identity: even a same-name
+            // exec must refresh it. A missed read clears the model's old
+            // image and signature, and the next split tick asks again.
+            let id = (self.probe.identity)(pid).unwrap_or_default();
+            sample
+                .leads
+                .push(lead_identity(pid, birth, id, self.vouches));
+        }
+        sample.coalitions = Some(coal_sample(read));
+        sample.timeline = self.timeline();
+        self.last = Some(now);
+    }
+
+    /// The birth read for `p`'s pid, while the sweep still names it the
+    /// same and gives it the same kernel start.
+    fn known(&self, p: &ProcSample) -> Option<i64> {
+        let start = p.start?;
+        self.births
+            .get(&p.pid)
+            .filter(|b| b.name == p.name && b.start == Some(start))
+            .map(|b| b.ms)
+    }
+
+    /// `p`'s birth, unix ms, from its kernel record (`table`'s, where the
+    /// tick read the whole table), kept for the ticks after
+    /// ([`Self::known`]); `None` where that record is gone or is another
+    /// process's (an exec or a reused pid between the sweep and the read),
+    /// which the next tick reads again.
+    fn read_birth(&mut self, p: &ProcSample, table: Option<&Births>) -> Option<i64> {
+        let read = match table {
+            Some(table) => table.get(&p.pid).cloned(),
+            None => (self.probe.birth)(p.pid),
+        };
+        let Some((_, ms)) = read.filter(|(name, _)| names_the_same(name, &p.name)) else {
+            self.births.remove(&p.pid);
+            return None;
+        };
+        self.births.insert(
+            p.pid,
+            Birth {
+                name: p.name.clone(),
+                start: p.start,
+                ms,
+            },
+        );
+        Some(ms)
+    }
+
+    /// The timeline: read again only when `kern.waketime` moved since it
+    /// was (or until one read).
+    fn timeline(&mut self) -> Option<TimelineSample> {
+        let wake = (self.probe.waketime_ms)();
+        if self.wake_seen != Some(wake) {
+            self.timeline = (self.probe.timeline)().map(|t| TimelineSample {
+                boot_ms: t.boot_ms,
+                sleep_ms: t.sleep_ms,
+                wake_ms: t.wake_ms,
+                wake_reason: t.wake_reason,
+            });
+            self.wake_seen = self.timeline.as_ref().map(|_| wake);
+        }
+        self.timeline.clone()
+    }
+}
+
+/// The model's word for a lead `pid` born at `birth_ms` whose identity the
+/// kernel answered `id`: its voucher unknown unless the code-signing reads
+/// vouch (`vouches`, [`SplitReader::vouches`]). PURE.
+fn lead_identity(
+    pid: u32,
+    birth_ms: i64,
+    id: aterm_sysprobe::identity::Identity,
+    vouches: bool,
+) -> LeadIdentity {
+    use aterm_sysprobe::identity::Voucher as Kernel;
+    use aterm_vitals::explain::Voucher;
+    let voucher = match id.voucher() {
+        _ if !vouches => Voucher::Unknown,
+        Kernel::Apple => Voucher::Apple,
+        Kernel::AppStore => Voucher::AppStore,
+        Kernel::DeveloperId => Voucher::DeveloperId,
+        Kernel::Development => Voucher::Development,
+        Kernel::Enterprise => Voucher::Enterprise,
+        Kernel::AdHoc => Voucher::AdHoc,
+        Kernel::Unsigned => Voucher::Unsigned,
+        Kernel::Unknown => Voucher::Unknown,
+    };
+    LeadIdentity {
+        pid,
+        birth_ms,
+        exe: id.exe,
+        voucher,
+        signing_id: id.signing_id,
+        team: id.team,
+    }
+}
+
+/// The coalitions `read` as the model takes them. PURE.
+fn coal_sample(read: aterm_sysprobe::coalitions::CoalitionRead) -> CoalSample {
+    CoalSample {
+        listed: read.listed,
+        newest: read.newest,
+        truncated: read.truncated,
+        rows: read
+            .rows
+            .into_iter()
+            .map(|u| CoalUsage {
+                id: u.id,
+                tasks_started: u.tasks_started,
+                tasks_exited: u.tasks_exited,
+                cpu_ns: u.cpu_ns,
+                bytes_read: u.bytes_read,
+                eqos_ns: u.eqos_ns,
+                footprint: u.footprint,
+            })
+            .collect(),
+    }
+}
+
+/// THE WHY FIXTURE (the [`WHY_FIXTURE_SEAM`] dev seam, a debug build only):
+/// a recorded scene of `aterm_vitals::explain::fixtures` the model reads in
+/// place of the machine's clocks, CPU, processes (this one and its user among
+/// them), tabs, delegated jobs and coalition lane, at the time since its
+/// first reading and with the host's own split ticks, so a lab instance
+/// shows the scene's causes on demand (the Deck's clause, `sys why`). The
+/// rest of each reading (memory where the scene has none, the GPU, disk,
+/// network, tokens) stays the machine's, and so does what the host does
+/// with a reading beside the model (the build slots' holders, the stuck
+/// engine's step); the delegated jobs' registry is published none. The
+/// scene's figures hold over any window: every one of its processes keeps
+/// one rate.
+#[cfg(debug_assertions)]
+pub(crate) struct WhyFixture {
+    scene: aterm_vitals::explain::fixtures::Scene,
+    /// The first reading's instant: the scene's origin.
+    t0: Option<Instant>,
+}
+
+/// No fixture in a build without debug assertions.
+#[cfg(not(debug_assertions))]
+pub(crate) enum WhyFixture {}
+
+#[cfg(debug_assertions)]
+impl WhyFixture {
+    /// The scene the seam names, if it names one.
+    fn from_seam() -> Option<Self> {
+        let named = aterm_types::dev_seam!(WHY_FIXTURE_SEAM)?;
+        let scene = match named.to_str()? {
+            "spotlight" => aterm_vitals::explain::fixtures::spotlight_1032(),
+            "calm" => aterm_vitals::explain::fixtures::calm_1510(),
+            other => {
+                aterm_log::warn!("system vitals: {WHY_FIXTURE_SEAM}={other} names no scene");
+                return None;
+            }
+        };
+        aterm_log::info!(
+            "system vitals: reading the {} scene",
+            named.to_string_lossy()
+        );
+        Some(Self { scene, t0: None })
+    }
+
+    /// `live` with the scene's reading now in its place ([`Self::at`]).
+    fn reading(&mut self, live: &Sample, split: bool) -> Sample {
+        let t0 = *self.t0.get_or_insert_with(Instant::now);
+        self.at(
+            live,
+            split,
+            u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// `live` with the scene's reading `at_ms` after its origin in its place:
+    /// the clocks, the cores (one cluster of them), the processes (where
+    /// `live` swept), the tabs and delegated jobs, the coalition lane and,
+    /// on a split tick (`split`), its coalitions, leads and timeline; memory
+    /// and the thermal state where the scene has them.
+    fn at(&self, live: &Sample, split: bool, at_ms: u64) -> Sample {
+        let scene = self.scene.reading(at_ms, split);
+        let cores = scene.cores.as_ref().map_or(0, Vec::len);
+        Sample {
+            clusters: vec![ClusterSpec {
+                name: "CPU".into(),
+                logical: (0..cores).filter_map(|c| u16::try_from(c).ok()).collect(),
+            }],
+            procs: live.procs.as_ref().and(scene.procs),
+            mem: scene.mem.or(live.mem),
+            thermal: scene.thermal.or(live.thermal),
+            gpu: live.gpu.clone(),
+            volume: live.volume.clone(),
+            cadence_ms: live.cadence_ms,
+            machine_only: live.machine_only,
+            load1: live.load1,
+            load: live.load,
+            swapped_kib: live.swapped_kib,
+            links: live.links.clone(),
+            proc_limits: live.proc_limits,
+            pid_counts: live.pid_counts,
+            disk: live.disk.clone(),
+            tokens: live.tokens.clone(),
+            plan: live.plan.clone(),
+            ..scene
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+impl WhyFixture {
+    /// None: the scenes are a debug build's (`explain::fixtures`). A
+    /// `dev-seams` build reads the seam and says it reads the machine.
+    fn from_seam() -> Option<Self> {
+        if aterm_types::dev_seam!(WHY_FIXTURE_SEAM).is_some() {
+            aterm_log::warn!(
+                "system vitals: {WHY_FIXTURE_SEAM} names a scene only a debug build has: \
+                 reading the machine"
+            );
+        }
+        None
+    }
+
+    fn reading(&mut self, _live: &Sample, _split: bool) -> Sample {
+        match *self {}
+    }
+}
+
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
     probe: aterm_sysprobe::Probe,
@@ -1053,6 +1633,11 @@ pub(crate) struct Reader {
     /// this thread's one, so `await sys slots>=…` and the occupancy board read
     /// one proof ([`Self::set_occupancy_facts`]).
     slots: aterm_sysprobe::slots::SlotReader,
+    /// The split set's lane and what it keeps between split ticks.
+    pub(crate) split: SplitReader,
+    /// The why fixture's scene, read in place of the machine (a debug build
+    /// with the seam set; never from the seam under test).
+    fixture: Option<WhyFixture>,
     /// The machine's words, read once.
     pub(crate) machine: Machine,
 }
@@ -1089,7 +1674,22 @@ impl Reader {
             .collect();
         let words = aterm_sysprobe::machine_words();
         let home = aterm_types::dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        Self {
+        // The inert test arm: a unit test reads no coalition and no scene
+        // unless it hands the reader its own.
+        let fixture = if cfg!(test) {
+            None
+        } else {
+            WhyFixture::from_seam()
+        };
+        let split = SplitReader::new(
+            if cfg!(test) {
+                CoalProbe::INERT
+            } else {
+                CoalProbe::KERNEL
+            },
+            &SPLIT_ARMED,
+        );
+        let mut reader = Self {
             probe: aterm_sysprobe::Probe::new(),
             clusters,
             vitals: aterm_vitals::Vitals::new(),
@@ -1110,12 +1710,25 @@ impl Reader {
                 platform_thermal
             },
             counter_throttle: None,
+            split,
+            fixture: None,
             machine: Machine {
                 cpu: words.cpu,
                 os: words.os,
                 family: os_family(),
             },
+        };
+        reader.read_scene(fixture);
+        reader
+    }
+
+    /// Read `fixture`'s scene, where there is one, in place of the machine,
+    /// under the scene's lane whatever the machine's is.
+    fn read_scene(&mut self, fixture: Option<WhyFixture>) {
+        if fixture.is_some() {
+            self.split.lane = CoalLane::On;
         }
+        self.fixture = fixture;
     }
 
     /// The counter reader's throttle level, read at most every
@@ -1169,9 +1782,23 @@ impl Reader {
         read
     }
 
-    /// One full reading folded into the trends: the machine counters and the process sweep, and the stuck engine's pass over that sweep.
+    /// One full reading folded into the trends: the machine counters and the
+    /// process sweep, the split set where it is a split tick
+    /// ([`SplitReader::due`]), and the stuck engine's pass over that sweep.
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
-        let sweep = aterm_sysprobe::processes();
+        let now = Instant::now();
+        let split = self.split.due(req, now);
+        let live_split = split && self.fixture.is_none();
+        let sweep = (self.split.probe.sweep)(aterm_sysprobe::SweepOpts {
+            coalitions: live_split,
+        });
+        // Between the sweep and the machine's sample, which takes its stamp,
+        // then the home volume, the load average and the cores' ticks: each
+        // end of the split's window reads the sweep, the coalitions and the
+        // stamp and ticks after them together.
+        let coalitions = (live_split && sweep.is_some())
+            .then(self.split.probe.coalitions)
+            .flatten();
         let mut sample = self.machine_sample(req);
         sample.machine_only = false;
         sample.procs_truncated = sweep.as_ref().is_some_and(|s| s.truncated);
@@ -1181,7 +1808,27 @@ impl Reader {
             .unwrap_or_default();
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
-        let mut snap = self.vitals.absorb(&sample);
+        if let Some(read) = coalitions {
+            self.split.fill(&mut sample, read, now);
+        }
+        // The why fixture's scene is the model's reading; the build slots'
+        // holders and the stuck engine keep the machine's.
+        let scene = self.fixture.as_mut().map(|fixture| {
+            if split {
+                self.split.last = Some(now);
+            }
+            fixture.reading(&sample, split)
+        });
+        let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
+        if self.split.lane.on() && snap.coal_lane == CoalLane::Off && scene.is_none() {
+            // The model found a read misread: the lane is off for good, so
+            // nothing more is read for it.
+            aterm_log::warn!(
+                "system vitals: the coalitions lane is off: a read did not read as the \
+                 record's layout"
+            );
+            self.split.lane = CoalLane::Off;
+        }
         let slots = self.set_occupancy_facts(&mut snap);
         snap.slot_tabs = crate::occupancy_host::slot_tabs(
             &slots,
@@ -1194,11 +1841,13 @@ impl Reader {
                     .and_then(aterm_uds::process::read_process_start)
             },
         );
+        // A scene's delegated jobs are not the machine's: none is published.
         crate::resource_jobs::publish(
             sample
                 .procs
                 .as_ref()
                 .and(snap.aterm.as_ref())
+                .filter(|_| scene.is_none())
                 .map(|_| snap.delegated.clone()),
         );
         let thrashing = sample.mem.is_some_and(|m| m.pressure == Pressure::Critical);
@@ -1217,7 +1866,13 @@ impl Reader {
     pub(crate) fn read_machine(&mut self, req: &Request) -> Snapshot {
         let mut sample = self.machine_sample(req);
         sample.machine_only = true;
-        let mut snap = self.vitals.absorb(&sample);
+        // The why fixture's scene is the model's reading; the stuck engine
+        // keeps the machine's clock.
+        let scene = self
+            .fixture
+            .as_mut()
+            .map(|fixture| fixture.reading(&sample, false));
+        let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         self.set_occupancy_facts(&mut snap);
         snap.jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,
@@ -1297,10 +1952,11 @@ impl Reader {
                 .collect(),
             plan: req.plan.clone(),
             procs_truncated: false,
+            // A split tick's whole reading adds them ([`SplitReader::fill`]).
             coalitions: None,
             leads: Vec::new(),
             timeline: None,
-            coal_lane: aterm_vitals::explain::CoalLane::Unsupported,
+            coal_lane: self.split.lane,
         }
     }
 }
@@ -1339,7 +1995,8 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
         at_ns: p.read_at.map(|t| {
             u64::try_from(t.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX)
         }),
-        coalition: None,
+        coalition: p.coalition,
+        // A split tick reads it ([`SplitReader::fill`]).
         birth_ms: None,
     }
 }
@@ -1752,10 +2409,20 @@ impl crate::App {
                 .values()
                 .filter(|ws| crate::stats_deck::stats_drawn_on(ws))
         };
-        let in_view = (bars && drawing().any(|ws| !ws.occluded))
+        let in_view = self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
         let focused = self.windows.values().any(|ws| ws.focused);
         Audience::of(in_view, bars && drawing().next().is_some(), focused)
+    }
+
+    /// Whether a window in view shows the bars, the Deck or the Sill: the
+    /// Fleet Monitor tab alone shows none ([`Request::deck`]).
+    fn deck_in_view(&self) -> bool {
+        self.stats_bars_form().shown()
+            && self
+                .windows
+                .values()
+                .any(|ws| crate::stats_deck::stats_drawn_on(ws) && !ws.occluded)
     }
 
     /// The deadline the loop folds for the next reading: the bars' cadence while a window in view shows the Deck or Fleet Monitor tab.
@@ -2353,6 +3020,8 @@ impl crate::App {
             cadence_ms: duration_ms(period),
             machine_only,
             jobs_now: false,
+            pull: false,
+            deck: self.deck_in_view(),
             tokens: each_session_once(tokens),
             plan: front_plan.and_then(|p| plan_fact(&p, &accounts, now)),
         }
@@ -2381,3 +3050,9 @@ impl crate::App {
 #[cfg(test)]
 #[path = "vitals_host_tests.rs"]
 mod tests;
+
+/// The split set's host side: which readings are split ticks, the cold
+/// pair, and what is read once and kept.
+#[cfg(test)]
+#[path = "vitals_host_split_tests.rs"]
+mod split_tests;

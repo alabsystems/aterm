@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm doctor`'s `spotlight:` row: what Spotlight's own index holds, under the home,
-//! of Rust build output and of rustup's offline docs (`rust-docs`) — files nobody
-//! searches, which Spotlight indexes as fast as a build writes them (`mds_stores` was
-//! measured near two cores on a checkout's `target/`). The count is Spotlight's
-//! (`mdfind`), never a walk of the disk: a crate's `.rmeta` stands for its build (each
-//! folder holding one also holds its objects and fingerprints), and an `.html` under a
-//! toolchain's `share/doc/rust/html` for its `rust-docs`. Any other `.html` in rustup's
-//! home is named by the component whose manifest lists it, else by its folder
-//! ([`pages`]). Read-only, macOS only, and nothing measured in a test binary.
+//! `aterm doctor`'s `spotlight:` row.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,11 +16,9 @@ const RUST_DOCS: &str = "share/doc/rust/html/";
 /// What Spotlight's index holds under the home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spotlit {
-    /// Each folder holding indexed crate files (`*.rmeta`), `~`-relative, with its count,
-    /// most first ([`build_root`]).
+    /// Each folder holding indexed crate files, `~`-relative, with its count, most first.
     pub builds: Vec<(String, usize)>,
-    /// rustup's home, `~`-relative, and the `*.html` indexed in it; `None` when there is
-    /// no rustup home or nothing in it is indexed.
+    /// rustup's home, `~`-relative, and the `*.html` indexed in it.
     pub rustup: Option<(String, Pages)>,
 }
 
@@ -37,8 +27,8 @@ pub(crate) struct Spotlit {
 pub(crate) struct Pages {
     /// `rust-docs` pages (a toolchain's `share/doc/rust/html`), per toolchain.
     pub docs: Vec<(String, usize)>,
-    /// Every other page, per what it is: `the <component> component` whose manifest
-    /// lists it, else the folder it is in.
+    /// Every other page, per what it is: `the <component> component` whose manifest lists it, else
+    /// the folder it is in.
     pub other: Vec<(String, usize)>,
 }
 
@@ -65,7 +55,6 @@ fn measure(home: &Path) -> Result<Spotlit, String> {
     let rustup: PathBuf = std::env::var_os("RUSTUP_HOME")
         .filter(|v| !v.is_empty())
         .map_or_else(|| home.join(".rustup"), Into::into);
-    // Spotlight answers with real paths: query and strip the canonical folder.
     let rustup_home = match std::fs::canonicalize(&rustup) {
         Ok(real) if real.is_dir() => {
             let listed = mdfind(&real, "*.html")?;
@@ -113,10 +102,7 @@ impl Tally {
     }
 }
 
-/// Sorts Spotlight's `*.html` paths under rustup's home `root`: a page under a
-/// toolchain's `share/doc/rust/html` is that toolchain's `rust-docs`; any other is named
-/// by `listed(toolchain, path in it)` — the component whose manifest lists it — else by
-/// its folder (`shown` renders a folder for the row).
+/// Sorts Spotlight's `*.html` paths under rustup's home `root`.
 pub(crate) fn pages<'a>(
     root: &str,
     paths: impl IntoIterator<Item = &'a str>,
@@ -192,8 +178,7 @@ fn manifest_text(path: &Path) -> Option<String> {
     (text.len() as u64 <= LIMIT).then_some(text)
 }
 
-/// The component whose manifest lists `rest` (a path inside the toolchain), as a
-/// `file:` entry or under a `dir:` one.
+/// The component whose manifest lists `rest`, as a `file:` entry or under a `dir:` one.
 pub(crate) fn installed_by(manifests: &[(String, String)], rest: &str) -> Option<String> {
     manifests.iter().find_map(|(component, text)| {
         text.lines()
@@ -223,11 +208,7 @@ fn mdfind(dir: &Path, pattern: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The folder a crate file's build lives in, as a person would delete or rename it: a
-/// toolchain's sysroot (the path before `/lib/rustlib/`), else the first `target` folder
-/// on the path (a checkout's, with every lane inside it), else the first `build` folder
-/// (another repository's, as Trust's bootstrap writes), else the folder above the
-/// profile that holds `deps/`, else the file's own folder.
+/// The folder a crate file's build lives in, as a person would delete or rename it.
 pub(crate) fn build_root(path: &str) -> String {
     if let Some((sysroot, _)) = path.split_once("/lib/rustlib/") {
         return sysroot.to_owned();
@@ -275,9 +256,7 @@ fn total(counts: &[(String, usize)]) -> usize {
     counts.iter().map(|(_, n)| n).sum()
 }
 
-/// The row's fact and whether it is clean, pure over the count: clean when Spotlight
-/// indexes no crate builds and no `rust-docs`; other HTML in rustup's home is named and
-/// never makes the row a note (no remedy removes a component's own files).
+/// The row's fact and whether it is clean, pure over the count.
 pub(crate) fn row(measured: &Result<Spotlit, String>) -> (bool, String) {
     let lit = match measured {
         Err(why) => return (false, format!("not measured ({why})")),
@@ -387,7 +366,6 @@ mod tests {
             ),
             ("/U/a/out/lane/debug/deps/libx-1.rmeta", "/U/a/out/lane"),
             ("/U/a/loose/libx.rmeta", "/U/a/loose"),
-            // A crate named like a folder is not one.
             ("/U/a/w/target", "/U/a/w"),
         ] {
             assert_eq!(build_root(path), root, "{path}");
@@ -423,12 +401,10 @@ mod tests {
             "/U/a/.rustup/toolchains/1.97.1-aarch64-apple-darwin/share/doc/rust/html/index.html",
             "/U/a/.rustup/toolchains/stable-aarch64-apple-darwin/share/doc/rust/COPYRIGHT.html",
             "/U/a/.rustup/toolchains/stable-aarch64-apple-darwin/share/doc/cargo/x.html",
-            // Named like the docs folder, but beside it: not rust-docs.
             "/U/a/.rustup/toolchains/stable-aarch64-apple-darwin/share/doc/rust/html.html",
             "/U/a/.rustup/toolchains/1.97.1-aarch64-apple-darwin/share/doc/rust/COPYRIGHT.html",
             "/U/a/.rustup/tmp/report.html",
             "/U/a/.rustup/tmp/other.html",
-            // Outside the root (Spotlight answered another spelling): its folder.
             "/elsewhere/toolchains/x/share/doc/rust/html/a.html",
         ];
         let found = pages(
@@ -479,7 +455,6 @@ mod tests {
                 "Spotlight indexes no Rust build output or rust-docs under ~".into()
             )
         );
-        // This Mac after `aterm init`: rustc's own license pages, nothing to remove.
         let licenses = Spotlit {
             builds: vec![],
             rustup: Some((

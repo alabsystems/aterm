@@ -75,7 +75,7 @@ pub enum TrustBinOrigin {
 impl TrustBinOrigin {
     /// The tier as a developer reads it in the provenance line.
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Store => "atpkg managed store",
             Self::Path => "PATH",

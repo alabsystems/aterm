@@ -106,7 +106,7 @@ macro_rules! bind {
             /// Authorize (`true`) or revoke (`false`) OSC 9 / 99 / 777 notifications; the
             /// engine is fail-closed until authorized. Already-queued notifications stay
             /// drainable after a revoke.
-            pub fn authorize_notifications(&mut self, allowed: bool) {
+            pub const fn authorize_notifications(&mut self, allowed: bool) {
                 self.term.set_allow_notifications(allowed);
             }
 

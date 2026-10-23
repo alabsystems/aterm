@@ -109,7 +109,7 @@ impl<'a> Parser<'a> {
         self.b.get(self.pos + offset).copied()
     }
 
-    fn eof(&self) -> bool {
+    const fn eof(&self) -> bool {
         self.pos >= self.b.len()
     }
 
@@ -906,7 +906,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn is_bare_key_byte(c: u8) -> bool {
+const fn is_bare_key_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
 }
 

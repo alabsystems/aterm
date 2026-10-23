@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hour ring (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §5.1, §5.2,
-//! §5.5): raw readings in 10 s wall-clock buckets, the strip's columns, and
-//! "now", the trailing mean of the last readings.
-//!
-//! A bucket holds readings in the resource's own unit (busy cores, bytes,
-//! bytes per second, tokens per minute, processes). Capacity is applied when
-//! the strip is painted, so one strip never mixes capacities. A bucket that
-//! read nothing is `None`, never 0.
-//!
-//! Bucket `k` covers unix seconds `[10k, 10k + 10)`. The newest bucket is the
-//! open one; it closes when a reading lands in a later bucket. When the wall
-//! clock steps back by at most [`CLAMP_BACK_S`] the reading lands in the open
-//! bucket; a longer step re-bases the ring, shifting every key by the step so
-//! history keeps its order and spacing.
+//! Ten-second wall-clock bucketed hour ring ([`CLAMP_BACK_S`]).
 
 use std::collections::VecDeque;
 
@@ -24,14 +11,13 @@ pub const BUCKET_S: i64 = 10;
 pub const BUCKET_MS: i64 = BUCKET_S * 1000;
 /// Buckets a ring keeps: an hour, what the lens shows.
 pub const RING_BUCKETS: usize = 360;
-/// The window "now" averages over (design §5.2), ms.
+/// The window "now" averages over , ms.
 pub const NOW_WINDOW_MS: i64 = 10_000;
 /// The longest step back that still lands in the open bucket, seconds.
 pub const CLAMP_BACK_S: i64 = 60;
 /// How long [`Recent`] keeps a reading, ms: the longest window asked of it.
 pub const RECENT_KEEP_MS: i64 = 60_000;
-/// The most readings [`Recent`] keeps (two a minute's worth at the lens's
-/// 2 Hz, with room to spare).
+/// Maximum number of readings retained in [`Recent`].
 const RECENT_CAP: usize = 256;
 
 /// One bucket's readings, raw.
@@ -96,8 +82,7 @@ pub struct Cell {
 }
 
 impl Cell {
-    /// Merge consecutive cells into one column: the mean of the read cells'
-    /// means, the largest max, over if any is.
+    /// Merge consecutive cells into one column.
     #[must_use]
     pub fn merge(cells: impl IntoIterator<Item = Cell>) -> Cell {
         let mut sum = 0.0;
@@ -118,17 +103,14 @@ impl Cell {
     }
 }
 
-/// The last minute of readings with their wall-clock times, for a trailing
-/// mean ([`Recent::mean`]). Times only move forward: a reading stamped before
-/// the newest drops the readings after it.
+/// The last minute of readings with their wall-clock times, for a trailing mean ([`Recent::mean`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Recent {
     v: VecDeque<(i64, f64)>,
 }
 
 impl Recent {
-    /// Record reading `v` taken at `at_ms` (unix ms). A non-finite reading is
-    /// ignored.
+    /// Record reading `v` taken at `at_ms` (unix ms).
     pub fn push(&mut self, at_ms: i64, v: f64) {
         if !v.is_finite() {
             return;
@@ -147,8 +129,7 @@ impl Recent {
         }
     }
 
-    /// The mean of the readings taken in `(now_ms − window_ms, now_ms]`;
-    /// `None` when there were none.
+    /// Mean of readings taken after `now_ms - window_ms` through `now_ms`.
     #[must_use]
     pub fn mean(&self, now_ms: i64, window_ms: i64) -> Option<f64> {
         let cutoff = i128::from(now_ms) - i128::from(window_ms);
@@ -166,8 +147,6 @@ impl Recent {
     }
 
     fn shift(&mut self, by_ms: i128) {
-        // A rebase may cross the whole signed millisecond domain. Readings
-        // shifted outside it cannot be represented; keep the rest exact.
         self.v.retain_mut(|(t, _)| {
             let Ok(shifted) = i64::try_from(i128::from(*t) + by_ms) else {
                 return false;
@@ -208,11 +187,7 @@ impl BucketRing {
         }
     }
 
-    /// Record a reading taken at `at_unix_ms`: `v` in the resource's unit, or
-    /// `None` for a reading that could not be taken (it still moves the open
-    /// bucket, so the span it missed draws hollow), and whether it was over
-    /// the resource's maximum. Returns the key of the bucket this push closed,
-    /// in the ring's keys after any re-base, when it closed one.
+    /// Record a reading taken at `at_unix_ms`.
     pub fn push(&mut self, at_unix_ms: i64, v: Option<f64>, over: bool) -> Option<i64> {
         let v = v.filter(|x| x.is_finite());
         let k = at_unix_ms.div_euclid(BUCKET_MS);
@@ -225,7 +200,6 @@ impl BucketRing {
             Some(open) if k == open => None,
             Some(open) if k > open => {
                 if k - open >= self.cap as i64 {
-                    // Silent for longer than the ring: none of it was read.
                     self.b.clear();
                     self.first_k = k;
                 } else {
@@ -239,8 +213,6 @@ impl BucketRing {
             }
             Some(open) if (open - k) * BUCKET_S <= CLAMP_BACK_S => None,
             Some(open) => {
-                // The clock stepped back further than a slew: shift history
-                // back by the step so this reading opens the next bucket.
                 let step = open + 1 - k;
                 self.first_k -= step;
                 self.recent.shift(-i128::from(step) * i128::from(BUCKET_MS));
@@ -310,9 +282,7 @@ impl BucketRing {
         self.b.iter().map(Bucket::cell).collect()
     }
 
-    /// The strip's `ncols` columns of `per_s` seconds each (a multiple of
-    /// 10), aligned to wall-clock multiples of `per_s`; the rightmost holds
-    /// `now_unix_ms` and is the open column (its period so far).
+    /// Computes `ncols` wall-clock-aligned columns of `per_s` seconds ending at `now_unix_ms`.
     #[must_use]
     pub fn columns(&self, per_s: u32, ncols: usize, now_unix_ms: i64) -> Vec<Cell> {
         columns_of(
@@ -324,9 +294,7 @@ impl BucketRing {
         )
     }
 
-    /// The mean of the readings taken in the `window_ms` before
-    /// `now_unix_ms` ([`NOW_WINDOW_MS`] for "now"); `None` when there were
-    /// none. It never depends on a layout's column period.
+    /// Mean of readings in the `window_ms` preceding `now_unix_ms` ([`NOW_WINDOW_MS`]).
     #[must_use]
     pub fn now_mean(&self, now_unix_ms: i64, window_ms: i64) -> Option<f64> {
         self.recent.mean(now_unix_ms, window_ms)
@@ -338,9 +306,7 @@ impl BucketRing {
         self.b.back().is_some_and(Bucket::is_over)
     }
 
-    /// The sustained-30 s value ending at bucket `k`: the smallest of the
-    /// means of buckets `k − 2`, `k − 1` and `k`, when all three were read.
-    /// One spike bucket cannot raise it.
+    /// The sustained-30 s value ending at bucket `k`.
     #[must_use]
     pub fn sustained(&self, k: i64) -> Option<f64> {
         (0..3).try_fold(f64::INFINITY, |m, i| {
@@ -349,8 +315,7 @@ impl BucketRing {
     }
 }
 
-/// [`BucketRing::columns`] over a ring's cells (`cells`, oldest first, the
-/// last with key `last_k`), as a snapshot carries them.
+/// Computes [`BucketRing::columns`] over a snapshot's `cells` ending at `last_k`.
 #[must_use]
 pub fn columns_of(
     cells: &[Cell],
@@ -398,13 +363,11 @@ mod tests {
             r.bucket(T0 / BUCKET_MS + 1).and_then(Bucket::value),
             Some(4.0)
         );
-        // Silence for 20 s: the bucket nothing landed in is not read.
         let _ = r.push(T0 + 30_500, Some(6.0), false);
         let cells = r.cells();
         assert_eq!(cells.len(), 4);
         assert_eq!(cells[2], Cell::default(), "not read is None, never 0");
         assert_eq!(cells[3].mean, Some(6.0));
-        // A reading that could not be taken moves the open bucket only.
         let _ = r.push(T0 + 40_000, None, false);
         assert_eq!(r.cells()[4].mean, None);
     }
@@ -412,37 +375,28 @@ mod tests {
     #[test]
     fn columns_merge_on_wall_clock_multiples() {
         let mut r = BucketRing::default();
-        // One reading per bucket from 10:00:00 to 10:01:30, valued by its
-        // bucket's index; 10:00:40 is not read.
         for i in 0..10 {
             let v = (i != 4).then_some(f64::from(i));
             let _ = r.push(T0 + i64::from(i) * 10_000, v, i == 7);
         }
         let now = T0 + 95_000;
-        // 10 s columns are the buckets themselves.
         let ten = r.columns(10, 3, now);
         assert_eq!(
             ten.iter().map(|c| c.mean).collect::<Vec<_>>(),
             [Some(7.0), Some(8.0), Some(9.0)]
         );
-        // 20 s columns start on even 20 s multiples: [80, 100) is the open
-        // column, [60, 80) holds buckets 6 and 7, [40, 60) only bucket 5.
         let twenty = r.columns(20, 3, now);
         assert_eq!(twenty[2].mean, Some(8.5));
         assert_eq!(twenty[1].mean, Some(6.5));
         assert!(twenty[1].over, "a column is over when one bucket is");
         assert_eq!(twenty[1].max, Some(7.0));
         assert_eq!(twenty[0].mean, Some(5.0), "the unread bucket is skipped");
-        // 30 s columns start on 30 s multiples: [90, 120) is open and holds
-        // bucket 9 so far; [60, 90) holds 6, 7, 8; [30, 60) holds 3 and 5.
         let thirty = r.columns(30, 5, now);
         assert_eq!(thirty[4].mean, Some(9.0));
         assert_eq!(thirty[3].mean, Some(7.0));
         assert_eq!(thirty[2].mean, Some(4.0));
         assert_eq!(thirty[1].mean, Some(1.0));
-        // Before the ring began: hollow.
         assert_eq!(thirty[0], Cell::default());
-        // A column with no read bucket is hollow, even beside read ones.
         let mut sparse = BucketRing::default();
         let _ = sparse.push(T0, Some(1.0), false);
         let _ = sparse.push(T0 + 40_000, Some(1.0), false);
@@ -470,7 +424,6 @@ mod tests {
         assert_eq!(r.now_mean(T0 + 55_000, NOW_WINDOW_MS), None);
         assert_eq!(Bucket::default().value(), None);
         assert!(!Bucket::default().is_over());
-        // A real zero is a reading.
         let _ = r.push(T0 + 60_000, Some(0.0), false);
         assert_eq!(r.now_mean(T0 + 60_000, NOW_WINDOW_MS), Some(0.0));
         assert_eq!(r.cells().last().and_then(|c| c.mean), Some(0.0));
@@ -483,12 +436,9 @@ mod tests {
             let _ = r.push(T0 + i * 10_000, Some(i as f64), false);
         }
         let open = r.open_k().expect("pushed");
-        // 30 s back: a slew, so it lands in the open bucket.
         assert_eq!(r.push(T0 + 25_000, Some(5.0), false), None);
         assert_eq!(r.open_k(), Some(open));
         assert_eq!(r.bucket(open).map(|b| b.n), Some(2));
-        // 2 h back: the ring re-bases. Every bucket keeps its order and
-        // spacing, nothing is lost, and the reading opens the next bucket.
         let before: Vec<Cell> = r.cells();
         let back = T0 + 25_000 - 2 * 3_600_000;
         let closed = r.push(back, Some(9.0), false);
@@ -498,17 +448,12 @@ mod tests {
         let after = r.cells();
         assert_eq!(&after[..before.len()], &before[..]);
         assert_eq!(after.last().and_then(|c| c.mean), Some(9.0));
-        // The readings before the step moved back with their buckets, so
-        // "now" is this reading alone.
         assert_eq!(r.now_mean(back, NOW_WINDOW_MS), Some(9.0));
-        // A forward step leaves unread buckets between.
         let _ = r.push(back + 40_000, Some(1.0), false);
         let cells = r.cells();
         let n = cells.len();
         assert_eq!(cells[n - 4..n - 1], [Cell::default(); 3]);
         assert_eq!(cells[n - 1].mean, Some(1.0));
-        // Rebase across the entire timestamp domain without wrapping a
-        // millisecond delta or retaining an unrepresentable shifted reading.
         let mut extremes = BucketRing::default();
         let _ = extremes.push(i64::MAX, Some(1.0), false);
         let _ = extremes.push(i64::MIN, Some(2.0), false);
@@ -530,8 +475,6 @@ mod tests {
 
     #[test]
     fn now_is_the_trailing_mean_whatever_the_bucket_boundary() {
-        // The lower edge may lie below MIN; saturating it to MIN would
-        // wrongly discard a real reading exactly at MIN.
         let mut edge = Recent::default();
         edge.push(i64::MIN, 4.0);
         assert_eq!(edge.mean(i64::MIN, NOW_WINDOW_MS), Some(4.0));
@@ -543,13 +486,10 @@ mod tests {
         assert_eq!(edge.mean(i64::MAX, NOW_WINDOW_MS), Some(16.0));
         assert_eq!(edge.mean(i64::MAX, i64::MIN), None);
         let mut r = BucketRing::default();
-        // One reading a second; the window straddles a bucket boundary.
         for i in 0..15 {
             let _ = r.push(T0 + i * 1000, Some(i as f64), false);
         }
-        // Readings 5..=14 are the last 10 s.
         assert_eq!(r.now_mean(T0 + 14_000, NOW_WINDOW_MS), Some(9.5));
-        // The open bucket alone would say 12 (readings 10..=14).
         assert_eq!(
             r.bucket(T0 / BUCKET_MS + 1).and_then(Bucket::value),
             Some(12.0)

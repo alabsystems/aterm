@@ -8,7 +8,7 @@
 //!
 //! Two checks, each the only automatic guard of its failure:
 //!
-//! * `cursor` answers `OK <row> <col> <visible:0|1> <style>`: the preflight every
+//! * `cursor` answers `OK <row> <col> <visible:0|1> <style>[ frame=open]`: the preflight every
 //!   `aterm drive` verb sends first, through the `aterm ctl` client, and no other
 //!   test sends it. The shape, not a bare `OK *`, so a verb routed to another
 //!   handler that also answers `OK …` does not pass for it.
@@ -46,12 +46,13 @@ const ACCEPTED_FLOOR: usize = BURST_KEYS / 2;
 /// the last echo has been judged — healed or not — before `metrics` is read.
 const QUIET_MS: u64 = 500;
 
-/// `cursor`'s documented reply (aterm-gui's `control_query::cmd_cursor`).
+/// `cursor`'s documented reply (aterm-gui's `control_query::cmd_cursor`), ` frame=open` ending one
+/// read on a DEC 2026 frame still unfinished at its bound.
 fn is_cursor_reply(reply: &str) -> bool {
     let fields: Vec<&str> = reply.split_whitespace().collect();
     matches!(
         fields.as_slice(),
-        ["OK", row, col, "0" | "1", _style]
+        ["OK", row, col, "0" | "1", _style] | ["OK", row, col, "0" | "1", _style, "frame=open"]
             if row.parse::<u32>().is_ok() && col.parse::<u32>().is_ok()
     )
 }
@@ -135,12 +136,15 @@ fn a_cursor_round_trip_and_a_typing_burst_heal_no_lost_wake() {
 #[test]
 fn only_cursors_own_reply_reads_as_one() {
     assert!(is_cursor_reply("OK 3 7 1 block"));
+    assert!(is_cursor_reply("OK 3 7 1 block frame=open"));
     for not in [
         "OK",
         "OK 3 7 2 block",
         "OK row 7 1 block",
         "OK 3 7 1",
         "ERR 3 7 1 x",
+        "OK 3 7 1 block frame=shut",
+        "OK 3 7 1 block frame=open x",
     ] {
         assert!(!is_cursor_reply(not), "{not}");
     }

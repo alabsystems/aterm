@@ -4,23 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/activation.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE. (Only the launchee's
-//! half survives: naming the launch on the window and ending its sequence. Requesting a
-//! token for a launch of our own stays cut with the rest of `startup_notify`. The messages
-//! are aterm-x11's `ClientMessage`s, where upstream used x11rb's.)
-//!
-//! X11 startup notification, the launchee's side:
-//! <https://specifications.freedesktop.org/startup-notification-spec/startup-notification-latest.txt>
-//!
-//! A launcher that reads `StartupNotify=true` in a desktop entry starts a sequence,
-//! shows a busy cursor or spinner for it, and hands the launched program its id in
-//! `DESKTOP_STARTUP_ID`. The program names that id on its window (`_NET_STARTUP_ID`,
-//! which the window manager reads at map for the launch's timestamp and workspace)
-//! and ends the sequence with a `remove` message once the window is shown.
-//!
-//! A running window activated by another client with such an id (GNOME Shell's
-//! `ActivationToken` for a click on a notification) ends that sequence the same way, and
-//! stamps its raise with the id's `_TIME` ([`startup_time`]).
+//! Modified by the aterm project in 2026; see the repository NOTICE.
 
 use aterm_x11::proto::event::ClientMessage;
 use aterm_x11::proto::xproto;
@@ -29,8 +13,7 @@ use super::atoms::*;
 use super::{IgnoreError as _, VoidCookie, X11Error, XConnection};
 
 impl XConnection {
-    /// Name the launch `startup_id` on `window` (`_NET_STARTUP_ID`). Set before the
-    /// window maps: the window manager reads it then.
+    /// Name the launch `startup_id` on `window` (`_NET_STARTUP_ID`).
     pub(crate) fn set_startup_id(
         &self,
         window: xproto::Window,
@@ -46,8 +29,8 @@ impl XConnection {
         )
     }
 
-    /// End the launch sequence `startup_id`: its `remove` message, broadcast on the
-    /// root window from `window` (a window of ours that outlives the send).
+    /// End the launch sequence `startup_id`: its `remove` message, broadcast on the root window
+    /// from `window` (a window of ours that outlives the send).
     pub(crate) fn end_startup_sequence(
         &self,
         window: xproto::Window,
@@ -60,7 +43,6 @@ impl XConnection {
             let mut data = [0u8; 20];
             data[..chunk.len()].copy_from_slice(chunk);
             let event = ClientMessage { format: 8, sequence: 0, window, type_: message_type, data };
-            // Every chunk after the first continues the message.
             message_type = atoms[_NET_STARTUP_INFO];
             self.send_void(xproto::send_event(
                 false,
@@ -75,10 +57,9 @@ impl XConnection {
     }
 }
 
-/// The X server time of the user action behind `startup_id`: the decimal stamp after its
-/// last `_TIME`, which a launcher appends (libstartup-notification's
+/// The X server time of the user action behind `startup_id`: the decimal stamp after its last
+/// `_TIME`, which a launcher appends (libstartup-notification's
 /// `<launcher>/<launchee>/<pid>-<seq>-<host>_TIME<time>`) and GTK reads the same way.
-/// `None` for an id with no stamp, or one past the server's 32-bit clock.
 pub(crate) fn startup_time(startup_id: &str) -> Option<u32> {
     let (_, after) = startup_id.rsplit_once("_TIME")?;
     let digits = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());

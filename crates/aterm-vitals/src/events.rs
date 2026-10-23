@@ -1,38 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Events: what changed between two snapshots that an agent reading `sys`
-//! minutes later should be told even when every figure has moved on
-//! (`docs/DESIGN-system-awareness-2026-10-16.md` §13.5).
-//!
-//! The [`Detector`] watches each snapshot the model makes and raises at most a
-//! few events per sample:
-//!
-//! * `pressure`: the kernel's memory pressure changed level;
-//! * `throttle`: the thermal level changed;
-//! * `swap`: swap traffic started (at least [`SWAP_ACTIVE_BPS`]) or stopped;
-//! * `disk`: the volume's free space crossed 10 %, 5 % or 1 GB, either way;
-//! * `load`: a scope's cores-worth moved by at least one core and held there
-//!   for [`LOAD_HOLD_NS`];
-//! * `tab`: a tab opened or closed;
-//! * `orphan`: a tab closed and left processes behind (pids its rows held in
-//!   the snapshot before, still alive under the same name);
-//! * `lane`: a reader became unavailable, or available again (the
-//!   coalitions' from one split tick's facts to the next);
-//! * `job`: a job's verdict moved ([`JobWatch`], run on the stuck engine's
-//!   view, which the host attaches after the model's pass).
-//!
-//! An event is numbered by the snapshot that raised it, so a cursor of a
-//! reply (`next=<ep>.<seq>`) orders against it directly. The host keeps them
-//! in a ring; this module only detects. Pure: no clock, no platform.
+//! System state transition event detector ([`Detector`], [`JobWatch`]).
+//! Thresholds are configured by [`SWAP_ACTIVE_BPS`] and [`LOAD_HOLD_NS`].
 
 use std::collections::{HashMap, HashSet};
 
 use crate::jobs::{Class, JobsView, Verdict};
 use crate::model::{Pressure, RowScope, Snapshot, Throttle};
 
-/// Swap traffic (in plus out) at or above this is "swapping": the quiet
-/// preset's line (`swap<1MB/s`).
+/// Swap traffic (in plus out) at or above this is "swapping".
 pub const SWAP_ACTIVE_BPS: f64 = 1_000_000.0;
 /// A scope's move must hold this long to be a `load` event: 10 s.
 pub const LOAD_HOLD_NS: u64 = 10_000_000_000;
@@ -165,8 +142,7 @@ pub enum EventKind {
         tab: u64,
         /// The job's id (`a<pgid>`, `b<block>`, `j<pid>`, `o<pid>`).
         id: String,
-        /// The verdict before; `None` for a job first seen in a verdict worth
-        /// saying (anything but `fine`).
+        /// The verdict before.
         from: Option<Verdict>,
         /// The verdict now.
         to: Verdict,
@@ -217,8 +193,7 @@ pub struct Detector {
     lanes: [Option<bool>; 4],
     /// Whether the last facts' coalition lane read.
     coalitions: Option<bool>,
-    /// Each tab's live processes in the last snapshot that swept them, for
-    /// `orphan`: `(pid, name, cores-worth)`.
+    /// Each tab's live processes in the last snapshot that swept them, for `orphan`.
     tab_procs: HashMap<u64, Vec<(u32, String, f32)>>,
 }
 
@@ -417,8 +392,6 @@ impl Detector {
                 _ => {}
             }
         }
-        // The coalitions are read on split ticks only: a snapshot carrying
-        // no facts says nothing about their lane.
         if let Some(now) = s.why.as_ref().map(|w| w.lane.on()) {
             if self.coalitions.is_some_and(|was| was != now) {
                 push(EventKind::Lane {
@@ -433,9 +406,7 @@ impl Detector {
 }
 
 impl Detector {
-    /// The processes closed tab `key` held in the last sweep that are still
-    /// alive in `s` under the same pid and name: how many, and the busiest's
-    /// name. `None` when none are (or `s` swept no processes).
+    /// Counts processes from closed tab `key` still alive in `s` and returns the busiest name.
     fn left_behind(&self, key: u64, s: &Snapshot) -> Option<(u32, Option<String>)> {
         if s.procs.is_empty() {
             return None;
@@ -454,22 +425,17 @@ impl Detector {
     }
 }
 
-/// THE JOB WATCH: a `job` event each time a job's verdict moves between two
-/// views of the stuck engine, and one for a job first seen in a verdict
-/// worth saying. A view that did not change (the engine not due: the
-/// snapshot carries the last one) raises nothing.
+/// Tracks job verdict transitions across stuck-engine views.
 #[derive(Debug, Default)]
 pub struct JobWatch {
     /// `(tab, id)` → the verdict last seen.
     seen: HashMap<(u64, String), Verdict>,
-    /// Whether a view was seen at all (the first one seeds, raising only the
-    /// verdicts worth saying).
+    /// Whether at least one view has been observed.
     seeded: bool,
 }
 
 impl JobWatch {
-    /// The events `view` raises against the last view, numbered by snapshot
-    /// `seq` taken at `at_ns`.
+    /// The events `view` raises against the last view, numbered by snapshot `seq` taken at `at_ns`.
     pub fn step(&mut self, view: &JobsView, seq: u64, at_ns: u64) -> Vec<Event> {
         let mut out = Vec::new();
         let mut now: HashMap<(u64, String), Verdict> = HashMap::with_capacity(view.rows.len());
@@ -572,7 +538,6 @@ mod tests {
                 to: Pressure::Warn
             }
         );
-        // An unknown level is no change.
         let mut s3 = snap(3, 3);
         s3.mem = s2.mem.clone();
         s3.mem.as_mut().unwrap().sample.pressure = Pressure::Unknown;
@@ -671,10 +636,8 @@ mod tests {
             s
         };
         assert!(d.detect(&at(1, 0.5)).is_empty());
-        // A spike that does not hold is no event.
         assert!(d.detect(&at(2, 3.0)).is_empty());
         assert!(d.detect(&at(3, 0.6)).is_empty());
-        // A move that holds 10 s is one, with the busiest process.
         for t in 4..14 {
             assert!(d.detect(&at(t, 3.0)).is_empty(), "t={t}");
         }
@@ -688,7 +651,6 @@ mod tests {
                 top: Some("trustc".into()),
             }
         );
-        // The new level is the reference: staying there raises nothing.
         for t in 15..40 {
             assert!(d.detect(&at(t, 3.1)).is_empty());
         }
@@ -729,7 +691,6 @@ mod tests {
                 }
             ]
         );
-        // A sample with no sweep says nothing about tabs.
         assert!(d.detect(&snap(3, 3)).iter().all(|e| e.kind.word() != "tab"));
     }
 
@@ -788,8 +749,6 @@ mod tests {
             proc(20, "sh", RowScope::Tab(1), 0.0),
         ];
         assert!(d.detect(&s1).is_empty());
-        // Tab 2 closes: its shell died, node and make live on under launchd;
-        // pid 12 now names another program (reused), so it is not counted.
         let mut s2 = snap(2, 2);
         s2.aterm = Some(ScopeView::default());
         s2.tabs = vec![tab(1)];
@@ -809,7 +768,6 @@ mod tests {
                 top: Some("node".into()),
             }
         );
-        // A tab that closes with nothing left raises only `tab`.
         let mut s3 = snap(3, 3);
         s3.aterm = Some(ScopeView::default());
         s3.tabs = Vec::new();
@@ -826,7 +784,6 @@ mod tests {
             rows,
             ..JobsView::default()
         };
-        // First sight: a fine job says nothing, a stuck one says so.
         let e = w.step(
             &view(vec![
                 row("a1", 7, Class::Running, Verdict::Fine),
@@ -842,14 +799,11 @@ mod tests {
             &e[0].kind,
             EventKind::Job { id, from: None, to: Verdict::Stuck, class: Class::Waiting, .. } if id == "a2"
         ));
-        // Nothing moved.
         let steady = view(vec![
             row("a1", 7, Class::Running, Verdict::Fine),
             stuck("a2", 7),
         ]);
         assert!(w.step(&steady, 6, 10).is_empty());
-        // a1 exited with 0; a2 stays stuck; the same id in another tab is
-        // its own job.
         let mut done = row("a1", 7, Class::Exited, Verdict::Exited);
         done.exit = Some(0);
         let e = w.step(

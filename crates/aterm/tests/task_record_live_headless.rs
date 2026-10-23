@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TASK RECORD THROUGH THE ONE `aterm` BINARY against a real `aterm
-//! --headless` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2): a
-//! worker's record is marked and read over the socket, rides `status` and
-//! `sessions`, and `aterm ctl await task` — the manager's one wait — answers
-//! over two workers with `all` once both are done, and times out with exit
-//! 124 when the news it would answer was already read.
-//!
-//! Every wait that must end is a one-minute hang detector; the one short
-//! `timeout=` is the timeout under test, never a latency budget. The wait over
-//! both workers names each worker's rev (`@<sid>:1`), so the marks may land
-//! before or after the client arms and the answer is the same.
-//!
-//! ISOLATION: `support/launch_isolation.rs` and `support/headless_boot.rs` (a
-//! product that cannot start fails; a scratch/spawn refusal is COULD NOT RUN,
-//! `boot_with`, never a pass).
+//! THE TASK RECORD THROUGH THE ONE `aterm` BINARY against a real `aterm --headless`
+//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.2): a worker's record is marked and read
+//! over the socket, rides `status` and `sessions`, and `aterm ctl await task` — the manager's one
+//! wait — answers over two workers with `all` once both are done, and times out with exit 124 when
+//! the news it would answer was already read.
 
 #![cfg(unix)]
 
@@ -69,18 +59,15 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
     );
     assert!(marked.trim_end().ends_with(" changed=1"), "{marked}");
     ctl_ok(&inst, &[&format!("@{b}"), "task", "mark", "working"]);
-    // A mark that changes nothing is no change.
     let again = ctl_ok(&inst, &[&format!("@{a}"), "task", "mark", "working"]);
     assert!(
         again.contains(" rev=1 ") && again.trim_end().ends_with(" changed=0"),
         "{again}"
     );
-    // An unknown state is the usage line, and exit 1.
     let bad = ctl(&inst, &[&format!("@{a}"), "task", "mark", "finished"]);
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("ERR usage: task"));
 
-    // The manager's wait over both workers, armed past each one's rev 1.
     let list = format!("@{a}:1,@{b}:1");
     let mut waiting = client_command(&inst, &["await", "task", &list, "all", HANG_MS]);
     let waiter = waiting.spawn().expect("spawn the waiting client");
@@ -95,14 +82,10 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
             "result_bytes=11",
         ],
     );
-    // An older build's done word, as a record carried from it marks it:
-    // still read.
     ctl_ok(
         &inst,
         &[&format!("@{b}"), "task", "mark", "done", "why=done-check"],
     );
-    // A waiter the instance never accepted, or answered busy, is asked again: it is armed past each
-    // worker's rev 1, so one armed after the marks answers them at once.
     let mut first = Some(waiter);
     let out = headless_boot::until_served(|| {
         let child = first
@@ -131,8 +114,6 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
         );
     }
 
-    // Re-armed with no since, the news is already read: the deadline answers,
-    // the row says where the worker stands, and the client exits 124.
     let timed = ctl(&inst, &["await", "task", &format!("@{a}"), "timeout=300"]);
     assert_eq!(timed.status.code(), Some(124), "{timed:?}");
     assert!(String::from_utf8_lossy(&timed.stderr).contains("OK timeout"));
@@ -141,7 +122,6 @@ fn a_workers_record_is_marked_read_published_and_awaited() {
         "{timed:?}"
     );
 
-    // Published: `status` and the `sessions` row carry the record.
     let record = status(&inst, &a);
     assert_eq!(field(&record, "task_state"), Some("done"), "{record}");
     assert_eq!(field(&record, "task_rev"), Some("2"), "{record}");
@@ -186,7 +166,6 @@ fn pct(s: &str) -> String {
 /// `aterm ctl` moves its record to `working why=turn` as it lands.
 #[test]
 fn a_workers_result_is_read_and_a_turn_opens_it_again() {
-    // Its own scratch world (`<prefix>-<pid>`): never the other test's.
     let inst = boot("atres");
     let (_, a) = boot_session(&inst);
     let sel = format!("@{a}");
@@ -233,7 +212,6 @@ fn a_workers_result_is_read_and_a_turn_opens_it_again() {
         "{out:?}"
     );
 
-    // A follow-up typed into the done worker.
     ctl_ok(&inst, &[&sel, "turn", "timeout=60000", "true"]);
     let record = ctl_ok(&inst, &[&sel, "task"]);
     assert_eq!(field(&record, "state"), Some("working"), "{record}");

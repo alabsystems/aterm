@@ -9007,10 +9007,12 @@ mod box_head_loop {
     include!("box_head_tests.rs");
 }
 
-mod turn_end {
-    use super::*;
-    include!("turn_end_loop_tests.rs");
-}
+// A module file, not an `include!` in an inline `mod turn_end`: rustc reads an
+// included file's `#[path]` modules from the included file's directory and
+// rustfmt from the inline module's (`turn_end/`), so only a module file names
+// the same files to both.
+#[path = "turn_end_loop_tests.rs"]
+mod turn_end;
 
 mod needs_loop {
     use super::*;

@@ -1,34 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! One record, two syntaxes: a producer writes each field once, as
-//! `s.<kind>("key", value)` with the key beside its value, and a [`FieldSink`]
-//! spells it. [`TextSink`] spells the control wire's `key=value` line,
-//! [`JsonSink`] one JSON object; a record with both forms drives either from
-//! the same emit function, so its two forms cannot disagree on a key, an order
-//! or a value.
-//!
-//! The spellings, per kind:
-//!
-//! | kind | text | JSON |
-//! |---|---|---|
-//! | [`count`](FieldSink::count) | `7` | `7` |
-//! | [`decimal`](FieldSink::decimal) | `1.25` (the value's places) | `1.25` |
-//! | [`flag`](FieldSink::flag) | the sink's [`FlagWords`] | `true` / `false` |
-//! | [`label`](FieldSink::label) | one token, percent-escaped ([`crate::pct`]) | a string ([`crate::json`]) |
-//! | [`absent`](FieldSink::absent) | the word given (`none`, `busy`, `-`) | `null` |
-//! | [`pairs`](FieldSink::pairs) | `a:1,b:2`, or the empty word | `{"a":1,"b":2}` |
-//!
-//! A [`Cell::Rec`] value inside pairs is `1/2/3` in text (its keys are the
-//! JSON form's alone) and `{"arms":1,"past":2}` in JSON. A pair key in text is
-//! percent-escaped with its separators `,` and `:` as well, so `k:v,k:v`
-//! splits back into the keys written whatever bytes they hold.
+//! Dual-syntax record field formatting for `key=value` text lines and JSON objects.
 
 use std::fmt::Write as _;
 
-/// How a text record spells a flag. Records differ (`metrics` says `0`/`1`,
-/// a status line `true`/`false`, the privacy report `yes`/`no`), so the record
-/// chooses when it builds its [`TextSink`]; JSON always says `true`/`false`.
+/// How a text record spells a boolean flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlagWords {
     /// `1` / `0`.
@@ -53,9 +30,7 @@ impl FlagWords {
     }
 }
 
-/// A number written with a fixed count of decimal places (`{:.N}`), the same
-/// digits in both syntaxes. A non-finite value is `null` in JSON, which has no
-/// spelling for it.
+/// A number formatted with a fixed count of decimal places.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Decimal {
     value: f64,
@@ -87,10 +62,7 @@ pub enum Cell<'a> {
     Rec(&'a [(&'a str, Cell<'a>)]),
 }
 
-/// The fields of one record, in order. Keys are the producer's constants and
-/// are written as given (JSON escapes them); every runtime string goes through
-/// [`label`](Self::label) or a [`pairs`](Self::pairs) key, which each syntax
-/// escapes its own way.
+/// Sink receiving the fields of one record in order.
 pub trait FieldSink {
     /// An integer.
     fn count(&mut self, key: &str, v: u64);
@@ -102,9 +74,7 @@ pub trait FieldSink {
     fn label(&mut self, key: &str, v: &str);
     /// No value: `text` (`none`, `busy`, `-`) in the text form, `null` in JSON.
     fn absent(&mut self, key: &str, text: &'static str);
-    /// A self-labelling ledger: `k:v,...` in text (`empty_text` when there are
-    /// no pairs; each `k` escaped so it holds no `,` or `:`), an object in JSON
-    /// (`{}` when empty).
+    /// Writes a key-value ledger as `k:v,...` in text (`empty_text` when empty) and an object in JSON.
     fn pairs(&mut self, key: &str, pairs: &[(&str, Cell<'_>)], empty_text: &'static str);
 
     /// [`count`](Self::count) when `Some`, else [`absent`](Self::absent).
@@ -135,9 +105,7 @@ pub trait FieldSink {
     }
 }
 
-/// The control wire's text form: `<head> key=value key=value ...`, every value
-/// one whitespace-free token as long as the producer's absent and empty words
-/// are.
+/// The control wire's `<head> key=value ...` text formatter.
 #[derive(Debug)]
 pub struct TextSink {
     out: String,
@@ -145,8 +113,7 @@ pub struct TextSink {
 }
 
 impl TextSink {
-    /// A line that starts with `head` (`OK`, or empty for a fragment) and
-    /// spells flags as `flags`.
+    /// Creates a line starting with `head` that formats flags with `flags`.
     #[must_use]
     #[inline]
     pub fn new(head: &str, flags: FlagWords) -> Self {

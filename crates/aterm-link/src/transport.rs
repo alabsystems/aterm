@@ -155,7 +155,7 @@ impl Backoff {
     }
 
     /// The link came up at `now`.
-    pub(crate) fn attached(&mut self, now: Instant) {
+    pub(crate) const fn attached(&mut self, now: Instant) {
         self.up_since = Some(now);
     }
 

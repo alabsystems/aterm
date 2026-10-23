@@ -685,3 +685,76 @@ fn a_light_bands_tail_fades_out() {
         );
     }
 }
+
+/// The ink a light body's source-over quads lay, alpha-weighted: each quad's
+/// premultiplied colour over its opacity, for the quads at least `min_alpha`
+/// opaque. `None` when no quad is.
+fn body_ink_of(under: &[GlowQuad], min_alpha: u8) -> Option<u32> {
+    let (mut sum, mut weight) = ([0.0f64; 3], 0.0f64);
+    for q in under.iter().filter(|q| q.alpha >= min_alpha) {
+        let a = f64::from(q.alpha);
+        let w = a * f64::from(q.w) * f64::from(q.h);
+        for (i, sh) in [16u32, 8, 0].into_iter().enumerate() {
+            sum[i] += f64::from((q.color >> sh) & 0xff) * 255.0 / a * w;
+        }
+        weight += w;
+    }
+    (weight > 0.0).then(|| {
+        let ch = |i: usize| ((sum[i] / weight).round() as u32).min(255);
+        (ch(0) << 16) | (ch(1) << 8) | ch(2)
+    })
+}
+
+/// SPARKLE'S BODY ON PAPER IS GOLD: typed on GitHub Light in its automatic
+/// colour, the body under the letters lays a bright, saturated gold (hue
+/// 38°–50°, saturation and value at least 0.8), the gold its paper beads are
+/// cored with, and the theme's text keeps [`BODY_CONTRAST_BAR`] over it
+/// even opaque; with a pinned colour it keeps the pin's hue. Laid in its
+/// hue's one-weight vivid ink, the starlight gold came out a burnt
+/// orange-brown that read under the letters as a muddy caramel smear.
+/// Negative control: that ink's value is under 0.8.
+#[test]
+fn sparkles_paper_body_is_gold() {
+    let mut c = light(GlowStyle::Sparkle);
+    c.theme_fg = 0x001F_2328;
+    c.color = SPARKLE_DEFAULT_COLOR;
+    let g = geom();
+    let ink = |c: &GlowConfig, bold: bool| {
+        let (mut glow, _out, t) = typed(c, 8);
+        glow.sparkle_paper_bold_ink = bold;
+        body_ink_of(&body(&mut glow, c, g, t, (2, 13)), 32).expect("the body lays ink")
+    };
+    let gold = ink(&c, false);
+    let (h, s, v) = crate::color_math::rgb2hsv(gold);
+    assert!(
+        (38.0..=50.0).contains(&h) && s >= 0.8 && v >= 0.8,
+        "the paper body is {gold:06X} (h {h:.0}, s {s:.2}, v {v:.2}), not a clean gold"
+    );
+    let contrast = {
+        let (a, b) = (rel_luminance(c.theme_fg), rel_luminance(gold));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    };
+    assert!(
+        contrast >= crate::cursor_glow::light_body::BODY_CONTRAST_BAR,
+        "the text keeps only {contrast:.2}:1 over the opaque gold"
+    );
+    // A pinned colour keeps its own hue.
+    let mut pinned = c;
+    pinned.color = 0x00D0_3A8C;
+    let pin = ink(&pinned, false);
+    let (ph, _, _) = crate::color_math::rgb2hsv(pin);
+    let (want, _, _) = crate::color_math::rgb2hsv(0x00D0_3A8C);
+    let off = (ph - want).abs().min(360.0 - (ph - want).abs());
+    assert!(
+        off <= 12.0,
+        "a pinned {:06X} body came out {pin:06X}",
+        0x00D0_3A8C
+    );
+    // The control: the one-weight vivid ink.
+    let bold = ink(&c, true);
+    let (_, _, bv) = crate::color_math::rgb2hsv(bold);
+    assert!(
+        bv < 0.8,
+        "control: the vivid ink {bold:06X} is the muddy one (v {bv:.2})"
+    );
+}

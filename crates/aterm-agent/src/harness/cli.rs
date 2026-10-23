@@ -251,10 +251,11 @@ VERBS:
     state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
   - `accounts sync [<source>] [--machine <mN>] [--json]`
     Synchronizes this machine's `accounts.toml` and `fleet-accounts.toml` from `<source>` (a
-    file, `~/` the home's; an http(s) URL fetched with curl, a Sheets `/edit` link as its CSV
-    export; or `rclone:<remote>:<path>`, the only source rclone runs for), else from the
-    source this machine configured. With none it reads nothing and exits 1: there is no
-    default source. Waits at most 10 s for the accounts lock, then fails and syncs nothing.
+    file, `~/` the home's; or an http(s) URL fetched with curl, a Sheets `/edit` link as its
+    CSV export; an `rclone:<remote>:<path>` source is refused, since aterm runs no rclone),
+    else from the source this machine configured. With none it reads nothing and exits 1:
+    there is no default source. Waits at most 10 s for the accounts lock, then fails and
+    syncs nothing.
   - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
     Serves the LAN account rotation dashboard and `fleet-accounts.toml` (default
     `127.0.0.1:8741`) from the same source.
@@ -568,7 +569,7 @@ pub enum AccountsCmd {
     },
     /// `accounts sync [<source>] [--machine <mN>] [--json]`: synchronize this machine's `accounts.toml` and `fleet-accounts.toml` from `source`, else the source this machine configured ([`super::accounts_sync::configured_source`]); with neither, nothing.
     Sync {
-        /// Optional path, URL or `rclone:<remote>:<path>` of a CSV or a `fleet-accounts.toml`.
+        /// Optional path or URL of a CSV or a `fleet-accounts.toml`.
         source: Option<String>,
         /// Optional machine ID override (`m8`, `m14`, …).
         machine: Option<String>,
@@ -577,7 +578,8 @@ pub enum AccountsCmd {
     },
     /// `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`: serve the local/LAN account rotation dashboard and `fleet-accounts.toml`.
     Serve {
-        /// Optional path, URL or `rclone:<remote>:<path>` of a CSV or a `fleet-accounts.toml`; else the configured source.
+        /// Optional path or URL of a CSV or a `fleet-accounts.toml`; else
+        /// the configured source.
         source: Option<String>,
         /// Optional bind address (`127.0.0.1:8741` or `0.0.0.0:8741`).
         bind: Option<String>,

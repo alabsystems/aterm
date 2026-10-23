@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! This machine's signing identity: the machine key, its signature, and the checks that
-//! the key is the one its record and the roster name.
-//!
-//! A signature is `atpkg_keys::sign` over the exact bytes: a detached 64-byte Ed25519
-//! signature in `<doc>.sig`, which the client verifies under the roster. There is no
-//! other key.
+//! Machine signing identity, detached Ed25519 signature, and roster checks.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +16,6 @@ pub struct MachineKey {
 
 impl std::fmt::Debug for MachineKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the key bytes.
         f.debug_struct("MachineKey")
             .field("path", &self.path)
             .finish_non_exhaustive()
@@ -33,8 +27,7 @@ impl MachineKey {
     ///
     /// # Errors
     ///
-    /// A refusal naming the provisioning verbs when there is no key there, or when the
-    /// file is not a pkcs8 Ed25519 key.
+    /// Returns an error when the key file is missing or is not a PKCS#8 Ed25519 key.
     pub fn load(ctx: &Ctx, path: &Path) -> Result<Self> {
         let pkcs8 = std::fs::read(path).map_err(|e| {
             Error::refused(format!(
@@ -56,7 +49,7 @@ impl MachineKey {
     ///
     /// # Errors
     ///
-    /// Never for a loaded key (it was checked at load).
+    /// Never for a loaded key.
     pub fn pubkey_b64(&self) -> Result<String> {
         atpkg_keys::pubkey_b64(&self.pkcs8).map_err(Error::refused)
     }
@@ -96,8 +89,7 @@ pub struct MachineRecord {
     pub pubkey: String,
 }
 
-/// A loaded identity that may sign an index under a given roster: the key, its record,
-/// and the proof that the roster lists that key under that id, unrevoked.
+/// A loaded identity verified to sign an index under a given roster.
 #[derive(Debug)]
 pub struct Signer {
     /// The key.
@@ -108,20 +100,11 @@ pub struct Signer {
     pub roster_seq: u64,
 }
 
-/// Load the identity and check it against the roster it signs under: the key file is the
-/// key the record names; the id is not revoked (checked first: a revoked machine has no
-/// key left on the roster to find, and must not be sent to `atpkg-keys join`); the roster
-/// lists this key under this id; and its entry is live now.
-///
-/// Each refusal names the fix before anything is signed: the self-check, like any
-/// verifier, must not be an oracle, so its own failure says only "no machine on that roster
-/// signed this index".
+/// Load the identity and check it against the roster it signs under.
 ///
 /// # Errors
 ///
-/// A refusal for a missing key or record, a key the record does not name, a revoked id,
-/// a key the roster does not list, a roster that lists it under another id, or an entry
-/// past its horizon.
+/// Returns an error if the key or record is missing, mismatched, revoked, unlisted, or expired.
 pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signer> {
     let key = MachineKey::load(ctx, &ctx.identity.key)?;
     let key_pub = key.pubkey_b64()?;
@@ -172,7 +155,6 @@ pub fn signer_for(ctx: &Ctx, roster: &aterm_update_core::Roster) -> Result<Signe
             record.id
         )));
     }
-    // A listed entry past its horizon signs what every client refuses.
     if let Err(why) = roster.machine(&record.id, ctx.now_unix) {
         return Err(Error::refused(format!(
             "machine '{id}' is listed on roster_seq {seq}, but the roster refuses it now \

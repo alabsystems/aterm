@@ -2,23 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! What the pinned astream-term models, read off the fold itself.
-//!
-//! The subset the oracle compares is the intersection of what BOTH engines
-//! model the same way, and astream-term's side of it moves with the
-//! `vendor/astream` pin. Each capability below is a tiny program whose result
-//! tells the old fold from one that gained the behaviour, so a pin bump that
-//! lands a widening turns the matching generator ops on by itself, and the
-//! hand-written exclusion it retires goes stale, which
-//! `the_corpus_agrees_or_is_excluded` reports. Nothing here is a version
-//! number or a list to keep in step: the fold answers for itself.
-//!
-//! Every probe but `ris_keeps_alt` is a widening of `fix/term-oracle-divergences`
-//! in astream (the branch this oracle's first run produced, landed on astream
-//! main as 4e91e82); `ris_keeps_alt` came with
-//! `fix/term-ris-keeps-the-alternate-buffer`, from a later review. Each
-//! names the xterm behaviour it brings the fold to. The "pinned fold" each doc
-//! below contrasts it with is the fold before its branch, whose answer a probe
-//! still tells apart.
 
 use astream_term::Record;
 use astream_term::screen::{Color, fold};
@@ -26,68 +9,53 @@ use astream_term::screen::{Color, fold};
 /// The capabilities, probed once per call (each is a fold of a few bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps {
-    /// EL/ED from a pending wrap clear the parked glyph and reset the wrap
-    /// (xterm util.c `ClearRight`: "with the right part cleared, we can't be
-    /// wrapping"). The pinned fold keeps the glyph and the wrap, as xterm.js.
+    /// EL/ED from a pending wrap clear the parked glyph and reset the wrap (xterm util.c
+    /// `ClearRight`: "with the right part cleared, we can't be wrapping").
     pub erase_resets_wrap: bool,
-    /// `ED 3` erases saved lines only (xterm `do_erase_display` case 3); with
-    /// no scrollback the visible screen is untouched. The pinned fold erases
-    /// the display.
+    /// `ED 3` erases saved lines only (xterm `do_erase_display` case 3).
     pub ed3_spares_screen: bool,
-    /// A line scrolled in takes the current SGR background (xterm screen.c
-    /// `ScrnClearLines` fills with `xtermColorPair`). The pinned fold scrolls
-    /// in a default blank.
+    /// A line scrolled in takes the current SGR background (xterm screen.c `ScrnClearLines` fills
+    /// with `xtermColorPair`).
     pub bce_on_scroll: bool,
-    /// VT and FF are line feeds (xterm `CASE_VMOT`: "form feed, line feed,
-    /// vertical tab" all `xtermIndex`). The pinned fold ignores them.
+    /// VT and FF are line feeds (xterm `CASE_VMOT`: "form feed, line feed, vertical tab" all
+    /// `xtermIndex`).
     pub vt_ff_feed: bool,
-    /// IND, NEL and RI (`ESC D`, `ESC E`, `ESC M`). The pinned fold consumes
-    /// them without effect.
+    /// IND, NEL and RI (`ESC D`, `ESC E`, `ESC M`).
     pub index_ops: bool,
     /// ICH, DCH, IL, DL and ECH (`CSI @`, `P`, `L`, `M`, `X`).
     pub insert_delete: bool,
-    /// DECSC saves, and DECRC restores, the SGR rendition with the position
-    /// (xterm `CursorSave`/`CursorRestore` save `flags` and the colours).
+    /// DECSC saves, and DECRC restores, the SGR rendition with the position (xterm
+    /// `CursorSave`/`CursorRestore` save `flags` and the colours).
     pub decsc_saves_pen: bool,
-    /// One alternate buffer that persists across `?47` switches (xterm keeps
-    /// it; only `?1047` clears it on leaving and `?1049` on entering).
+    /// One alternate buffer that persists across `?47` switches (xterm keeps it; only `?1047`
+    /// clears it on leaving and `?1049` on entering).
     pub alt_persists: bool,
-    /// RIS keeps that buffer and its DECSC slot, as xterm's full reset does
-    /// (charproc.c `ReallyReset`: `FromAlternate(xw, True)` clears the buffer
-    /// only if it is up, and `CursorSave` writes the main slot alone). The
-    /// fold before astream `fix/term-ris-keeps-the-alternate-buffer` rebuilt
-    /// the whole screen, both gone.
+    /// RIS keeps that buffer and its DECSC slot, as xterm's full reset does (charproc.c
+    /// `ReallyReset`: `FromAlternate(xw, True)` clears the buffer only if it is up, and
+    /// `CursorSave` writes the main slot alone).
     pub ris_keeps_alt: bool,
-    /// The alternate-screen switches clear as xterm's do: `?1049h` ends in
-    /// `ClearScreen` even when the alternate screen is already up, and
-    /// `?1047l` runs it before leaving; `ClearScreen` resets the pending wrap
-    /// (charproc.c `srm_OPT_ALTBUF_CURSOR`, `srm_OPT_ALTBUF`; util.c
-    /// `ClearScreen`). The pinned fold skips the second entry's clear and
-    /// carries a pending wrap across both switches.
+    /// The alternate-screen switches clear as xterm's do: `?1049h` ends in `ClearScreen` even when
+    /// the alternate screen is already up, and `?1047l` runs it before leaving; `ClearScreen`
+    /// resets the pending wrap (charproc.c `srm_OPT_ALTBUF_CURSOR`, `srm_OPT_ALTBUF`; util.c
+    /// `ClearScreen`).
     pub alt_clears: bool,
-    /// Malformed UTF-8 becomes one U+FFFD per maximal subpart (Unicode 3.9,
-    /// the WHATWG decoder, aterm): `C0 80` is two replacements. The pinned fold
-    /// replaces a whole overlong or surrogate sequence with one.
+    /// Malformed UTF-8 becomes one U+FFFD per maximal subpart (Unicode 3.9, the WHATWG decoder,
+    /// aterm): `C0 80` is two replacements.
     pub utf8_subparts: bool,
-    /// Origin mode (DECOM, `?6`): CUP and VPA count rows from the top margin
-    /// and stop at the bottom one, `?6` homes, DECSC saves it (xterm
-    /// `CursorSet`, `DECSC_FLAGS`). Came with astream `b13/origin-irm-su`;
-    /// the fold before it ignored `?6`.
+    /// Origin mode (DECOM, `?6`): CUP and VPA count rows from the top margin and stop at the bottom
+    /// one, `?6` homes, DECSC saves it (xterm `CursorSet`, `DECSC_FLAGS`).
     pub origin_mode: bool,
-    /// Insert mode (IRM, `CSI 4 h`): each glyph shifts the line right first
-    /// (xterm `WriteText` runs `InsertChar`). The fold before
-    /// `b13/origin-irm-su` consumed ANSI modes.
+    /// Insert mode (IRM, `CSI 4 h`): each glyph shifts the line right first (xterm `WriteText` runs
+    /// `InsertChar`).
     pub insert_mode: bool,
-    /// SU and SD (`CSI n S`, `CSI n T`): the region scrolls, the cursor and
-    /// its pending wrap stay (xterm `xtermScroll`, `RevScroll`). The fold
-    /// before `b13/origin-irm-su` consumed both.
+    /// SU and SD (`CSI n S`, `CSI n T`): the region scrolls, the cursor and its pending wrap stay
+    /// (xterm `xtermScroll`, `RevScroll`).
     pub scroll_up_down: bool,
-    /// Newline mode (LNM, `CSI 20 h`): LF, VT and FF return the carriage too
-    /// (xterm `CASE_VMOT` under `LINEFEED`). Came with `b13/origin-irm-su`.
+    /// Newline mode (LNM, `CSI 20 h`): LF, VT and FF return the carriage too (xterm `CASE_VMOT`
+    /// under `LINEFEED`).
     pub newline_mode: bool,
-    /// G0/G1 designation of ASCII and DEC Special Graphics (`ESC ( 0`,
-    /// `ESC ) 0`), SO/SI, xterm's table, and DECSC saving the sets. Came with
-    /// astream `b13/charsets`; the fold before it consumed every SCS.
+    /// G0/G1 designation of ASCII and DEC Special Graphics (`ESC ( 0`, `ESC ) 0`), SO/SI, xterm's
+    /// table, and DECSC saving the sets.
     pub charsets: bool,
 }
 

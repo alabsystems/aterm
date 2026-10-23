@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the momentum glow's snapshot.
-//! * The round trip at every event boundary of every fixture: snapshot,
-//!   encode, decode, restore, continue, which equals the straight run on the
-//!   same epoch, onto a later epoch (negative offsets), and onto another
-//!   epoch.
-//! * The per-field negative controls.
-//! * The cold memo.
-//! * The byte layout and the byte-flip and truncation sweeps.
-//! * Each validation refusal, and a property sweep that `validate` accepts
-//!   every state random engine streams reach.
-//! * The horizon and the settle schedule's reach near the `Instant` ceiling.
+//! Round-trip, byte-layout, and validation tests for cursor-momentum snapshots.
 
 use std::time::Duration;
 
@@ -25,8 +15,7 @@ use crate::cursor_momentum::test_fixtures::{
 };
 use crate::cursor_momentum::{LightInkMemo, MomentumGlowConfig, MomentumGlowFrame};
 
-/// A straight run: the observation of every input, and the engine and its
-/// snapshot at every boundary (`engines[k]` is the state before input `k`).
+/// A straight run: the observation of every input.
 struct Straight {
     obs: Vec<Obs>,
     engines: Vec<MomentumGlow>,
@@ -106,7 +95,6 @@ fn a_snapshot_taken_after_the_first_key_carries_negative_offsets_and_continues_e
     let mut negative = 0usize;
     for (name, evs) in fixtures() {
         let clock = Clock::ahead(Duration::ZERO);
-        // Later than every key of the burst fixtures: their stamps predate it.
         let epoch = clock.at(2_500 * MS);
         let run = straight(&evs, &clock, epoch);
         for k in 0..=evs.len() {
@@ -141,8 +129,6 @@ fn a_snapshot_restored_onto_another_epoch_continues_exactly() {
         let lead = 1_250 * MS;
         let run = straight(&evs, &here, here.at(lead));
         for k in 0..=evs.len() {
-            // The same offsets, placed on the other host's epoch; the inputs
-            // after the boundary are rebased with it.
             let g = through_bytes(&run.snaps[k], there.at(lead));
             let (obs, end) = resume(g, &evs[k..], &there);
             assert_eq!(
@@ -370,7 +356,7 @@ fn cooled() -> MomentumGlowSnapshot {
     }
 }
 
-/// The layout table, stated independently of the codec: field, offset, size.
+/// The layout table, stated independently of the codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
     Schema,
@@ -469,8 +455,7 @@ fn decode_refuses_every_truncation_and_every_extension_by_length() {
     }
 }
 
-/// What decoding `s`'s encoding with byte `i` XORed by `mask` must give,
-/// worked out from the layout table alone.
+/// What decoding `s`'s encoding with byte `i` XORed by `mask` must give.
 fn expected_after_flip(
     s: &MomentumGlowSnapshot,
     i: usize,
@@ -553,10 +538,6 @@ fn expected_after_flip(
 }
 
 /// Every byte under three masks, over a hot, a cooled and the rest state.
-/// Decode returns exactly what the layout table says: the exact refusal, or
-/// exactly the snapshot with that one field changed. A changed snapshot then
-/// either restores and round-trips, or is refused by `validate` (or lands
-/// outside the instants). Nothing panics.
 #[test]
 fn every_byte_flip_is_refused_exactly_or_decodes_to_exactly_the_flipped_field() {
     let epoch = Clock::ahead(Duration::ZERO).origin;
@@ -1095,8 +1076,7 @@ fn a_stamp_at_the_horizon_restores_and_schedules_and_one_past_it_is_refused() {
 /// A 120 Hz lane.
 const LANE: Duration = Duration::from_micros(8_333);
 
-/// The latest whole-second instant `checked_add` forms from `base`, found by
-/// bisection (64 steps of pure arithmetic).
+/// The latest whole-second instant `checked_add` forms from `base`, found by bisection.
 fn instant_ceiling(base: Instant) -> Instant {
     let (mut lo, mut hi) = (0u64, u64::MAX);
     while lo < hi {
@@ -1114,9 +1094,6 @@ fn instant_ceiling(base: Instant) -> Instant {
 /// Near the platform's `Instant` ceiling the epoch itself is representable,
 /// but a stamp whose settle schedule (`τ·ln 255 + SETTLE_MARGIN`, 333 s at the
 /// profile's longest τ) would cross the ceiling is refused at restore.
-/// Every restore that succeeds can then be asked `cold_at`,
-/// `next_change_deadline` and `value` without a panic: the reach check is
-/// what keeps the engine's unchecked additions inside the range.
 #[test]
 fn near_the_instant_ceiling_a_stamp_whose_schedule_cannot_form_is_refused_and_any_other_schedules()
 {
@@ -1127,7 +1104,6 @@ fn near_the_instant_ceiling_a_stamp_whose_schedule_cannot_form_is_refused_and_an
             .expect("the ceiling has room below it")
     };
     let slow = MOMENTUM_PROFILE.max_tau_s;
-    // (seconds of room above the epoch, τ, whether the reach fits)
     let cases = [
         (100u64, slow, false),
         (100, TAU, true),
@@ -1245,7 +1221,7 @@ fn a_latched_tau_past_the_profile_is_refused_and_the_profiles_own_is_restored() 
     );
 }
 
-/// splitmix64, seeded: deterministic and dependency-free.
+/// splitmix64, seeded.
 struct Rng(u64);
 
 impl Rng {
@@ -1271,8 +1247,7 @@ impl Rng {
     }
 }
 
-/// A τ a tick latches: production, the fixtures', the profile's longest, a
-/// short one, a subnormal, or any in `(0, max_tau_s]`.
+/// A τ a tick latches.
 fn random_tau(r: &mut Rng) -> f32 {
     match r.below(7) {
         0 => TAU,
@@ -1285,9 +1260,7 @@ fn random_tau(r: &mut Rng) -> f32 {
     }
 }
 
-/// A key's τ, which the bare engine takes unadmitted: mostly in the profile,
-/// sometimes NaN, zero, negative, infinite or past the profile (the value
-/// then reads 0 and the key stores exactly the credit).
+/// A key's τ, which the bare engine takes unadmitted.
 fn random_key_tau(r: &mut Rng) -> f32 {
     match r.below(12) {
         0 => f32::NAN,
@@ -1299,9 +1272,7 @@ fn random_key_tau(r: &mut Rng) -> f32 {
     }
 }
 
-/// The time to the next input: a repeated instant, frame cadence, the decay's
-/// own scale (a key 2.7–3.7 s after one key lands on a value near
-/// `SNAP_ZERO` at production τ), seconds, or hours.
+/// The time to the next input.
 fn random_gap(r: &mut Rng) -> i128 {
     let n = |r: &mut Rng, k: u64| i128::from(r.below(k));
     match r.below(8) {
@@ -1314,9 +1285,7 @@ fn random_gap(r: &mut Rng) -> i128 {
     }
 }
 
-/// A tick on a dark or a light page, admitted under the profile, with each
-/// inert arm (disabled, zero intensity, no cursor, outside the grid) drawn
-/// now and then.
+/// A tick on a dark or a light page, admitted under the profile, with each inert arm.
 fn random_tick(r: &mut Rng, at: i128) -> Ev {
     let dark = r.below(2) == 0;
     let geom = if r.below(2) == 0 { plain() } else { padded() };
@@ -1404,7 +1373,6 @@ fn validate_accepts_every_state_random_engine_streams_reach_at_every_epoch() {
                     at,
                     tau: random_key_tau(&mut r),
                 },
-                // The same tick again: the same frame settles the glow.
                 (8..=10, Some(Ev::Tick { cur, geom, cfg, .. })) => Ev::Tick { cur, at, geom, cfg },
                 (8..=16, _) => random_tick(&mut r, at),
                 _ => Ev::Query { at, lane },

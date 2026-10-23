@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! How often System State's worker tries a Secrets stage that did not finish. The
-//! worker passes every minute; a vault that does not answer, or a Mac an admin has
-//! not let in yet, gives the same answer again and again, and asking every minute
-//! filled the owner's log with "No route to host" (2026-10-22). An unfinished try is
-//! followed by a pause that doubles from [`FIRST_PAUSE`] up to [`LONGEST`] (one, two,
-//! then four minutes), and anything that can change the answer ends the pause at once:
-//! another network, a build of aterm that has not tried it yet, a change to this Mac's
-//! vault state (the subscriber writing the version that lets it in), aterm opened from where
-//! it is installed after a run from its disk image, or the person's Apply or Restart in System State, which starts a new setup run. A try whose change
-//! failed (its line journaled, the change not made) is made at most [`TRIES`] times in
-//! a row; then the stage waits for one of those changes, as the doctor holds an item
-//! whose change does not take. Between tries the stage shows the last try's rows
-//! unchanged, so the worker's log keeps one line, not one a minute.
+//! Backoff and retry tracking for the initial-setup Secrets stage.
 
 use super::{PROFILE, Path, Row, Value, durable_directory, json, write_json};
 use aterm_machines::init_secrets::SecretsOps;
@@ -26,17 +14,10 @@ pub(super) const RECORD: &str = "secrets-attempt.json";
 /// The pause after a first unfinished try: the worker's own cadence.
 pub(super) const FIRST_PAUSE: Duration = Duration::from_secs(60);
 
-/// The longest pause, the third doubling of the worker's minute: a vault that comes back on
-/// the network this Mac is already on, which no mark shows, is asked again within it. An
-/// admin's approval reaches a pending Mac through its subscriber, and the version the
-/// subscriber writes changes this Mac's vault state, which ends the pause at the worker's
-/// next pass; the subscriber asks again at once on a new network, and otherwise within its
-/// own wait after an error (at most a minute), which this pause does not shorten.
+/// Maximum backoff pause between unfinished Secrets attempts.
 pub(super) const LONGEST: Duration = Duration::from_secs(4 * 60);
 
-/// How many tries in a row whose change failed are made before the stage waits for a change
-/// that can alter the answer: each such try writes a line in the account's journal, which
-/// keeps a bounded history.
+/// Maximum consecutive failed change attempts before waiting for an external change.
 pub(super) const TRIES: u32 = 2;
 
 /// How many builds a row of tries remembers having tried.
@@ -59,11 +40,9 @@ pub(super) trait Reads {
     fn build(&self) -> String;
     /// Now, in seconds since the epoch.
     fn now(&self) -> u64;
-    /// The addresses this Mac's traffic leaves by
-    /// ([`aterm_secrets::server::route_sources`]), as text.
+    /// Outbound route source addresses as text.
     fn routes(&self) -> String;
-    /// The vault of the one console account, as the stage's item reads it; `None` without
-    /// a single console account.
+    /// Vault handle for the single console account, if any.
     fn vault(&self) -> Option<Arc<dyn SecretsOps>>;
 }
 
@@ -81,8 +60,6 @@ pub(super) fn pace(reads: &dyn Reads) -> Pace {
 /// membership and the version it holds, the files it wrote, whether its subscriber runs),
 /// and whether this aterm is a copy that goes away, which no subscriber may run
 /// ([`SecretsOps::fleeting`]).
-/// When the subscriber last heard from the vault is left out: it changes on every sync and
-/// says nothing new. Local reads only; a read that fails is part of the digest.
 fn marks(reads: &dyn Reads) -> String {
     use aterm_secrets::client::Membership;
     use aterm_secrets::service::State;
@@ -135,8 +112,7 @@ impl Reads for Live {
     }
 }
 
-/// The pause after `tries` unfinished tries in a row: [`FIRST_PAUSE`], doubled per try, at
-/// most [`LONGEST`].
+/// Returns the backoff pause after `tries` consecutive unfinished attempts.
 pub(super) fn pause(tries: u32) -> Duration {
     let doublings = tries.saturating_sub(1).min(16);
     FIRST_PAUSE.saturating_mul(1 << doublings).min(LONGEST)
@@ -229,8 +205,7 @@ impl Attempt {
     }
 }
 
-/// The rows to show in place of a try at `pace`, while the last unfinished try of setup
-/// run `revision` pauses or holds: `None` when a try is due.
+/// Returns the cached rows while the last unfinished attempt of `revision` is paused or held.
 pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>> {
     let last = Attempt::load(root)?;
     let due = last.at.saturating_add(pause(last.tries).as_secs());
@@ -248,11 +223,7 @@ pub(super) fn paused(root: &Path, revision: u64, pace: &Pace) -> Option<Vec<Row>
     )
 }
 
-/// Keep what a try of setup run `revision` did, `pace` read after it. A finished try ends
-/// the row of tries. An unfinished one counts on from the last when nothing changed between
-/// them, and from one otherwise (another build in the same row counts from one too, and
-/// joins it); a failed one adds to the failures in a row, and any other ends them. Each of
-/// its unfinished `rows` then says when the next try comes.
+/// Records the outcome of a Secrets attempt for `revision` at `pace`.
 ///
 /// # Errors
 /// The record cannot be written or removed.
@@ -386,7 +357,6 @@ mod tests {
         assert!(paused(root, 3, &other).is_none(), "build");
         assert!(paused(root, 3, &pace("m", 999)).is_none(), "clock set back");
 
-        // The second unchanged try pauses two minutes; a changed one counts from one.
         let mut rows = blocked("the vault does not answer");
         record(root, 3, &pace("m", 1_060), false, &mut rows).unwrap();
         assert!(rows[0].detail.contains("2 minutes after this try"));
@@ -479,8 +449,6 @@ mod tests {
         other.build = "1.0.0+gdef".into();
         assert!(paused(root, 3, &other).is_none(), "build");
 
-        // That build's try fails too: held again at once. A third build's try that stands
-        // aside ends the failures in a row, and its pause is only a pause.
         let mut rows = failed();
         record(root, 3, &other, false, &mut rows).unwrap();
         assert!(rows[0].detail.ends_with(HELD), "{rows:?}");

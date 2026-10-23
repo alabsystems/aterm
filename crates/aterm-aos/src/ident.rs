@@ -1,28 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Identities: domain-separated SHA-256 digests, versioned artifacts, and the task identity
-//! that binds them.
-//!
-//! # The law
-//!
-//! A [`Digest`] is SHA-256 over a domain string and then, for each part, its length as a
-//! `u64` LE followed by its bytes ([`Digest::of`]). The length framing makes the encoding of
-//! a part list injective — `["ab", "c"]` and `["a", "bc"]` never collide — and the domain
-//! separates every use (an artifact digest can never be mistaken for a state digest).
-//!
-//! An [`ArtifactId`] names one versioned artifact by kind, name, version and the digest of
-//! its declared content. For prebuilt code the descriptor is its name, version and the build
-//! id the host supplies — not machine code bytes: Aos M2 switches between two implementations
-//! compiled into the same build, and the descriptor says which.
-//!
-//! A [`TaskIdentity`] binds the five artifacts a hosted task runs under. Its digest is taken
-//! over the canonical wire encoding of all five, so two identities that differ in any field
-//! of any artifact have different digests.
-//!
-//! [`Revision`] and [`BranchId`] are plain counters minted by a [`crate::publish::Boundary`]:
-//! a commit or a restore mints a new revision, a restore a new branch, so a candidate keyed to
-//! an older head can never be mistaken for the current one even when the state bytes match.
+//! Identities: domain-separated SHA-256 digests, versioned artifacts, and the task identity that
+//! binds them.
 
 use core::fmt;
 
@@ -36,7 +16,7 @@ pub const ARTIFACT_DOMAIN: &[u8] = b"aterm-aos-artifact-v1\0";
 /// The domain under which [`TaskIdentity::digest`] digests an identity's encoding.
 pub const IDENTITY_DOMAIN: &[u8] = b"aterm-aos-identity-v1\0";
 
-/// A SHA-256 digest. `Debug` and `Display` print it as 64 lowercase hex digits.
+/// A SHA-256 digest.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Digest(pub [u8; 32]);
 
@@ -59,8 +39,8 @@ impl Digest {
         s
     }
 
-    /// The first 12 hex digits: enough to tell digests apart in a status line, never an
-    /// identity check.
+    /// The first 12 hex digits: enough to tell digests apart in a status line, never an identity
+    /// check.
     #[must_use]
     pub fn short(&self) -> String {
         let mut s = String::with_capacity(12);
@@ -90,16 +70,14 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
     }
 }
 
-/// A part length as the u64 the framing writes. `usize` is at most 64 bits on every target
-/// this builds for, so the conversion never saturates there.
+/// A part length as the u64 the framing writes.
 #[inline]
 pub(crate) fn len_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Streaming form of [`Digest::of`]: the same bytes reach the hash, so
-/// `builder(domain).part(a).part(b).finish() == Digest::of(domain, &[a, b])`. Used where the
-/// parts are many (a trace's inputs) and collecting them first would only copy them.
+/// `builder(domain).part(a).part(b).finish() == Digest::of(domain, &[a, b])`.
 pub(crate) struct DigestBuilder(Sha256);
 
 impl DigestBuilder {
@@ -122,7 +100,7 @@ impl DigestBuilder {
     }
 }
 
-/// What an [`ArtifactId`] names. The discriminant is its wire byte.
+/// What an [`ArtifactId`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ArtifactKind {
@@ -161,7 +139,7 @@ impl ArtifactKind {
     }
 }
 
-/// One versioned artifact. Two ids are the same artifact only when every field is equal.
+/// One versioned artifact.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArtifactId {
     /// What the artifact is.
@@ -175,10 +153,8 @@ pub struct ArtifactId {
 }
 
 impl ArtifactId {
-    /// `digest = Digest::of(b"aterm-aos-artifact-v1\0", [kind, name, version, descriptor])`,
-    /// with `kind` as its byte and `version` as u32 LE. `descriptor` is the artifact's declared
-    /// content (for prebuilt code: its name, version and the build id the host supplies), not
-    /// machine code bytes.
+    /// `digest = Digest::of(b"aterm-aos-artifact-v1\0", [kind, name, version, descriptor])`, with
+    /// `kind` as its byte and `version` as u32 LE.
     #[must_use]
     pub fn new(kind: ArtifactKind, name: &str, version: u32, descriptor: &[u8]) -> ArtifactId {
         let digest = Digest::of(
@@ -245,10 +221,10 @@ impl TaskIdentity {
     }
 }
 
-/// A revision of a hosted task's live pair. Minted by a boundary; never reused within it.
+/// A revision of a hosted task's live pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Revision(pub u64);
 
-/// A branch of a hosted task's history. A restore starts a new one.
+/// A branch of a hosted task's history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchId(pub u64);

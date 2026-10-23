@@ -146,8 +146,11 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     let path = dir.path().join("c.sock");
     let published = path.to_str().expect("utf8").to_string();
     let listener = CtlListener::bind(&path).expect("bind");
+    // Three request lanes: the held verb keeps one to the end, and the lane that answered the
+    // `ping` before the exec frees only once its thread reads the hang-up, which on a loaded
+    // machine can come after the reopened socket's client arrives; a third serves that client.
     let lanes = Lanes::new(LaneLimits {
-        rpc: 2,
+        rpc: 3,
         wait: 1,
         inline: 1,
         open: 8,
@@ -168,7 +171,11 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     std::thread::spawn(move || {
         supervisor.run(
             move |stream| {
-                let _ = lanes.admit(stream);
+                // Refused as the instance refuses one: with the busy line, not a bare close.
+                if let Err(stream) = lanes.admit(stream) {
+                    let _ = (&stream)
+                        .write_all(aterm_types::control_verbs::CONTROL_BUSY_LINE.as_bytes());
+                }
             },
             move || stopping.load(Ordering::Acquire),
         );

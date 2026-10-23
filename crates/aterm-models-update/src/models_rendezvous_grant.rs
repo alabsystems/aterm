@@ -1,54 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seamless handoff's rendezvous grant across a version boundary: which grant a parent
-//! sends to which claim, and what a successor may adopt of it.
+//! The seamless handoff's rendezvous grant across a version boundary.
 
 use aterm_spec::derive::Model;
 
 /// One launched-lane handoff, from the candidate the parent verified to the descriptors its
 /// successor adopts.
-///
-/// The environment chooses whether the successor's code reads the chunked `ATRZ2G` grant
-/// (`capable`), whether its verified `Info.plist` declares that (`declared`, only of code that
-/// can), and whether the pool outgrew one descriptor message (`large`: more than 62 sessions).
-/// The parent may offer the chunked grant (`ATERM_HANDOFF_GRANT_CAPS`); the successor claims
-/// `ATRZ2C` when offered and capable, else `ATRZ1C`. The parent then grants one message
-/// (`ATRZ1G`), two (`ATRZ2G`, standing for "more than one"), or refuses before any descriptor
-/// leaves. Messages go one at a time; the parent may stop after the first (it died or its write
-/// failed), and the successor adopts the whole grant or refuses and closes all it received.
-///
-/// Each claim has a mutant that breaks it alone:
-/// * `OfferedOnlyWhenDeclared` — offered only to a candidate whose sealed bundle declares it
-///   (mutant: offer to any candidate).
-/// * `ChunkedClaimOnlyWhenOffered` — `ATRZ2C` is claimed only when offered, so an older parent
-///   is claimed as always (mutant: claim it unoffered).
-/// * `ChunkedGrantOnlyToChunkedClaim` — an `ATRZ1C` claimant is never sent `ATRZ2G` (mutant:
-///   grant it anyway).
-/// * `OneMessageWhenItFits` — up to 62 sessions the grant is `ATRZ1G` whatever was claimed
-///   (mutant: chunk a small pool).
-/// * `AdoptionIsWhole` — a successor adopts only a grant it holds every message of (mutant:
-///   adopt after the first chunk).
-/// * `RefusalClosesEverything` — a refusal leaves nothing held (mutant: keep what arrived).
-///
-/// Tier-1: `handoff_rendezvous`'s `rendezvous_grant_conformance` drives the shipping decisions
-/// (`grant_shape`, `offers_chunked_grant`, the claim frames) and a real chunked grant over a
-/// real rendezvous, cut short and whole.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_rendezvous_grant_model() -> Model {
     aterm_spec::ty_model! {
         NativeUpdateRendezvousGrant {
             const Buggy = 0;
-            // 0 choosing, 1 launched, 2 claimed, 3 granting, 4 the parent stopped.
             var phase = 0;
             var capable = 0;
             var declared = 0;
             var large = 0;
             var offered = 0;
-            // 1 ATRZ1C, 2 ATRZ2C.
             var claimed = 0;
-            // 1 ATRZ1G, 2 ATRZ2G, 3 refused before any descriptor left.
             var grant = 0;
             var need = 0;
             var sent = 0;

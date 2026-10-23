@@ -277,7 +277,7 @@ pub fn block_check<P: crate::BlockFn>(signature: &str) -> Result<(), String> {
     }
 }
 
-fn angle_end(b: &[u8], open: usize) -> usize {
+const fn angle_end(b: &[u8], open: usize) -> usize {
     let (mut depth, mut j, mut quoted) = (0_usize, open, false);
     while j < b.len() {
         match b[j] {

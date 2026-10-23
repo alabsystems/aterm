@@ -1,24 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE NEGATIVE CONTROLS: defects planted in a copy of the shim, each of which
-//! the oracle must catch, and catch for the planted reason.
-//!
-//! The conformance crate and the shim are regenerated together, and a
-//! regeneration that drops a class of assertion leaves the oracle green while it
-//! checks less. Each control here plants one realistic defect of one class — a
-//! primitive the cell stops re-exporting, a nominal pointee widened to
-//! `c_void`, a correlated FD_SET/FD_ISSET mapping, a method made private, a
-//! method's signature or body changed, a C-macro body changed, an extern
-//! declaration turned inline, a method widened to safe, an extra inherent method,
-//! a dropped `Clone`/`Copy`, an extern bound to another linker symbol, an
-//! architecture-only body edit — and requires the oracle's evidence: the
-//! compiler error by code and name, the runtime test by name, the shape record,
-//! the symbol, the sibling pair. A control whose source text the regenerated shim
-//! no longer carries is a finding too: the control must move with it.
-//!
-//! The copy lives in a scratch directory with its own target directory, so the
-//! checkout is never edited.
+//! THE NEGATIVE CONTROLS: defects planted in a copy of the shim, each of which the oracle must
+//! catch, and catch for the planted reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -96,11 +80,10 @@ impl ControlId {
 /// How a control failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlFailure {
-    /// The unmutated subject already shows the defect, so planting it proves
-    /// nothing.
+    /// The unmutated subject already shows the defect, so planting it proves nothing.
     Baseline { detail: String },
-    /// The text the mutation replaces is not in the shim `expected` times: the
-    /// shim was regenerated and the control must follow it.
+    /// The text the mutation replaces is not in the shim `expected` times: the shim was regenerated
+    /// and the control must follow it.
     Anchor {
         file: String,
         anchor: String,
@@ -582,7 +565,6 @@ fn derived(path: &str) -> ShapeRecord {
 }
 
 /// Run every control for `cell` against a copy of the checkout at `root`.
-///
 /// # Errors
 /// When the copy cannot be made or targo cannot be started.
 pub fn run(

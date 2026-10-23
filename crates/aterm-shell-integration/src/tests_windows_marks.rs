@@ -402,7 +402,8 @@ fn test_git_bash_records_the_typed_line_and_marks_a_subshell_line() {
 
 /// A Git Bash whose `/tmp` went away while it ran still runs every line typed, records it
 /// as typed and gives a line that opens with a subshell its block ([`GIT_BASH_LINES`]),
-/// fresh or with the PS0 a loader of v0.107.0-v0.108.0 left in a running shell.
+/// fresh or with the PS0 a loader of v0.107.0-v0.108.0 left in a running shell, which then
+/// loads this build in place (a second load, not a fresh one).
 #[cfg(windows)]
 #[test]
 fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
@@ -416,9 +417,13 @@ fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
         .join("scripts")
         .join("aterm_shell_integration.bash");
     let slashed = |path: &Path| path.display().to_string().replace('\\', "/");
+    let load = format!(". {}\n", posix_quoted(&script));
     for (start, ps0) in [
-        ("fresh", ""),
-        ("v0.108.0's PS0", "PS0='${ __aterm_ps0; }'\n"),
+        ("fresh", String::new()),
+        (
+            "v0.108.0's PS0",
+            format!("{load}PS0='${{ __aterm_ps0; }}'\n"),
+        ),
     ] {
         let world = PowerShellWorld::new();
         let dir = world.root.path();
@@ -428,9 +433,8 @@ fn test_git_bash_whose_tmp_went_away_runs_every_line_as_typed() {
             &rc,
             format!(
                 "unset TMPDIR\nHISTFILE={}\nHISTCONTROL=ignorespace\nalias ls='ls -F'\n\
-                 PS1='T\\#> '\n{ps0}. {}\n",
+                 PS1='T\\#> '\n{ps0}{load}",
                 posix_quoted(&dir.join("history's")),
-                posix_quoted(&script)
             ),
         )
         .expect("write the rc");

@@ -3,55 +3,32 @@
 
 //! Typed-word detector: the companion reacts to lexicon words typed at the prompt, in every
 //! language [`aterm_lexicon`] knows.
-//!
-//! * [`Class::Feline`] (`kitty`, `gato`, `猫`, …) records a Kitty Log sighting, at most one
-//!   per [`TYPED_SUMMON_COOLDOWN`]. It draws nothing itself: the echoed word gets the screen
-//!   scanner's ambient word-cat.
-//! * [`Class::Profanity`] makes the companion wince, as `word_decorations`'s `CurseCue` does
-//!   for a curse on screen; this also covers a curse typed into a no-echo prompt.
-//! * [`Class::Canine`] (`dog`, `perro`, `子犬`, …) summons the dog cameo
-//!   ([`crate::dog_cameo`]), only after [`DOG_SUMMON_KEYS`] printed keystrokes.
-//!
-//! Matching is the lexicon's own (word boundaries, `ambiguous` gating, morphology), never a
-//! substring test: substrings of a multilingual vocabulary fire on innocent words (`pick`).
-//!
-//! The detector is fed only from the host's committed key presses, never screen content: PTY
-//! output, paste and a program printing the word cannot fire it. It does not branch on
-//! `Source`, so a controller typing `kitty` fires like a human.
 
 use aterm_lexicon::{Class, Lexicon, Match, ScanOptions, ScanScratch};
 use aterm_time::Instant;
 use std::time::Duration;
 
-/// Minimum spacing between Kitty Log rows from typed summons, per window. 30 s matches the Kitty
-/// Log's flush debounce, so spam cannot force writer batches. The completion itself (and its
-/// ambient cat) is never withheld.
+/// Minimum spacing between Kitty Log rows from typed summons, per window.
 pub const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Printed keystrokes this window's detector must see before a canine word summons the dog.
-/// Counted on the committed-key path only, over the window's lifetime; session switches, breaks
-/// and backspaces never reset it.
 pub const DOG_SUMMON_KEYS: u64 = 500;
 
 /// Everything one keystroke (or one IME commit char) produced: four independent flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TypedHit {
-    /// A feline word completed. Nothing on the input path draws for it; the echoed word's
-    /// ambient cat is the answer.
+    /// A feline word completed.
     pub feline: bool,
     /// A feline word completed and the Kitty Log's cooldown granted the row.
-    /// Never set without [`Self::feline`].
     pub records: bool,
     /// A profanity word completed: the companion's wince is owed.
     pub profanity: bool,
-    /// A canine word completed past the [`DOG_SUMMON_KEYS`] gate: the dog cameo is owed. Below
-    /// the gate the completion is consumed silently.
+    /// A canine word completed past the [`DOG_SUMMON_KEYS`] gate: the dog cameo is owed.
     pub canine: bool,
 }
 
 impl TypedHit {
-    /// Fold a second outcome in, keeping the strongest of each independent
-    /// axis. Used across the chars of one IME commit.
+    /// Fold a second outcome in, keeping the strongest of each independent axis.
     #[inline]
     #[must_use]
     pub const fn merge(self, other: Self) -> Self {
@@ -68,24 +45,16 @@ impl TypedHit {
 /// history. Small because the typing path scans it on every key.
 const BUF_CAP: usize = 48;
 
-/// Ident-namespace tag for typed-summon sightings (`b"typedKit"` as big-endian ASCII). The host
-/// XORs it with its summon sequence (`App::kitty_summon_seq`) so each recorded summon is a fresh
-/// `(session, ident)` episode for the Kitty Log's dedupe ring, apart from the word renderer's
-/// occurrence idents.
+/// Ident-namespace tag for typed-summon sightings (`b"typedKit"` as big-endian ASCII).
 pub const TYPED_SUMMON_IDENT_TAG: u64 = 0x7479_7065_644B_6974;
 
-/// Ident-namespace tag for favourite sightings (`b"favKitty"` as big-endian ASCII), sharing the
-/// summon sequence. The favourite path bypasses the dedupe ring; the tag keeps ledger episode
-/// identities collision-free.
+/// Ident-namespace tag for favourite sightings (`b"favKitty"` as big-endian ASCII).
 pub const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 
-/// Ident-namespace tag for typed dog summons (`b"typedDog"` as big-endian ASCII), XOR'd with
-/// the same summon sequence. Never recorded; it seeds the dog cameo's breed/coat roll.
+/// Ident-namespace tag for typed dog summons (`b"typedDog"` as big-endian ASCII).
 pub const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
 
-/// Per-window detector state: the rolling keystroke window (keyed to the
-/// session it was typed into), the summon cooldown stamp, and the resident
-/// scan buffers.
+/// Per-window detector state: rolling keystroke window, summon cooldown stamp, and resident scan buffers.
 #[derive(Default)]
 pub struct TypedKittySummon {
     /// Rolling window of recent printed keystrokes (≤ [`BUF_CAP`] chars), stored raw: the
@@ -137,10 +106,6 @@ impl TypedKittySummon {
     }
 
     /// Feed one committed printed keystroke; reports what the lexicon word it completed owes.
-    ///
-    /// A completion consumes its letters, so its tail never re-fires. For a feline word the
-    /// cooldown decides only whether the Kitty Log records it, and a suppressed record does not
-    /// restamp the clock.
     pub fn note_char(
         &mut self,
         now: Instant,
@@ -153,18 +118,9 @@ impl TypedKittySummon {
         self.keys_typed = self.keys_typed.saturating_add(1);
         self.buf.push(ch);
         self.trim();
-        // A completion is a match ending at the window's end, and the scanner
-        // ends a token only on a token character (an interior joiner only when
-        // a token character follows) and a no-space run only on a no-space
-        // character, so a key that is neither completes nothing.
         if !(aterm_lexicon::is_token_char(ch) || aterm_lexicon::is_no_space_script(ch)) {
             return TypedHit::default();
         }
-        // Scan only the trailing token / no-space run plus the two characters
-        // of left context the scanner's code-adjacency guard reads, segmented
-        // with the lexicon's own predicates (its `token_end`, walked
-        // backwards). Exact for any surface length: earlier tokens could only
-        // yield matches that do not end at the window end.
         let start = Self::trailing_scan_start(&self.buf, ch);
         let Self {
             buf,
@@ -175,23 +131,17 @@ impl TypedKittySummon {
         } = self;
         lexicon.scan_into_with_scratch(&buf[start..], opts, chars, matches, scratch);
         let end = self.chars.len();
-        // A word completed on this keystroke iff a match ends at the window's
-        // end. Anything earlier was already consumed or is mid-word context.
         let hit =
             self.matches
                 .iter()
                 .filter(|m| m.end == end)
                 .fold(None::<Class>, |acc, m| match (acc, m.class) {
-                    // Cross-class homographs resolve by the lexicon's own total
-                    // order (profanity > feline), matching the screen scanner.
                     (Some(Class::Profanity), _) | (_, Class::Profanity) => Some(Class::Profanity),
                     (_, class) => Some(class),
                 });
         let Some(class) = hit else {
             return TypedHit::default();
         };
-        // Consume the completion before the cooldown check: retyping only the
-        // tail (or holding a letter) never completes again.
         self.buf.clear();
         match class {
             Class::Profanity => TypedHit {
@@ -199,8 +149,6 @@ impl TypedKittySummon {
                 ..TypedHit::default()
             },
             Class::Feline => {
-                // Inside the ledger window the completion still stands (the
-                // ambient cat still comes); only the row is not written.
                 let records = !self
                     .last_summon
                     .is_some_and(|at| now.saturating_duration_since(at) < TYPED_SUMMON_COOLDOWN);
@@ -217,7 +165,6 @@ impl TypedKittySummon {
                 canine: self.keys_typed >= DOG_SUMMON_KEYS,
                 ..TypedHit::default()
             },
-            // Other classes (animal, emphasis) carry no companion reaction.
             _ => TypedHit::default(),
         }
     }
@@ -227,10 +174,6 @@ impl TypedKittySummon {
     /// a no-space-script char), extended by two preceding chars of left
     /// context. Walks `buf.char_indices().rev()` directly in O(token_len) with
     /// zero scratch storage.
-    ///
-    /// Token segmentation mirrors the scanner's `token_end`, backwards: a
-    /// maximal run of token chars where an interior joiner (`'`, `’`, `-`)
-    /// counts only with token chars on both sides.
     fn trailing_scan_start(buf: &str, last: char) -> usize {
         let mut rev = buf.char_indices().rev().peekable();
         if rev.next().is_none() {
@@ -247,10 +190,6 @@ impl TypedKittySummon {
                 if aterm_lexicon::is_token_char(c) {
                     rev.next();
                 } else if aterm_lexicon::is_interior_joiner(c) {
-                    // Consume the joiner; if the char before it is a token
-                    // char, the joiner is interior (consume that token char
-                    // too and keep walking). Otherwise the joiner was already
-                    // the first of the two left-context chars.
                     rev.next();
                     if let Some(&(_, c2)) = rev.peek()
                         && aterm_lexicon::is_token_char(c2)
@@ -264,31 +203,24 @@ impl TypedKittySummon {
                 }
             }
         }
-        // Two chars of left context for `left_suppresses` (`c == '.'` looks one
-        // further back than the adjacent char).
         let _ = rev.next();
         rev.next().map_or(0, |(idx, _)| idx)
     }
 
-    /// A plain Backspace pops the most recent char (typo tolerance, bounded
-    /// by [`BUF_CAP`] of history). Popping never fires — deletion cannot
-    /// complete a word here, only [`Self::note_char`] checks for completion.
+    /// Pop the most recent char on a plain Backspace.
     #[inline]
     pub fn note_backspace(&mut self, session: u64) {
         self.rekey(session);
         self.buf.pop();
     }
 
-    /// A word-breaking key (Enter/Tab/Escape/Delete/nav/kill chords, raw byte
-    /// sequences) clears the window: the run must be typed as one word.
+    /// Clear the window on a word-breaking key.
     #[inline]
     pub fn note_break(&mut self) {
         self.buf.clear();
     }
 
-    /// Serious Mode's drain: clear the live typing window without dropping the
-    /// warmed-up scan buffers, the Kitty Log cooldown (`last_summon`), or the
-    /// canine keystroke odometer (`keys_typed`). Idempotent.
+    /// Clear the live typing window for Serious Mode.
     #[inline]
     pub fn drain_serious(&mut self) {
         self.buf.clear();
@@ -327,7 +259,6 @@ mod tests {
             "damn that cat, what the hell kitty?!  puppy dog doggo",
             "cat's cat-like cat-cat cat'-cat cat''s ca't c-a-t catcat",
         ];
-        // Reference: a whole-window scan with the same hit/clear rule.
         struct Reference {
             buf: String,
             chars: Vec<char>,
@@ -383,11 +314,7 @@ mod tests {
             for (k, ch) in line.chars().enumerate() {
                 let expect = reference.note_char(ch, &lexicon, &opts);
                 let got = det.note_char(now, 7, ch, &lexicon, &opts);
-                // `TypedHit` surfaces three classes, and the canine reaction is
-                // further gated on `keys_typed`, so compare completions via the
-                // fact both sides expose: a completion clears the window.
                 let got_completed = det.buf.is_empty() && !reference.buf.is_empty() || {
-                    // both cleared, or neither
                     det.buf.is_empty() == reference.buf.is_empty() && expect.is_some()
                 };
                 assert_eq!(
@@ -612,8 +539,6 @@ mod tests {
             "no dog fresh out of the box"
         );
         assert_eq!(feed_dogs(&mut d, t, 7, "puppy "), 0, "no puppy either");
-        // "dog puppy " above already advanced the odometer by 11; filler walks
-        // it to exactly one keystroke short of the gate.
         type_filler(&mut d, t, 7, DOG_SUMMON_KEYS - 11 - 4);
         assert_eq!(feed_dogs(&mut d, t, 7, "dog "), 0, "one short of the gate");
         assert_eq!(feed_dogs(&mut d, t, 7, "dog "), 1, "the gate opened — dog!");
@@ -693,8 +618,6 @@ mod tests {
             0,
             "the run did not survive the break"
         );
-        // The leftover `ty` is still in the window, so the next word needs a
-        // delimiter, as it would when actually typed.
         assert_eq!(feed(&mut d, t, 7, " kitty"), 1);
     }
 

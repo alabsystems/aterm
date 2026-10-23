@@ -129,13 +129,13 @@ impl Ctl {
 
     /// The underlying stream, for a caller that must bound a read.
     #[must_use]
-    pub fn get_ref(&self) -> &UnixStream {
+    pub const fn get_ref(&self) -> &UnixStream {
         &self.writer
     }
 
     /// Whether this connection is lost.
     #[must_use]
-    pub fn lost(&self) -> bool {
+    pub const fn lost(&self) -> bool {
         self.lost
     }
 

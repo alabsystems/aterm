@@ -80,7 +80,7 @@ impl std::fmt::Debug for JournalSecret {
 pub struct ContentFingerprint(pub u64);
 
 impl ContentFingerprint {
-    pub fn of(bytes: &[u8]) -> Self {
+    pub const fn of(bytes: &[u8]) -> Self {
         Self(aterm_hash::fnv_mix_u64(
             aterm_hash::fnv1a_64(bytes),
             bytes.len() as u64,
@@ -232,7 +232,7 @@ pub struct ObservedFileVersion {
 }
 
 impl ObservedFileVersion {
-    pub(crate) fn missing() -> Self {
+    pub(crate) const fn missing() -> Self {
         Self {
             exists: false,
             identity: None,
@@ -243,7 +243,7 @@ impl ObservedFileVersion {
         }
     }
 
-    pub fn observed(bytes: &[u8], identity: Option<u128>, modified_ns: Option<u64>) -> Self {
+    pub const fn observed(bytes: &[u8], identity: Option<u128>, modified_ns: Option<u64>) -> Self {
         Self {
             exists: true,
             identity,
@@ -255,12 +255,12 @@ impl ObservedFileVersion {
     }
 
     /// How the text read with this version maps back to its bytes.
-    pub fn encoding(&self) -> DiskEncoding {
+    pub const fn encoding(&self) -> DiskEncoding {
         self.encoding
     }
 
     /// This version, its text held with `encoding`.
-    pub(crate) fn with_encoding(self, encoding: DiskEncoding) -> Self {
+    pub(crate) const fn with_encoding(self, encoding: DiskEncoding) -> Self {
         Self { encoding, ..self }
     }
 }
@@ -532,7 +532,7 @@ pub struct SaveReducer {
 }
 
 impl SaveReducer {
-    pub fn new(document: DocumentId, observed: ObservedFileVersion) -> Self {
+    pub const fn new(document: DocumentId, observed: ObservedFileVersion) -> Self {
         Self {
             document,
             next_generation: 1,
@@ -547,11 +547,11 @@ impl SaveReducer {
         &self.phase
     }
 
-    pub(crate) fn observed(&self) -> ObservedFileVersion {
+    pub(crate) const fn observed(&self) -> ObservedFileVersion {
         self.observed
     }
 
-    pub(crate) fn pending(&self) -> Option<&SavePlan> {
+    pub(crate) const fn pending(&self) -> Option<&SavePlan> {
         self.pending.as_ref()
     }
 
@@ -795,7 +795,7 @@ impl JournalRecord {
         Ok(record)
     }
 
-    pub fn belongs_to_key(&self, key: JournalDocumentKey) -> bool {
+    pub const fn belongs_to_key(&self, key: JournalDocumentKey) -> bool {
         self.document_raw == key.0
     }
 }
@@ -1036,14 +1036,14 @@ pub struct JournalImageGeneration {
 }
 
 impl JournalImageGeneration {
-    pub fn missing() -> Self {
+    pub const fn missing() -> Self {
         Self {
             exists: false,
             fingerprint: ContentFingerprint::of(&[]),
         }
     }
 
-    pub fn of(bytes: &[u8]) -> Self {
+    pub const fn of(bytes: &[u8]) -> Self {
         Self {
             exists: true,
             fingerprint: ContentFingerprint::of(bytes),
@@ -1063,7 +1063,7 @@ impl JournalOwnerId {
         (raw != 0).then_some(Self(raw))
     }
 
-    pub fn raw(self) -> u64 {
+    pub const fn raw(self) -> u64 {
         self.0
     }
 
@@ -1215,7 +1215,11 @@ impl DraftJournalReducer {
         Self::new_with_key(document, JournalDocumentKey(document.get()), durable_seq)
     }
 
-    pub fn new_with_key(document: DocumentId, key: JournalDocumentKey, durable_seq: Seq) -> Self {
+    pub const fn new_with_key(
+        document: DocumentId,
+        key: JournalDocumentKey,
+        durable_seq: Seq,
+    ) -> Self {
         Self {
             document,
             key,
@@ -1226,12 +1230,12 @@ impl DraftJournalReducer {
         }
     }
 
-    pub fn durable_seq(&self) -> Seq {
+    pub const fn durable_seq(&self) -> Seq {
         self.durable_seq
     }
 
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
-    pub fn phase(&self) -> &JournalPhase {
+    pub const fn phase(&self) -> &JournalPhase {
         &self.phase
     }
 
@@ -1601,7 +1605,7 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
@@ -1649,7 +1653,7 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
     }
 }

@@ -10,8 +10,8 @@ use aterm_core::terminal::{Terminal, smart_word_in_cells};
 
 use crate::host::SessionHost;
 use crate::wire::{
-    VisibleTrim, WAIT_DEFAULT_MS, json_ok, json_str_field, pct_encode_into, push_visible,
-    trimmed_len, wait_ms,
+    VisibleTrim, WAIT_DEFAULT_MS, frame_open_tail, frame_unfinished_now, json_ok, json_str_field,
+    pct_encode_into, push_visible, trimmed_len, wait_ms,
 };
 
 /// The host does not resolve the target sid.
@@ -41,7 +41,7 @@ const fn state_word(state: aterm_core::terminal::BlockState) -> &'static str {
 
 /// `blocks [N] --json`: return OSC 133/633 command blocks as JSON.
 pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String {
-    let Some(items) = host.with_terminal(sid, |t: &Terminal| {
+    let Some(items) = host.with_terminal_as_it_stands(sid, |t: &Terminal| {
         let all: Vec<_> = t.all_blocks().collect();
         let slice = last_n(&all, rest);
         let opt_row = |r: Option<u64>| r.map_or_else(|| "null".to_string(), |v| v.to_string());
@@ -76,7 +76,7 @@ pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String 
 /// `blocks [N]`: return OSC 133/633 command blocks, oldest first.
 pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use std::fmt::Write as _;
-    host.with_terminal(sid, |t: &Terminal| {
+    host.with_terminal_as_it_stands(sid, |t: &Terminal| {
         let all: Vec<_> = t.all_blocks().collect();
         let slice = last_n(&all, rest);
         let mut out = format!("OK {}\n", slice.len());
@@ -119,11 +119,16 @@ pub fn cmd_blocktext(host: &impl SessionHost, sid: u64, rest: &str) -> String {
 
 /// Format command block `id`'s output for `blocktext`.
 pub fn blocktext(host: &impl SessionHost, sid: u64, id: u64, trim: bool) -> String {
-    match host.with_terminal(sid, |t: &Terminal| block_text(t, id)) {
+    match host.with_terminal(sid, |t: &Terminal| (block_text(t, id), frame_open(t))) {
         None => NO_SESSION.to_string(),
-        Some(Err(refusal)) => refusal.to_string(),
-        Some(Ok(text)) => frame_block_text(&text, trim),
+        Some((Err(refusal), _)) => refusal.to_string(),
+        Some((Ok(text), open)) => frame_block_text(&text, trim, open),
     }
+}
+
+/// ` frame=open` when the program's DEC 2026 frame is unfinished under the host's hold.
+fn frame_open(t: &Terminal) -> &'static str {
+    frame_open_tail(frame_unfinished_now(t))
 }
 
 /// Block `id`'s raw output text, or the reply line that refuses it.
@@ -138,7 +143,7 @@ fn block_text(t: &Terminal, id: u64) -> Result<String, &'static str> {
 }
 
 /// Frame block output `text` (see [`blocktext`]).
-fn frame_block_text(text: &str, trim: bool) -> String {
+fn frame_block_text(text: &str, trim: bool, open: &str) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
     blocktext_tests::FRAMED.with(|n| n.set(n.get() + 1));
@@ -149,7 +154,7 @@ fn frame_block_text(text: &str, trim: bool) -> String {
         rows
     };
     let mut out = String::with_capacity(text.len() + 64);
-    let _ = write!(out, "OK {sent}");
+    let _ = write!(out, "OK {sent}{open}");
     if trim {
         let _ = write!(out, " trimmed={}", rows - sent);
     }
@@ -178,7 +183,8 @@ fn scan_blocks(t: &Terminal) -> (Option<(u64, Option<i32>)>, bool) {
     (newest_done, in_flight)
 }
 
-/// `wait [timeout_ms]`: wait for the newest completed command block.
+/// `wait [timeout_ms]`: wait for the newest completed command block, reading the marks
+/// as they stand ([`SessionHost::with_terminal_as_it_stands`]).
 pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let timeout_ms = match rest.trim() {
         "" => WAIT_DEFAULT_MS,
@@ -192,7 +198,7 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
         let exit = exit.map_or_else(|| "-".to_string(), |c| c.to_string());
         format!("OK complete {id} exit={exit}\n")
     };
-    let Some((entry_done, in_flight)) = host.with_terminal(sid, scan_blocks) else {
+    let Some((entry_done, in_flight)) = host.with_terminal_as_it_stands(sid, scan_blocks) else {
         return NO_SESSION.to_string();
     };
     if !in_flight && let Some((id, exit)) = entry_done {
@@ -201,7 +207,7 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     let baseline = entry_done.map(|(id, _)| id);
     let sub = host.subscribe(sid);
     loop {
-        let Some(newest) = host.with_terminal(sid, |t: &Terminal| {
+        let Some(newest) = host.with_terminal_as_it_stands(sid, |t: &Terminal| {
             t.newest_completed_block().map(|b| (b.id, b.exit_code))
         }) else {
             return NO_SESSION.to_string();
@@ -315,52 +321,42 @@ pub fn select_line(t: &mut Terminal, row: i32) -> (i32, i32) {
     (first, last)
 }
 
-/// `select ...`: drive the engine's text selection.
+/// `select ...`: drive the engine's text selection, ` frame=open` after `OK` when the program's
+/// DEC 2026 frame is unfinished under the host's hold.
 pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     const USAGE: &str = "ERR usage: select <r1> <c1> <r2> <c2> | select word <r> <c> | \
                          select line <r> | select block <r1> <c1> <r2> <c2> | \
                          select extend <r> <c> | select clear\n";
     let rest = rest.trim();
-    if rest == "clear" {
-        if host
-            .with_terminal_mut(sid, |t| t.text_selection_mut().clear())
-            .is_none()
-        {
-            return NO_SESSION.to_string();
-        }
-        host.request_redraw(sid);
-        return "OK\n".to_string();
-    }
     let mut it = rest.split_whitespace();
-    let Some(head) = it.next() else {
-        return USAGE.to_string();
-    };
-    match head {
-        "word" => {
+    let open = match it.next() {
+        Some("clear") if rest == "clear" => host.with_terminal_mut(sid, |t| {
+            t.text_selection_mut().clear();
+            frame_open(t)
+        }),
+        None => return USAGE.to_string(),
+        Some("word") => {
             let (Some(Ok(r)), Some(Ok(c))) = (
                 it.next().map(str::parse::<i32>),
                 it.next().map(str::parse::<u16>),
             ) else {
                 return "ERR usage: select word <r> <c>\n".to_string();
             };
-            if host
-                .with_terminal_mut(sid, |t| {
-                    select_word(t, r, c);
-                })
-                .is_none()
-            {
-                return NO_SESSION.to_string();
-            }
+            host.with_terminal_mut(sid, |t| {
+                select_word(t, r, c);
+                frame_open(t)
+            })
         }
-        "line" => {
+        Some("line") => {
             let Some(Ok(r)) = it.next().map(str::parse::<i32>) else {
                 return "ERR usage: select line <r>\n".to_string();
             };
-            if host.with_terminal_mut(sid, |t| select_line(t, r)).is_none() {
-                return NO_SESSION.to_string();
-            }
+            host.with_terminal_mut(sid, |t| {
+                select_line(t, r);
+                frame_open(t)
+            })
         }
-        "block" => {
+        Some("block") => {
             let (Some(Ok(r1)), Some(Ok(c1)), Some(Ok(r2)), Some(Ok(c2))) = (
                 it.next().map(str::parse::<i32>),
                 it.next().map(str::parse::<u16>),
@@ -369,19 +365,15 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
             ) else {
                 return "ERR usage: select block <r1> <c1> <r2> <c2>\n".to_string();
             };
-            if host
-                .with_terminal_mut(sid, |t| {
-                    let sel = t.text_selection_mut();
-                    sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
-                    sel.update_selection(r2, c2, SelectionSide::Right);
-                    sel.complete_selection();
-                })
-                .is_none()
-            {
-                return NO_SESSION.to_string();
-            }
+            host.with_terminal_mut(sid, |t| {
+                let sel = t.text_selection_mut();
+                sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
+                sel.update_selection(r2, c2, SelectionSide::Right);
+                sel.complete_selection();
+                frame_open(t)
+            })
         }
-        "extend" => {
+        Some("extend") => {
             let (Some(Ok(r)), Some(Ok(c))) = (
                 it.next().map(str::parse::<i32>),
                 it.next().map(str::parse::<u16>),
@@ -391,7 +383,7 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
             let extended = host.with_terminal_mut(sid, |t| {
                 let sel = t.text_selection_mut();
                 if !sel.has_selection() || sel.is_empty() {
-                    return false;
+                    return None;
                 }
                 let st = sel.start();
                 let side = if (r, c) < (st.row, st.col) {
@@ -401,15 +393,14 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
                 };
                 sel.extend_selection(r, c, side);
                 sel.complete_selection();
-                true
+                Some(frame_open(t))
             });
             match extended {
-                None => return NO_SESSION.to_string(),
-                Some(false) => return "ERR no selection\n".to_string(),
-                Some(true) => {}
+                Some(None) => return "ERR no selection\n".to_string(),
+                extended => extended.flatten(),
             }
         }
-        r1s => {
+        Some(r1s) => {
             let (Some(c1s), Some(r2s), Some(c2s)) = (it.next(), it.next(), it.next()) else {
                 return USAGE.to_string();
             };
@@ -426,41 +417,41 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
             } else {
                 ((r1, c1), (r2, c2))
             };
-            if host
-                .with_terminal_mut(sid, |t| {
-                    let sel = t.text_selection_mut();
-                    sel.start_selection(sr, sc, SelectionSide::Left, SelectionType::Simple);
-                    sel.update_selection(er, ec, SelectionSide::Right);
-                    sel.complete_selection();
-                })
-                .is_none()
-            {
-                return NO_SESSION.to_string();
-            }
+            host.with_terminal_mut(sid, |t| {
+                let sel = t.text_selection_mut();
+                sel.start_selection(sr, sc, SelectionSide::Left, SelectionType::Simple);
+                sel.update_selection(er, ec, SelectionSide::Right);
+                sel.complete_selection();
+                frame_open(t)
+            })
         }
-    }
+    };
+    let Some(open) = open else {
+        return NO_SESSION.to_string();
+    };
     host.request_redraw(sid);
-    "OK\n".to_string()
+    format!("OK{open}\n")
 }
 
 /// `selection`: return the selected text.
 pub fn cmd_selection(host: &impl SessionHost, sid: u64) -> String {
-    let Some((text, truncated)) = host.with_terminal(sid, Terminal::selection_to_string_bounded)
-    else {
+    let Some(((text, truncated), open)) = host.with_terminal(sid, |t: &Terminal| {
+        (t.selection_to_string_bounded(), frame_open(t))
+    }) else {
         return NO_SESSION.to_string();
     };
     match text {
         Some(text) if !text.is_empty() => {
             let lines: Vec<&str> = text.split('\n').collect();
             let incomplete = if truncated { " incomplete" } else { "" };
-            let mut out = format!("OK {}{incomplete}\n", lines.len());
+            let mut out = format!("OK {}{incomplete}{open}\n", lines.len());
             for l in lines {
                 out.push_str(l);
                 out.push('\n');
             }
             out
         }
-        _ => "OK 0\n".to_string(),
+        _ => format!("OK 0{open}\n"),
     }
 }
 
@@ -469,20 +460,21 @@ pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {
     if !host.capabilities().clipboard {
         return "ERR unsupported\n".to_string();
     }
-    let Some((text, truncated)) = host.with_terminal(sid, Terminal::selection_to_string_bounded)
-    else {
+    let Some(((text, truncated), open)) = host.with_terminal(sid, |t: &Terminal| {
+        (t.selection_to_string_bounded(), frame_open(t))
+    }) else {
         return NO_SESSION.to_string();
     };
     match text {
         Some(t) if !t.is_empty() => {
             if host.clipboard_set(&t) {
                 let incomplete = if truncated { " incomplete" } else { "" };
-                format!("OK {}{incomplete}\n", t.len())
+                format!("OK {}{incomplete}{open}\n", t.len())
             } else {
                 "ERR pbcopy failed\n".to_string()
             }
         }
-        _ => "OK 0\n".to_string(),
+        _ => format!("OK 0{open}\n"),
     }
 }
 
@@ -1019,12 +1011,16 @@ mod blocktext_tests {
     #[test]
     fn blocktext_frames_each_row_and_trims_the_blank_tail() {
         let text = "out\x01\n\u{a0}\n\x01 \t\n\n";
-        assert_eq!(frame_block_text(text, false), "OK 4\nout\n\n\n\n");
-        assert_eq!(frame_block_text(text, true), "OK 1 trimmed=3\nout\n");
-        assert_eq!(frame_block_text("", false), "OK 0\n");
-        assert_eq!(frame_block_text("", true), "OK 0 trimmed=0\n");
+        assert_eq!(frame_block_text(text, false, ""), "OK 4\nout\n\n\n\n");
+        assert_eq!(frame_block_text(text, true, ""), "OK 1 trimmed=3\nout\n");
         assert_eq!(
-            frame_block_text("a\r\nb \u{9b} \r\n", false),
+            frame_block_text(text, true, " frame=open"),
+            "OK 1 frame=open trimmed=3\nout\n"
+        );
+        assert_eq!(frame_block_text("", false, ""), "OK 0\n");
+        assert_eq!(frame_block_text("", true, ""), "OK 0 trimmed=0\n");
+        assert_eq!(
+            frame_block_text("a\r\nb \u{9b} \r\n", false, ""),
             "OK 2\na\nb\n"
         );
         for sample in [
@@ -1038,7 +1034,7 @@ mod blocktext_tests {
         ] {
             for trim in [false, true] {
                 assert_eq!(
-                    frame_block_text(sample, trim),
+                    frame_block_text(sample, trim, ""),
                     two_step_reply(sample, trim),
                     "{sample:?} trim={trim}"
                 );
@@ -1130,7 +1126,7 @@ mod blocktext_tests {
         assert_eq!(framed() - start, 2, "a refusal frames nothing");
 
         let inside = host.with_terminal(0, |t| {
-            frame_block_text(&block_text(t, 0).expect("the block has output"), false)
+            frame_block_text(&block_text(t, 0).expect("the block has output"), false, "")
         });
         assert_eq!(inside.as_deref(), Some(whole.as_str()));
         assert_eq!(

@@ -86,7 +86,7 @@ impl<R: BufRead> Decoder<R> {
 
     /// Refuses every frame that carries no content checksum ([`DecodeError::NoChecksum`]) at its header, before any of its content is read.
     #[must_use]
-    pub fn require_checksum(mut self) -> Self {
+    pub const fn require_checksum(mut self) -> Self {
         self.require_checksum = true;
         self
     }

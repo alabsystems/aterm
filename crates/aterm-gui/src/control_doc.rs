@@ -1,27 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `doc` control verb's lane handler (amacs design §7c; slice A1): the
-//! live documents the Editor views show, listed and read.
-//!
-//! `doc ls [uri=<file-uri>]` answers `OK <n>` and one
-//! [`DocRow`](amacs::protocol::doc::DocRow) per document; `doc read
-//! <doc-id|file-uri> [lines=<A>-<B>]` answers `OK <nbytes> doc=<d>` and the
-//! buffer's anchored lines, [`format_lines`] capped at [`DOC_READ_CAP`]: the
-//! rows `amacs --read` prints of the same text, so an agent edits a live
-//! buffer with the anchors it would use on the file. `doc apply`, `save` and
-//! `log` are the verb's later sub-forms, answered `ERR unsupported` until
-//! they are served.
-//!
-//! The lane parses the request, resolves the spellings of a URI it names
-//! (the realpath one reads the file system), asks the main thread in one
-//! turn (`App::doc_answer`, `app_doc`), observes each document's file for
-//! `disk=` and counts the lines up to the person's caret for `cursor=` and
-//! `sel=`: the file reads and text walks happen here, never on the main
-//! thread. The logic
-//! is written against an injected ask, as `control_edit`'s is, since no
-//! event-loop proxy can be built in a unit test.
-
 use amacs::protocol::doc::{DiskState, DocRef, DocRequest};
 use amacs::protocol::read::{DOC_READ_CAP, LineRange, format_lines};
 use aterm_window::event_loop::EventLoopProxy;
@@ -141,9 +120,6 @@ fn ls_reply(documents: Vec<DocFacts>) -> String {
             facts.place();
             let DocFacts { mut row, disk, .. } = facts;
             row.disk = disk_state(disk.as_ref());
-            // A canonical URI is percent-encoded, one whitespace-free token,
-            // so a row always formats; one that did not is left out of the
-            // count and logged rather than sent split.
             row.format()
                 .inspect_err(|error| aterm_log::warn!("doc ls: doc {} left out: {error}", row.doc))
                 .ok()
@@ -165,8 +141,6 @@ fn disk_state(probe: Option<&DiskProbe>) -> DiskState {
     let Some(DiskProbe { path, baseline }) = probe else {
         return DiskState::Unknown;
     };
-    // Lengths are compared too, so a version's own length bounds the bytes
-    // worth reading: a longer file differs whatever its prefix holds.
     let limit = usize::try_from(baseline.len)
         .unwrap_or(crate::native_document_host::DEFAULT_DOCUMENT_LIMIT)
         .min(crate::native_document_host::DEFAULT_DOCUMENT_LIMIT);
@@ -229,8 +203,6 @@ mod tests {
             assert_eq!(serve_doc(rest, &mut ask), answer, "doc {rest}");
         }
         assert_eq!(*asked.borrow(), Vec::new());
-        // NEGATIVE CONTROL: a well-formed read is asked, and its unknown
-        // answer named.
         assert_eq!(serve_doc("read 7", &mut ask), "ERR unknown doc 7\n");
         assert_eq!(*asked.borrow(), vec![DocQuery::Read(DocNames::Id(7))]);
     }
@@ -251,8 +223,6 @@ mod tests {
         let names = spellings(&uri).unwrap();
         assert_eq!(names.first(), Some(&uri));
         assert!(names.contains(&real), "{names:?}");
-        // A file that is not there is spelled from its resolved directory,
-        // as admission keys a document of it.
         let gone =
             crate::native_document_host::path_to_file_uri(&dir.path().join("gone.txt")).unwrap();
         let real_dir = std::fs::canonicalize(dir.path()).unwrap();
@@ -261,7 +231,6 @@ mod tests {
         let names = spellings(&gone).unwrap();
         assert_eq!(names.first(), Some(&gone));
         assert!(names.contains(&real_gone), "{names:?}");
-        // So is one under a directory that is not there either.
         let deep = crate::native_document_host::path_to_file_uri(
             &dir.path().join("no-such-dir").join("x.txt"),
         )

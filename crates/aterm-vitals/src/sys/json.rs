@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `sys` JSON (§13.4): ONE SHAPE PER FIGURE, so a parser can always tell a
-//! bound from a range from an unknown.
-//!
-//! * an exact known figure is a bare integer: `"cpu_mc": 9760`;
-//! * a bounded figure is `{"v": n, "bound": "at_least" | "at_most", "cause":
-//!   <why>}`, with `"unread": k` exactly when the cause is `refused`;
-//! * an unknown figure is `{"why": "<word>"}`, never `null` and never 0;
-//! * a range is `{"lo": n, "hi": n}`.
-//!
-//! [`Jv`] has no float and no null variant, so neither can be written; the
-//! constructors below are the only way the other three shapes are made, and
-//! [`contract_violations`] walks a reply for anything else.
+//! The `sys` JSON (§13.4): ONE SHAPE PER FIGURE, so a parser can always tell a bound from a range
+//! from an unknown.
 
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,11 +166,7 @@ fn write_str(out: &mut String, s: &str) {
 /// The keys a split object holds, and nothing else (§13.4).
 pub const SPLIT_PARTS: [&str; 5] = ["tab", "aterm_rest", "others", "services", "unaccounted"];
 
-/// Every way `v` breaks the shape contract, as `path: what` lines; empty when
-/// it holds. The rules: an object with `v` is exactly a bound; with `why`,
-/// exactly an unknown whose word is in the closed set; with `lo`, exactly a
-/// range; a key ending `_split` or named `split_mc`/`split_pm`, when an object
-/// of parts, holds exactly [`SPLIT_PARTS`].
+/// Every way `v` breaks the shape contract, as `path: what` lines; empty when it holds.
 #[must_use]
 pub fn contract_violations(v: &Jv) -> Vec<String> {
     let mut out = Vec::new();
@@ -265,8 +251,7 @@ fn check_bound(v: &Jv, path: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The value of a split part in millicores (or any unit) when it is a known
-/// figure or a bound; `None` for an unknown.
+/// The value of a split part in millicores (or any unit) when it is a known figure or a bound.
 #[must_use]
 pub fn part_value(v: &Jv) -> Option<i64> {
     match v {

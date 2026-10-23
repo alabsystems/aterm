@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The composed `aterm doctor` over a scratch home, prefix and state root (design S5):
-//! `--read-only` changes nothing, bare doctor restores and reads back, a held store lock
-//! is a note, and unresolved checks keep readiness non-green. The facts are given
-//! ([`Gathered::of_facts`]) and the packages' rows are read over the scratch tree, so no
-//! test reads or writes this machine's own state.
+//! The composed `aterm doctor` over a scratch home, prefix and state root (design S5).
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -311,7 +307,6 @@ fn bare_doctor_restores_a_deleted_shim_and_a_missing_link_and_leaves_an_opted_ou
         assert!(journal.contains(id), "{id} in\n{journal}");
     }
 
-    // The person deletes atpkg's block: the opt-out. The shim and the link go again.
     std::fs::write(scratch.zshrc(), "export EDITOR=vi\n").unwrap();
     std::fs::remove_file(scratch.shim("ay")).unwrap();
     std::fs::remove_file(scratch.link()).unwrap();
@@ -385,7 +380,6 @@ fn a_held_store_lock_is_a_note_and_nothing_is_repaired() {
         Some(aterm_converge::StoodAside::Lock(CONTENDED.to_owned()))
     );
 
-    // Released, the same run repairs.
     drop(held);
     let ran = run(&scratch, Mark::Ok, &[], true);
     assert!(
@@ -410,7 +404,6 @@ fn a_usable_shell_does_not_hide_failed_repairs_or_manual_steps() {
     assert!(!report(&json).complete);
 
     let broken = broken("exit-broken");
-    // A program whose build ALab withdrew: no local step fixes it.
     broken.install("az", 3);
     atpkg::activate::install_tombstone_shim(&broken.layout(), &ToolName::new("az").unwrap())
         .unwrap();

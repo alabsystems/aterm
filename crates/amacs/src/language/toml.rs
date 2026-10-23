@@ -216,7 +216,7 @@ struct Nesting {
 }
 
 impl Nesting {
-    fn open(&mut self, table: bool) {
+    const fn open(&mut self, table: bool) {
         if self.depth < 32 {
             let bit = 1u32 << self.depth;
             if table {
@@ -228,7 +228,7 @@ impl Nesting {
         self.depth = self.depth.saturating_add(1);
     }
 
-    fn close(&mut self) {
+    const fn close(&mut self) {
         if self.depth > 0 {
             self.depth -= 1;
             if self.depth < 32 {
@@ -238,7 +238,7 @@ impl Nesting {
     }
 
     /// Whether the innermost open bracket is an inline table.
-    fn in_table(&self) -> bool {
+    const fn in_table(&self) -> bool {
         match self.depth.checked_sub(1) {
             Some(depth) if depth < 32 => self.tables & (1u32 << depth) != 0,
             _ => false,

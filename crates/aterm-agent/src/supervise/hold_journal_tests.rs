@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOLDS THE LOOP JOURNALS (`docs/DESIGN-harness-occupancy-2026-10-20.md`
-//! §6, the retro's cause 6; `run.rs`'s `HoldSaid`): a point decided NOTHING
-//! and a break in the agent's own background work no host step was offered
-//! at each say `HOLD seq=<n> …` once per change, and a successor loop says
-//! its first again into the same journal. Mounted from
-//! `turn_end_loop_tests.rs`, so `Mock`, its screens and its hosts are in
-//! scope.
+//! Tests for `HOLD` journal records across point decisions, background breaks, and handoffs.
 
 use super::*;
 
@@ -60,7 +54,8 @@ fn background_reads(host: Option<Arc<dyn IdleHost>>, reads: &[bool]) -> Vec<Stri
         } else {
             busy_screen()
         };
-        s.host_steps_in_background(&screen_at(seq, rows), &mut since, None, &mut heard);
+        s.host_steps_in_background(&screen_at(seq, rows), &mut since, None, &mut heard)
+            .expect("the break's step");
     }
     heard.noted
 }
@@ -81,7 +76,6 @@ fn a_background_break_no_host_wants_is_journaled_once_per_episode() {
     let asks_nothing = Arc::new(Withholds::default());
     let noted = background_reads(Some(asks_nothing as Arc<dyn IdleHost>), &reads);
     assert_eq!(holds(&noted), once_each, "{noted:#?}");
-    // Negative control.
     let host = Arc::new(BackgroundHost::default());
     let noted = background_reads(Some(Arc::clone(&host) as Arc<dyn IdleHost>), &reads);
     assert!(holds(&noted).is_empty(), "{noted:#?}");
@@ -125,7 +119,8 @@ fn a_held_break_names_its_guard_once() {
             &mut since,
             None,
             &mut heard,
-        );
+        )
+        .expect("the break's step");
     }
     assert_eq!(
         holds(&heard.noted),
@@ -134,8 +129,8 @@ fn a_held_break_names_its_guard_once() {
         heard.noted
     );
     assert_eq!(host.backgrounds.load(Ordering::SeqCst), 0);
-    // Negative control: the live turn the wait loop reads takes the act.
-    s.host_steps_in_background(&screen_at(5, busy_screen()), &mut since, None, &mut heard);
+    s.host_steps_in_background(&screen_at(5, busy_screen()), &mut since, None, &mut heard)
+        .expect("the break's step");
     s.took(5, None, &mut heard);
     for seq in 6..8 {
         s.host_steps_in_background(
@@ -143,7 +138,8 @@ fn a_held_break_names_its_guard_once() {
             &mut since,
             None,
             &mut heard,
-        );
+        )
+        .expect("the break's step");
     }
     assert_eq!(holds(&heard.noted).len(), 1, "{:#?}", heard.noted);
     assert!(
@@ -194,8 +190,6 @@ fn a_nothing_point_is_journaled_once_per_change() {
     let mut m = Mock::new(vec![ended(SAID)]);
     let mut s = session(&mut m, Some("@s-1".to_string()));
     let mut heard = Heard::default();
-    // The decision's own read of the host, as `decide_to_act_now` keeps it
-    // (the full loop's path: `a_successor_journals_its_first_hold_after_a_handoff`).
     let decide = |s: &mut Session<'_, Mock>, seq: u64, action: TurnEndAction, heard: &mut Heard| {
         s.decided_withheld = host.on.load(Ordering::SeqCst);
         let point = s.turn_of(screen_at(seq, ended(SAID)));
@@ -228,7 +222,6 @@ fn a_nothing_point_is_journaled_once_per_change() {
         "{:#?}",
         heard.noted
     );
-    // Attended.
     let mut attended = Attended::default();
     let point = s.turn_of(screen_at(6, ended(SAID)));
     s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut attended)
@@ -237,7 +230,6 @@ fn a_nothing_point_is_journaled_once_per_change() {
         holds(&attended.noted),
         ["HOLD seq=6 point nothing why=attended"]
     );
-    // Negative control: a wait decided says no hold.
     let mut fresh = Mock::new(vec![ended(SAID)]);
     let mut s = session(&mut fresh, Some("@s-1".to_string()));
     let mut heard = Heard::default();
@@ -279,7 +271,6 @@ fn a_successor_journals_its_first_hold_after_a_handoff() {
     let both = one_loop();
     assert_eq!(both, [held.clone(), held]);
     let _ = std::fs::remove_dir_all(&dir);
-    // The wait: each loop's first decision of it is said.
     let until = Instant::now() + Duration::from_secs(600);
     let waited = || {
         let mut m = Mock::new(vec![ended(SAID)]);
@@ -321,12 +312,10 @@ fn a_point_decided_with_no_host_read_says_no_earlier_withheld() {
     let mut m = Mock::new(vec![ended(SAID)]);
     let mut s = session(&mut m, Some("@s-1".to_string()));
     let mut heard = Heard::default();
-    // The decision's own read of the host, as `decide_to_act_now` keeps it.
     s.decided_withheld = true;
     let point = s.turn_of(screen_at(1, ended(SAID)));
     s.turn_end_execute(&point, TurnEndAction::Nothing, &opts, &[], &mut heard)
         .expect("the point's act");
-    // A wait decided ends the hold said.
     let point = s.turn_of(screen_at(2, ended(SAID)));
     let wait = TurnEndAction::WaitUntil {
         until: Instant::now() + Duration::from_secs(600),
@@ -335,7 +324,6 @@ fn a_point_decided_with_no_host_read_says_no_earlier_withheld() {
     };
     s.turn_end_execute(&point, wait, &opts, &[], &mut heard)
         .expect("the point's act");
-    // Behind another loop's claim: NOTHING, decided with no read of the host.
     s.claim = claim::Claim::Behind {
         holder: "another".to_string(),
         tried: Instant::now(),
@@ -381,16 +369,14 @@ fn a_break_no_host_wants_is_said_only_once_it_stood_the_settle() {
         } else {
             busy_screen()
         };
-        s.host_steps_in_background(&screen_at(seq, rows), &mut since, None, heard);
+        s.host_steps_in_background(&screen_at(seq, rows), &mut since, None, heard)
+            .expect("the break's step");
     };
-    // Eight reads flipping, each a second apart, a live turn last: never a
-    // hold.
     for seq in 1..=8 {
         read(&mut s, seq, seq % 2 == 1, &mut heard);
         clock.skip(Duration::from_secs(1));
     }
     assert!(holds(&heard.noted).is_empty(), "{:#?}", heard.noted);
-    // Negative control: a break that stands the settle, said once.
     read(&mut s, 9, true, &mut heard);
     clock.skip(settle - Duration::from_millis(1));
     read(&mut s, 10, true, &mut heard);

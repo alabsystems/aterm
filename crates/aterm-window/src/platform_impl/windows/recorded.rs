@@ -4,27 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! RECORDED Windows keyboard input, replayed through the real key path: the window messages a
-//! hand on a German, French or US-International keyboard (or an input method) makes Windows
-//! post, with the keyboard state Windows reports while each is handled, fed through the
-//! `KeyEventBuilder`, the modifier read and the IME handling the window procedure runs. What
-//! comes out is what the application would receive: `ModifiersChanged`, `KeyboardInput` and
-//! `Ime` events, in order.
-//!
-//! Windows is read through `keyboard::replay` while a replay runs, so nothing here touches the
-//! desktop: no window, no `SendInput`, no layout loaded into the session (`LoadKeyboardLayout`
-//! would add the layout to the person's input switcher). A recorded layout is the part of a
-//! layout's `ToUnicodeEx` table the recordings press ([`RecordedLayout`]), entered under a layout
-//! handle no keyboard has.
-//!
-//! The message rules [`Typist`] follows are Windows': a key pressed while Alt is held and Ctrl
-//! is not posts `WM_SYSKEYDOWN` and its characters `WM_SYSCHAR`; AltGr is Ctrl+Alt, so the
-//! system posts a left Ctrl press before the right Alt's; a dead key posts `WM_DEADCHAR` and the
-//! next key the composed character (or both characters, when they do not compose); an Alt code's
-//! character arrives as a `WM_CHAR` after Alt's release; a key an input method takes arrives as
-//! `VK_PROCESSKEY`, its result as `WM_IME_COMPOSITION`.
-//!
-//! Tests and debug builds only, like the seam it drives.
+//! Recorded Windows keyboard and IME message replay through the real key path.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -48,9 +28,7 @@ use super::keyboard::{replay, KeyEventBuilder};
 use super::keyboard_layout::{Layout, WindowsModifiers, LAYOUT_CACHE};
 use super::window_state::ImeState;
 
-/// One character key of a recorded layout: its position (`code`), its virtual key, what
-/// `ToUnicodeEx` gives at each level (none, Shift, AltGr, AltGr+Shift; `None` for nothing), and
-/// whether Caps Lock shifts it (a letter's `CAPLOK`).
+/// One character key of a recorded layout: position, virtual key, levels, and Caps Lock.
 pub struct LayoutKey {
     pub code: KeyCode,
     pub vk: u16,
@@ -98,8 +76,7 @@ pub struct RecordedLayout {
 }
 
 impl RecordedLayout {
-    /// The layout handle the replay answers `GetKeyboardLayout(0)` with: the LANGID in the low
-    /// word, as a real handle has it, and in the high word a device no keyboard has.
+    /// Synthetic layout handle returned for `GetKeyboardLayout(0)` during replay.
     pub fn hkl(&self) -> u64 {
         ((0xA7E0 + u64::from(self.variant)) << 16) | u64::from(self.lang)
     }
@@ -186,8 +163,7 @@ impl CompositionSource for Composition {
     }
 }
 
-/// One recorded window message, with the keyboard state Windows reports while it is handled
-/// and, for an IME message, what the input context answers.
+/// One recorded window message with its keyboard state and IME composition.
 #[derive(Clone, Debug)]
 pub struct Message {
     pub message: u32,
@@ -210,10 +186,7 @@ impl Message {
     }
 }
 
-/// Builds a message sequence the way Windows posts it for keys pressed and released, tracking
-/// the keyboard state. Keys are named by virtual key and scan code (with the extended bit); a
-/// modifier by its side's key (`VK_LCONTROL`, `VK_RMENU`), which Windows reports to the window
-/// as the sideless one.
+/// Builds a Windows key/IME message sequence while tracking the keyboard state.
 #[derive(Clone, Debug)]
 pub struct Typist {
     keys: [u8; 256],
@@ -346,8 +319,7 @@ impl Typist {
         self
     }
 
-    /// An input method's message (`WM_IME_STARTCOMPOSITION`, `WM_IME_COMPOSITION` with its
-    /// `GCS_*` flags in `lparam`, `WM_IME_ENDCOMPOSITION`) and what its context answers.
+    /// Appends an IME message (`WM_IME_*`) with its `lparam` flags and context composition.
     pub fn ime(mut self, message: u32, lparam: u32, composition: Composition) -> Self {
         self.push(message, 0, lparam as isize, composition);
         self
@@ -375,9 +347,7 @@ impl Drop for Ending {
     }
 }
 
-/// Replay `messages` on `layout` through the window's key path, as the window procedure
-/// handles each (the modifier update for a key message, the key event builder, the Alt-code
-/// commit, the IME arms with IME allowed), and return the events it would send, in order.
+/// Replays `messages` on `layout` through the window's key path and returns the resulting events.
 pub fn replay(layout: &RecordedLayout, messages: &[Message]) -> Vec<Replayed> {
     let hkl = layout.hkl();
     LAYOUT_CACHE.lock().unwrap().layouts.insert(hkl, layout.layout());
@@ -429,10 +399,7 @@ pub fn replay(layout: &RecordedLayout, messages: &[Message]) -> Vec<Replayed> {
     out
 }
 
-/// Layouts and the keys the recordings press: scan codes are the PC/AT set-1 codes of the key
-/// positions (`KeyCode` names a position), virtual keys and characters the shipped layouts'
-/// (`00000409`, `00020409`, `00000407`, `0000040C`), written down by hand: the recordings are
-/// not captured from a live session.
+/// Recorded keyboard layouts (`en-US`, `en-US` International, `de-DE`, `fr-FR`, `ja-JP`, `ko-KR`).
 pub mod layouts {
     use super::{ch, dead, letter, symbol, LayoutKey, RecordedLayout};
     use crate::keyboard::KeyCode;
@@ -464,8 +431,7 @@ pub mod layouts {
         RecordedLayout { lang: 0x0409, variant: 0, has_alt_graph: false, decimal: ".", keys }
     }
 
-    /// United States-International (`00020409`): `'`, `"`, `` ` ``, `~` and `^` are dead keys,
-    /// and AltGr types the accented letters.
+    /// United States-International (`00020409`): dead keys and AltGr accented letters.
     pub fn en_us_intl() -> RecordedLayout {
         let keys = vec![
             letter(KeyCode::KeyA, 0x41, "a", [ch("á"), ch("Á")]),
@@ -547,9 +513,7 @@ pub mod layouts {
     }
 }
 
-/// The keys the recordings press: `(virtual key, set-1 scan code, extended)`. The character
-/// keys' virtual keys are the US layout's; a layout that moves a letter (QWERTZ, AZERTY) posts
-/// its own, which [`layouts`] records beside the key.
+/// Physical keys `(virtual_key, scan_code, extended)` used by the recordings.
 pub mod keys {
     pub type Physical = (u16, u16, bool);
     pub const LCTRL: Physical = (0xA2, 0x1D, false);
@@ -756,9 +720,7 @@ mod tests {
             .collect();
         assert_eq!(ime, [
             Ime::Enabled,
-            // Not yet converted (ATTR_INPUT): the range is the caret, after `に`.
             Ime::Preedit("に".into(), Some((3, 3))),
-            // Converted and targeted (ATTR_TARGET_CONVERTED): the whole clause.
             Ime::Preedit(converted.into(), Some((0, converted.len()))),
             Ime::Preedit(String::new(), None),
             Ime::Commit(converted.into()),

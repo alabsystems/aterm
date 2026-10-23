@@ -2,51 +2,32 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The armed tray card's ring bookkeeping, apart from its textures: which slot
-//! a change writes, which rows, and which in-flight presents the write must
-//! outlast. The renderer's `ensure_metal_tray_card` owns the textures and the
-//! GPU calls; every decision about them is made here, so it is checked with no
-//! GPU (`tests/conformance_tray_card_ring.rs` binds it to
-//! `aterm_models_render::metal_tray_card_ring_model`).
-//!
-//! A present samples the slot shown when it is encoded, and the slot records
-//! that present's number as its last reader before the present takes it. A
-//! present numbered later than a slot's last reader therefore samples another
-//! slot, never this one; so a rewrite of the slot not shown settles only the
-//! presents numbered up to its last reader ([`present_may_read`]) and is never
-//! held behind the in-flight present that shows the other slot, which the
-//! second slot exists to avoid. A CPU `replaceRegion:` is outside the queue's
-//! hazard tracking, which is why the presents that may read it are settled at
-//! all.
+//! The armed tray card's ring bookkeeping, apart from its textures.
 
-/// How many slots the ring rotates through: the shown one, and one to write
-/// the next change into while a present may still sample the shown one.
+/// How many slots the ring rotates through.
 pub const TRAY_CARD_SLOTS: usize = 2;
 
 /// One slot's bookkeeping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrayCardSlot {
-    /// Rows `[y0, y1)` that differ from the card's bytes: what changed while
-    /// another slot was shown. `None` when it holds the card's bytes.
+    /// Rows `y0, y1)` that differ from the card's bytes: what changed while another slot was shown.
     pub stale: Option<(u32, u32)>,
     /// The present that last sampled it: its number in the arm's present count.
     pub last_read: Option<u64>,
 }
 
-/// A change's write, planned by [`TrayCardRing::plan_change`] before anything
-/// is touched and landed by [`TrayCardRing::land_change`] once it is done.
+/// A change's write, planned by [`TrayCardRing::plan_change`] before anything is touched and landed
+/// by [`TrayCardRing::land_change`] once it is done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrayCardWrite {
-    /// The slot to write: a new one while the ring is short, else the one
-    /// shown least recently.
+    /// The slot to write: a new one while the ring is short, else the one shown least recently.
     pub slot: usize,
     /// Whether [`Self::slot`] is a texture still to mint.
     pub mint: bool,
-    /// Settle every in-flight present numbered up to this one (the slot's last
-    /// reader) before the write: the presents [`present_may_read`] names.
+    /// Settle every in-flight present numbered up to this one (the slot's last reader) before the
+    /// write: the presents [`present_may_read`] names.
     pub settle_through: Option<u64>,
-    /// The rows `[y0, y1)` to upload: the change, and what the slot missed
-    /// while another was shown.
+    /// The rows `y0, y1)` to upload: the change, and what the slot missed while another was shown.
     pub rows: (u32, u32),
 }
 
@@ -58,17 +39,16 @@ pub struct TrayCardRing {
     height: u32,
 }
 
-/// Whether the in-flight present numbered `seq` may sample a slot whose last
-/// reader was present `last_read`: only one numbered no later, since each
-/// present samples the slot shown when it is encoded and a slot records its
-/// reader before that present takes its number.
+/// Whether the in-flight present numbered `seq` may sample a slot whose last reader was present
+/// `last_read`: only one numbered no later, since each present samples the slot shown when it is
+/// encoded and a slot records its reader before that present takes its number.
 #[must_use]
 #[inline]
 pub const fn present_may_read(seq: u64, last_read: u64) -> bool {
     seq <= last_read
 }
 
-/// The rows `[y0, y1)` covering both `a` (if any) and `b`.
+/// The rows `y0, y1)` covering both `a` (if any) and `b`.
 #[must_use]
 #[inline]
 pub fn union_band(a: Option<(u32, u32)>, b: (u32, u32)) -> (u32, u32) {
@@ -76,8 +56,8 @@ pub fn union_band(a: Option<(u32, u32)>, b: (u32, u32)) -> (u32, u32) {
 }
 
 impl TrayCardRing {
-    /// A freshly minted ring of one slot, `height` rows, holding the card and
-    /// shown, read by `reader` as [`Self::read_unchanged`] says.
+    /// A freshly minted ring of one slot, `height` rows, holding the card and shown, read by
+    /// `reader` as [`Self::read_unchanged`] says.
     #[must_use]
     #[inline]
     pub fn fresh(height: u32, reader: Option<u64>) -> Self {
@@ -105,10 +85,7 @@ impl TrayCardRing {
         self.slots.get(index).copied()
     }
 
-    /// The card is unchanged and the shown slot is drawn again: by the present
-    /// that will take the number `reader`, which it records, or (`None`) by a
-    /// command buffer waited inline (a readback's tray bake), which leaves no
-    /// reader in flight to record.
+    /// The card is unchanged and the shown slot is drawn again.
     #[inline]
     pub fn read_unchanged(&mut self, reader: Option<u64>) {
         if let Some(reader) = reader {
@@ -116,14 +93,11 @@ impl TrayCardRing {
         }
     }
 
-    /// The write a change of rows `band` needs, deciding everything and
-    /// changing nothing (a texture mint may still fail).
+    /// The write a change of rows `band` needs, deciding everything and changing nothing.
     #[must_use]
     #[inline]
     pub fn plan_change(&self, band: (u32, u32)) -> TrayCardWrite {
         if self.slots.len() < TRAY_CARD_SLOTS {
-            // Undefined until written: every row is to be written, and no
-            // present has sampled it.
             return TrayCardWrite {
                 slot: self.slots.len(),
                 mint: true,
@@ -141,12 +115,7 @@ impl TrayCardRing {
         }
     }
 
-    /// The planned `write` of rows `band` landed: its slot holds the card and
-    /// is shown, every other slot misses `band` too, and its reader is the
-    /// present that will take the number `reader`, or none (`None`: drawn by a
-    /// command buffer waited inline, as [`Self::read_unchanged`] says). Its
-    /// earlier readers were settled before the write
-    /// ([`TrayCardWrite::settle_through`]).
+    /// The planned `write` of rows `band` landed.
     #[inline]
     pub fn land_change(&mut self, write: TrayCardWrite, band: (u32, u32), reader: Option<u64>) {
         if write.mint {

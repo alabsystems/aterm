@@ -126,12 +126,12 @@ impl Identity {
     }
 
     /// The recipient (public key) of this identity.
-    pub fn recipient(&self) -> Recipient {
+    pub const fn recipient(&self) -> Recipient {
         Recipient(self.public)
     }
 
     /// The 32 secret bytes (for the X25519 unwrap).
-    pub fn secret_bytes(&self) -> &[u8; 32] {
+    pub const fn secret_bytes(&self) -> &[u8; 32] {
         &self.secret
     }
 }
@@ -618,7 +618,7 @@ pub fn armor(binary: &[u8]) -> String {
 }
 
 /// ASCII whitespace as the reference's `bytes.TrimSpace` sees it.
-fn is_space(c: u8) -> bool {
+const fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 

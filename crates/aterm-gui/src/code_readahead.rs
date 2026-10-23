@@ -2,24 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! A window's start asks for this executable's code in one read.
-//!
-//! A launch whose code is out of the page cache (after a reboot, an update, or memory pressure
-//! that evicted it) otherwise brings it in one page fault at a time, and the kernel's
-//! read-around is slow at that: a sequential walk of a profiling build's 55 MB `__TEXT`
-//! through a mapping took 66-68 ms (0.8 GB/s), and aterm's scattered first calls are no walk.
-//! One `F_RDADVISE` of the running slice's `__TEXT` queues the whole range at the disk's
-//! sequential rate and returns: the same walk then finished in 8.5 ms, for 1.2 ms of the
-//! caller's time with the pages cold and 44 µs (opening the file and advising it, median of
-//! 200) with them resident. A headless start with its pages cold reached `ready` in 47 ms
-//! against 77 without it, n=12 (r6 sweep #19, `docs/measured/cold-pages-2026-10-20.md`).
-//!
-//! The range is the running slice's in a universal file (`csops(CS_OPS_PIDOFFSET)`) and
-//! `__TEXT`'s size comes from this image's own header, so nothing is read to find it. macOS
-//! only: the measured fault cost and the advisory call are Darwin's.
 
-/// Ask the kernel to read this executable's `__TEXT` into the page cache now; best effort
-/// and asynchronous (the call queues the reads and returns). The window's entry calls it
-/// first, once the front door has answered every verb, `--help` and `--version`.
+/// Ask the kernel to read this executable's `__TEXT` into the page cache now.
 #[cfg(target_os = "macos")]
 pub(crate) fn read_ahead_own_code() {
     let Some((offset, length)) = own_code_range() else {
@@ -36,8 +20,6 @@ pub(crate) fn read_ahead_own_code() {
 #[cfg(target_os = "macos")]
 fn read_ahead(file: &std::fs::File, offset: u64, length: u64) -> bool {
     use std::os::fd::AsRawFd as _;
-    // `<sys/fcntl.h>`: `F_RDADVISE` and its `struct radvisory { off_t ra_offset; int
-    // ra_count; }`.
     const F_RDADVISE: libc::c_int = 44;
     #[repr(C)]
     struct Radvisory {
@@ -52,8 +34,8 @@ fn read_ahead(file: &std::fs::File, offset: u64, length: u64) -> bool {
         ra_offset,
         ra_count,
     };
-    // SAFETY: `advice` is a live `struct radvisory` for the call's duration; the descriptor
-    // is `file`'s, open for reading.
+    // SAFETY: `advice` is a live `struct radvisory` for the call's duration; the descriptor is
+    // `file`'s, open for reading.
     unsafe { libc::fcntl(file.as_raw_fd(), F_RDADVISE, &raw const advice) == 0 }
 }
 
@@ -62,7 +44,6 @@ fn read_ahead(file: &std::fs::File, offset: u64, length: u64) -> bool {
 /// missing.
 #[cfg(target_os = "macos")]
 fn own_code_range() -> Option<(u64, u64)> {
-    // `<mach-o/loader.h>`.
     const MH_MAGIC_64: u32 = 0xfeed_facf;
     const LC_SEGMENT_64: u32 = 0x19;
     /// `struct mach_header_64`; its load commands follow it in memory.
@@ -88,7 +69,6 @@ fn own_code_range() -> Option<(u64, u64)> {
         fileoff: u64,
         filesize: u64,
     }
-    // xnu `bsd/sys/codesign.h`: the offset of the process's Mach-O slice in its file.
     const CS_OPS_PIDOFFSET: u32 = 6;
     unsafe extern "C" {
         /// The linker's symbol for this executable's own header, mapped at `__TEXT`'s start.
@@ -109,8 +89,8 @@ fn own_code_range() -> Option<(u64, u64)> {
     };
     let slice = u64::try_from(slice).ok().filter(|_| rc == 0)?;
     let header = &raw const _mh_execute_header;
-    // SAFETY: the linker defines the symbol at this executable's mapped Mach-O header, which
-    // stays mapped (read-only) for the process's life.
+    // SAFETY: the linker defines the symbol at this executable's mapped Mach-O header, which stays
+    // mapped (read-only) for the process's life.
     let (magic, ncmds, sizeofcmds) =
         unsafe { ((*header).magic, (*header).ncmds, (*header).sizeofcmds) };
     if magic != MH_MAGIC_64 {
@@ -123,8 +103,8 @@ fn own_code_range() -> Option<(u64, u64)> {
         if at + 8 > end {
             return None;
         }
-        // SAFETY: `at + 8` is within `sizeofcmds`, the mapped load commands; every command
-        // starts with its `cmd` and `cmdsize`.
+        // SAFETY: `at + 8` is within `sizeofcmds`, the mapped load commands; every command starts
+        // with its `cmd` and `cmdsize`.
         let (cmd, size) = unsafe {
             let head = commands.add(at).cast::<[u32; 2]>().read_unaligned();
             (head[0], head[1] as usize)
@@ -177,7 +157,6 @@ mod tests {
         // SAFETY: the mapping made above, of `len` bytes.
         unsafe { libc::munmap(map, len) };
         assert_eq!(rc, 0, "mincore");
-        // `MINCORE_INCORE` is bit 0.
         let resident = vec.iter().filter(|&&b| b & 1 != 0).count();
         (resident, vec.len())
     }
@@ -221,7 +200,6 @@ mod tests {
                 0
             );
             out.write_all(&vec![0x5a; len]).expect("write");
-            // Written out, so no page of it lingers dirty; a test promises nothing past a crash.
             aterm_durable::ordered(&out).expect("flush");
         }
         let file = std::fs::File::open(&path).expect("open");

@@ -5,6 +5,9 @@
 
 use std::process::ExitCode;
 
+use aterm_uds::lifeline::OnWake;
+use aterm_uds::listener::names_now;
+
 use crate::bridge::{Bridge, Config};
 use crate::transport;
 
@@ -379,10 +382,17 @@ pub(crate) fn default_state_dir() -> String {
 }
 
 /// `aterm link broker`: run the local fabric bus on a Unix socket.
+///
+/// Besides a replaced build and a poisoned log, it ends itself, cleanly and exit 0, when its
+/// launcher's lifeline is cut (`--lifeline-fd <n>`, [`aterm_uds::lifeline`]: a test's or a
+/// tool's throwaway broker; a supervised one takes none) or its socket path no longer names
+/// the listener it bound ([`ends_itself`]). Never for being idle or orphaned: a
+/// `--service none` or hand-run broker has nothing to restart it.
 fn broker(args: &[String]) -> ExitCode {
     let watch = ExeWatch::capture();
     const USAGE: &str = "\
 usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <tier>]
+                         [--lifeline-fd <n>]
        aterm link broker --repair <log>
 
   <socket>             Unix socket path the bridge's `--broker` names (place in a 0700 dir)
@@ -404,14 +414,19 @@ usage: aterm link broker <socket> [log] [--secret-file <path>] [--durability <ti
                        flush in full before ack. Non-strict brokers flush and mark the
                        log closed on SIGTERM/SIGINT/SIGHUP; an unclean stop across a
                        reboot advances the log's generation.
+  --lifeline-fd <n>    descriptor <n> is the read end of a pipe or FIFO its launcher
+                       holds and never writes: the broker stops cleanly within seconds
+                       of its end-of-file (the launcher is gone, however it ended). For
+                       a test's or tool's throwaway broker; a supervised one takes none
   --repair <log>       truncate <log> at its first corrupt record and exit (`nothing to
                        repair` if clean; refuses if held by a running broker or written
                        by a newer aterm release)
 
 Prints `listening <socket>` when bound, keeps `<log>.health` (0600) beside the log,
-exits 0 when its executable is replaced, and exits 75 when its log is poisoned so its
-supervisor can restart it. Retains `ev` records up to 7 days / 256 MiB, unread mail up
-to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<log>.held`).
+exits 0 when its executable is replaced or its socket file is removed or taken by
+another socket, and exits 75 when its log is poisoned so its supervisor can restart it.
+Retains `ev` records up to 7 days / 256 MiB, unread mail up to 7 days / 64 MiB, latest
+presence, and other records up to 7 days / 32 MiB (`<log>.held`).
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -426,10 +441,12 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
     };
     let secret_file = parsed.secret_file.cloned();
     let durability = parsed.durability.cloned();
+    let lifeline_fd = parsed.lifeline_fd.cloned();
+    let lifeline_at = parsed.lifeline_at;
     let repair = parsed.repair;
     let words: Vec<&str> = parsed.words.iter().map(|word| word.as_str()).collect();
     if repair {
-        if secret_file.is_some() || durability.is_some() {
+        if secret_file.is_some() || durability.is_some() || lifeline_fd.is_some() {
             eprintln!("aterm link broker: --repair takes <log> alone: it serves nothing");
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -464,6 +481,14 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
         [_, _, extra, ..] => {
             return usage_error(&format!("unexpected argument `{extra}`"));
         }
+    };
+    // The lifeline is adopted here, while this process is still single-threaded (closing
+    // inherited copies closes descriptors by number) and before anything is opened. A bad
+    // number is a usage error: a launcher that silently got no lifeline would leak the
+    // broker it asked about.
+    let mut lifeline = match lifeline_fd.as_deref().map(adopt_lifeline).transpose() {
+        Ok(lifeline) => lifeline,
+        Err(why) => return usage_error(&why),
     };
     let secret_file = secret_file.or_else(|| {
         let beside = std::path::Path::new(&endpoint).with_file_name(crate::enable::MINT_SECRET);
@@ -557,6 +582,9 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
             return ExitCode::FAILURE;
         }
     };
+    // The listener it bound, read right after the bind and against the path at every wake
+    // ([`path_named`]).
+    let bound = aterm_uds::listener::listener_read(&endpoint);
     if let Err(e) = broker.keep_health(crate::broker_health::HEALTH_EVERY) {
         eprintln!(
             "aterm link broker: {}: could not write its health ({e}); astream tries again every \
@@ -593,14 +621,12 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
     let mut poison_said = false;
     loop {
         std::thread::park_timeout(crate::broker_health::POLL);
-        let why = if let Some(sig) = stop.as_ref().and_then(StopSignal::taken) {
-            format!("stopped by {sig}")
-        } else if let Some(reason) = broker.poisoned() {
-            use std::io::Write as _;
-            if seam.on_poison == crate::broker_health::OnPoison::Stay {
+        // The seam's `stay` switches off the poison exit and no other: a poisoned broker it
+        // keeps serving still ends with its launcher, its path and its build.
+        let poisoned = match broker.poisoned() {
+            Some(reason) if seam.on_poison == crate::broker_health::OnPoison::Stay => {
                 if !poison_said {
-                    let _ = writeln!(
-                        std::io::stderr(),
+                    eprintln!(
                         "aterm link broker: {log}: {} ({reason}); NOT exiting: {}=stay keeps it \
                          serving",
                         crate::broker_health::POISONED_WORDS,
@@ -608,13 +634,19 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
                     );
                     poison_said = true;
                 }
-                continue;
+                None
             }
+            poisoned => poisoned,
+        };
+        let why = if let Some(sig) = stop.as_ref().and_then(StopSignal::taken) {
+            format!("stopped by {sig}")
+        } else if let Some(reason) = poisoned {
+            use std::io::Write as _;
             let restart = (!crate::broker_health::supervised()).then(|| {
                 let argv: Vec<String> = std::env::args_os()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
-                crate::fabric::shown_argv(&argv)
+                crate::fabric::shown_argv(&by_hand(argv, args.len(), lifeline_at))
             });
             drop(keep);
             drop(broker);
@@ -624,6 +656,11 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
                 crate::broker_health::poisoned_line(&log, &reason, restart.as_deref())
             );
             return ExitCode::from(crate::broker_health::POISONED_EXIT);
+        } else if let Some(end) = ends_itself(
+            lifeline.as_mut().and_then(OnWake::cut),
+            path_named(&endpoint, &bound),
+        ) {
+            end.words(&endpoint)
         } else {
             let Some(w) = watch.as_mut() else {
                 continue;
@@ -663,6 +700,119 @@ to 7 days / 64 MiB, latest presence, and other records up to 7 days / 32 MiB (`<
     }
 }
 
+/// The words a broker's exit line opens with when its lifeline was cut:
+/// `aterm link broker: lifeline cut (…)`.
+pub const LIFELINE_CUT_WORDS: &str = "lifeline cut";
+
+/// The words a broker's exit line carries, after its socket path, when no socket
+/// is there any more.
+pub const PATH_GONE_WORDS: &str = "is gone, so no client can reach this broker";
+
+/// Take over `--lifeline-fd <number>` ([`aterm_uds::lifeline::adopt`]), close any copy
+/// of the launcher's end this process inherited at another number (held here, it would
+/// keep the lifeline from ever reading end-of-file), and watch it at the serving loop's
+/// wakes. Call it while the process is single-threaded. `Err` says why the descriptor
+/// cannot be a lifeline.
+fn adopt_lifeline(number: &str) -> Result<OnWake, String> {
+    let flag = aterm_uds::lifeline::FLAG;
+    let fd: i32 = number
+        .parse()
+        .map_err(|_| format!("{flag} {number} is not a descriptor number"))?;
+    let lifeline = aterm_uds::lifeline::adopt(fd).map_err(|e| e.to_string())?;
+    // Unsure, so say so: the lifeline still works unless this process holds a copy
+    // of its launcher's end, which is what could not be checked.
+    if let Err(e) = aterm_uds::lifeline::close_inherited_copies(&lifeline) {
+        eprintln!(
+            "aterm link broker: could not check for inherited copies of its lifeline ({e}); \
+             one held here would keep it from ending"
+        );
+    }
+    OnWake::new(lifeline).map_err(|e| format!("{flag} {number}: {e}"))
+}
+
+/// Why a serving broker ends itself at one wake of its loop ([`ends_itself`]).
+#[derive(Debug)]
+enum SelfEnd {
+    /// Its lifeline read end-of-file, or could no longer be read: the process that
+    /// started it is gone (or can no longer be told to live).
+    LauncherGone(aterm_uds::lifeline::Cut),
+    /// No socket is at its path any more: no client can reach it.
+    PathGone,
+    /// Another socket was bound or renamed over its path: clients reach that one.
+    PathTaken,
+}
+
+impl SelfEnd {
+    /// The exit line's words, after `aterm link broker: `.
+    fn words(&self, endpoint: &str) -> String {
+        match self {
+            Self::LauncherGone(aterm_uds::lifeline::Cut::Closed) => format!(
+                "{LIFELINE_CUT_WORDS} (end-of-file): the process that started it is gone; exiting"
+            ),
+            Self::LauncherGone(aterm_uds::lifeline::Cut::Failed(e)) => format!(
+                "{LIFELINE_CUT_WORDS} (it could no longer be read: {e}): whether the process \
+                 that started it lives cannot be told; exiting"
+            ),
+            Self::PathGone => format!("{endpoint} {PATH_GONE_WORDS}; exiting"),
+            Self::PathTaken => format!(
+                "{endpoint} now names another socket, which its clients reach instead; exiting"
+            ),
+        }
+    }
+}
+
+/// THE BROKER'S OWN END, decided from what one wake of its loop read: `cut`, its
+/// lifeline's answer (`None` with no lifeline, or while its launcher holds it), and
+/// `path`, what its socket path names against the listener it bound (`None` when no
+/// identity was read at the bind). `None`: it serves on. Pure, so every answer is a
+/// table test. Neither an idle broker nor an orphaned one is ended here: a
+/// `--service none` or hand-run broker has nothing to restart it.
+fn ends_itself(
+    cut: Option<aterm_uds::lifeline::Cut>,
+    path: Option<aterm_uds::listener::Named>,
+) -> Option<SelfEnd> {
+    use aterm_uds::listener::Named;
+    if let Some(cut) = cut {
+        return Some(SelfEnd::LauncherGone(cut));
+    }
+    match path? {
+        Named::Same | Named::Unread => None,
+        Named::Nothing => Some(SelfEnd::PathGone),
+        Named::Another => Some(SelfEnd::PathTaken),
+    }
+}
+
+/// What one wake reads of `endpoint` against `bound`, the broker's reading of it right after
+/// its bind ([`aterm_uds::listener::listener_read`]), for [`ends_itself`]. That reading is
+/// the first look: one that proved no socket there (unlinked between the bind and the read)
+/// is a path already gone. `None` when it failed otherwise, which names no listener and turns
+/// the pathless check off rather than end a broker that serves. A socket renamed over the path
+/// in those microseconds is taken for the broker's own, as astream's own reading takes it.
+fn path_named(
+    endpoint: &str,
+    bound: &std::io::Result<Option<aterm_uds::listener::ListenerId>>,
+) -> Option<aterm_uds::listener::Named> {
+    match bound {
+        Ok(Some(bound)) => Some(names_now(endpoint, *bound)),
+        Ok(None) => Some(aterm_uds::listener::Named::Nothing),
+        Err(_) => None,
+    }
+}
+
+/// `argv`, this process's own, as a person runs it again by hand: without the
+/// `--lifeline-fd <n>` at `lifeline` among the verb's own `args` words (which end
+/// `argv`), a descriptor only the launcher that started it could hand it. Any other
+/// argv as it is.
+fn by_hand(mut argv: Vec<String>, args: usize, lifeline: Option<usize>) -> Vec<String> {
+    let at = lifeline.map(|at| argv.len().saturating_sub(args) + at);
+    if let Some(at) = at.filter(|&at| {
+        argv.get(at).map(String::as_str) == Some(aterm_uds::lifeline::FLAG) && at + 1 < argv.len()
+    }) {
+        argv.drain(at..=at + 1);
+    }
+    argv
+}
+
 /// The first stop signal (`SIGTERM`, `SIGINT`, `SIGHUP`) received by a non-strict broker.
 struct StopSignal(std::sync::Arc<std::sync::atomic::AtomicI32>);
 
@@ -675,7 +825,7 @@ impl StopSignal {
     }
 }
 
-fn signal_name(sig: i32) -> &'static str {
+const fn signal_name(sig: i32) -> &'static str {
     #[cfg(unix)]
     {
         match sig {
@@ -1047,6 +1197,95 @@ mod tests {
 
     fn argv(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_string).collect()
+    }
+
+    /// **A BROKER ENDS ITSELF ONLY WITH ITS LAUNCHER OR ITS PATH.** A cut lifeline
+    /// (end-of-file, or a read that failed) ends it whatever its path names; with none, a
+    /// path that names nothing or another socket ends it; a lifeline its launcher holds,
+    /// or none at all, beside a path that still names its listener, or a bind whose
+    /// identity could not be read, keeps it serving. NEGATIVE CONTROL: the serving rows,
+    /// a live launcher and a still-named path, which no wake may end.
+    #[test]
+    fn a_broker_ends_itself_only_when_its_launcher_or_its_path_is_gone() {
+        use aterm_uds::lifeline::Cut;
+        use aterm_uds::listener::Named;
+        for path in [Some(Named::Same), None] {
+            assert!(
+                ends_itself(None, path).is_none(),
+                "a live launcher, {path:?}: it serves on"
+            );
+        }
+        for path in [Some(Named::Same), Some(Named::Nothing), None] {
+            assert!(
+                matches!(
+                    ends_itself(Some(Cut::Closed), path),
+                    Some(SelfEnd::LauncherGone(Cut::Closed))
+                ),
+                "a cut lifeline beside {path:?}"
+            );
+        }
+        let failed = ends_itself(Some(Cut::Failed(std::io::Error::other("EIO"))), None);
+        assert!(
+            matches!(&failed, Some(SelfEnd::LauncherGone(Cut::Failed(_)))),
+            "{failed:?}"
+        );
+        assert!(matches!(
+            ends_itself(None, Some(Named::Nothing)),
+            Some(SelfEnd::PathGone)
+        ));
+        assert!(matches!(
+            ends_itself(None, Some(Named::Another)),
+            Some(SelfEnd::PathTaken)
+        ));
+        // The words a reader of `broker.err` and the live tests look for.
+        let line = SelfEnd::LauncherGone(Cut::Closed).words("/r/bus.sock");
+        assert!(line.starts_with(LIFELINE_CUT_WORDS), "{line}");
+        let line = SelfEnd::PathGone.words("/r/bus.sock");
+        assert!(
+            line.starts_with(&format!("/r/bus.sock {PATH_GONE_WORDS}")),
+            "{line}"
+        );
+    }
+
+    /// **THE BIND'S OWN READING COUNTS AS THE FIRST LOOK.** A socket unlinked between the
+    /// bind and the broker's reading of it leaves a path the read proves gone: the broker is
+    /// unreachable from its first wake and ends then. A reading that failed otherwise names
+    /// no listener, and a path read that fails is no answer: both keep it serving.
+    /// NEGATIVE CONTROL: the failed bind-time reading, which turns the check off.
+    #[test]
+    fn a_path_gone_before_the_first_look_ends_the_broker() {
+        use aterm_uds::listener::Named;
+        let gone = "/nonexistent-aterm-link-dir/b.sock";
+        let unbound = path_named(gone, &Ok(None));
+        assert!(
+            matches!(ends_itself(None, unbound), Some(SelfEnd::PathGone)),
+            "a path gone before the first look: {unbound:?}"
+        );
+        let unread = path_named(gone, &Err(std::io::Error::other("EIO")));
+        assert!(
+            ends_itself(None, unread).is_none(),
+            "a bind-time read that failed: {unread:?}"
+        );
+        assert!(
+            ends_itself(None, Some(Named::Unread)).is_none(),
+            "a wake's read that failed"
+        );
+    }
+
+    /// **THE RESTART A PERSON IS TOLD TO RUN CARRIES NO LIFELINE**: only the launcher
+    /// that started the broker could hand that descriptor, and one named at a prompt is
+    /// a terminal, which the broker refuses. NEGATIVE CONTROLS: an argv with no lifeline
+    /// is shown whole, and so is one where the place given names no lifeline flag.
+    #[test]
+    fn the_restart_a_person_runs_carries_no_lifeline() {
+        let armed = argv("aterm link broker s l --lifeline-fd 0 --durability strict");
+        assert_eq!(
+            by_hand(armed, 6, Some(2)),
+            argv("aterm link broker s l --durability strict")
+        );
+        let bare = argv("aterm link broker s l");
+        assert_eq!(by_hand(bare.clone(), 2, None), bare);
+        assert_eq!(by_hand(bare.clone(), 2, Some(0)), bare, "no flag there");
     }
 
     /// A replacement is a different file, settled over two looks (renamed over the path or

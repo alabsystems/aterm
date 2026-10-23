@@ -239,8 +239,11 @@ pub(crate) fn find_acquire(bal: &str) -> Option<usize> {
     [
         "term_lock(",
         "term_lock_ui(",
+        "term_lock_whole(",
+        "term_lock_whole_when(",
         "with_terminal(",
         "with_terminal_mut(",
+        "with_terminal_as_it_stands(",
     ]
     .iter()
     .filter_map(|needle| bal.find(needle))
@@ -404,6 +407,10 @@ fn bind_guard(lhs: &str, rhs: &str) -> Option<Vec<String>> {
         "term_lock".len()
     } else if rest.starts_with("term_lock_ui(") {
         "term_lock_ui".len()
+    } else if rest.starts_with("term_lock_whole(") {
+        "term_lock_whole".len()
+    } else if rest.starts_with("term_lock_whole_when(") {
+        "term_lock_whole_when".len()
     } else {
         return None;
     };
@@ -709,6 +716,50 @@ fn helper() {
 
 fn cross_resize(term: &Mutex<Terminal>, rows: usize, cols: usize) {
     term_lock(term).resize(rows, cols);
+}
+"##,
+        ),
+        (
+            "a control read's whole-frame hold is the same guard, chained",
+            r##"
+fn read_then_resize(term: &Mutex<Terminal>, rows: usize, cols: usize) {
+    crate::term_lock_whole(term).resize(rows, cols);
+}
+"##,
+        ),
+        (
+            "a control read's whole-frame hold is the same guard, bound",
+            r##"
+fn read_then_resize(term: &Mutex<Terminal>, rows: usize, cols: usize) {
+    let mut t = term_lock_whole(term);
+    t.grid_mut().resize(rows, cols);
+}
+"##,
+        ),
+        (
+            "a read's whole-frame hold that decides when to wait is the same guard, chained",
+            r##"
+fn read_then_resize(term: &Mutex<Terminal>, rows: usize, cols: usize, on: ReadOn) {
+    crate::term_lock_whole_when(term, |_| on == ReadOn::Control).resize(rows, cols);
+}
+"##,
+        ),
+        (
+            "a read's whole-frame hold that decides when to wait is the same guard, bound",
+            r##"
+fn read_then_resize(term: &Mutex<Terminal>, rows: usize, cols: usize, on: ReadOn) {
+    let mut t = term_lock_whole_when(term, |t| on == ReadOn::Control && t.rows() > 0);
+    t.grid_mut().resize(rows, cols);
+}
+"##,
+        ),
+        (
+            "the host's hold of the terminal as it stands is the same guard",
+            r##"
+fn verb_rewrap(host: &impl SessionHost, sid: SessionId) {
+    host.with_terminal_as_it_stands(sid, |t: &Terminal| {
+        t.rewrap(0);
+    });
 }
 "##,
         ),

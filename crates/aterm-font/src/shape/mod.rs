@@ -7,29 +7,7 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! aterm's text shaper (TF.6 of docs/AUDIT-third-party-2026-10-15.md), carved
-//! from rustybuzz 0.20.1 to the surface a terminal reaches.
-//!
-//! - `GSUB` lookup types 1 to 8 with lookup flags and mark filtering sets,
-//!   feature variations, and the skipping rules for ZWJ, ZWNJ and default
-//!   ignorables;
-//! - the default features (`ccmp`, `locl`, `rlig`, `calt`, `liga`, ...),
-//!   automatic fractions, and a caller's features over the whole run;
-//! - OpenType script selection from the run's first strong script;
-//! - the Arabic shaper's joining forms, computed in buffer (logical) order;
-//! - default ignorables hidden behind the space glyph.
-//!
-//! [`ShapePlan`] and the buffers have rustybuzz's shape, so a caller swaps
-//! one for the other: build a [`ShapeFace`] over an [`crate::Face`] at its
-//! instance, guess a [`UnicodeBuffer`]'s segment properties, and
-//! [`shape_with_plan`] with a plan for them. Output clusters are the UTF-8
-//! byte offsets [`UnicodeBuffer::push_str`] assigns, or the clusters given to
-//! [`UnicodeBuffer::add`]. `pipeline.rs` lists what upstream does that this
-//! does not.
-//!
-//! Every answer on the TF.1 shaping corpus is rustybuzz's, glyph id for glyph
-//! id and cluster for cluster, apart from those deliberate deltas; aterm-render's
-//! `font_oracle` replays it.
+//! aterm's text shaper, carved from rustybuzz 0.20.1 to the surface a terminal reaches.
 
 mod apply;
 mod arabic;
@@ -97,8 +75,7 @@ impl UnicodeBuffer {
         self.0.add(c as u32, cluster);
     }
 
-    /// Sets the direction (left unset, [`Self::guess_segment_properties`]
-    /// takes the script's).
+    /// Sets the direction (left unset, [`Self::guess_segment_properties`] takes the script's).
     #[inline]
     pub fn set_direction(&mut self, direction: Direction) {
         self.0.direction = direction;
@@ -118,9 +95,8 @@ impl UnicodeBuffer {
         self.0.script
     }
 
-    /// Sets the script to the first that is not Common, Inherited or
-    /// Unknown, and the direction to the one it is written in, for whichever
-    /// of the two is unset.
+    /// Sets the script to the first that is not Common, Inherited or Unknown, and the direction to
+    /// the one it is written in, for whichever of the two is unset.
     #[inline]
     pub fn guess_segment_properties(&mut self) {
         self.0.guess_segment_properties();
@@ -174,9 +150,8 @@ impl GlyphBuffer {
     }
 }
 
-/// Shapes `buffer` on `face` with `features`, guessing its segment
-/// properties and building a plan for them. Prefer [`shape_with_plan`] with a
-/// kept plan when shaping many runs.
+/// Shapes `buffer` on `face` with `features`, guessing its segment properties and building a plan
+/// for them.
 #[inline]
 pub fn shape(face: &ShapeFace, features: &[Feature], mut buffer: UnicodeBuffer) -> GlyphBuffer {
     buffer.guess_segment_properties();
@@ -184,8 +159,8 @@ pub fn shape(face: &ShapeFace, features: &[Feature], mut buffer: UnicodeBuffer) 
     shape_with_plan(face, &plan, buffer)
 }
 
-/// Shapes `buffer` on `face` with `plan`, which must have been built for the
-/// buffer's direction and script (else the plan's are used).
+/// Shapes `buffer` on `face` with `plan`, which must have been built for the buffer's direction and
+/// script (else the plan's are used).
 #[inline]
 pub fn shape_with_plan(face: &ShapeFace, plan: &ShapePlan, buffer: UnicodeBuffer) -> GlyphBuffer {
     let mut buffer = buffer.0;

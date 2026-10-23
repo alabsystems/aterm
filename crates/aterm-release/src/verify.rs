@@ -12,7 +12,7 @@ use aterm_update_core::Manifest;
 use crate::gates;
 use crate::ledger::{self, Error, Result};
 use crate::manifest_out;
-use crate::publish::{self, TagKind, gh_retry, step};
+use crate::publish::{self, TagKind, step};
 
 /// One published (non-draft) release carrying a parseable manifest.
 #[derive(Debug, Clone)]
@@ -43,22 +43,15 @@ pub fn scan_head_before_claim(slug: &str) -> Result<Vec<Published>> {
     Ok(head)
 }
 
-/// The [`RELEASE_ROW_JQ`] row of the release `releases/latest` names, or `None` when the
-/// channel has none (HTTP 404: a channel nothing was released on yet).
+/// The [`release_row`] of the release `releases/latest` names, or `None` when the channel has none (HTTP 404).
 fn latest_release_row(slug: &str) -> Result<Option<String>> {
-    let endpoint = format!("repos/{slug}/releases/latest");
-    let out = publish::gh_raw(&["api", &endpoint, "--jq", RELEASE_ROW_JQ])?;
-    if !out.success() {
-        let stderr = out.stderr_utf8();
-        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-            return Ok(None);
-        }
-        return Err(Error::new(format!(
-            "read the channel's latest release failed: {}; nothing was claimed",
-            stderr.trim()
-        )));
-    }
-    Ok(Some(out.stdout_utf8()))
+    let latest =
+        crate::github::get_optional(&format!("repos/{slug}/releases/latest")).map_err(|error| {
+            Error::new(format!(
+                "read the channel's latest release failed: {error}; nothing was claimed"
+            ))
+        })?;
+    Ok(latest.map(|release| crate::github::rows([release_row(&release)])))
 }
 
 /// [`scan_head_before_claim`]'s judgement, pure.
@@ -98,7 +91,7 @@ pub(crate) fn head_reaches_latest(latest: Option<&str>, head: Option<&str>) -> R
     )))
 }
 
-/// Scans the channel's release metadata (at most 10 pages of 100) before downloading any manifest.
+/// Scans the channel's release metadata (the listing read whole) before downloading any manifest.
 pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     let metadata = release_metadata_listing(slug)?;
     let mut identities = std::collections::BTreeMap::new();
@@ -175,37 +168,28 @@ pub fn scan_published(slug: &str, stop_early: bool) -> Result<Vec<Published>> {
     Ok(found)
 }
 
-/// The channel's release metadata, one lossless line per release in arbitrary API order:
-/// ID, tag, draft flag, prerelease flag, exact appcast count.
-const RELEASE_ROW_JQ: &str = r#". as $r |
-        ([$r.assets[]? | select(.name == "aterm-appcast.toml")] | length) as $exact_count |
-        [($r.id | tostring), $r.tag_name, ($r.draft | tostring),
-         ($r.prerelease | tostring), ($exact_count | tostring)] | @tsv"#;
+/// One release object as the five-field row [`parse_release_metadata`] reads: id, tag, draft flag, prerelease flag, exact appcast count.
+pub(crate) fn release_row(release: &aterm_json::Value) -> String {
+    let exact_count = release["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|asset| asset["name"].as_str() == Some("aterm-appcast.toml"))
+        .count();
+    crate::github::tsv(&[
+        &crate::github::tostring(&release["id"]),
+        &release["tag_name"],
+        &crate::github::tostring(&release["draft"]),
+        &crate::github::tostring(&release["prerelease"]),
+        &aterm_json::Value::String(exact_count.to_string()),
+    ])
+}
 
+/// [`release_row`] of every release on `slug`, the listing read whole (an incomplete or
+/// inconsistent listing is refused).
 fn release_metadata_listing(slug: &str) -> Result<String> {
-    const PER_PAGE: usize = 100;
-    const MAX_PAGES: u32 = 10;
-    let metadata_jq = format!(".[] | {RELEASE_ROW_JQ}");
-    let mut metadata = String::new();
-    for page in 1..=MAX_PAGES {
-        let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
-        let listing = gh_retry(&["api", &path, "--jq", &metadata_jq])?;
-        let text = listing.stdout_utf8();
-        let page_len = text.lines().count();
-        metadata.push_str(&text);
-        if !text.is_empty() && !text.ends_with('\n') {
-            metadata.push('\n');
-        }
-        if page_len < PER_PAGE {
-            break;
-        }
-        if page == MAX_PAGES {
-            return Err(Error::new(format!(
-                "release listing reached the {MAX_PAGES}-page safety cap before exhaustion"
-            )));
-        }
-    }
-    Ok(metadata)
+    let listing = publish::release_listing(slug)?;
+    Ok(crate::github::rows(listing.iter().map(release_row)))
 }
 
 /// The refusal [`publish::release_asset_identity_for_release_id`] raises, verbatim: the
@@ -222,29 +206,11 @@ fn release_identity_listing(
     slug: &str,
     wanted: &std::collections::BTreeSet<u64>,
 ) -> Result<std::collections::BTreeMap<u64, publish::ReleaseObjectIdentity>> {
-    const PER_PAGE: usize = 100;
-    const MAX_PAGES: u32 = 10;
-    let mut observed = std::collections::BTreeMap::new();
-    for page in 1..=MAX_PAGES {
-        let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
-        let out = gh_retry(&["api", &path, "--jq", publish::release_identity_jq(true)])?;
-        let text = out.stdout_utf8();
-        let page_len = text.lines().count();
-        let captured = captured_identity_rows(&text, wanted);
-        let rows = publish::parse_release_object_identity_rows(&captured)?;
-        for row in rows {
-            observed.insert(row.id, row);
-        }
-        if page_len < PER_PAGE {
-            break;
-        }
-        if page == MAX_PAGES {
-            return Err(Error::new(format!(
-                "release identity listing reached the {MAX_PAGES}-page safety cap before exhaustion"
-            )));
-        }
-    }
-    Ok(observed)
+    let listing = publish::release_listing(slug)?;
+    let text = publish::release_identity_rows(&listing);
+    let captured = captured_identity_rows(&text, wanted);
+    let rows = publish::parse_release_object_identity_rows(&captured)?;
+    Ok(rows.into_iter().map(|row| (row.id, row)).collect())
 }
 
 /// The `wanted` releases' rows out of one page of the channel's identity listing, selected
@@ -774,7 +740,6 @@ fn head_status(url: &str) -> Result<String> {
 pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     publish::assert_origin_repo_binding(&ledger::GitCli::new(repo), &origin_slug_of(repo)?)?;
     let slug = publish::workspace_channel_slug(repo)?;
-    let _cred = publish::ChannelCred::enter();
     println!("aterm-release · verify ({slug})");
     let version = match version {
         Some(v) => v,
@@ -873,7 +838,6 @@ fn signing_requirement() -> &'static str {
 /// `targo --unverified ship status`.
 pub fn run_status(repo: &Path) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
-    let _cred = publish::ChannelCred::enter();
     println!("aterm-release · status ({slug})");
     step("signing", signing_requirement());
 
@@ -1265,15 +1229,10 @@ fn demote_yank_release_convergently(
         Error::new("yank target scan carries no immutable GitHub release object snapshot")
     })?;
     let endpoint = format!("repos/{slug}/releases/{}", expected.id);
-    publish::gh_retry_guarded(
-        &[
-            "api",
-            "--method",
-            "PATCH",
-            &endpoint,
-            "-F",
-            "prerelease=true",
-        ],
+    crate::github::send(
+        aterm_update_core::github_rest::Method::Patch,
+        &endpoint,
+        Some(&aterm_json::json!({"prerelease": true})),
         || {
             let observed = publish::release_object_by_id(slug, expected.id)?;
             publish::validate_release_object_snapshot(observed.as_ref(), expected)?;
@@ -1335,7 +1294,6 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
         &origin_slug_of(repo)?,
         &gates::current_own_cutter_gate,
     )?;
-    let _cred = publish::ChannelCred::enter();
     let scanned = scan_published(&slug, false)?;
     let matching = scanned
         .iter()
@@ -1492,7 +1450,6 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
         ))
     })?;
     publish::ordinary_resume_claim_preflight(repo, &git, &journal)?;
-    let _cred = publish::ChannelCred::enter();
 
     if release_state(&slug, &tag)? == ReleaseState::Published {
         return Err(Error::new(format!(
@@ -1568,7 +1525,7 @@ fn origin_slug_of(repo: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// One page of `release_identity_jq(true)` output: id, tag, draft, target, tab-separated.
+    /// Identity rows as [`publish::release_identity_rows`] writes them: id, tag, draft, target, tab-separated.
     const PAGE_WITH_A_TAGLESS_DRAFT: &str = "9\t\ttrue\tmain\n12\tv0.3.0\tfalse\tabc123\n";
 
     /// A head scan below the release the latest pointer names is torn and refuses before

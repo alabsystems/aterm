@@ -495,7 +495,11 @@ fn bodies(cell: &Cell, decls: &Decls, out: &mut Vec<String>) -> Result<(), Strin
         ]
         .map(String::from),
     );
-    out.push(format!("type fd_word = {};", handwritten::fd_word(cell.os)));
+    out.push(format!(
+        "{}{};",
+        crate::siblings::BODY_MARKER,
+        handwritten::fd_word(cell.os)
+    ));
     out.push(String::new());
     if cell.os == Os::GnuLinux {
         out.extend(
@@ -893,5 +897,46 @@ pub const extern \"C\" fn WSTOPSIG(status: c_int) -> c_int {
         };
         let error = emit(&CELLS[0], &decls, &measured()).expect_err("no body");
         assert_eq!(error, "no body written for WNOWHERE on mac");
+    }
+
+    /// The sibling gate finds a cell's hand-written section by a line of code
+    /// this generator writes, so a comment prune of the cell sources (every
+    /// `//` line gone, as 3410d4c0e1, 8bcda75523 and 6e1ffead74 did to them)
+    /// leaves each section defined and the gate's verdict the code's.
+    #[test]
+    fn a_comment_prune_leaves_each_sibling_section_and_the_verdict() {
+        use crate::siblings::{SiblingFinding, compare};
+        use std::collections::BTreeMap;
+        let prune = |text: &str| -> String {
+            text.lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| format!("{line}\n"))
+                .collect()
+        };
+        let emitted: BTreeMap<&str, String> = CELLS
+            .iter()
+            .map(|cell| {
+                let text = emit(cell, &Decls::default(), &measured()).expect("an empty cell");
+                (cell.source, text)
+            })
+            .collect();
+        let pruned: BTreeMap<&str, String> = emitted
+            .iter()
+            .map(|(file, text)| (*file, prune(text)))
+            .collect();
+        assert_ne!(emitted, pruned, "the generator writes comments to prune");
+        assert_eq!(compare(&emitted), []);
+        assert_eq!(compare(&pruned), [], "a comment prune changed the verdict");
+        // Negative control: the pruned sections are still compared.
+        let mut planted = pruned;
+        let x86 = planted.get_mut("darwin_x86_64.rs").expect("the cell");
+        x86.push_str("const fn planted() {}\n");
+        assert!(
+            compare(&planted)
+                .iter()
+                .any(|f| matches!(f, SiblingFinding::Differs { os: Os::Darwin, .. })),
+            "{:?}",
+            compare(&planted)
+        );
     }
 }

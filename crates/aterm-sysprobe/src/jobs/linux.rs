@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The job probe's Linux arm: `/proc/<pid>/…` read under a root, so it is
-//! compiled and tested on every host against fixture trees.
-//!
-//! * `stat` — state, parent, group, session, terminal (`tty_nr`, `tpgid`),
-//!   CPU times (own and reaped children's), start time, major faults;
-//! * `status` — uid and context switches; `io` — `syscr + syscw`, `wchar`,
-//!   `read_bytes`, `write_bytes` (another user's is refused: counters
-//!   unknown, never zero); `schedstat` — time on a core and waiting for one;
-//! * `wchan` and `task/<tid>/{stat,wchan}` — the kernel function each waits
-//!   in, which Linux names publicly;
-//! * `fd/<n>` links and `fdinfo/<n>` — a regular file's offset (an appending
-//!   writer's grows, and no path is touched), a pipe's inode and direction,
-//!   a socket's inode (then its row in `net/tcp` and `net/tcp6`: state, peer,
-//!   receive queue), an epoll set's interests (`tfd:` lines).
-//!
-//! Every file is read through a bounded buffer; `net/tcp` gets
-//! [`NET_TCP_CAP`].
+//! The job probe's Linux arm: `/proc/<pid>/…` read under a root, so it is compiled and tested on
+//! every host against fixture trees.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -78,19 +63,13 @@ pub struct StatLine {
     pub start: u64,
 }
 
-/// Parse a `/proc/<pid>/stat` line; `None` when it is malformed. The name
-/// is the text between the first `(` and the LAST `)`, so a `comm` holding
-/// parentheses or spaces cannot move a field.
+/// Parse a `/proc/<pid>/stat` line; `None` when it is malformed.
 #[must_use]
 pub fn parse_stat(text: &str) -> Option<StatLine> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let name = text.get(open + 1..close)?.to_owned();
     let f: Vec<&str> = text.get(close + 1..)?.split_whitespace().collect();
-    // After the name, 0-based: state(0) ppid(1) pgrp(2) session(3) tty_nr(4)
-    // tpgid(5) flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11)
-    // stime(12) cutime(13) cstime(14) priority(15) nice(16) threads(17)
-    // itrealvalue(18) starttime(19).
     let num = |i: usize| -> Option<u64> { f.get(i)?.parse().ok() };
     let tpgid: i64 = f.get(5)?.parse().ok()?;
     let cut = |t: i64| u64::try_from(t.max(0)).unwrap_or(0);
@@ -152,8 +131,8 @@ pub fn parse_io(text: &str) -> IoLine {
     }
 }
 
-/// `/proc/<pid>/status`'s uid (the real one, first of four) and context
-/// switches (voluntary + involuntary).
+/// `/proc/<pid>/status`'s uid (the real one, first of four) and context switches (voluntary +
+/// involuntary).
 #[must_use]
 pub fn parse_status(text: &str) -> (Option<u32>, Option<u64>) {
     let uid = text.lines().find_map(|l| {
@@ -173,8 +152,7 @@ pub fn parse_schedstat(text: &str) -> Option<(u64, u64)> {
     Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
 }
 
-/// `/proc/<pid>/wchan`: the kernel function, `None` for `0` or empty (on a
-/// core, or not waiting).
+/// `/proc/<pid>/wchan`: the kernel function, `None` for `0` or empty (on a core, or not waiting).
 #[must_use]
 pub fn parse_wchan(text: &str) -> Option<String> {
     let w = text.trim();
@@ -265,7 +243,6 @@ pub fn parse_fdinfo(text: &str) -> FdInfo {
         } else if let Some(v) = line.strip_prefix("ino:") {
             info.ino = v.trim().parse().ok();
         } else if let Some(v) = line.strip_prefix("tfd:") {
-            // `tfd:        5 events:       19 data: …` (events in hex).
             let mut f = v.split_whitespace();
             let tfd = f.next().and_then(|t| t.parse().ok());
             let events = f
@@ -319,8 +296,7 @@ fn parse_addr(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
     Some((ip, port))
 }
 
-/// Parse a `net/tcp` (or, with `v6`, `net/tcp6`) table; malformed rows are
-/// skipped, and so is a torn last line.
+/// Parse a `net/tcp` (or, with `v6`, `net/tcp6`) table.
 #[must_use]
 pub fn parse_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
     let whole = match text.rfind('\n') {
@@ -347,8 +323,7 @@ pub fn parse_net_tcp(text: &str, v6: bool) -> Vec<TcpRow> {
         .collect()
 }
 
-/// `Max processes`' soft limit in a `/proc/<pid>/limits`; `None` for
-/// `unlimited` or where absent.
+/// `Max processes`' soft limit in a `/proc/<pid>/limits`; `None` for `unlimited` or where absent.
 #[must_use]
 pub fn max_processes(text: &str) -> Option<u64> {
     text.lines()
@@ -508,8 +483,7 @@ fn fds(dir: &Path, sleeping: Option<bool>) -> Option<(Vec<FdReading>, bool)> {
     Some((out, truncated))
 }
 
-/// Read one process under `root` (`/proc`, or a fixture tree), with `hz`
-/// clock ticks per second; `None` when its `stat` is unreadable.
+/// Read one process under `root` (`/proc`, or a fixture tree), with `hz` clock ticks per second.
 #[must_use]
 pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts> {
     let dir = root.join(pid.to_string());
@@ -535,8 +509,6 @@ pub fn read(root: &Path, pid: u32, want_fds: bool, hz: u64) -> Option<ProcFacts>
     if state == RunState::Zombie {
         return Some(facts);
     }
-    // `io` is ptrace-gated: another user's process refuses it, and then
-    // every counter is unknown rather than its CPU alone being trusted.
     if let Some(io) = read_text(&dir.join("io")).map(|t| parse_io(&t)) {
         let sched = read_text(&dir.join("schedstat")).and_then(|t| parse_schedstat(&t));
         facts.counters = Some(Counters {

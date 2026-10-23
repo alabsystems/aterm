@@ -1,21 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm doctor`'s own rows as converge items (docs/DESIGN-init-system-2026-10-20.md §4.2,
-//! S5): the shell (`base.shell.starts`, separately reporting shell usability), the
-//! privacy grants, the stale copies of aterm, the
-//! machine's Spotlight, program check and console host, and the session's instances,
-//! fabric, recovery ledger and exceptions.
-//!
-//! Every row but the copies is a fact nothing on this machine changes: its probe is the
-//! reading ([`Fact`]), class `person`, so no surface applies it. The stale copies are the
-//! one `asked` item here: the probe looks, and the apply moves them to the Trash. The
-//! Developer Tools pane is not an apply: a fix-mode gather brings the owner to it, at most
-//! once per ten minutes ([`super::devtools_hand_over`]), and the row says what it did.
-//!
-//! `crates/aterm` composes these items with the packages' repair items and `aterm pkg
-//! doctor`'s rows, runs them through the engine, and renders the report from the rows
-//! ([`render`]): the text is never read back.
+//! `aterm doctor`'s own rows as converge items (docs/DESIGN-init-system-2026-10-20.md §4.2, S5).
 
 use std::sync::Mutex;
 
@@ -23,7 +9,7 @@ use aterm_converge::{Class, Explain, Item, ItemReport, Layer, Outcome, Probe, Re
 
 use super::{DoctorRow, Mark};
 
-/// The shell row: whether aterm can start the shell. The one essential item.
+/// The shell row: whether aterm can start the shell.
 pub const SHELL: &str = "base.shell.starts";
 /// The stale copies of aterm (macOS): the one `asked` item.
 pub const COPIES: &str = "base.pkg.copies";
@@ -31,8 +17,8 @@ pub const COPIES: &str = "base.pkg.copies";
 /// The Developer Tools row, whose fix-mode gather hands the owner to the pane.
 pub const DEVTOOLS: &str = "base.privacy.devtools";
 
-/// Whether a run narrowed to `only` reads the Developer Tools row, so a fix-mode gather
-/// may hand the owner to its pane ([`gather`]): `--only pkg` opens nothing.
+/// Whether a run narrowed to `only` reads the Developer Tools row, so a fix-mode gather may hand
+/// the owner to its pane ([`gather`]): `--only pkg` opens nothing.
 #[must_use]
 pub fn hands_over(only: &[String]) -> bool {
     only.is_empty()
@@ -41,9 +27,9 @@ pub fn hands_over(only: &[String]) -> bool {
             .any(|token| aterm_converge::selects(token, DEVTOOLS, "privacy", Some(Layer::Base)))
 }
 
-/// Whether the `--only` word `token` names one of doctor's own rows (its id, its family or
-/// the base layer), on any platform: what a run checks before it reads anything, so a word
-/// that names nothing is refused before the Developer Tools hand-over ([`gather`]).
+/// Whether the `--only` word `token` names one of doctor's own rows (its id, its family or the base
+/// layer), on any platform: what a run checks before it reads anything, so a word that names
+/// nothing is refused before the Developer Tools hand-over ([`gather`]).
 #[must_use]
 pub fn names(token: &str) -> bool {
     ROWS.iter()
@@ -132,18 +118,15 @@ fn named(label: &str) -> Option<(&'static str, &'static str, &'static str)> {
 pub struct Args {
     /// `--read-only`: probe and plan, change nothing.
     pub read_only: bool,
-    /// `--json`: the rows in the one report schema ([`aterm_converge::Report`]), or a
-    /// settings action's fleet document ([`settings`]).
+    /// `--json`: the rows in the one report schema, or a settings action's fleet document.
     pub json: bool,
     /// `--only <id,...>`: the items, families or layers to run ([`aterm_converge::select`]).
     pub only: Vec<String>,
-    /// `--check`, `--apply` or `--restore`: the fleet settings profile alone, none of the
-    /// items ([`settings`]).
+    /// `--check`, `--apply` or `--restore`: the fleet settings profile alone, none of the items.
     pub settings: Option<Settings>,
 }
 
-/// A settings-only action on the macOS fleet settings profile
-/// (docs/DESIGN-macos-doctor-2026-10-19.md): no item runs and no window opens.
+/// A settings-only action on the macOS fleet settings profile: no item runs and no window opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Settings {
     /// `--check`: read the profile's settings, change nothing.
@@ -154,10 +137,7 @@ pub enum Settings {
     Restore,
 }
 
-/// `aterm doctor`'s arguments: one of `--read-only`, `--check`, `--apply` and `--restore`,
-/// `--json`, and `--only <id,...>` (or `--only=<id,...>`, never with a settings action),
-/// each at most once. Anything else is the usage refusal, which names the grammar.
-///
+/// `aterm doctor`'s arguments.
 /// # Errors
 /// The refusal's one line.
 pub fn args(rest: &[String]) -> Result<Args, String> {
@@ -167,7 +147,6 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
     let mut only_given = false;
     let mut rest = rest.iter();
     while let Some(arg) = rest.next() {
-        // The one action: `--read-only` (no settings action) or a settings action.
         let action = match arg.as_str() {
             "--read-only" => Some(None),
             "--check" => Some(Some(Settings::Check)),
@@ -217,10 +196,7 @@ pub fn args(rest: &[String]) -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// A settings action's report and exit ([`Settings`]): the profile's rows as text, or with
-/// `json` the fleet document (`"document": "aterm-doctor"`, its `settings` the profile's
-/// own report). Exit 1 when a setting drifted, a step was blocked or unverified, or the
-/// pass failed; off macOS every action is refused, exit 1.
+/// A settings action's report and exit ([`Settings`]).
 #[must_use]
 pub fn settings(action: Settings, json: bool) -> (String, u8) {
     #[cfg(target_os = "macos")]
@@ -237,8 +213,6 @@ pub fn settings(action: Settings, json: bool) -> (String, u8) {
                 if !json {
                     return (report.to_text(), code);
                 }
-                // The profile's report is a document of its own: kept as a value, never
-                // a quoted document inside this one.
                 match aterm_json::from_str::<aterm_json::Value>(&report.to_json()) {
                     Ok(settings) => {
                         let doc = aterm_json::json!({
@@ -294,8 +268,7 @@ pub struct Gathered {
 }
 
 impl Gathered {
-    /// The facts already read, as the pure report's tests build them: every row a fact,
-    /// the copies' among them as the prune left it.
+    /// The facts already read, as the pure report's tests build them.
     #[cfg(test)]
     pub(crate) fn of_rows(lines: Vec<DoctorRow>) -> Self {
         Self {
@@ -304,9 +277,7 @@ impl Gathered {
         }
     }
 
-    /// Facts as a composing crate's tests give them (`crates/aterm`'s doctor): each
-    /// `(label, mark, fact)` a row of [`super::doctor_rows`]'s shape, and no stale-copy
-    /// item. A label no row has is dropped.
+    /// Facts as a composing crate's tests give them (`crates/aterm`'s doctor).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn of_facts(facts: &[(&str, Mark, &str)]) -> Self {
@@ -328,8 +299,7 @@ impl Gathered {
         }
     }
 
-    /// The rows as items, in report order: each fact, and the stale copies after the
-    /// privacy rows (where the report has always put them).
+    /// The rows as items, in report order: each fact, and the stale copies after the privacy rows.
     #[must_use]
     pub fn items(&self) -> Vec<Box<dyn Item + '_>> {
         let leading = self
@@ -373,14 +343,11 @@ impl Gathered {
             &mut aterm_converge::ReadOnly,
             &mut |_| {},
         )
-        // No doctor item names another: nothing can refuse the order.
         .unwrap_or_default()
     }
 }
 
-/// Read this machine's facts for `aterm doctor`; with `fix`, the Developer Tools hand-over
-/// first ([`super::devtools_hand_over`]). On macOS the stale copies are an item, looked at
-/// by its probe and moved by its apply.
+/// Read this machine's facts for `aterm doctor`; with `fix`, the Developer Tools hand-over first.
 #[must_use]
 pub fn gather(fix: bool) -> Gathered {
     Gathered {
@@ -390,14 +357,13 @@ pub fn gather(fix: bool) -> Gathered {
 }
 
 /// The diagnostic facts' legacy shell-health assessment, used by isolated fact tests.
-/// The composed command uses [`render_readiness`] over all selected rows.
 #[must_use]
 pub fn render(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) -> (String, i32) {
     super::render_doctor_lines(&report_lines(gathered, rows, sections))
 }
 
-/// The composed doctor's explicit readiness assessment, retaining each fact including
-/// shell usability while distinguishing selected checks from complete OS setup.
+/// The composed doctor's explicit readiness assessment, retaining each fact including shell
+/// usability while distinguishing selected checks from complete OS setup.
 #[must_use]
 pub fn render_readiness(
     gathered: &Gathered,
@@ -479,10 +445,7 @@ fn report_lines(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) 
     lines
 }
 
-/// Print `aterm doctor`'s answer as the diagnostics print theirs: exit 0 on stdout, any
-/// other code on stderr (so `aterm doctor && aterm` scripts), spelled for the shell that
-/// reads it. `stdout` keeps any code on stdout: a document's reader reads it whole (the
-/// JSON, and a settings action's report, which a fleet collector parses).
+/// Print `aterm doctor`'s answer as the diagnostics print theirs.
 #[must_use]
 pub fn answer(text: &str, code: u8, stdout: bool) -> std::process::ExitCode {
     if code == 0 || stdout {
@@ -627,8 +590,6 @@ impl Item for CopiesItem<'_> {
     }
 
     fn class(&self) -> Class {
-        // It moves copies of aterm a person may have put there (to the Trash, which a
-        // person can undo): only on a pass a person started.
         Class::Asked
     }
 

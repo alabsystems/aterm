@@ -1522,7 +1522,7 @@ fn host_read_barrier(
 /// Off the Vulkan cells (Metal on macOS, DX12 on Windows) a completed command
 /// buffer's writes to a mapped readback buffer reach the host without one.
 #[cfg(all(wgpu_arm, not(all(unix, not(target_vendor = "apple")))))]
-fn host_read_barrier(
+const fn host_read_barrier(
     _device: &wgpu::Device,
     _readbacks: &[wgpu::Buffer],
 ) -> Option<wgpu::CommandBuffer> {

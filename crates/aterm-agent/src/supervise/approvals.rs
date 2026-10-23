@@ -13,6 +13,66 @@ use super::policy::turn_end::{Conversation, LimitTry};
 /// How much of a command a row keeps.
 pub const COMMAND_BYTES: usize = 4096;
 
+/// What every rule of the facts seam opens with (`fact-hold@v1`, `fact-would@v1`,
+/// `fact-intent@v1`; [`super::facts`]).
+pub const FACT_RULE_PREFIX: &str = "fact-";
+
+/// A FACT ROW IS NO ACT (the occupancy red-team's F13): a line the facts seam typed
+/// (`fact-hold@v1` `typed`) is told the agent beside its own work, never a policy act, so no
+/// reader of acts counts it: no short streak, no `continue_per_hour`, no landing, no try, no
+/// person's exchange ended. Whether `rule` is such a rule.
+#[must_use]
+pub fn is_fact_rule(rule: &str) -> bool {
+    !facts_counted() && rule.starts_with(FACT_RULE_PREFIX)
+}
+
+/// Whether the ledger line `line` is a fact row ([`is_fact_rule`]): its `rule_id` field opens
+/// with [`FACT_RULE_PREFIX`]. The pattern spans the field's own quotes, which [`json_str`]
+/// escapes inside every value, so no command, reason or sid forges it.
+#[must_use]
+pub fn is_fact_line(line: &str) -> bool {
+    !facts_counted() && line.contains(",\"rule_id\":\"fact-")
+}
+
+/// The ledger text `body`'s lines but its fact rows ([`is_fact_line`]): what every reader of
+/// acts walks.
+fn act_lines(body: &str) -> impl DoubleEndedIterator<Item = &str> {
+    body.lines().filter(|l| !is_fact_line(l))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The negative control of [`is_fact_line`]: fact rows read as acts on this thread.
+    static FACTS_COUNTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether fact rows read as acts on this thread (tests only: [`with_facts_counted`]).
+#[cfg(test)]
+fn facts_counted() -> bool {
+    FACTS_COUNTED.with(std::cell::Cell::get)
+}
+
+/// The shipped build: never.
+#[cfg(not(test))]
+const fn facts_counted() -> bool {
+    false
+}
+
+/// Run `f` with fact rows read as acts on this thread (the readers' negative control), undone
+/// after it even on unwind.
+#[cfg(test)]
+pub(crate) fn with_facts_counted<T>(f: impl FnOnce() -> T) -> T {
+    struct Undo;
+    impl Drop for Undo {
+        fn drop(&mut self) {
+            FACTS_COUNTED.with(|c| c.set(false));
+        }
+    }
+    FACTS_COUNTED.with(|c| c.set(true));
+    let _undo = Undo;
+    f()
+}
+
 /// What a row says was done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -193,8 +253,7 @@ pub fn last_act_count_in(body: &str, sid: Option<&str>) -> Option<(i64, Option<S
     let last = *typed_at_in(body, sid).last()?;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let prefix = format!("{{\"ts\":{last},");
-    let count = body
-        .lines()
+    let count = act_lines(body)
         .rev()
         .filter(|l| l.starts_with(&prefix) && l.contains(",\"decision\":\"typed\","))
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
@@ -814,7 +873,7 @@ pub fn typed_texts(path: &Path, sid: Option<&str>) -> Vec<Typed> {
     };
     let sid = sid.map(|s| s.trim_start_matches('@'));
     let mut out = Vec::new();
-    for line in body.lines().filter(|l| l.contains("\"typed\"")) {
+    for line in act_lines(&body).filter(|l| l.contains("\"typed\"")) {
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
@@ -852,8 +911,7 @@ pub fn typed_at_in(body: &str, sid: Option<&str>) -> Vec<i64> {
         ",\"rule_id\":{},",
         json_str(super::policy::login::RULE_LOGIN_DONE)
     );
-    let mut out: Vec<i64> = body
-        .lines()
+    let mut out: Vec<i64> = act_lines(body)
         .filter(|l| l.contains(&want_sid) && l.contains(",\"decision\":\"typed\","))
         .filter(|l| !(l.contains(&move_rule) && l.contains(&move_command)))
         .filter(|l| !l.contains(&probe_rule) && !l.contains(&login_done))
@@ -872,7 +930,7 @@ pub fn login_typed_last_in(body: &str, sid: Option<&str>) -> Option<i64> {
     use super::policy::turn_end::RULE_LOGIN;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last = None;
-    for line in body.lines() {
+    for line in act_lines(body) {
         let typed = line.contains(",\"decision\":\"typed\",");
         if !typed && !line.contains(RULE_TURN_RAN) {
             continue;
@@ -969,7 +1027,7 @@ pub fn open_left_in(body: &str, sid: Option<&str>) -> Option<String> {
     use super::policy::turn_end::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut open: Option<String> = None;
-    for line in body.lines() {
+    for line in act_lines(body) {
         let typed = line.contains(",\"decision\":\"typed\",");
         if !typed && !line.contains(",\"decision\":\"skipped\",") {
             continue;
@@ -1002,6 +1060,8 @@ pub fn left_after_typed(open: &str, rule: &str, command: &str) -> Option<String>
     };
     match rule {
         RULE_USAGE_PROBE => Some(open.to_string()),
+        // A fact line ends no person's exchange ([`is_fact_rule`]).
+        rule if is_fact_rule(rule) => Some(open.to_string()),
         RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_LIMIT_RESUME | RULE_LOGIN_BACK
             if open.starts_with(LEFT_AT_WALL) =>
         {
@@ -1122,8 +1182,7 @@ pub fn awaited_try_in(body: &str, sid: Option<&str>) -> Option<AwaitedTry> {
     use super::policy::turn_end::{RULE_LIMIT_RESUME, RULE_USAGE_PROBE};
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last: Option<AwaitedTry> = None;
-    for v in body
-        .lines()
+    for v in act_lines(body)
         .filter(|l| {
             l.contains(",\"decision\":\"typed\",") || l.contains(",\"decision\":\"waiting\",")
         })
@@ -1207,8 +1266,7 @@ pub fn usage_attempt_taken_in(
     let mut ended = false;
     let mut took_turn = false;
     let mut wall_program = None;
-    for v in body
-        .lines()
+    for v in act_lines(body)
         .filter(|l| {
             l.contains(",\"decision\":\"typed\",") || l.contains(",\"decision\":\"waiting\",")
         })
@@ -1277,7 +1335,10 @@ pub fn usage_attempt_taken_in(
             }
             match text("rule_id") {
                 Some(RULE_WALL_WAIT_END)
-                    if matches!(text("reason"), Some(LIMIT_ENDED | WALL_LEFT_NO_TASK)) =>
+                    if matches!(
+                        text("reason"),
+                        Some(LIMIT_ENDED | LIMIT_ENDED_ELSEWHERE | WALL_LEFT_NO_TASK)
+                    ) =>
                 {
                     last = None;
                 }
@@ -1400,8 +1461,7 @@ fn walk_done_check(body: &str, sid: Option<&str>) -> (Option<CheckOwed>, u32) {
     let mut owed: Option<CheckOwed> = None;
     let mut judged = 0_u32;
     let mut api_cut = false;
-    for v in body
-        .lines()
+    for v in act_lines(body)
         .filter(|l| {
             l.contains(",\"decision\":\"typed\",") || l.contains(",\"decision\":\"waiting\",")
         })
@@ -1602,8 +1662,7 @@ pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut walk = LandWalk::default();
     let mut act = None;
-    for v in body
-        .lines()
+    for v in act_lines(body)
         .filter(|l| LandWalk::reads(l))
         .filter_map(|l| aterm_json::from_str::<aterm_json::Value>(l).ok())
     {
@@ -1865,8 +1924,7 @@ pub fn short_streak_in(body: &str, sid: Option<&str>) -> Option<StreakSeed> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last: Option<StreakSeed> = None;
     let mut recorded = false;
-    for v in body
-        .lines()
+    for v in act_lines(body)
         .filter(|l| {
             l.contains(",\"decision\":\"typed\",") || l.contains(",\"decision\":\"waiting\",")
         })
@@ -1954,7 +2012,7 @@ pub fn carry_ended_in(body: &str, sid: Option<&str>) -> bool {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let esc = format!("({PERSONS_ESC})");
     let (mut ended, mut judged) = (false, false);
-    for line in body.lines() {
+    for line in act_lines(body) {
         if !line.contains(",\"decision\":\"") {
             continue;
         }
@@ -2190,7 +2248,7 @@ pub fn relaunch_waiting_in(body: &str, sid: Option<&str>) -> Option<i64> {
     use super::policy::turn_end::RULE_MODEL_FALLBACK;
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut made = None;
-    for line in body.lines() {
+    for line in act_lines(body) {
         let typed = line.contains(",\"decision\":\"typed\",");
         if !typed && !line.contains(RELAUNCH_WAITS) {
             continue;
@@ -2226,7 +2284,7 @@ pub fn relaunch_waiting(path: &Path, sid: Option<&str>) -> Option<i64> {
 pub fn open_model_switch_in(body: &str, sid: Option<&str>) -> Option<OpenSwitch> {
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut walk = SwitchWalk::default();
-    for line in body.lines().filter(|l| SwitchWalk::reads(l)) {
+    for line in act_lines(body).filter(|l| SwitchWalk::reads(l)) {
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
@@ -2386,7 +2444,7 @@ pub fn account_moves_in(body: &str, sid: Option<&str>) -> AccountMoves {
     use super::policy::turn_end::{AccountAt, RULE_ACCOUNT, Unmade};
     let mut out = AccountMoves::default();
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
-    for line in body.lines() {
+    for line in act_lines(body) {
         let typed = line.contains(",\"decision\":\"typed\",");
         let skipped = line.contains(",\"decision\":\"skipped\",");
         let waits = line.contains(",\"decision\":\"waiting\",");
@@ -2508,6 +2566,12 @@ pub const OFF_STOOD: &str = "autopilot off stood: the person drove the session; 
      the carry and an act a wall cut are over";
 
 pub const LIMIT_ENDED: &str = "the limit's track ended (work, or another wall): its tries are over";
+
+/// A limit ended where another program's screen was read in the tab
+/// ([`super::policy::turn_end::TurnEndState::limit_ended_elsewhere`]); it ends
+/// the episode and its tries as [`LIMIT_ENDED`] does.
+pub const LIMIT_ENDED_ELSEWHERE: &str =
+    "the limit's track ended (another program runs in the tab): its tries are over";
 
 pub const RULE_TRY_OVER: &str = "try-over@v1";
 
@@ -2642,7 +2706,7 @@ pub fn open_wall_in(body: &str, sid: Option<&str>) -> Option<OpenWall> {
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut open: Option<OpenWall> = None;
     let mut retry_ms = None;
-    for line in body.lines() {
+    for line in act_lines(body) {
         let waits = line.contains(",\"decision\":\"waiting\",");
         let typed = line.contains(",\"decision\":\"typed\",");
         if !waits && !typed {
@@ -5529,3 +5593,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "approvals_fact_tests.rs"]
+mod fact_tests;

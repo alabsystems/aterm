@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the disk watch's reserve on Windows: real files in a scratch
-//! directory on NTFS, links made as junctions (a file symlink needs a
-//! privilege a plain account lacks), compression and sparseness set by the
-//! system's own `compact` and `fsutil`.
+//! Tests for the disk watch's reserve on Windows.
 
 use std::os::windows::fs::MetadataExt as _;
 

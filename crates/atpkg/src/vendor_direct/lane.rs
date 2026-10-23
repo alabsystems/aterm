@@ -358,7 +358,7 @@ impl Outcome {
 
     /// The version active when the lane finished, when one is known.
     #[must_use]
-    pub(crate) fn active_version(&self) -> Option<Version> {
+    pub(crate) const fn active_version(&self) -> Option<Version> {
         match &self.verdict {
             Verdict::Installed { to, .. } | Verdict::RolledBack { to, .. } => Some(*to),
             Verdict::Current(v) => Some(*v),
@@ -401,7 +401,7 @@ impl Pending {
 
     /// The exact download size, from the verified documents.
     #[must_use]
-    pub(crate) fn download_bytes(&self) -> u64 {
+    pub(crate) const fn download_bytes(&self) -> u64 {
         self.candidate.artifact.artifact().size
     }
 
@@ -414,7 +414,7 @@ impl Pending {
 
     /// What its landing's disk gate checks: the download and the tree it unpacks to, an archive's at its unpack bound.
     #[must_use]
-    pub(crate) fn landing_bytes(&self) -> crate::flow::LandingBytes {
+    pub(crate) const fn landing_bytes(&self) -> crate::flow::LandingBytes {
         crate::flow::LandingBytes::of(self.candidate.artifact.artifact())
     }
 }

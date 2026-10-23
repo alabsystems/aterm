@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The open recorder: this program under the name `open`, first on the `PATH`
-//! of the lab's agents (`runs/<tag>/shim/open`) and their `BROWSER`. It NEVER
-//! opens anything: a URL a sign-in would open in the person's browser is
-//! logged to `$LAB_OPEN_LOG` (its scheme and host only, never the query, which
-//! carries a login's state and challenge) and answered 0. The jail denies
-//! `/usr/bin/open` and Launch Services' open doors as well, so a direct call
-//! fails rather than reaching the desktop.
-//!
-//! Every launch line the lab writes for an agent names both:
-//! `LAB_OPEN_LOG=<scratch>/open.log` and `BROWSER=<run>/shim/open`. Claude
-//! Code (2.1.306, read from its bundle) opens a URL as `$BROWSER <url>`, or a
-//! bare-name `open <url>` when `BROWSER` is unset, and reveals a file with a
-//! bare-name `open -R`, so both land here. A line the lab does not write gets
-//! neither: a worker's Claude Code, which the instance's `spawn` types into a
-//! login shell that lists the shim last on its `PATH`, has no `BROWSER`, so
-//! its bare-name `open` is `/usr/bin/open`, which the jail refuses (nothing
-//! opens, and nothing is logged). The proofs read what was logged through
-//! [`Witness`], beside a [`control`] that shows the recorder logs at all.
+//! The lab `open` / `$BROWSER` shim recorder and its [`Witness`] / [`control`] checks.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -33,10 +16,7 @@ pub const CONTROL_URL: &str = "x-lab-control://selftest";
 pub const NOTHING_OPENED: &str = "nothing was opened on the desktop: the open recorder logged nothing from the lab (its \
                                   control, a bare-name open in the jail, was logged)";
 
-/// The recorder's control: a bare-name `open` of [`CONTROL_URL`] in the
-/// lab's jail, the shim first on its `PATH`, logged to its own file (never the
-/// lab's `open.log`, which must stay empty). A recorder that logs nothing at
-/// all would make an empty `open.log` prove nothing. The control's log.
+/// The recorder's control ([`CONTROL_URL`]).
 pub fn control(run: &Run) -> PathBuf {
     let shim_path = format!("{}:/usr/bin:/bin", run.run.join("shim").display());
     let log = run.w.join("open-control.log");
@@ -53,8 +33,7 @@ pub fn control(run: &Run) -> PathBuf {
     log
 }
 
-/// What the recorder logged: the lab's agents' opens (`open.log`) and its
-/// control's ([`control`]).
+/// What the recorder logged: the lab's agents' opens (`open.log`) and its control's ([`control`]).
 #[derive(Debug, Default)]
 pub struct Witness {
     /// `<scratch>/open.log`, which every agent's launch line names.
@@ -96,16 +75,14 @@ impl Witness {
     }
 }
 
-/// The verdict on the recorder: nothing the lab ran opened anything (its
-/// `open.log` holds nothing) and the control was logged.
+/// The verdict on the recorder.
 #[must_use]
 pub fn nothing_opened(opened: &str, control: &str) -> bool {
     let logged = format!(" open {CONTROL_URL}");
     opened.trim().is_empty() && control.lines().any(|l| l.ends_with(&logged))
 }
 
-/// What one argument is logged as: `scheme://authority` of a URL, `<a path or
-/// app>` for anything else, nothing for an option.
+/// What one argument is logged as.
 #[must_use]
 pub fn logged(arg: &str) -> Option<String> {
     if arg.contains("://") {
@@ -147,8 +124,7 @@ pub fn main(args: &[String]) -> i32 {
     0
 }
 
-/// `aterm-lab hold <port> <secs>`: hold a connection to the stub on loopback
-/// for `secs` (the selftests' orphan control: what it holds open, the witness sees).
+/// `aterm-lab hold <port> <secs>`.
 #[must_use]
 pub fn hold(args: &[String]) -> i32 {
     let (Some(port), Some(secs)) = (

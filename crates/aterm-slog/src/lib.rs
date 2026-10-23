@@ -1,37 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! aterm's session log engine (`docs/DESIGN-session-log-2026-10-15.md`): a
-//! hierarchical record of what a session does, session › run › turn › step,
-//! with point marks on whichever node is open.
-//!
-//! An ENGINE crate (`aterm-census`'s `engine-platform`): no file system,
-//! threads, sockets, process spawning or clock reads. Time enters only as a
-//! host-provided [`Stamp`]; the settle wait of the [`TurnTracker`] is a wake
-//! the host schedules.
-//!
-//! - [`Rec`] is one record; its vocabularies are closed ([`vocab`]) and every
-//!   field key is declared once, with its tier and cap, in [`FIELDS`].
-//! - [`encode`]/[`decode`] are the one-line form (and [`encode_bus`] the
-//!   `v=2` bus body). An encoding at [`Tier::Wire`] cannot carry an H or C
-//!   key; a record over [`MAX_RECORD_BYTES`] is refused.
-//! - [`Log`] is one session's ring, bounded by 2048 records and 256 KiB,
-//!   evicting level-aware ([`evict_class`]), with exact gap counts, pull
-//!   cursors and the open/close discipline.
-//! - [`Log::carry`] and [`Log::from_carry`] carry a log across a seamless
-//!   update as text lines, cut to a budget in the eviction order.
-//! - [`journal`] is the disk journal's line codec and the reader's view of
-//!   it (crash closes derived at read time); [`Log::from_journal`] the log a
-//!   read rebuilds, and [`Notify`] the host writer's wake every append rings.
-//! - [`TurnTracker`] turns screen verdict words into turns and steps.
-//! - [`Fold`] reduces records to a [`SessionState`]; [`Fold::clause`] is the
-//!   tab clause, [`brief()`] the token-budgeted rollup.
-//! - [`NodeLog`] is the instance's own ring (node `n`: its start, fabric
-//!   link and config facts), RAM only and never on the bus.
-//!
-//! Producers call typed methods ([`Log::open`], [`Log::close`],
-//! [`Log::mark`], [`TurnTracker::observe`]); no payload string is formatted
-//! to be parsed back.
+//! Session log engine recording hierarchical session, run, turn, and step events.
 
 #![forbid(unsafe_code)]
 

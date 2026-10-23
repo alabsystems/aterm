@@ -1,24 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg run <tool>` — the engine of `aterm <tool>`, which is how a terminal the
-//! `agents/` twin does not lead reaches the managed copy — execs the store binary WITHOUT
-//! its shim, so it has to do what the shim and the twin do before their `exec`:
-//!
-//! * export the environment the build declares (design S7): `aterm claude` ran Claude
-//!   Code with its own updater ON beside a `bin/claude` that ran it off — and on a machine
-//!   where an older `repair` had laid `bin/claude` plain, reading the shim would not help,
-//!   so the build's `<build>.shim-env` sidecar comes first;
-//! * answer a vendor's own self-update verb as the FIRST argument the way the twin does
-//!   (`atpkg::selfupdate`): `aterm claude install stable` ran the vendor's installer,
-//!   which installs a copy the managed name never runs.
-//!
-//! Driven through the real dev binary over a temp HOME whose default prefix holds a
-//! managed `claude` build — a fake that prints the variable and its argv, and exits 7 —
-//! with the shim itself run beside it as the control. NEVER THE REAL STORE: `HOME` is a
-//! temp directory, `XDG_CONFIG_HOME` an absent one and the registry a local directory,
-//! and no ending driven here reaches the update child (a declined shape answers before
-//! it).
+//! Tests for `atpkg run <tool>` environment export and self-update interception.
 
 #![cfg(unix)]
 #![allow(
@@ -165,9 +148,6 @@ fn run_exports_what_the_build_declares_over_a_shim_laid_plain() {
     let fx = Fixture::new("drifted");
     fx.install_claude(&[]);
     fx.declare("DISABLE_AUTOUPDATER=1");
-    // The missing export is independent of posture. Unknown leading option
-    // arity (including --version) stays as typed; a known print launch gets
-    // the managed default. Both paths still honor the build's declaration.
     for (args, forwarded, defaulted) in [
         (&["--version"][..], "--version", false),
         (

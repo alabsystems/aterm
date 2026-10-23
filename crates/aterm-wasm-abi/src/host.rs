@@ -1,20 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The JS calls a module makes, as raw `aterm_host` imports the generated
-//! glue provides: the two the panic hook needs and the two browser clocks.
-//!
-//! The glue knows each by name and signature and refuses a module importing
-//! anything else, so an import added here is added to `verify glue` in
-//! the same change.
-//!
-//! | import | JS |
-//! |---|---|
-//! | `aterm_host.console_error(ptr, len)` | `console.error(text)` |
-//! | `aterm_host.error_stack(out)` | `new Error().stack`, written as a string the module owns |
-//! | `aterm_host.performance_now()` | `performance.now()` |
-//! | `aterm_host.date_now()` | `Date.now()` |
-//! | `aterm_host.object_drop(index)` | release a [`crate::js::JsObject`]'s slot in the glue's object table |
+//! The JS calls a module makes, as raw `aterm_host` imports the generated glue provides: the two
+//! the panic hook needs and the two browser clocks.
 
 use crate::panic_hook::Console;
 
@@ -42,9 +30,8 @@ pub fn console_error(text: &str) {
 #[must_use]
 pub fn error_stack() -> String {
     let mut out = [0usize; 2];
-    // SAFETY: the glue writes a pointer and length to the two words at
-    // `out`: a UTF-8 string it allocated with `aterm_alloc`/`aterm_realloc`
-    // at exactly that length, now this module's.
+    // SAFETY: the glue writes a pointer and length to the two words at `out`: a UTF-8 string it
+    // allocated with `aterm_alloc`/`aterm_realloc` at exactly that length, now this module's.
     unsafe {
         host_error_stack(&mut out);
         <String as crate::marshal::FromAbi>::from_abi(out[0], out[1])
@@ -52,8 +39,8 @@ pub fn error_stack() -> String {
     .unwrap_or_default()
 }
 
-/// `performance.now()`, resolved at call time, so one module works in a
-/// window, a worker and a worklet.
+/// `performance.now()`, resolved at call time, so one module works in a window, a worker and a
+/// worklet.
 #[must_use]
 pub fn performance_now() -> f64 {
     host_performance_now()
@@ -65,14 +52,12 @@ pub fn date_now() -> f64 {
     host_date_now()
 }
 
-/// Release slot `index` of the glue's object table (a dropped
-/// [`crate::js::JsObject`]).
+/// Release slot `index` of the glue's object table (a dropped [`crate::js::JsObject`]).
 pub fn object_drop(index: u32) {
     host_object_drop(index);
 }
 
-/// The panic hook's console through these imports
-/// (`panic_hook::set_once(host::CONSOLE)`).
+/// The panic hook's console through these imports (`panic_hook::set_once(host::CONSOLE)`).
 pub const CONSOLE: Console = Console {
     error: console_error,
     stack: error_stack,

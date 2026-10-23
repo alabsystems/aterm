@@ -91,7 +91,7 @@ impl PresenceView {
     }
 
     #[cfg(not(test))]
-    fn notify(&self) {}
+    const fn notify(&self) {}
 
     /// Forget everything held and start `phase` under a new generation,
     /// hanging up the old reader's socket if it had one.

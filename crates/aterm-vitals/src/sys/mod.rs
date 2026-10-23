@@ -3,24 +3,6 @@
 
 //! THE AGENT INTERFACE: `aterm ctl sys` and `await sys`
 //! (`docs/DESIGN-system-awareness-2026-10-16.md` §13).
-//!
-//! Pure: the host hands a [`Ctx`] (the snapshot, the target tab, who asks) and
-//! gets lines and JSON back. The pieces:
-//!
-//! * [`query`]: the grammar ([`SysQuery::parse`]), and which forms read only
-//!   the target's own rows ([`SysQuery::target_rows_only`]); every other form
-//!   is Owner-only.
-//! * [`json`]: a JSON value with exactly the four figure shapes the contract
-//!   allows (a bare integer, a bound, an unknown, a range), and no float or
-//!   null at all.
-//! * [`view`]: each view's text and JSON.
-//! * [`delta`]: the fingerprints of a reply's lines and a delta against them.
-//! * [`predicate`]: the `await sys` grammar and its evaluation on a snapshot.
-//!
-//! FOREIGN TEXT (§13.3): no argv, environment, title or file content of
-//! another process is ever printed. A process is `pid=` and an `exe=` word
-//! that passes [`exe_word`]'s rule, else `exe=-`; a path prints only when the
-//! folder is one of the caller's own tab ([`Ctx::path_ok`]), decided per root.
 
 pub mod delta;
 pub mod disk;
@@ -39,8 +21,7 @@ pub use view::{Reply, render_json, render_text};
 use crate::events::Event;
 use crate::model::Snapshot;
 
-/// The unavailable words a figure may carry (§13.4), the closed set. A word
-/// with a `:` takes a qualifier (`lane_off:ioreport`).
+/// The unavailable words a figure may carry (§13.4), the closed set.
 pub const UNAVAILABLE_WORDS: &[&str] = &[
     "unsupported",
     "needs_privilege:",
@@ -63,8 +44,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "unread_format",
 ];
 
-/// Whether `word` is one of [`UNAVAILABLE_WORDS`] (a qualified one with a
-/// non-empty qualifier).
+/// Whether `word` is one of [`UNAVAILABLE_WORDS`] (a qualified one with a non-empty qualifier).
 #[must_use]
 pub fn is_unavailable_word(word: &str) -> bool {
     UNAVAILABLE_WORDS.iter().any(|w| match w.strip_suffix(':') {
@@ -80,9 +60,7 @@ pub fn is_unavailable_word(word: &str) -> bool {
     })
 }
 
-/// A process's `exe=` word: its name when it matches
-/// `^[A-Za-z0-9._+-]{1,32}$`, else `-` (§13.3). Still the process's own
-/// choice: data, never an instruction.
+/// A process's `exe=` word: its name when it matches `^[A-Za-z0-9._+-]{1,32}$`, else `-` (§13.3).
 #[must_use]
 pub fn exe_word(name: &str) -> &str {
     let ok = !name.is_empty()
@@ -123,8 +101,7 @@ pub struct Machine {
     pub cpu: Option<String>,
     /// The OS and version (`macOS 27.0.1`).
     pub os: Option<String>,
-    /// The OS family word (`macOS`, `Linux`): the services part's name and
-    /// the placement note.
+    /// The OS family word (`macOS`, `Linux`): the services part's name and the placement note.
     pub family: &'static str,
 }
 
@@ -174,17 +151,15 @@ pub struct Target {
     pub fg_pgid: Option<u32>,
 }
 
-/// One folder a scope works in (a disk root, §10.4). Its sizes come from the
-/// disk walker through [`disk`]'s seam: [`RootSize::NotSampled`] (every size
-/// `unavailable(not_sampled)`) where no walker measures it.
+/// One folder a scope works in (a disk root, §10.4).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Root {
     /// What it is (`cwd`).
     pub kinds: Vec<&'static str>,
     /// Its path.
     pub path: String,
-    /// The sessions (local keys) whose folder it is: its path and its
-    /// subtrees' print only to a caller in one of their tabs (§13.3 rule 4).
+    /// The sessions (local keys) whose folder it is: its path and its subtrees' print only to a
+    /// caller in one of their tabs (§13.3 rule 4).
     pub keys: Vec<u64>,
     /// The tab it belongs to (1-based), where known.
     pub tab: Option<usize>,
@@ -201,8 +176,7 @@ pub struct Root {
 }
 
 impl Root {
-    /// Where it lies when its path may not be printed: `home`, `tmp` or
-    /// `volume`.
+    /// Where it lies when its path may not be printed: `home`, `tmp` or `volume`.
     #[must_use]
     pub fn under(&self, home: Option<&str>) -> &'static str {
         if home.is_some_and(|h| !h.is_empty() && self.path.starts_with(h)) {
@@ -236,8 +210,8 @@ pub struct VolumeFacts {
     pub free: u64,
     /// Free to this user, bytes.
     pub available: u64,
-    /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), where
-    /// it measured this volume.
+    /// The disk watch's level word (`ok`, `low`, `short`, `emergency`), where it measured this
+    /// volume.
     pub level: Option<String>,
 }
 
@@ -280,8 +254,7 @@ pub struct Ctx<'a> {
     pub target: &'a Target,
     /// Every session the host shows.
     pub tabs: &'a [TabFact],
-    /// The sessions of the caller's own tab; `None` with no caller session
-    /// (a person outside aterm), when every path may print (§13.3 rule 4).
+    /// The sessions of the caller's own tab.
     pub caller_panes: Option<&'a [u64]>,
     /// Machine-wide rows (top processes outside the caller's scope) may print.
     pub owner_class: bool,
@@ -297,8 +270,8 @@ pub struct Ctx<'a> {
     pub events: &'a [Event],
     /// Why a `since=` reply is full.
     pub gap: Option<Gap>,
-    /// The newest snapshot seq the host published (a machine-only reading's
-    /// included, whose events the cursor has passed); 0 for the snapshot's.
+    /// The newest snapshot seq the host published (a machine-only reading's included, whose events
+    /// the cursor has passed); 0 for the snapshot's.
     pub head_seq: u64,
 }
 
@@ -312,8 +285,8 @@ impl Ctx<'_> {
         }
     }
 
-    /// Whether a folder of the sessions `keys` may print its path: one of them
-    /// is in the caller's own tab, or there is no caller (§13.3 rule 4).
+    /// Whether a folder of the sessions `keys` may print its path: one of them is in the caller's
+    /// own tab, or there is no caller (§13.3 rule 4).
     #[must_use]
     pub fn path_ok(&self, keys: &[u64]) -> bool {
         self.caller_panes
@@ -356,9 +329,8 @@ pub fn clock_s(ms: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-/// Pct-encode `text` for a record value: every byte outside
-/// `[A-Za-z0-9._~/+:@,=-]` becomes `%XX`, so a space, `;` or newline cannot
-/// split a field or end a line.
+/// Pct-encode `text` for a record value: every byte outside `[A-Za-z0-9._~/+:@,=-]` becomes `%XX`,
+/// so a space, `;` or newline cannot split a field or end a line.
 #[must_use]
 pub fn pct(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

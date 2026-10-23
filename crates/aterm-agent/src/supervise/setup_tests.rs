@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! [`SessionSetup`]: what the setters write into it, and that a tape's
-//! header gives every field of it back.
+//! [`SessionSetup`].
 
 use super::*;
 use crate::supervise::tape::header::{Entry, Header};
@@ -110,7 +109,6 @@ fn setup_lines(text: &str) -> Vec<&str> {
 /// present and not raised: its value is the host's to raise, never setup.
 #[test]
 fn every_field_of_the_setup_comes_back_from_the_header() {
-    // An absolute root of this host (a `/`-rooted path names no drive on Windows).
     let dir = Path::new(if cfg!(windows) {
         r"C:\odd-root"
     } else {
@@ -190,7 +188,6 @@ fn the_setters_write_the_setup() {
         (Duration::from_millis(10), 99)
     );
 
-    // The setup alone rebuilds the same session's setup.
     let mut ctl2 = NoCtl;
     let rebuilt = Session::from_setup(&mut ctl2, setup.clone());
     assert_eq!(rebuilt.setup(), &setup);
@@ -262,8 +259,6 @@ fn a_stand_in_workers_environment_is_never_written() {
 #[test]
 fn an_older_tape_waits_in_the_step_its_recorded_settle_gave() {
     let mut setup = SessionSetup::new(None);
-    // The session's own worker: a stand-in comes back known by its digest
-    // only ([`a_stand_in_workers_environment_is_never_written`]).
     setup.approval_env.worker = WorkerSource::Session;
     setup.background_settle = Duration::from_secs(2);
     setup.wait_step = Duration::from_secs(2);
@@ -325,7 +320,6 @@ fn the_ladder_seam_scales_the_short_back_off_ladder_and_nothing_else() {
         assert_eq!(read(bad), None, "{bad:?}");
     }
     assert_eq!(TurnEndTiming::ladder_scale(None), None);
-    // the tape's header carries it: a replay waits the scaled ladder
     let mut setup = SessionSetup::new(None);
     setup.approval_env.worker = WorkerSource::Session;
     setup.turn_end_timing = scaled.clone();

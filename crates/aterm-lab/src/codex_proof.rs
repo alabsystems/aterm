@@ -1,24 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The proofs for Codex in the lab.
-//!
-//! `codex-selftest [tag] [--keep]` (about 20 s): a lab of its own (the harness
-//! off: this is the jail's and Codex's proof, not the harness's), a
-//! `codex-run` turn the stub holds 3 s (outside the instance's tree, where the
-//! witness must watch it too), the real Codex launched in the tab on the lab
-//! provider and one turn the stub answers, then the egress witness (both
-//! Codex processes seen talking to the stub, nothing external), the owner's
-//! `~/.codex` (never looked at: only the kernel's refusals, the decoy and what
-//! Codex itself holds open are read), the open recorder, the isolation probes
-//! on a replica home with this lab's rules, `twin` refusing a planted link, an
-//! orphan in the jail found and witnessed, and after `down` nothing left in
-//! the jail. Each witness has a control that shows it can see; one whose
-//! control saw nothing is UNPROVEN, never ok. Exit 1 when a check fails.
-//!
-//! (`codex-captures`, which captured Codex's screens for aterm's Codex
-//! screen reader, went with that reader on 2026-10-16: aterm reads no Codex
-//! screen.)
+//! Self-test and isolation proofs for Codex in the lab.
 
 use std::fs;
 use std::path::Path;
@@ -71,8 +54,7 @@ impl Tally {
         }
     }
 
-    /// Print `verb`'s verdict over every check counted: PASS (how many of
-    /// them unproven) and 0, or FAIL and 1.
+    /// Print `verb`'s verdict over every check counted.
     ///
     /// # Errors
     /// None: a selftest's verdict is its exit status.
@@ -99,8 +81,7 @@ fn ok(b: bool) -> Verdict {
     if b { Verdict::Ok } else { Verdict::Fail }
 }
 
-/// What the scratch HOME's decoy `.codex` holds: each entry's name, kind,
-/// size and modification time, and the decoy file's bytes.
+/// What the scratch HOME's decoy `.codex` holds.
 fn decoy_state(run: &Run) -> String {
     let d = run.w.join("home/.codex");
     let mut rows: Vec<String> = fs::read_dir(&d)
@@ -162,8 +143,7 @@ fn codex_talked(run: &Run, pids: &[i32]) -> bool {
         })
 }
 
-/// A custom mode the stub answers once, holding the turn `delay_ms` (Codex does
-/// not keep its connection alive after an answer, and a 1 Hz witness must see it open).
+/// Configures a custom stub mode that holds the turn for `delay_ms`.
 fn held_turn_mode(run: &Run, name: &str, text: &str) -> Result<(), Fail> {
     let body =
         format!("{{\"times\": 1, \"delay_ms\": 3000, \"stream\": true, \"text\": \"{text}\"}}\n");
@@ -220,7 +200,6 @@ pub fn cmd_codex_selftest(args: &[String]) -> Res {
             ))
         }
     })?;
-    // the lab it brought up does not outlive it, however it ends
     let result = selftest_checks(&run);
     let mut t = match result {
         Ok(t) => t,
@@ -235,8 +214,6 @@ pub fn cmd_codex_selftest(args: &[String]) -> Res {
     } else {
         let k = crate::lab::down(&tag, false)?;
         println!("lab '{tag}' is down; logs kept in {}", k.display());
-        // asked afresh after down, of the kernel, by the jail's mark: not the pids collected before it (a
-        // leftover of codex-run, which had exited, was in none of them)
         let mut asked: Vec<i32> = before.clone();
         asked.extend(&pids);
         let left = jail_left(&run.mark, &asked);
@@ -270,16 +247,8 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
             "codex-selftest: no managed Codex here (aterm pkg install codex, or LAB_CODEX=/path/to/codex)",
         ));
     }
-    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
     let watched = crate::selftest::Watched::of(paths());
     let decoy0 = decoy_state(run);
-    // The decoy's control: a jailed Codex started with NO CODEX_HOME and HOME a second scratch home writes into
-    // that home's .codex at once (it makes tmp/arg0 there at every start, --version too), so a lab Codex that fell
-    // back to $HOME/.codex would change the decoy. The refusals' control: the same jailed Codex with its HOME in the
-    // run directory, which the jail refuses it; the unified log keeps such a report or drops it (on macOS 27 it kept
-    // mach-lookup and process-exec refusals and no file refusal at all), so its silence about ~/.codex counts only
-    // when it kept the control. The recorder's control: a bare-name `open` in the jail, on the lab Codex's PATH,
-    // lands on the recorder and is logged.
     let ctlname = format!(
         "lab-control-refusal-{}-{}",
         std::process::id(),
@@ -308,8 +277,6 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         "== codex {} in lab '{}' (the lab provider: base_url http://127.0.0.1:{}/v1, a fake env_key)",
         run.codex_ver, run.tag, run.port
     );
-    // codex-run's Codex runs OUTSIDE the instance's tree, and the witness must watch it too: one `exec` turn the
-    // stub holds 3 s, before the tab's Codex is up; its pid is the last of jailed.pids
     held_turn_mode(
         run,
         "selftest-run",
@@ -364,7 +331,6 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     })?;
     let run = &Run::load(&run.tag)?;
     let door = Door::new(run)?;
-    // the composer itself (a row that begins with `›`), not the header above it, which draws while Codex starts
     let drew = door.seen("^›", 60)?;
     let mut answered = false;
     if drew {
@@ -383,8 +349,6 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
                 ],
             );
     }
-    // the TAB's rollout of its turn, under the scratch CODEX_HOME: Codex kept to it. codex-run's is there too and is
-    // never taken (exec's are skipped, and only the tab's turn holds the selftest text)
     let mut rollout = false;
     for _ in 0..20 {
         if let Some(f) = crate::codex::tab_rollout(run) {
@@ -396,7 +360,6 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         }
         stop::sleep(Duration::from_millis(500))?;
     }
-    // the witness must have seen the tab Codex's own connection to the stub, under its pid
     let pids = codex_pids(run);
     for _ in 0..20 {
         if codex_talked(run, &pids) {
@@ -441,11 +404,9 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     }
     let opened = crate::recorder::Witness::read(run, &open_control);
     opened.print();
-    // ~/.codex: what the kernel refused naming it, what Codex holds open, and the decoy of the scratch HOME
     let mut klog = String::new();
     let mut control = false;
     for _ in 0..3 {
-        // a report reaches the log within a second or so, when it is kept
         klog = crate::verbs::sandbox_log("3");
         if klog.contains(&ctlname) {
             control = true;
@@ -453,8 +414,6 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         }
         stop::sleep(Duration::from_secs(1))?;
     }
-    // the refusals of THIS lab's processes (the controls and codex-runs among them): another lab, the probes' own
-    // jailed reach for ~/.codex, any other sandboxed process of the owner are not this lab's Codex
     let pat: Vec<String> = crate::procs::lab_pids_ever(run)
         .iter()
         .map(ToString::to_string)

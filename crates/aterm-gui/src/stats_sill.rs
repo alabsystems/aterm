@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SILL, the stats bars' compact form (`[sys] stats_bars = "sill"`,
-//! `docs/DESIGN-system-awareness-2026-10-16.md` §12.2): the three bars as
-//! stacked light lanes in the window's existing bottom pad, a row of core
-//! squares, the GPU tank and a mark well. It takes **no terminal row, ever**:
-//! painting a pad never re-grids, and the pad's height is the
-//! `window_padding` setting, never data.
-//!
-//! Geometry at 2× (a 24 px pad): the lanes are 4 px capsules lit out of 2 px
-//! grooves at sill y 2–6, 8–12 and 14–18, top to bottom Global, aterm, Tab
-//! (the owner's order and the order of nesting); the bottom 6 px are left to
-//! the drop-target border. The Tab lane lights at two tabs and more inside
-//! the same pad, so no tab count moves anything. From the left: the mark
-//! well (56 pt, reserved so values never refold), the core squares by
-//! cluster and the GPU tank, then the CPU, memory and disk columns sharing
-//! what remains 55 : 25 : 20 with 12 pt gaps. The CPU and memory lanes share
-//! one scale per column, so Tab ≤ aterm ≤ Global reads as geometry and
-//! aterm versus others is the gap between two lane ends.
-//!
-//! The width law (§12.2) keys what shows to the sill's width in points:
-//! everything at 900 pt and up; the disk column folds to its ◢ under 900,
-//! memory to its pressure cap under 600, the cores to one tile per cluster
-//! under 400, and under 240 only the well, the cluster tiles and a CPU column
-//! of at least 80 pt remain. The layout reads only the width, the core count
-//! and the tab count, so values never refold anything.
+//! Compact stats sill rendered in the window's bottom padding without re-gridding.
 
 use aterm_vitals::model::{CpuView, MemView, Snapshot};
 use aterm_vitals::trend::TrendView;
@@ -34,12 +11,10 @@ use crate::stats_deck::{DeckGeom, DeckInput};
 use crate::stats_paint::{Bar, Hit, Instrument, Mark, Painter, a, panel};
 use crate::widget::{DrawPrim, rgba};
 
-/// The least bottom pad, in points, that holds the sill (§12.2: "Stats bars
-/// need 8 pt of bottom padding").
+/// Minimum bottom padding in points required to show the sill.
 pub(crate) const SILL_MIN_PT: f64 = 8.0;
 
-/// The sill's height in device px: the window's bottom pad when it holds the
-/// sill, else 0 (hidden).
+/// The sill's height in device px: the window's bottom pad when it holds the sill, else 0 (hidden).
 pub(crate) fn sill_px(pad: usize, scale: f64) -> usize {
     if !scale.is_finite() || scale <= 0.0 {
         return 0;
@@ -81,13 +56,9 @@ fn lane_rows(s: f32) -> [(f32, f32); 3] {
     [(top, h), (top + h + gap, h), (top + 2.0 * (h + gap), h)]
 }
 
-/// Paint the sill: its prims and the hit regions its instruments own (card
-/// pixels; the press, motion and wheel over one never reach the pane).
+/// Paints the sill primitives and instrument hit regions.
 pub(crate) fn sill_paint(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<Hit>) {
     let (mut prims, hits) = sill_instruments(g, input);
-    // On a translucent floor, a plate of the floor at α 0.92 behind each
-    // instrument only, so the floor stays translucent and the instruments
-    // keep the contrast their inks were solved for (§12.2 "Plate").
     if let Some(alpha) = input.plate {
         let s = g.scale.max(0.5);
         let r = (2.0 * s).round();
@@ -124,14 +95,11 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     };
     let fold = Fold::of((right - left) / s);
     let rows = lane_rows(s);
-    // At 2× the lanes carry all five channels; at 1× (2 px lanes) level and
-    // momentum only, so halo and feather go to the lens.
     let lane_bottom = rows[2].0 + rows[2].1;
     let show_tab = input.tab_count >= 2 && lane_bottom <= h;
     let band_y = 0.0f32;
     let band_h = (lane_bottom + s.round()).min(h);
 
-    // The mark well: reserved width, so a mark arriving never moves a lane.
     let well_w = p.px(56.0);
     let mut x = left;
     if !input.marks.is_empty() {
@@ -166,7 +134,6 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     }
     x += well_w + p.px(8.0);
 
-    // The core row and the GPU tank.
     if let Some(cpu) = snap.cpu.as_ref() {
         x = core_row(&mut p, cpu, snap, x, band_h, fold, &mut hits);
         x += p.px(12.0);
@@ -201,7 +168,6 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         return (p.prims, hits);
     }
 
-    // The CPU column: capacity, one scale for the three lanes.
     let pinned = snap
         .cpu
         .as_ref()
@@ -240,13 +206,10 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             *bar,
         ));
     }
-    // The column's end bracket, 1 × 10 px at 2×, fills when the machine is
-    // pinned so a full lane never reads as merely long.
     let bh = (5.0 * s).round().min(band_h);
     p.bracket(x + cpu_w + 1.0, rows[0].0, bh, pinned);
     x += cpu_w + bracket_room + gap;
 
-    // The memory column: physical memory, one scale.
     if let Some(m) = snap.mem.as_ref() {
         if fold.memory && mem_w > 0.0 {
             memory_lanes(&mut p, x, &rows, mem_w, m, snap, tab, show_tab, &mut hits);
@@ -267,7 +230,6 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
         }
     }
 
-    // The disk column: the volume's used part, free as groove.
     if let Some(v) = snap.volume.as_ref() {
         let low = v.total > 0 && (v.available as f64) < v.total as f64 * 0.1;
         if fold.disk && disk_w > 0.0 {
@@ -318,8 +280,7 @@ fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
         .push(panel(x, gy, w, gh, (gh / 2.0).floor(), a(track, 0.7)));
 }
 
-/// The ◢ a filling volume shows at the end of its lane: a right triangle
-/// drawn from strokes, never a glyph.
+/// The ◢ a filling volume shows at the end of its lane.
 fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: aterm_vitals::ink::Rgb) {
     let side = (h + 2.0).round();
     let c = rgba(ink, 0xFF);
@@ -342,9 +303,7 @@ fn pressure_ink(
     }
 }
 
-/// The memory column's lanes: Global by class (used, compressed, cache, free
-/// as groove), a pressure cap and swap as a dashed capsule past the end; the
-/// scopes' footprints on the same physical scale, clipped with a chevron.
+/// The memory column's lanes.
 #[allow(clippy::too_many_arguments)]
 fn memory_lanes(
     p: &mut Painter<'_>,
@@ -402,7 +361,6 @@ fn memory_lanes(
         ));
     }
     if m.sample.swap_used > 0 {
-        // Swap: a dashed capsule past the column's end, at most 12 pt.
         let sw = (m.sample.swap_used as f32 / total * w)
             .round()
             .clamp(p.px(2.0), p.px(12.0));
@@ -450,9 +408,7 @@ fn memory_lanes(
     }
 }
 
-/// The core squares by cluster (or one tile per cluster when folded, or two
-/// rows of small squares for 25–96 cores), then the GPU tank. Returns where
-/// the row ends.
+/// Paints the per-cluster CPU core tiles and the GPU tank.
 fn core_row(
     p: &mut Painter<'_>,
     cpu: &CpuView,
@@ -464,7 +420,6 @@ fn core_row(
 ) -> f32 {
     let s = p.s;
     let n = cpu.total();
-    // 16 px squares at 2×, 7 px at 1×; never taller than the lanes' band.
     let big = if s >= 1.5 { (8.0 * s).round() } else { 7.0 };
     let big = big.min((band_h - s.round().max(1.0)).max(4.0));
     let gutter = (1.5 * s).round().max(1.0);
@@ -484,7 +439,6 @@ fn core_row(
             x += cluster_gap;
         }
         if per_cluster {
-            // One tile at the cluster's mean, a 1 px tick at its busiest.
             let loads: Vec<f32> = cluster
                 .cores
                 .iter()
@@ -675,7 +629,6 @@ mod tests {
             .iter()
             .filter(|p| matches!(p, DrawPrim::Panel { w, h, radius, .. } if *w == 16.0 && *h == 16.0 && *radius >= 2.0))
             .count();
-        // A track and a clipped fill per tile at least.
         assert!(squares >= 10, "{squares}");
     }
 

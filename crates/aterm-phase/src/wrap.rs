@@ -52,7 +52,7 @@ fn wraps_with(
 }
 
 /// The room a line drawn from column `col` of a pane `width` cells wide has in a box as wide as the pane less `col` on each side: a footer's, a banner's, a `⎿` notice's (whose box ends at the pane's edge: the rule reads such a row full a little early).
-pub(crate) fn room(col: usize, width: usize) -> usize {
+pub(crate) const fn room(col: usize, width: usize) -> usize {
     width.saturating_sub(2 * col)
 }
 

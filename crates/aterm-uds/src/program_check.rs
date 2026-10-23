@@ -3,15 +3,6 @@
 
 //! MACOS'S PROGRAM CHECK, READ FROM OUTSIDE: `syspolicyd`'s thread pool, for
 //! [`aterm_vitals::program_check`]'s judge.
-//!
-//! `syspolicyd` runs as root, and libproc answers `EPERM` for another user's
-//! workqueue (`PROC_PIDWORKQUEUEINFO`) and thread list. `/bin/ps` is setuid
-//! root and prints both (`wq`, `wql`), so one bounded `ps` of one pid is the
-//! read: a platform binary, which the program check never holds, and no
-//! `args` column, so it never reads the arguments of a process held mid-start
-//! (a `ps` that did hung in the kernel for hours during 2026-10-20's wedge).
-//! Never a request to `syspolicyd` or `tccd` themselves: in a wedge it would
-//! never return.
 
 use std::time::Duration;
 
@@ -20,8 +11,8 @@ pub use aterm_vitals::program_check::{Daemon, Reading};
 /// `syspolicyd`'s image.
 pub const SYSPOLICYD: &str = "/usr/libexec/syspolicyd";
 
-/// How long one `ps` may take before it is killed: a hang detector, never a
-/// budget (it answers in under 10 ms).
+/// How long one `ps` may take before it is killed: a hang detector, never a budget (it answers in
+/// under 10 ms).
 pub const PS_HANG: Duration = Duration::from_secs(10);
 
 /// Reaping reserve after killing our timed-out `ps`. A child the kernel
@@ -68,15 +59,14 @@ pub enum Look {
     Read(Reading),
     /// No `syspolicyd` runs (launchd starts one at the next request).
     NoneRunning,
-    /// Nothing could be read: off macOS, the process table or a candidate's
-    /// image could not be read, or `ps` failed, printed no pool line, or
-    /// outlived its hang bound.
+    /// Nothing could be read: off macOS, the process table or a candidate's image could not be
+    /// read, or `ps` failed, printed no pool line, or outlived its hang bound.
     Unread,
 }
 
-/// One look at `syspolicyd`'s pool: its workqueue threads and the kernel's
-/// limit flag from `ps -o wq=,wql= -p <pid>`, with the constrained limit the
-/// kernel sets (`kern.wq_max_constrained_threads`).
+/// One look at `syspolicyd`'s pool: its workqueue threads and the kernel's limit flag from `ps -o
+/// wq=,wql= -p <pid>`, with the constrained limit the kernel sets
+/// (`kern.wq_max_constrained_threads`).
 #[must_use]
 pub fn look(hang: Duration) -> Look {
     #[cfg(target_os = "macos")]
@@ -116,9 +106,8 @@ fn read_daemon(daemon: Daemon, hang: Duration) -> Option<Reading> {
     })
 }
 
-/// `ps -o wq=,wql=`'s one line: the workqueue threads, and whether `wql`
-/// names a limit (`C`, constrained, or `T`, total; `-` for none). `None` for
-/// anything else. PURE.
+/// `ps -o wq=,wql=`'s one line: the workqueue threads, and whether `wql` names a limit (`C`,
+/// constrained, or `T`, total; `-` for none).
 #[must_use]
 pub fn parse(out: &str) -> Option<(u64, bool)> {
     let mut lines = out.lines().filter(|l| !l.trim().is_empty());
@@ -146,7 +135,6 @@ mod tests {
 
     #[test]
     fn parse_reads_ps_lines_and_refuses_anything_else() {
-        // Measured on a healthy syspolicyd (pid 489), 2026-10-21.
         assert_eq!(parse("    1   -\n"), Some((1, false)));
         assert_eq!(parse("   95   C\n"), Some((95, true)));
         assert_eq!(parse("  512   T\n"), Some((512, true)));
@@ -167,12 +155,10 @@ mod tests {
     fn the_live_syspolicyd_reads_through_ps() {
         let daemon = match daemon() {
             Ok(daemon) => daemon,
-            // Launchd runs none until the next request; nothing to read.
             Err(Look::NoneRunning) => return,
             Err(missed) => panic!("the process table reads: {missed:?}"),
         };
         assert!(daemon.pid > 1);
-        // A read that must happen: a one-minute hang detector, not `PS_HANG`.
         let Look::Read(reading) = look(Duration::from_secs(60)) else {
             panic!("ps reads syspolicyd's pool");
         };

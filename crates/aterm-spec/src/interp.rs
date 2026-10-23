@@ -1108,13 +1108,13 @@ impl Space {
 
     /// The number of reachable states: what [`bmc`] returns for the same model with no invariants.
     #[must_use]
-    pub fn states(&self) -> usize {
+    pub const fn states(&self) -> usize {
         self.graph.steps.len()
     }
 
     /// The actions that fire somewhere in the space: [`fired_actions`]' answer.
     #[must_use]
-    pub fn fired(&self) -> &BTreeSet<&'static str> {
+    pub const fn fired(&self) -> &BTreeSet<&'static str> {
         &self.graph.fired
     }
 

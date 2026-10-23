@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What the fx layers cost on the CPU (`docs/DESIGN-card-engine-2026-10-19.md`
-//! §5 "Run-list CPU stamping", §4.9 "zero cost at rest"). A measurement, not a
-//! gate: the numbers land in the design's §4.2 as-built note.
-//!
-//! * `sprite_vs_rects`: dithered Index8 arts drawn as sprite items (run-list
-//!   stamping) against the SAME pixels drawn as one flat rect per texel run
-//!   (the quad representation a producer would otherwise emit), both asserted
-//!   byte-equal first, at an integer and a non-integer scale.
-//! * `settled_at_rest`: the cached path's one-row text frame with and without
-//!   settled layers (the same `Arc`s every frame) spanning that row.
-//! * `glow_stream`: a `glow_under` frame of flat additive, translucent,
-//!   opaque and gradient quads, the shared `draw_flat_add` loop the fx rects
-//!   now share (`fill_glow_span`); its body uses only APIs older than the fx
-//!   layers, so the same function measures a pre-fx tree.
-//! * `scroll_under_card`: an inline stream (one line a frame) on the cached
-//!   path with and without a settled card layer, against full repaints of the
-//!   same frames, the price B1a's refusal of the blit paid (§4.4).
-//!
-//! ```sh
-//! targo --unverified bench -p aterm-render --bench fx_raster
-//! ```
+//! What the fx layers cost on the CPU (`docs/DESIGN-card-engine-2026-10-19.md` §5 "Run-list CPU
+//! stamping", §4.9 "zero cost at rest").
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -143,8 +124,6 @@ fn as_rects(sp: &FxSprite) -> Vec<FxItem> {
                 y: sp.y + r0,
                 w: (c1 - c0) as u16,
                 h: (r1 - r0) as u16,
-                // Index `k` paints entry `k − 1`; the rect palette doubles
-                // every entry so each rect is flat.
                 ink: 2 * (run.value - 1),
             }));
         }
@@ -389,11 +368,8 @@ fn glow_stream(rend: &mut Renderer) {
             let (c, c2) = (0x0010_2030 + u32::from(k) * 0x0001_0101, 0x0030_1008);
             let mut q = GlowQuad::flat(r as u16, x, y0 as u16, 30, (y1 - y0) as u16, c, 0);
             match k % 4 {
-                // Flat translucent (premultiplied: every channel under 0x60).
                 1 => q.alpha = 0x60,
-                // Flat opaque: the store arm.
                 2 => (q.color, q.alpha) = (0x0022_3344, 255),
-                // Flat additive, and the additive gradient set below.
                 _ => {}
             }
             (q.color2, q.alpha2) = if k % 4 == 3 {

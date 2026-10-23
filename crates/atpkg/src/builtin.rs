@@ -1,27 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Programs BUILT INTO aterm (amacs design §8.5): commands the one `aterm` binary serves
-//! under an argv0 alias beside itself. They update when aterm updates, and no index,
-//! store build or shim ever holds them.
-//!
-//! # Apart from the stub roster, on purpose
-//!
-//! [`BUILTIN_PROGRAMS`] is not [`crate::stub::DEFAULT_SET_STUB_NAMES`], and
-//! [`crate::stub::describe`] never consults it. The front door sends any name `describe`
-//! knows to `atpkg run`, which would look for `amacs` in the store and find nothing; a
-//! built-in name belongs to the front door's own verb ([`Builtin::verb`]). So nothing here
-//! makes a name a roster program. What this module gives atpkg is the honest answer for
-//! one:
-//!
-//! * `which` names the copy that runs: the alias beside the running aterm, in the state
-//!   [`crate::state::built_in`], or a copy earlier on `PATH` that shadows it;
-//! * `list` shows a "built in" section in its human form only (the porcelain rows are
-//!   store builds, and pipes key on them byte for byte);
-//! * `install`, `update` and `verify` say there is nothing to fetch or check, and exit 0;
-//! * `uninstall` refuses and names the setting that turns the program's role off, and
-//!   `pin`, `unpin`, `rollback` and `update --vendor|--alab` refuse: no store build exists
-//!   to hold, go back to or trade.
+//! Programs BUILT INTO aterm (amacs design §8.5).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -35,8 +15,8 @@ pub struct Builtin {
     pub verb: &'static str,
     /// The authored one-line what-it-is, as `list` shows it.
     pub summary: &'static str,
-    /// What to change instead of uninstalling, said to a person who asked to: a
-    /// built-in program cannot leave the binary, but its role on this machine can end.
+    /// What to change instead of uninstalling, said to a person who asked to: a built-in program
+    /// cannot leave the binary, but its role on this machine can end.
     pub opt_out: &'static str,
 }
 
@@ -74,8 +54,6 @@ pub fn alias_dir() -> Option<PathBuf> {
 }
 
 /// `which`'s answer for `tool` when it is built in, else `None` (the store's arms answer).
-/// Reads the running executable's directory, this build's version and the first `tool`
-/// on `path_var` ([`crate::vendor::first_on_path`]).
 #[must_use]
 pub fn which_line(tool: &str, path_var: Option<&OsStr>) -> Option<String> {
     let program = builtin(tool)?;
@@ -87,16 +65,7 @@ pub fn which_line(tool: &str, path_var: Option<&OsStr>) -> Option<String> {
     ))
 }
 
-/// The pure half of [`which_line`]. `first_on_path` is the copy a shell runs when the name
-/// is typed (`None`: nothing on `PATH` answers to it), and the first arrow names what
-/// runs, as on every `which` line:
-///
-/// * the alias, or nothing on `PATH` ⇒ `<name> → <dir>/<name> — built in: aterm <version>`;
-/// * any other copy ⇒ `<name> → <copy> — built in: aterm <version> — SHADOWED by <copy>`.
-///
-/// When no live executable answers at the alias (an install from before it, or an
-/// unreadable executable path, `dir` = `None`), the line ends `(not laid in this install)`,
-/// naming the alias when another copy leads the line.
+/// The pure half of [`which_line`].
 #[must_use]
 pub fn which_line_at(
     program: &Builtin,
@@ -106,8 +75,6 @@ pub fn which_line_at(
 ) -> String {
     let file = format!("{}{}", program.name, std::env::consts::EXE_SUFFIX);
     let (alias, laid) = match dir {
-        // The same test every laid file's hand-over asks: an executable regular file, a
-        // link to one counting (an alias is a link to `aterm`, or a hard link on Windows).
         Some(dir) => {
             let path = dir.join(&file);
             let laid = crate::stub::is_live_atpkg(&path);
@@ -152,8 +119,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// The "built in" section of `list`'s human form: a heading, then one aligned row per
-/// program. Never part of the porcelain form.
+/// The "built in" section of `list`'s human form: a heading, then one aligned row per program.
 #[must_use]
 pub fn list_human_lines(version: &str) -> Vec<String> {
     let width = BUILTIN_PROGRAMS
@@ -172,24 +138,16 @@ pub fn list_human_lines(version: &str) -> Vec<String> {
     lines
 }
 
-/// What a store verb answers for a built-in program: the line and whether it is a
-/// refusal (stderr, exit 1) or the answer (stdout, exit 0).
+/// What a store verb answers for a built-in program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerbAnswer {
     pub line: String,
     pub refused: bool,
 }
 
-/// The answer `verb` gives when its operands (the argv after the verb), less the verb's
-/// own `flags`, which the arity gate does not count as names either, are exactly one
-/// built-in program's name. Else `None`, and the verb runs as it always did, its own
-/// grammar refusing what it refuses (`install --default-set amacs` stays a usage error).
-///
-/// * `install` and `update` (`--retry` too) have nothing to fetch, and `verify` no store
-///   build to check: the answer;
-/// * `uninstall` cannot remove what is part of the binary, and names [`Builtin::opt_out`];
-/// * `pin`, `unpin`, `rollback` and `update --vendor|--alab` refuse: there is no store
-///   build to hold, go back to or trade for another.
+/// The answer `verb` gives when its operands (the argv after the verb), less the verb's own
+/// `flags`, which the arity gate does not count as names either, are exactly one built-in program's
+/// name.
 #[must_use]
 pub fn verb_answer(
     verb: &str,
@@ -302,7 +260,6 @@ mod tests {
             format!("amacs → amacs — {built_in} {not_laid}")
         );
 
-        // An alias is a link to the executable it names.
         executable(&dir.join("aterm"));
         std::os::unix::fs::symlink("aterm", &alias).unwrap();
         let ours = format!("amacs → {} — {built_in}", alias.display());
@@ -311,7 +268,6 @@ mod tests {
             which_line_at(amacs, Some(&dir), Some(&alias), "1.2.0"),
             ours
         );
-        // A `~/.local/bin` link to the alias runs the same aterm: no shadow.
         let local_bin = crate::testdir::dir("atpkg-builtin-local-bin-");
         std::os::unix::fs::symlink(&alias, local_bin.join("amacs")).unwrap();
         assert_eq!(
@@ -326,7 +282,6 @@ mod tests {
             )
         );
 
-        // The copy that runs is the first on PATH, a relative entry never counting.
         let path = std::env::join_paths([Path::new("relative"), &foreign_dir, &local_bin]).unwrap();
         assert_eq!(
             crate::vendor::first_on_path("amacs", Some(&path)),

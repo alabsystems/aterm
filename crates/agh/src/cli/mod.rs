@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The CLI (design §8, §9): `main_entry`, `run`, the context a verb runs in and what a verb
-//! answers. A verb returns an `Outcome`; only `out` writes to stdout or stderr.
+//! The CLI: `main_entry`, `run`, the context a verb runs in and what a verb answers.
 
 pub mod args;
 mod cmd_api;
@@ -86,7 +85,6 @@ pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
         },
         Ok(Parsed::ReplayTaped(global)) => {
             // The tape is read once, here, and handed to the run: a tape that cannot be read
-            // twice (a pipe, `/dev/stdin`, a FIFO) replays as a file does.
             let tape = match taping::read_taped(&global) {
                 Ok(tape) => tape,
                 Err(e) => return out::fail(ctx, "-", &e),
@@ -96,8 +94,6 @@ pub fn run(args: &[String], ctx: &mut Ctx) -> u8 {
                 Ok(Parsed::Run(verb, mut inv)) => {
                     inv.global.replay.clone_from(&global.replay);
                     inv.global.record.clone_from(&global.record);
-                    // The taped line, parsed alone, carried no tape flag, so rule 6 had
-                    // nothing to judge: judge it now, under the tapes this run uses.
                     if let Err(e) = args::tape_rule(verb, &inv.global) {
                         return out::fail(ctx, &inv.verb_name(), &e);
                     }
@@ -129,15 +125,11 @@ fn run_verb(
 ) -> u8 {
     let name = inv.verb_name();
     let opts = OutputOpts::from_global(&inv.global);
-    // `--output -` streams the bytes as the verb runs, so the output flags that cannot apply
-    // to bytes are refused before anything moves, never after the stream.
     if inv.flag("--output") == Some("-")
         && let Err(e) = out::refuse_projection_flags(&name, &opts)
     {
         return out::fail(ctx, &name, &e.with_next(args::help_next(&inv.path)));
     }
-    // A `--fields` that does not parse or a `--jq` that does not compile is refused before
-    // the verb spends a request, a wait or a file it would then throw away.
     if let Err(e) = out::check_opts(&name, &opts) {
         return out::fail(ctx, &name, &e);
     }
@@ -159,8 +151,6 @@ fn run_verb(
         }
         Err(e) => {
             let replay_failed = matches!(e.sub, Sub::Replay(_));
-            // A usage error from the resource layer, which knows no verb, still names this
-            // verb's help page.
             let e = out::with_verb_help(e, &name);
             (out::fail(ctx, &name, &e), replay_failed)
         }
@@ -172,8 +162,7 @@ fn run_verb(
     }
 }
 
-/// What a verb runs in: the environment, the files, the streams, the effect seam and the
-/// client.
+/// What a verb runs in: the environment, the files, the streams, the effect seam and the client.
 pub struct Ctx {
     /// Environment reads: proxy variables, env profiles, ambient tokens.
     pub env: Arc<dyn EnvSource + Send + Sync>,
@@ -185,15 +174,13 @@ pub struct Ctx {
     pub stderr: Box<dyn std::io::Write>,
     /// Standard input.
     pub stdin: Box<dyn std::io::Read>,
-    /// Whether stdin is a terminal: `auth add --stdin` refuses one, which would echo the
-    /// token as it is typed.
+    /// Whether stdin is a terminal.
     pub stdin_is_terminal: bool,
     /// Whether stdout is a terminal.
     pub stdout_is_terminal: bool,
     /// Whether stderr is a terminal.
     pub stderr_is_terminal: bool,
-    /// THE effect seam (plan §4.6.27): the client's clocks, sleeps and round trips, and every
-    /// stdout write (`out::write_stdout`), cross it. `--record` and `--replay` replace it.
+    /// THE effect seam (plan §4.6.27).
     pub fx: Arc<Fx>,
     /// `None`: `HttpTransport::new(env)`.
     pub transport: Option<Arc<dyn Transport>>,
@@ -252,11 +239,7 @@ impl std::io::Read for StdinDoor {
 }
 
 impl Ctx {
-    /// The real process: `ProcessEnv`, `Dirs::from_env()`, stdout through the door
-    /// (`aterm_uds::stdout::write_all`, which ends `| head` quietly), `std::io::stderr()`,
-    /// stdin unbuffered (on unix a duplicate of fd 0, read on first use), `IsTerminal` for the
-    /// three terminal flags, `Fx::live()`, no transport (the real one),
-    /// `Endpoints::github_com()`, caller `cli`, a new `Redactor`, `RetryPolicy::STANDARD`.
+    /// The real process.
     #[must_use]
     pub fn production() -> Ctx {
         Ctx {
@@ -279,9 +262,7 @@ impl Ctx {
         }
     }
 
-    /// A test context: `Dirs::under(root)`, captured stdout and stderr, an empty stdin, the
-    /// three terminal flags false, `Fx::simulated(1_760_000_000)`, caller `test`,
-    /// `RetryPolicy::NONE`.
+    /// A test context.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn for_tests(
@@ -337,14 +318,8 @@ impl Ctx {
         self
     }
 
-    /// The client, built on first use and kept for the rest of the command line. The router
-    /// is `config::load(dirs)` (no dirs, or no file: `Router::empty()`). The client gets the
-    /// transport (or `HttpTransport::new(env)`), the endpoints, the env, the rate book
-    /// (`RateBook::at(dirs.rate())`, or none), `fx`, the caller, the retry policy, a clone of
-    /// the redactor, and `backstop(timeout)`.
-    ///
+    /// The client, built on first use and kept for the rest of the command line.
     /// # Errors
-    ///
     /// `config::load`'s refusal: the CLI fails closed on an invalid agh.toml.
     pub fn github(&mut self) -> Result<Github> {
         if let Some(gh) = &self.github {
@@ -395,7 +370,7 @@ impl std::io::Write for SharedBuf {
     }
 }
 
-/// What a test reads back. Clones share the buffers.
+/// What a test reads back.
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Default)]
 pub struct Captured {
@@ -475,8 +450,7 @@ pub enum Answer {
     Files(Vec<FileWritten>),
     /// Nothing on stdout.
     Nothing,
-    /// A report on stdout, then the error's two lines: `release wait`'s timeout, `auth status`
-    /// and `policy check` (design §8.1).
+    /// A report on stdout, then the error's two lines.
     FailedWith {
         /// The report.
         value: aterm_json::Value,
@@ -503,9 +477,7 @@ pub enum Completeness {
 }
 
 impl Completeness {
-    /// `End::Complete` → Complete; `Limited { at }` → `Limited { asked: at }`;
-    /// `Capped { pages }`, which a listing ends with only under `--partial` →
-    /// `Partial { why: "the listing stopped at the {pages}-page cap" }`.
+    /// `End::Complete` → Complete.
     #[must_use]
     pub fn of(end: End) -> Completeness {
         match end {
@@ -584,8 +556,7 @@ impl Receipt {
         }
     }
 
-    /// The receipt of a verb about one repository: `new`, `metered` over the client's meter,
-    /// naming `slug`.
+    /// The receipt of a verb about one repository.
     #[must_use]
     pub(crate) fn for_repo(inv: &Invocation, gh: &Github, slug: &crate::slug::Slug) -> Receipt {
         let mut receipt = Receipt::new(&inv.verb_name()).metered(&gh.meter());
@@ -600,9 +571,7 @@ impl Receipt {
         self.must_print = true;
     }
 
-    /// Fill `requests`, `as_` and `rate` from `meter`. A followed 301 adds the note
-    /// `moved={old}->{new}` and sets `must_print`; so does a fall to anonymous while
-    /// `rate.remaining < 10`.
+    /// Fill `requests`, `as_` and `rate` from `meter`.
     #[must_use]
     pub fn metered(mut self, meter: &Meter) -> Receipt {
         self.requests = meter.requests;

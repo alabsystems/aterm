@@ -158,7 +158,7 @@ impl MasterPhrase {
 }
 
 /// The 5-bit value of one phrase character.
-fn b32_val(c: u8) -> u8 {
+const fn b32_val(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
         b'a'..=b'h' => c - b'a' + 10,

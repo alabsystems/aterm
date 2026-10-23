@@ -120,7 +120,7 @@ impl KeptUntilRan {
     }
 
     /// Every child started from a file under the directory has shown it ran: it goes when dropped.
-    pub fn ran(&mut self) {
+    pub const fn ran(&mut self) {
         self.ran = true;
     }
 }

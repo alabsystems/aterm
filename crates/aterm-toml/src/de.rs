@@ -60,7 +60,7 @@ enum Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    fn from_item(item: &'a Item) -> Self {
+    const fn from_item(item: &'a Item) -> Self {
         match item {
             Item::None => Node::Missing,
             Item::Value(v) => Node::Value(v),
@@ -77,7 +77,7 @@ impl<'a> Node<'a> {
         }
     }
 
-    fn type_name(self) -> &'static str {
+    const fn type_name(self) -> &'static str {
         match self {
             Node::Missing => "nothing",
             Node::Value(v) => v.type_name(),
@@ -93,11 +93,11 @@ struct Deserializer<'a> {
 }
 
 impl<'a> Deserializer<'a> {
-    fn new(source: Option<&'a str>, node: Node<'a>) -> Self {
+    const fn new(source: Option<&'a str>, node: Node<'a>) -> Self {
         Self { source, node }
     }
 
-    fn item(source: Option<&'a str>, item: &'a Item) -> Self {
+    const fn item(source: Option<&'a str>, item: &'a Item) -> Self {
         Self {
             source,
             node: Node::from_item(item),
@@ -237,7 +237,7 @@ struct TableAccess<'a, I> {
 }
 
 impl<'a, I> TableAccess<'a, I> {
-    fn new(source: Option<&'a str>, entries: I) -> Self {
+    const fn new(source: Option<&'a str>, entries: I) -> Self {
         Self {
             source,
             entries,
@@ -389,7 +389,7 @@ struct DatetimeAccess<'a> {
 }
 
 impl<'a> DatetimeAccess<'a> {
-    fn new(value: &'a crate::Datetime) -> Self {
+    const fn new(value: &'a crate::Datetime) -> Self {
         Self { value, done: false }
     }
 }

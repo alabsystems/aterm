@@ -104,7 +104,7 @@ impl Interface {
 
     /// The interface's name.
     #[inline]
-    pub fn name(&self) -> &'static CStr {
+    pub const fn name(&self) -> &'static CStr {
         // SAFETY: built from a `&'static CStr` by `new`.
         unsafe { CStr::from_ptr(self.name) }
     }
@@ -169,7 +169,7 @@ impl Message {
 
     /// The message's name.
     #[inline]
-    pub fn name(&self) -> &'static CStr {
+    pub const fn name(&self) -> &'static CStr {
         // SAFETY: built from a `&'static CStr` by `new`.
         unsafe { CStr::from_ptr(self.name) }
     }
@@ -177,14 +177,14 @@ impl Message {
     /// The signature: an optional since-version prefix, then one type code
     /// per argument (`i u f s o n a h`), each optionally after `?`.
     #[inline]
-    pub fn signature(&self) -> &'static CStr {
+    pub const fn signature(&self) -> &'static CStr {
         // SAFETY: as for `name`.
         unsafe { CStr::from_ptr(self.signature) }
     }
 
     /// The interface of signature argument `i`, if it names one.
     #[inline]
-    pub fn arg_interface(&self, i: usize) -> Option<&'static Interface> {
+    pub const fn arg_interface(&self, i: usize) -> Option<&'static Interface> {
         if i >= signature_args(self.signature().to_bytes()) {
             return None;
         }

@@ -1,24 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The X11 oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md),
-//! built outside the aterm workspace (see Cargo.toml): registry
-//! x11rb-protocol 0.13.2 and x11rb 0.13.2 write the bytes and answers, and
-//! aterm-x11 is held to the committed recordings with no x11rb in its graph.
-//!
-//!   requests   each request aterm-x11 encodes, as x11rb-protocol encodes it
-//!   replies    reply packets x11rb-protocol serializes, and its parse of each
-//!              (or ERR), malformed ones included
-//!   events     event packets, and x11rb-protocol's parse of each
-//!   icccm      WM_SIZE_HINTS / WM_HINTS / WM_CLASS as x11rb writes and reads them
-//!   xrm        resource databases and x11rb-protocol's answer to each query
-//!   xrm-include  resource files with `#include` lines, written to a scratch
-//!              tree, and x11rb-protocol's answer to each query of each file
-//!              read as a home file is (its own directory the base)
-//!
-//! A row is `<case>\t<hex>[\t<fields>]`. Fields are `name=value` pairs in a
-//! fixed order, integers in decimal, byte strings in hex, `-` for None; the
-//! test renders aterm-x11's answers the same way.
+//! The X11 oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md), built outside the
+//! aterm workspace (see Cargo.toml): registry x11rb-protocol 0.13.2 and x11rb 0.13.2 write the
+//! bytes and answers, and aterm-x11 is held to the committed recordings with no x11rb in its graph.
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -416,7 +401,6 @@ fn requests() {
         },
     );
     req("free_gc", FreeGCRequest { gc: 0x0060_0003 });
-    // LW.7: the window system's own requests the rows above lacked.
     req(
         "create_colormap",
         CreateColormapRequest {
@@ -481,9 +465,6 @@ fn requests() {
             data: Cow::Borrowed(&[9, 8, 7, 6, 5]),
         },
     );
-    // Longer than a 16-bit length field says: x11rb-protocol writes 0 there,
-    // which the transport rewrites in the BIG-REQUESTS form. Recorded as its
-    // head and length (its body is the data, verbatim).
     let big: Vec<u8> = (0..262_144u32).map(|i| (i % 251) as u8).collect();
     let (bytes, _) = Request::serialize(
         PutImageRequest {
@@ -526,7 +507,6 @@ fn requests() {
         },
     );
     req("get_modifier_mapping", GetModifierMappingRequest);
-    // MIT-SHM, at the major opcode a server might assign.
     req_major("shm_query_version", 130, shm::QueryVersionRequest);
     let fd = || File::open("/dev/null").expect("/dev/null").into();
     req_major(
@@ -575,7 +555,6 @@ fn requests() {
             offset: 4096,
         },
     );
-    // RandR at major opcode 140, XInput at 131.
     use x11rb_protocol::protocol::{randr, xinput};
     req_major(
         "randr_query_version",
@@ -803,7 +782,6 @@ fn replies() {
     property("get_property_absent", 0, 0, 0, &[]);
     property("get_property_card16", 16, 6, 12, &[1, 0, 2, 0]);
     property("get_property_incr", 32, 0x1a7, 0, &65_536u32.to_ne_bytes());
-    // Malformed: value_len promises more than the packet holds.
     let mut lie = wire(
         GetPropertyReply {
             format: 8,
@@ -1760,8 +1738,6 @@ fn icccm() {
             render_size_hints(&WmSizeHints::try_parse(&bytes).unwrap().0)
         );
     }
-    // What a reader makes of bytes it did not write: the pre-ICCCM-1 short
-    // form (60 bytes), and a truncated property.
     let legacy = &full.serialize()[..60];
     reply::<WmSizeHints>("size_hints_legacy", legacy, render_size_hints);
     reply::<WmSizeHints>(
@@ -1907,8 +1883,6 @@ fn include_tree() -> Vec<(String, String)> {
     .iter()
     .map(|(p, t)| ((*p).to_owned(), (*t).to_owned()))
     .collect();
-    // A chain past Xlib's nesting limit: d<k> sets a.depth to k and includes
-    // d<k+1>, so the answer names the deepest file followed.
     for k in 1..=102 {
         files.push((
             format!("d{k:03}"),

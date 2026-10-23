@@ -13,7 +13,8 @@
 //! ([`FactsState::observe_closed`]), so a restart never tells it twice.
 //!
 //! Currently holds one kind, [`FactKind::Hold`], whose rows the hold clock writes
-//! (`occupancy::hold`); nothing is typed for it yet, and nothing in the loop reads this state.
+//! (`occupancy::hold`), and the occupancy door's outcome rows under `prompt` (`occupancy::door`):
+//! the loop's door reads this state before it types.
 //!
 //! [`FactKind`] shares its name with `crate::harness::footer::FactKind` (the footer's fact
 //! lines): name this one by its path, never glob-import both.

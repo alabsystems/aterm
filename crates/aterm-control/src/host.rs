@@ -185,11 +185,16 @@ pub trait SessionHost {
     /// Resolves `@<selector>` against the roster.
     fn resolve(&self, selector: Selector<'_>) -> Option<u64>;
 
-    /// Runs `f` against session `sid`'s terminal if served by this host.
+    /// Runs `f` against session `sid`'s terminal if served by this host; a host may first wait, bounded, for an unfinished DEC 2026 frame.
     fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R>;
 
     /// Runs `f` with mutable access to session `sid`'s terminal if served by this host.
     fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R>;
+
+    /// [`SessionHost::with_terminal`] as the terminal stands, never waiting for a frame (`blocks`, `wait`).
+    fn with_terminal_as_it_stands<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
+        self.with_terminal(sid, f)
+    }
 
     /// Requests a repaint for `sid` if served by this host.
     fn request_redraw(&self, sid: u64);

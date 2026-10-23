@@ -4,22 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/seat/pointer/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! The pointer events.
-//!
-//! Modified by the aterm project in 2026; see the repository NOTICE.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): a pointer's
-//! frames come from first-party `aterm_wayland::seat` (grouped as smithay-client-toolkit
-//! grouped them, `aterm_wayland::pointer_frame`), and its cursor is the backend's own
-//! [`WinitPointer`]: a cursor-shape-v1 device where the compositor offers one, else the user's
-//! cursor theme through libwayland-cursor on a cursor surface, as sctk's `ThemedPointer` did.
-//! The `wl_pointer` itself is `Seats`'; every request on it is made through
-//! `Seats::with_seat`, so none races its release.
-//!
-//! LOCAL PATCH (aterm), 2026-10-20 (docs/AUDIT-third-party-2026-10-15.md, L-HEADER-LW7): a
-//! pointer on one of a window's shadow-margin parts (`window::frame`) shows the resize cursor of
-//! the edge or corner it is near and a left press there resizes the window, as sctk-adwaita's
-//! frame did; the application hears none of it (the part is no surface of the window's).
+//! Wayland pointer event handling and cursor management.
 
 use std::ffi::{CStr, CString};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -68,8 +53,6 @@ impl WinitState {
         for event in events {
             let window_id = wayland::make_wid(event.surface);
 
-            // Ensure that window exists (the pointer may be on a surface that is no window of
-            // ours: its own cursor surface, or one already gone).
             let mut window = match self.windows.get_mut().get_mut(&window_id) {
                 Some(window) => window.lock().unwrap(),
                 None => {
@@ -82,10 +65,6 @@ impl WinitState {
             let position: PhysicalPosition<f64> =
                 LogicalPosition::new(event.position.0, event.position.1).to_physical(scale_factor);
 
-            // LOCAL PATCH (aterm), LW.5: upstream routed events on its client-side frame's
-            // subsurfaces to the frame here (cursor, move, resize, buttons, menu). The window
-            // has no frame, so every event is the window's own; the application's header hit-
-            // tests them and calls `drag_window`, `drag_resize_window` or `show_window_menu`.
             match event.kind {
                 PointerKind::Enter { .. } => {
                     self.events_sink
@@ -93,7 +72,6 @@ impl WinitState {
 
                     window.pointer_entered(Arc::downgrade(&themed_pointer));
 
-                    // Set the currently focused surface.
                     themed_pointer.set_focused_window(Some(window_id));
 
                     self.events_sink.push_window_event(
@@ -104,7 +82,6 @@ impl WinitState {
                 PointerKind::Leave { .. } => {
                     window.pointer_left(&Arc::downgrade(&themed_pointer));
 
-                    // Remove the active surface.
                     themed_pointer.set_focused_window(None);
 
                     self.events_sink
@@ -132,34 +109,24 @@ impl WinitState {
                 PointerKind::Axis { horizontal, vertical, .. } => {
                     let has_discrete_scroll = horizontal.discrete != 0 || vertical.discrete != 0;
 
-                    // Figure out what to do about start/ended phases here.
-                    //
-                    // Figure out how to deal with `Started`. Also the `Ended` is not guaranteed
-                    // to be sent for mouse wheels.
                     let phase = if horizontal.stop || vertical.stop {
                         TouchPhase::Ended
                     } else {
                         match themed_pointer.phase() {
-                            // Discrete scroll only results in moved events.
                             _ if has_discrete_scroll => TouchPhase::Moved,
                             TouchPhase::Started | TouchPhase::Moved => TouchPhase::Moved,
                             _ => TouchPhase::Started,
                         }
                     };
 
-                    // Update the phase.
                     themed_pointer.set_phase(phase);
 
-                    // Mice events have both pixel and discrete delta's at the same time. So prefer
-                    // the discrete values if they are present.
                     let delta = if has_discrete_scroll {
-                        // NOTE: Wayland sign convention is the inverse of winit.
                         MouseScrollDelta::LineDelta(
                             (-horizontal.discrete) as f32,
                             (-vertical.discrete) as f32,
                         )
                     } else {
-                        // NOTE: Wayland sign convention is the inverse of winit.
                         MouseScrollDelta::PixelDelta(
                             LogicalPosition::new(-horizontal.absolute, -vertical.absolute)
                                 .to_physical(scale_factor),
@@ -240,39 +207,29 @@ fn resize_icon(direction: ResizeDirection) -> CursorIcon {
 struct PointerFocus {
     /// Currently focused window.
     surface: Option<WindowId>,
-
     /// Current axis phase.
     phase: TouchPhase,
-
     /// The edge or corner a shadow-margin part under the pointer resizes by, as its cursor
     /// shows it (`None`: on no part, or one that resizes nothing).
     frame_edge: Option<ResizeDirection>,
 }
 
-/// A seat's pointer as winit keeps it: the window it is on, its scroll phase, and its cursor (a
-/// cursor-shape device, else a cursor surface showing the theme's images).
+/// A seat's pointer state, scroll phase, and cursor device or surface.
 pub struct WinitPointer {
     /// The seat (its registry name).
     seat: u32,
-
     /// The cursor surface's integer scale (sctk's `SurfaceData::scale_factor`).
     cursor_scale: AtomicI32,
-
     focus: Mutex<PointerFocus>,
-
     /// The loaded cursor themes, one per scale, and their buffers.
     themes: Mutex<Vec<(i32, Theme)>>,
-
     /// `wp_cursor_shape_device_v1`, where the compositor offers cursor-shape-v1.
     shape_device: Option<Owned>,
-
     /// The surface the theme's images are shown on.
     surface: Owned,
-
     /// Keep the theme's global alive through a window thread's last in-flight
     /// request, including one that outlasts the event loop. Drop it after themes.
     shm: Arc<Owned>,
-
     /// The connection the objects are on, which outlives them.
     _connection: Arc<Connection>,
 }
@@ -359,9 +316,7 @@ impl WinitPointer {
         self.cursor_scale.store(scale.max(1), Ordering::Relaxed);
     }
 
-    /// Show `icon` (sctk's `ThemedPointer::set_cursor`): the shape where the compositor
-    /// draws shapes, else the theme's first image under the icon's names. False when the
-    /// pointer has entered no surface yet, or the theme has no such cursor.
+    /// Sets the pointer cursor to `icon` via cursor-shape-v1 or the legacy cursor theme.
     pub(crate) fn set_cursor(&self, seats: &Seats, icon: CursorIcon) -> bool {
         if let Some(device) = self.shape_device.as_ref() {
             return seats
@@ -411,7 +366,6 @@ impl WinitPointer {
             if surface.version() >= 4 {
                 wl_surface::damage_buffer(surface, 0, 0, image.width as i32, image.height as i32);
             } else {
-                // Fallback for the old old surface.
                 wl_surface::damage(
                     surface,
                     0,
@@ -420,10 +374,8 @@ impl WinitPointer {
                     image.height as i32 / scale,
                 );
             }
-            // Commit the surface to place the cursor image in the compositor's memory.
             wl_surface::commit(surface);
         }
-        // Set the pointer surface to change the pointer.
         let (hx, hy) = (image.hotspot_x as i32 / scale, image.hotspot_y as i32 / scale);
         seats
             .with_seat(self.seat, |seat| {
@@ -459,7 +411,6 @@ fn load_theme(scale: i32, shm: Proxy) -> Option<Theme> {
 
 /// Convert the Wayland button into winit.
 fn wayland_button_to_winit(button: u32) -> MouseButton {
-    // These values are coming from <linux/input-event-codes.h>.
     const BTN_LEFT: u32 = 0x110;
     const BTN_RIGHT: u32 = 0x111;
     const BTN_MIDDLE: u32 = 0x112;

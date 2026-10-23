@@ -787,6 +787,7 @@ pub(crate) enum MetaWriteError {
     TooLong { cap: usize },
     NotAQuestionsPolicy,
     NotAnAutopilot,
+    HungUp,
 }
 
 /// Pure validation.
@@ -825,18 +826,40 @@ pub(crate) fn validated_meta_value(
 }
 
 /// Apply one validated metadata mutation and, on an actual change, record the `meta-change` timeline event (`field=<f> value=<pct|->`).
+#[cfg(test)]
 pub(crate) fn apply_meta_value(
     ctx: &crate::SessionCtx,
     field: MetaField,
     value: Option<String>,
     by: aterm_slog::Actor,
 ) -> bool {
+    try_apply_meta_value(ctx, field, value, by).unwrap_or(false)
+}
+
+fn try_apply_meta_value(
+    ctx: &crate::SessionCtx,
+    field: MetaField,
+    value: Option<String>,
+    by: aterm_slog::Actor,
+) -> Result<bool, MetaWriteError> {
     if field == MetaField::Autopilot {
         // A wire write (or an in-process one through it): no window surface.
-        return apply_autopilot(ctx, value, None, by, None).moved;
+        return Ok(apply_autopilot(ctx, value, None, by, None).moved);
     }
     let payload = meta_change_payload(field, value.as_deref());
+    #[cfg(all(test, unix))]
+    if matches!(field, MetaField::Attention | MetaField::Description) {
+        attention_delivery_tests::before_effect();
+    }
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    // A deadline may have closed this lane's caller while it waited for meta.
+    // Check under the effect lock: a replacement lane can already have settled
+    // newer display annotations, which this abandoned request must not undo.
+    if matches!(field, MetaField::Attention | MetaField::Description)
+        && crate::control::caller_hung_up()
+    {
+        return Err(MetaWriteError::HungUp);
+    }
     meta.driver_writes |= field.bit();
     let (changed, moved) = if field == MetaField::Attention {
         let moved = meta.set_bare_attention(value);
@@ -853,7 +876,7 @@ pub(crate) fn apply_meta_value(
     if changed && field == MetaField::Autopilot {
         crate::harness_host::ring();
     }
-    moved
+    Ok(moved)
 }
 
 /// What one write of the Autopilot pair did ([`apply_autopilot`]).
@@ -1073,7 +1096,12 @@ pub(crate) fn write_attention_kind(
     by: aterm_slog::Actor,
 ) -> Result<bool, AttentionWriteError> {
     let value = validated_attention_value(owner, edit).map_err(AttentionWriteError::Meta)?;
+    #[cfg(all(test, unix))]
+    attention_delivery_tests::before_effect();
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::control::caller_hung_up() {
+        return Err(AttentionWriteError::Meta(MetaWriteError::HungUp));
+    }
     let moved = meta
         .set_attention_kind(owner, value, kind)
         .map_err(|AttentionOwnersFull| AttentionWriteError::OwnersFull)?;
@@ -1710,7 +1738,7 @@ pub(crate) fn write_session_meta(
     by: aterm_slog::Actor,
 ) -> Result<bool, MetaWriteError> {
     let value = validated_meta_value(field, edit)?;
-    Ok(apply_meta_value(ctx, field, value, by))
+    try_apply_meta_value(ctx, field, value, by)
 }
 
 /// What an adopted session's recorders say about the time before the seamless update that adopted it.
@@ -1778,6 +1806,7 @@ pub(crate) struct SessionTimeline {
     path: Option<PathReading>,
     leader_copy: Option<(i32, &'static str)>,
     leader_no_harness: Option<i32>,
+    leader_no_harness_applied: Option<i32>,
     upgrade: Option<aterm_agent::harness::upgrade_drive::Row>,
     upgrade_note: Option<aterm_agent::harness::footer::UpgradeNote>,
     resizes: crate::resize_ledger::ResizeLedger,
@@ -2848,6 +2877,7 @@ impl SessionTimeline {
         let had_reader = self.agent.reader.take().is_some();
         self.leader_copy = None;
         self.leader_no_harness = None;
+        self.leader_no_harness_applied = None;
         if self.agent.program.take().is_some() || had_reader {
             // its worker must still see the foreground group leave.
             crate::harness_host::ring();
@@ -3470,17 +3500,38 @@ impl SessionTimeline {
 
     /// Record whether `pgid`'s leader was started with `--no-harness` / `--no-alab-harness`
     /// (`ATERM_NO_HARNESS=1`).
-    pub(crate) fn set_leader_no_harness(&mut self, pgid: i32, no_harness: bool) {
+    pub(crate) fn set_leader_no_harness(&mut self, pgid: i32, no_harness: bool) -> bool {
         if self.agent.program_pgid != pgid {
-            return;
+            return false;
         }
-        self.leader_no_harness = no_harness.then_some(pgid);
+        let next = no_harness.then_some(pgid);
+        let changed = self.leader_no_harness != next;
+        self.leader_no_harness = next;
+        changed
     }
 
     /// Whether the current foreground leader was started with `--no-harness` / `--no-alab-harness`.
     pub(crate) fn leader_no_harness(&self) -> bool {
         self.leader_no_harness
             .is_some_and(|pgid| pgid > 0 && pgid == self.agent.program_pgid)
+    }
+
+    /// Whether the current foreground leader requested `--no-harness` and the window has not yet
+    /// applied `Autopilot::Off` to the session metadata for this process group.
+    pub(crate) fn unapplied_leader_no_harness(&self) -> bool {
+        self.leader_no_harness() && self.leader_no_harness_applied != self.leader_no_harness
+    }
+
+    /// Claim the current foreground leader's `--no-harness` request once per process group so
+    /// launching a CLI with `--no-harness` disables the harness even in a tab whose Autopilot
+    /// word was set earlier, while still letting the user manually turn the harness back on
+    /// during that CLI run.
+    pub(crate) fn take_leader_no_harness(&mut self) -> bool {
+        if !self.unapplied_leader_no_harness() {
+            return false;
+        }
+        self.leader_no_harness_applied = self.leader_no_harness;
+        true
     }
 
     /// `` of the last PATH measurement, or `None`.
@@ -4617,6 +4668,10 @@ mod meta_atomicity_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "attention_delivery_tests.rs"]
+mod attention_delivery_tests;
 
 #[cfg(test)]
 mod keyed_attention_tests {

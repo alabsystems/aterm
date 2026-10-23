@@ -91,7 +91,6 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
     let now = Instant::now();
     let opening_rows = screen(LOGIN_OPENING);
     assert!(dialog_stands(&opening_rows));
-    // The dialog's own busy read does not mean the worker started a turn.
     let opening = TurnEndReading {
         phase: crate::supervise::phase::Phase::Busy,
         ..TurnEndReading::of(
@@ -136,9 +135,6 @@ fn the_approval_policy_answers_only_the_picker_of_its_own_login() {
         let d = decide(&read, &rows, &c);
         assert!(matches!(d, Decision::Escalate { .. }), "{approve:?}: {d:?}");
 
-        // A predecessor's `/login` survives its browser spinner, but no
-        // genuine worker turn. A later personal picker must not inherit
-        // the old login's method authority, even after the person's grace.
         for work_started in [false, true] {
             let mut st = TurnEndState::default();
             st.seed_login(std::time::Duration::ZERO, now);
@@ -201,7 +197,6 @@ fn the_picker_of_a_login_back_elsewhere_is_answered_by_nobody() {
             matches!(&d, Decision::Escalate { reason, .. } if reason.contains("Esc")),
             "{approve:?}: {d:?}"
         );
-        // NEGATIVE CONTROL: carried, the same picker is aterm's.
         let ours = ApprovalCtx {
             login_carry: true,
             login_back: false,
@@ -258,7 +253,6 @@ fn the_picker_over_a_renewed_login_is_answered_by_nobody() {
             matches!(&d, Decision::Escalate { reason, .. } if reason.contains("Esc")),
             "{approve:?}: {d:?}"
         );
-        // NEGATIVE CONTROL: carried, the same picker is aterm's.
         let ours = ApprovalCtx {
             login_carry: true,
             login_renewed: false,
@@ -325,8 +319,6 @@ fn each_dialog_state_gets_its_act() {
         ),
         "{enter:?}"
     );
-    // A person's `/login` over a weekly usage limit or model bucket also gets
-    // its success Enter once.
     let mut limit_st = TurnEndState::default();
     let expired = screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
     let mut weekly = TurnEndReading::of(

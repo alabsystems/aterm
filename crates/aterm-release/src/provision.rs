@@ -240,7 +240,8 @@ pub fn run_provision(
     record("notary", notary_acquire(!check_only), &mut checks);
 
     phase(5, "credentials", "the tokens and profile a cut is handed");
-    record("github", gh_check(), &mut checks);
+    // The channel token is the cut's only GitHub identity: every release read and write
+    // is REST through curl with it (`crate::github`), so no CLI login is audited.
     record(
         "channel",
         channel_token_check(&slug, !check_only),
@@ -1516,7 +1517,6 @@ pub fn audit(repo: &Path, id: &str) -> Vec<Finding> {
     let (apple, apple_sha1) = apple_identity_check(id, false, None);
     found.push((crate::apple::APPLE_LABEL, apple));
     found.push(("notary", notary_check()));
-    found.push(("github", gh_check()));
     let slug = std::fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
         .and_then(|manifest| channel::update_channel_slug(&manifest))
@@ -1652,12 +1652,6 @@ pub fn ask_words(label: &str, what: &str) -> AskWords {
             "Signing certificate blocks the release".to_string(),
             "this Mac holds no Developer ID certificate that signs".to_string(),
             "Finish the certificate errand ship provision starts on this Mac".to_string(),
-        ),
-        "github" => (
-            "github",
-            "GitHub login blocks the release".to_string(),
-            "gh is not signed in on this Mac".to_string(),
-            "Sign in with gh auth login".to_string(),
         ),
         "channel" => (
             "channel",
@@ -1918,87 +1912,15 @@ fn profile_check(
     }
 }
 
-#[cfg(unix)]
-fn gh_check() -> Check {
-    let ran = Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-        .map(|out| {
-            (
-                out.status.success(),
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            )
-        })
-        .map_err(|e| e.to_string());
-    gh_verdict(ran)
-}
-
-/// What `gh auth status` answered, by its cause (pure, so each answer is a test): a
-/// missing or refused login is the owner's ([`Check::Owner`]); a `GITHUB_TOKEN`/`GH_TOKEN`
-/// in this shell (gh prefers it over its keyring) and a missing `gh` are this machine's;
-/// a network that did not answer is [`Check::CouldNotRun`].
-#[cfg(unix)]
-fn gh_verdict(ran: std::result::Result<(bool, String), String>) -> Check {
-    let (ok, text) = match ran {
-        Ok(answer) => answer,
-        Err(e) => {
-            return Check::Fail {
-                what: format!("could not run gh: {e}"),
-                fix: "the GitHub CLI is the owner's to put on a release host (aterm installs \
-                      none), then `gh auth login`"
-                    .into(),
-            };
-        }
-    };
-    if ok {
-        return Check::Pass("gh is authenticated".into());
-    }
-    let lower = text.to_ascii_lowercase();
-    let first = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("(no answer)");
-    let transport = [
-        "timeout",
-        "timed out",
-        "could not connect",
-        "connection refused",
-        "no such host",
-        "dial tcp",
-        "network is unreachable",
-        "error connecting",
-    ];
-    if transport.iter().any(|t| lower.contains(t)) {
-        return Check::CouldNotRun(format!("GitHub did not answer gh auth status: {first}"));
-    }
-    if lower.contains("(github_token)") || lower.contains("(gh_token)") {
-        return Check::Fail {
-            what: "gh cannot authenticate with the GITHUB_TOKEN/GH_TOKEN this shell exports — gh \
-                   prefers it over the keyring"
-                .into(),
-            fix: "unset GITHUB_TOKEN GH_TOKEN (or export a valid one), then gh auth status".into(),
-        };
-    }
-    Check::Owner {
-        what: format!("gh is not signed in: {first}"),
-        fix: "gh auth login".into(),
-    }
-}
-
-/// The channel repo is a different org than the dev remote, so `gh`'s default account
-/// cannot publish there; the cut threads a dedicated token from a file.
+/// The channel token is the cut's GitHub identity (every release read and write is REST
+/// through curl with it on stdin, `crate::github`): its presence and mode, checked here.
 #[cfg(unix)]
 fn channel_token_check(slug: &str, may_change: bool) -> Check {
     use std::os::unix::fs::PermissionsExt as _;
     let where_it_lives = publish::channel_token_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.secrets/gh_access_token_alabsystems".into());
-    let present = publish::channel_token().is_some();
+    let present = crate::github::has_token();
     let path = publish::channel_token_path();
     let open = path
         .as_ref()
@@ -2206,31 +2128,6 @@ mod tests {
             channel_token_verdict(at, "alabsystems/aterm", true, false, true),
             Check::Pass(_)
         ));
-        let not_signed_in = "github.com\n  X Failed to log in to github.com account someone \
-                             (keyring)\n  - The token in keyring is invalid.\n";
-        assert!(matches!(
-            gh_verdict(Ok((false, not_signed_in.into()))),
-            Check::Owner { .. }
-        ));
-        assert!(matches!(
-            gh_verdict(Ok((
-                false,
-                "error connecting to api.github.com\ncheck your internet connection".into()
-            ))),
-            Check::CouldNotRun(_)
-        ));
-        assert!(matches!(
-            gh_verdict(Ok((
-                false,
-                "github.com\n  X Failed to log in to github.com using token (GITHUB_TOKEN)\n"
-                    .into()
-            ))),
-            Check::Fail { .. }
-        ));
-        assert!(matches!(
-            gh_verdict(Err("No such file or directory".into())),
-            Check::Fail { .. }
-        ));
     }
 
     /// Every ask the release can raise is one the wire stands: title, reason and step within
@@ -2247,7 +2144,6 @@ mod tests {
                 "notarytool profile 'aterm-notary' did not authenticate",
             ),
             (APPLE_LABEL, "no Developer ID Application identity"),
-            ("github", "gh is not authenticated"),
             ("channel", "no channel token"),
             ("profile", "no credentials profile"),
             ("roster", "the roster does not authorize this key"),

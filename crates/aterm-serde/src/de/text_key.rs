@@ -11,32 +11,12 @@ use crate::de::{Deserializer, Visitor};
 use crate::private::Content;
 
 /// A deserializer that may hold a map key written as text.
-///
-/// [`TextKeyDeserializer`] asks it for that text before it hands a key type
-/// an integer or a `bool`.
 pub trait KeyText {
     /// The key's text, or `None` when this key is not text.
     fn key_text(&self) -> Option<&str>;
 }
 
 /// Reads a map key back from the text a string-keyed format wrote it as.
-///
-/// A JSON object key and a TOML table key are strings, so the writer spells a
-/// `u32`, `i128` or `bool` key as text: `Display`'s spelling of the integer,
-/// `true` or `false`. Wrapped around the format's key deserializer, this gives
-/// a key type that asks for an integer or a `bool` exactly that spelling back:
-/// an optional `-`, then `0` alone or digits with no leading zero (never
-/// `-0`), up to 64 bits as `u64`/`i64` and wider as `u128`/`i128`, so the
-/// visitor's own range check names the type it wanted. Any other spelling
-/// (`007`, `+7`, `-0`, `True`) goes to the wrapped deserializer, which hands
-/// the visitor the string, and the visitor refuses it. An `Option` or newtype
-/// request sees the key itself, so `Option<u32>` and `struct Id(u32)` keys
-/// read back too. Every other request, and every key that is not text, goes
-/// to the wrapped deserializer unchanged.
-///
-/// The formats wrap their own key deserializers in it, and so does serde's
-/// buffered map (a `#[serde(flatten)]` map, an untagged or internally tagged
-/// enum), so a key reads back the same whichever path reaches it.
 pub struct TextKeyDeserializer<D> {
     inner: D,
 }

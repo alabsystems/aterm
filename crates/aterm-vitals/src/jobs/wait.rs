@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Naming the wait (§11.5 Tier A, §11.8 Tier B).
-//!
-//! Tier A runs every tick from kernel facts alone, no stacks: the terminal
-//! mode word for the three tty names, the pipe wait flags (lane L7) and the
-//! peer handle that names the other end, TCP state and queued bytes, kqueue
-//! sleep and its entries (lane L6), uninterruptible threads, and on Linux the
-//! kernel function a process waits in (`wchan`). It is looked up for the
-//! job's waiting leaves in the table's order; the first name that matches
-//! wins. A `pipe` or `pipe-full` counts as its peer does: the wait recurses
-//! into the writer (or the reader).
-//!
-//! One departure from the table's literal order: `tcp` names the wait only
-//! when the connection is what the process waits on. A process asleep on an
-//! event queue waits on what the queue holds (`follow`, `listen`, a queue
-//! whose every entry is an idle connection is `tcp`, `timer`, else
-//! `event-loop`), and one that holds a listening socket serves it, so an
-//! idle dev server or connection pool with a keep-alive connection open is
-//! never a silent TCP peer.
-//!
-//! Tier B is a sampled stack, taken only on request; this module maps its
-//! leaf frame to a word ([`map_leaf_frame`]), from libSystem wrapper names
-//! only, never program names.
+//! Tier A kernel-fact wait classification and Tier B sampled leaf-frame mapping.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -84,10 +63,7 @@ impl TierB {
     }
 }
 
-/// The Tier B word for one leaf frame of the waiting thread, as `sample`
-/// prints it (`__semwait_signal  (in libsystem_kernel.dylib) + 8`). Only the
-/// symbol's first word is read; `$NOCANCEL`-style suffixes, a `_nocancel`
-/// tail and leading underscores are ignored.
+/// Maps one leaf frame of a waiting thread to its [`TierB`] classification.
 #[must_use]
 pub fn map_leaf_frame(frame: &str) -> TierB {
     let sym = frame.split_whitespace().next().unwrap_or("");
@@ -129,7 +105,7 @@ pub const fn rank(name: WaitName) -> u8 {
     }
 }
 
-/// How a Tier A name counts (§11.6), before a pipe's peer is followed.
+/// Returns how a Tier A wait name counts before following a pipe's peer.
 #[must_use]
 pub const fn standing_of(name: WaitName) -> Standing {
     match name {
@@ -147,9 +123,7 @@ pub const fn standing_of(name: WaitName) -> Standing {
     }
 }
 
-/// What the naming sees beyond one process: every detailed reading, the
-/// lanes, how long each process has been in an uninterruptible wait, and how
-/// a process in another job counts.
+/// Process table, lane capabilities, and wait ages used for Tier A classification.
 pub struct Scene<'a> {
     /// The detailed readings, by pid.
     pub procs: &'a HashMap<u32, &'a JobProc>,
@@ -176,9 +150,7 @@ pub struct JobFacts {
     pub consumer: Option<u32>,
 }
 
-/// Name the wait of a job whose waiting leaves are `leaves` (live, not
-/// zombies; the first is the job's own leaf when it has one), with `shell`
-/// naming the shell for the builtin case.
+/// Classifies the wait of a job from its waiting `leaves` and `shell`.
 #[must_use]
 pub fn name_job(
     scene: &Scene<'_>,
@@ -228,7 +200,6 @@ fn leaf_wait(
     let fds: &[Fd] = p.fds.as_deref().unwrap_or(&[]);
     let mk = |n: WaitName| Wait::bare(n, standing_of(n), pid, name);
 
-    // serves / pipe: this process sleeps reading a pipe.
     let linux_reading =
         wchan.starts_with("pipe_read") || wchan == "pipe_wait" || wchan == "wait_for_partner";
     for f in fds {
@@ -261,11 +232,9 @@ fn leaf_wait(
         return Some(w);
     }
     if wchan == "wait_for_partner" {
-        // A FIFO opened for reading with no writer yet.
         return Some(mk(WaitName::Pipe));
     }
 
-    // pipe-full: this process sleeps writing a full pipe.
     let linux_writing = wchan.starts_with("pipe_write") || wchan == "pipe_wait_writable";
     for f in fds {
         let FdKind::Pipe {
@@ -291,11 +260,6 @@ fn leaf_wait(
         return Some(w);
     }
 
-    // follow / listen / tcp / timer / event-loop: a sleeping event queue
-    // says what the process waits on (lane L6 lists its entries). A server
-    // asleep on its listener with an idle keep-alive connection open waits
-    // on the listener: a connection is the wait only when it is all the
-    // queue waits for.
     for f in fds {
         let FdKind::EventQueue {
             sleeping: Some(true),
@@ -335,9 +299,6 @@ fn leaf_wait(
         return Some(mk(WaitName::EventLoop));
     }
 
-    // No event queue. A process that holds a listening socket serves it
-    // (blocked in `accept`, or polling the listener with its connections):
-    // an idle connection it also holds is not its wait.
     if let Some(port) = fds.iter().find_map(|f| match &f.kind {
         FdKind::Tcp {
             state: TcpState::Listen,
@@ -350,8 +311,6 @@ fn leaf_wait(
         w.port = Some(port);
         return Some(w);
     }
-    // tcp: an open connection with nothing queued to read, and nothing else
-    // that names the wait (curl blocked on a silent peer).
     if let Some(c) = fds.iter().find_map(idle_connection) {
         let mut w = mk(WaitName::Tcp);
         w.tcp = Some(c);
@@ -367,7 +326,6 @@ fn leaf_wait(
         return Some(mk(WaitName::EventLoop));
     }
 
-    // kernel: an uninterruptible wait of 10 s or more.
     if scene
         .d_age
         .get(&pid)
@@ -393,8 +351,6 @@ fn holder(scene: &Scene<'_>, peer: u64, this: u64, want_write: bool, not: u32) -
             if *handle != peer {
                 continue;
             }
-            // Darwin: the ends have distinct handles. Linux: one inode, so the
-            // direction tells the ends apart.
             let shared = peer == this;
             if shared && *write_end != Some(want_write) {
                 continue;

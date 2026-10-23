@@ -1368,7 +1368,12 @@ impl Host for NativeHost {
                         status: status.into(),
                         detail: row
                             .why
-                            .or(row.to)
+                            .or_else(|| match (row.from, row.to) {
+                                (Some(from), Some(to)) => Some(format!("{from} → {to}")),
+                                (None, Some(to)) => Some(to),
+                                (Some(from), None) => Some(from),
+                                (None, None) => None,
+                            })
                             .unwrap_or_else(|| "workstation item completed".into()),
                     }
                 })

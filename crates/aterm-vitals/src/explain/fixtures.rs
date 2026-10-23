@@ -234,8 +234,13 @@ impl Scene {
 
     /// The reading `at_ms` from the first split tick: a split tick (at a
     /// whole number of windows) reads the coalitions, each process's
-    /// coalition and birth, and the leads.
-    fn reading(&self, at_ms: u64, split: bool) -> Sample {
+    /// coalition and birth, and the leads. The host's dev seam
+    /// (`ATERM_DEV_WHY_FIXTURE`) asks it at any `at_ms`, a split tick where
+    /// the host's own cadence makes one: every counter grows at its figure,
+    /// so a scene whose processes keep one rate ([`Proc::fast`] unset) reads
+    /// its figures over any window.
+    #[must_use]
+    pub fn reading(&self, at_ms: u64, split: bool) -> Sample {
         let w = self.window_ms;
         let there = |span: Span| match span {
             Span::Whole => true,

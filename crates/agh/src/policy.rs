@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Routing (design §6.4–§6.5): tiers, access classes, requests, decisions and the Router.
+//! Routing tiers, access classes, requests, decisions, and `Router`.
 
 use aterm_json::{Map, Value};
 
@@ -84,9 +84,7 @@ impl Access {
     }
 }
 
-/// How the destination was named. The library default is `Default`, which no release-tier
-/// write accepts. A `Literal` carries the `ExplicitTarget` it was made from, and a library
-/// caller can carry one but never make one (design §10.2).
+/// How the destination was named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Named {
     /// `OWNER/NAME` typed on this command line.
@@ -98,11 +96,7 @@ pub enum Named {
     Default,
 }
 
-/// A repository typed as `OWNER/NAME` on this command line. It has no public constructor, and
-/// no public function returns one. In M1 only the CLI makes one, from argv text, in
-/// `Invocation::repo` and `content` (crate-private) and in `whoami --for`, and it never leaves
-/// the verb that made it. M2 adds `Router::grant`, for the `[[writers]]` callers, and a
-/// private provenance; private fields keep that additive.
+/// A repository typed as `OWNER/NAME` on this command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExplicitTarget {
     slug: Slug,
@@ -110,11 +104,6 @@ pub struct ExplicitTarget {
 
 impl ExplicitTarget {
     /// The text as `RepoArg::parse` reads it, which must be a literal `OWNER/NAME`.
-    ///
-    /// # Errors
-    ///
-    /// Usage: `RepoArg::parse`'s errors; an `@target` → `a literal destination is OWNER/NAME,
-    /// not @{name}`.
     pub(crate) fn from_argv(arg: &std::ffi::OsStr) -> Result<ExplicitTarget> {
         match RepoArg::parse(&arg.to_string_lossy())? {
             RepoArg::Literal(slug) => Ok(ExplicitTarget { slug }),
@@ -132,7 +121,7 @@ impl ExplicitTarget {
     }
 }
 
-/// What a request is about. `#[non_exhaustive]`.
+/// What a request is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RouteTarget {
@@ -146,8 +135,7 @@ pub enum RouteTarget {
     Identity,
 }
 
-/// One routing question. `#[non_exhaustive]`: callers outside agh start from `read`,
-/// `writer_read` or `write` and set fields.
+/// One routing question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RouteRequest {
@@ -187,7 +175,7 @@ impl RouteRequest {
         }
     }
 
-    /// A write of `target`. M1 decides it (`whoami --for … --op write`); no M1 path sends one.
+    /// A write of `target`.
     #[inline]
     #[must_use]
     pub fn write(target: RouteTarget) -> RouteRequest {
@@ -303,7 +291,6 @@ impl AnonymousWhy {
 }
 
 /// Why the Router refused, or (`MethodNotRead`) why the client's pipeline did before routing.
-/// `#[non_exhaustive]`: M2 adds `NotGranted` (`policy.not_granted`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RefusalCode {
@@ -342,8 +329,7 @@ pub enum RefusalCode {
 }
 
 impl RefusalCode {
-    /// snake_case: `writer_absent`, `writer_unusable`, `chain_exhausted`, …, `tier_mismatch`,
-    /// `method_not_read`, …
+    /// Returns the `snake_case` refusal code identifier.
     #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
@@ -406,8 +392,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    /// `Error::new(code.kind(), why)`, `Sub::Policy(code)`, `next`, `repo`, and each judged step
-    /// as `Tried::Skipped { as_: step.label(), why: presence.slug() }`.
+    /// `Error::new(code.kind(), why)`, `Sub::Policy(code)`, `next`, `repo`.
     #[must_use]
     pub fn into_error(self, repo: Option<&Slug>) -> Error {
         let tried = self
@@ -429,7 +414,7 @@ impl Refusal {
     }
 }
 
-/// The Router's answer. `#[non_exhaustive]`, so a match outside agh carries a `_` arm.
+/// The Router's answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Decision {
@@ -466,8 +451,7 @@ pub struct Explanation {
     pub decision: Decision,
 }
 
-/// A presence into `item`, the one form a chain step and the writer share: `presence` as one
-/// word (`present`, `absent` or `unusable`), and for an unusable profile `why`, its slug.
+/// A presence into `item`, the one form a chain step and the writer share.
 fn insert_presence(item: &mut Map, presence: Presence) {
     let word = match presence {
         Presence::Present => "present",
@@ -481,10 +465,7 @@ fn insert_presence(item: &mut Map, presence: Presence) {
 }
 
 impl Explanation {
-    /// `{"chain":[{"presence","step"[,"why"]}],"decision":{"send":{"profile","tier"}} |
-    /// {"anonymous":{"why"}} | {"refuse":{"code","next","why"}},"op","owner","tier",
-    /// "writer":{"presence","profile"[,"why"]}|null}`. An anonymous step has no `presence`; an
-    /// unusable step or writer adds `"why": <slug>`.
+    /// Formats the explanation as a canonical JSON object.
     #[must_use]
     pub fn to_json(&self) -> Value {
         let chain = self
@@ -572,8 +553,7 @@ impl Router {
         self.validated.is_some()
     }
 
-    /// Release for a floor owner (`RELEASE_FLOOR_OWNERS`, ASCII case-insensitively), whatever
-    /// its row says; else the owner's row tier; else External.
+    /// Resolves the effective tier for an owner (`Release`, configured row tier, or `External`).
     #[must_use]
     pub fn tier_of(&self, owner: &str) -> Tier {
         if on_floor(owner) {
@@ -585,8 +565,7 @@ impl Router {
             .map_or(Tier::External, |row| row.tier)
     }
 
-    /// The owner's chain (`None`: the default chain); a floor owner with no row and every
-    /// other owner use the default chain; no config → `[Anonymous]`.
+    /// The owner's chain (`None`: the default chain).
     #[must_use]
     pub fn read_chain(&self, owner: Option<&str>) -> Vec<ChainStep> {
         let Some(validated) = &self.validated else {
@@ -631,10 +610,7 @@ impl Router {
         self.validated.as_ref()?.targets.get(name)
     }
 
-    /// THE decision (design §6.4; the plan's §4.6.13 algorithm), with its two decide-time tier
-    /// walls: whatever `Validated` the router holds, a release-tier profile serves only a
-    /// release-tier owner, and an owner is written only by a profile of its own tier.
-    /// `presence` judges a profile by name; each step it judges is in a refusal's `tried`.
+    /// THE decision , with its two decide-time tier walls.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -651,15 +627,13 @@ impl Router {
         }
     }
 
-    /// The owner as the refusal texts name it: the owner, or `the default` for a path with
-    /// none.
+    /// The owner as the refusal texts name it: the owner, or `the default` for a path with none.
     fn owner_label(req: &RouteRequest) -> String {
         req.owner()
             .map_or_else(|| "the default".to_string(), str::to_string)
     }
 
-    /// What `agh whoami --for` and `-R` name: the repository, else `{owner}/NAME` (both take
-    /// only OWNER/NAME), else `REPO`.
+    /// What `agh whoami --for` and `-R` name.
     fn repo_label(req: &RouteRequest) -> String {
         match &req.target {
             RouteTarget::Repo(slug) => slug.to_string(),
@@ -713,8 +687,6 @@ impl Router {
                     vec![step]
                 }
             };
-            // The tier wall (L6 at decide time): a release-tier profile in a chain that serves
-            // no release-tier owner is refused before any presence is judged, never skipped.
             let tier = self.target_tier(req);
             let home = req.target != RouteTarget::Unscoped && tier == Tier::Release;
             for step in &chain {
@@ -776,8 +748,7 @@ impl Router {
         )
     }
 
-    /// A WriterRead or a Write: exactly the owner's writer, of the owner's own tier, and for a
-    /// release-tier Write a destination typed literally.
+    /// A WriterRead or a Write.
     fn decide_writer(&self, req: &RouteRequest, presence: &dyn Fn(&str) -> Presence) -> Decision {
         if req.anonymous {
             return refuse(
@@ -853,7 +824,6 @@ impl Router {
                 );
             }
         }
-        // The tier wall (L2 and L6 at decide time).
         let Some(profile) = self.profile(writer) else {
             return refuse(
                 RefusalCode::TierMismatch,
@@ -890,9 +860,7 @@ impl Router {
         }
     }
 
-    /// The owner's whole read chain, each step with its presence (the anonymous step Present),
-    /// the owner's writer with its presence, for every access, and `decide`'s decision for the
-    /// request: `whoami --for` shows the chain and the writer beside the answer.
+    /// Evaluates the owner's read chain, writer presence, and routing decision for `whoami --for`.
     #[must_use]
     pub fn explain(&self, req: &RouteRequest, presence: &dyn Fn(&str) -> Presence) -> Explanation {
         let owner = req.owner();
@@ -961,8 +929,7 @@ fn tier_mismatch(profile: &str, ptier: Tier, owner: &str, tier: Tier) -> Decisio
     )
 }
 
-/// The model's view of a decision, `(phase, used)`: Send at release tier → (1, 2); any other
-/// Send → (1, 1); Anonymous → (2, 0); Refuse → (3, 0).
+/// The model's view of a decision, `(phase, used)`: Send at release tier → (1, 2).
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 pub fn project_decision(decision: &Decision) -> (i64, i64) {
@@ -977,9 +944,7 @@ pub fn project_decision(decision: &Decision) -> (i64, i64) {
     }
 }
 
-/// The host of the sixteen `spec_unmodeled` waivers of `AghRouteWall` (design §17.1): the
-/// seven world actions, which choose the request and what the machine holds, and the nine
-/// `Buggy = 1` mutants, which no shipping code performs. It does nothing.
+/// The host of the sixteen `spec_unmodeled` waivers of `AghRouteWall` .
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
@@ -1111,9 +1076,6 @@ pub fn project_decision(decision: &Decision) -> (i64, i64) {
 #[doc(hidden)]
 pub fn route_wall_environment() {}
 
-// The in-crate tests, in crate because only agh makes a `Named::Literal` (design §10.2)
-// or a `Validated` that `validate` did not check (plan §4.6.12). The conformance writes token
-// files, which are unix-only (plan §1, rule 12).
 #[cfg(all(test, unix))]
 #[path = "policy_conformance_tests.rs"]
 mod conformance_tests;

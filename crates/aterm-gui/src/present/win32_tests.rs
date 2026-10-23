@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GDI presenter on a live Windows desktop (LW.3's scripted CpuSurface
-//! tests, docs/AUDIT-third-party-2026-10-15.md): a window of the test's own, a
-//! script of resizes, paints and presents, and after each present the
-//! window's pixels read back from its DC (`BitBlt` into a bitmap, then
-//! `GetDIBits`) and held to what the script put on it. user32, gdi32 and
-//! kernel32 are declared here, not taken from aterm-win32, so the readback is
-//! a witness independent of the declarations the presenter calls.
-//!
-//! Session 0 (sshd's logons) has no display, so there the tests end COULD NOT
-//! RUN; the Windows lane runs them in `lane`'s desktop session
-//! (docs/WINDOWS-RUNTIME-LANE.md, `exec --desktop`).
+//! Live Windows desktop GDI presenter and readback tests.
 
 use std::num::NonZeroU32;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -19,9 +9,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use super::{GdiSurface, Win32PresentError};
 use crate::present::{CpuFrameBuffer as _, DamageRect};
 
-/// user32's, gdi32's and kernel32's own declarations (winuser.h, wingdi.h,
-/// processthreadsapi.h), handles as `isize` as the crate's other leaf
-/// declarations take them.
+/// user32's, gdi32's and kernel32's own declarations.
 #[allow(non_snake_case, clippy::upper_case_acronyms)]
 mod witness {
     use std::ffi::c_void;
@@ -71,8 +59,7 @@ mod witness {
         pub lpszClassName: *const u16,
     }
 
-    /// `BITMAPINFOHEADER`: for a 32-bit `BI_RGB` readback the colour table is
-    /// empty, so the header alone is the `BITMAPINFO`.
+    /// `BITMAPINFOHEADER`.
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
     pub struct BitmapInfoHeader {
@@ -189,8 +176,7 @@ mod witness {
 
 use witness as w;
 
-/// End the test COULD NOT RUN in session 0, which draws nowhere a readback
-/// sees.
+/// End the test COULD NOT RUN in session 0, which draws nowhere a readback sees.
 fn need_a_desktop() {
     let mut session = 0;
     // SAFETY: this process's id and an out pointer.
@@ -204,9 +190,7 @@ fn need_a_desktop() {
     }
 }
 
-/// A top-level popup window of this thread, `width` x `height` client pixels
-/// (a popup has no frame), topmost, never activated; destroyed when dropped.
-/// One at a time in the process: each holds [`DESK`] while it lives.
+/// A top-level popup window of this thread, `width` x `height` client pixels ([`DESK`]).
 struct TestWindow {
     hwnd: isize,
     _desk: MutexGuard<'static, ()>,
@@ -222,9 +206,7 @@ impl TestWindow {
         need_a_desktop();
         let desk = DESK.lock().unwrap_or_else(PoisonError::into_inner);
         let class: Vec<u16> = CLASS.encode_utf16().chain([0]).collect();
-        // SAFETY: plain calls with live arguments; the class names
-        // `DefWindowProcW`, which handles every message (with no background
-        // brush, painting nothing).
+        // SAFETY: plain calls with live arguments.
         unsafe {
             w::SetThreadDpiAwarenessContext(w::PER_MONITOR_AWARE_V2);
             let instance = w::GetModuleHandleW(std::ptr::null());
@@ -299,9 +281,7 @@ impl TestWindow {
         self.pump();
     }
 
-    /// The window made `width` x `height`, and nothing it queued dispatched:
-    /// what it gained stays in its update region, as it is when aterm
-    /// presents in the `Resized` the change brings, before any `WM_PAINT`.
+    /// The window made `width` x `height`, and nothing it queued dispatched.
     fn resize_unpumped(&self, width: i32, height: i32) {
         // SAFETY: this thread's window.
         let ok = unsafe {
@@ -326,14 +306,12 @@ impl TestWindow {
         (r.right - r.left, r.bottom - r.top)
     }
 
-    /// The client area's pixels as `0x00RRGGBB` words, row 0 first: copied
-    /// from the window's DC into a bitmap, then read by `GetDIBits`.
+    /// The client area's pixels as `0x00RRGGBB` words, row 0 first.
     fn readback(&self) -> Vec<u32> {
         self.pump();
         let (width, height) = self.client();
         let mut out = vec![0u32; (width * height) as usize];
-        // SAFETY: the window's DC, a bitmap and a DC made, used and freed
-        // here; `out` holds `height` rows of `width` 32-bit words.
+        // SAFETY: the window's DC, a bitmap and a DC made, used and freed here.
         unsafe {
             let window_dc = w::GetDC(self.hwnd);
             assert_ne!(window_dc, 0, "GetDC");
@@ -366,7 +344,6 @@ impl TestWindow {
             assert_ne!(copied, 0, "BitBlt from the window");
             assert_eq!(lines, height, "GetDIBits's scanlines");
         }
-        // BI_RGB's fourth byte is not colour.
         for px in &mut out {
             *px &= 0x00ff_ffff;
         }
@@ -389,8 +366,7 @@ fn gdi_objects() -> u32 {
     unsafe { w::GetGuiResources(w::GetCurrentProcess(), w::GR_GDIOBJECTS) }
 }
 
-/// A word per pixel that differs in every channel from its neighbours' and
-/// from another `seed`'s.
+/// A word per pixel that differs in every channel from its neighbours' and from another `seed`'s.
 fn pattern(seed: u32, x: u32, y: u32) -> u32 {
     let r = (x * 31 + y * 17 + seed * 101) & 0xff;
     let g = (x * 7 + y * 3 + seed * 13) & 0xff;
@@ -421,8 +397,7 @@ enum Commit {
 enum Step {
     /// Size the surface (and the window, when it fits a window).
     Resize(u32, u32),
-    /// Acquire, paint `seed`'s pattern into each of `paint` (all of it when
-    /// empty), and commit.
+    /// Acquire, paint `seed`'s pattern into each of `paint` (all of it when empty), and commit.
     Frame {
         paint: Vec<DamageRect>,
         seed: u32,
@@ -430,8 +405,7 @@ enum Step {
     },
 }
 
-/// What one step answered: the age the acquire saw (`None` for a resize),
-/// whether it succeeded, and the window's pixels after it.
+/// What one step answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Answer {
     age: Option<u8>,
@@ -439,13 +413,10 @@ struct Answer {
     glass: Vec<u32>,
 }
 
-/// A CPU surface the script drives. softbuffer 0.4.8's was the other until
-/// it left at LW.3; what it answered is recorded in
-/// docs/measured/windows-lw3-2026-10-21.md.
+/// A CPU surface the script drives.
 trait Glass {
     fn resize(&mut self, width: u32, height: u32) -> bool;
-    /// Acquire, `paint` the buffer, commit: the age seen and whether the
-    /// commit succeeded.
+    /// Acquire, `paint` the buffer, commit.
     fn frame(&mut self, paint: &mut dyn FnMut(&mut [u32]), commit: &Commit) -> (u8, bool);
 }
 
@@ -469,8 +440,7 @@ impl Glass for GdiSurface {
     }
 }
 
-/// `seed`'s pattern painted into each of `rects` of a buffer `width` wide
-/// (all of it when there are none).
+/// `seed`'s pattern painted into each of `rects` of a buffer `width` wide.
 fn paint_into(buf: &mut [u32], width: u32, rects: &[DamageRect], seed: u32) {
     let height = u32::try_from(buf.len()).unwrap_or(u32::MAX) / width.max(1);
     let whole = [rect(0, 0, width, height)];
@@ -484,7 +454,7 @@ fn paint_into(buf: &mut [u32], width: u32, rects: &[DamageRect], seed: u32) {
     }
 }
 
-/// Run `script` on `glass` over `window`: each step's answer.
+/// Run `script` on `glass` over `window`.
 fn run(window: &TestWindow, glass: &mut dyn Glass, script: &[Step]) -> Vec<Answer> {
     let mut width = 0;
     let mut answers = Vec::new();
@@ -522,10 +492,7 @@ const H0: u32 = 131;
 const W1: u32 = 190;
 const H1: u32 = 203;
 
-/// The script: a whole present, damage that under-claims what was painted,
-/// two rectangles at the far corners, a whole present of what was painted
-/// before, a resize to the same size, a new size, and the two refusals (the
-/// damage one with a good rectangle before its bad one).
+/// The script: a whole present.
 fn script() -> Vec<Step> {
     let frame = |paint: Vec<DamageRect>, seed, commit| Step::Frame {
         paint,
@@ -535,7 +502,6 @@ fn script() -> Vec<Step> {
     vec![
         Step::Resize(W0, H0),
         frame(vec![], 1, Commit::Whole),
-        // Painted at (200,100) too, outside the damage: it must not show.
         frame(
             vec![rect(10, 20, 50, 30), rect(200, 100, 1, 1)],
             2,
@@ -546,7 +512,6 @@ fn script() -> Vec<Step> {
             3,
             Commit::Damage(vec![rect(0, 0, W0, 1), rect(W0 - 1, H0 - 1, 1, 1)]),
         ),
-        // Nothing painted, all of it presented: (200,100) shows now.
         frame(vec![rect(0, 0, 1, 1)], 1, Commit::Whole),
         Step::Resize(W0, H0),
         frame(
@@ -556,8 +521,6 @@ fn script() -> Vec<Step> {
         ),
         Step::Resize(W1, H1),
         frame(vec![], 5, Commit::Whole),
-        // The second rectangle is past GDI's coordinates: refused, and
-        // nothing drawn, not even the first.
         frame(
             vec![rect(0, 0, W1, H1)],
             6,
@@ -567,12 +530,7 @@ fn script() -> Vec<Step> {
     ]
 }
 
-/// What the script must answer, step by step, by its own rules: an acquire
-/// after a present sees age 1 and the buffer as it was, a present shows the
-/// buffer within its damage only, a damage rectangle past GDI's coordinates
-/// is refused with nothing drawn, and a resize to a new size starts at age 0.
-/// A step's pixels are `None` where the script does not say them: a resized
-/// window before its first present shows what Windows left there.
+/// What the script must answer, step by step, by its own rules.
 fn expected() -> Vec<(Option<u8>, bool, Option<Vec<u32>>)> {
     let mut answers = Vec::new();
     let (mut width, mut height) = (0u32, 0u32);
@@ -626,8 +584,7 @@ fn expected() -> Vec<(Option<u8>, bool, Option<Vec<u32>>)> {
     answers
 }
 
-/// Where `got` differs first from `want`, at the steps `known` says the
-/// pixels of: the step, and its first differing pixel.
+/// Where `got` differs first from `want`.
 fn first_difference(got: &[Answer], want: &[Answer], known: &[bool]) -> Option<String> {
     if got.len() != want.len() {
         return Some(format!("{} steps against {}", got.len(), want.len()));
@@ -675,8 +632,6 @@ fn known() -> Vec<bool> {
 /// rules ([`expected`]).
 #[test]
 fn the_window_shows_what_was_presented_within_its_damage() {
-    // A refused later copy still ends in a flush of the earlier queued one;
-    // that first copy error wins over a simultaneous flush failure.
     let failed = rect(10, 20, 50, 30);
     for (copies_ok, flush_ok) in [(true, true), (true, false), (false, true), (false, false)] {
         let calls = std::cell::RefCell::new(Vec::new());
@@ -722,8 +677,6 @@ fn the_window_shows_what_was_presented_within_its_damage() {
     if let Some(at) = first_difference(&got, &want, &known()) {
         panic!("the GDI presenter against the script: {at}");
     }
-    // The script is not vacuous: its damage hid a painted pixel until the
-    // whole present showed it, and the refused present drew nothing.
     let at = |answer: &Answer, x: u32, y: u32| answer.glass[(y * W0 + x) as usize];
     assert_eq!(at(&got[2], 200, 100), pattern(1, 200, 100));
     assert_eq!(at(&got[4], 200, 100), pattern(2, 200, 100));
@@ -761,17 +714,12 @@ fn rows_the_window_gains_after_a_present_are_drawn_by_the_next() {
     let window = TestWindow::new(W0 as i32, H0 as i32);
     // SAFETY: this thread's window, which outlives the surface.
     let mut surface = unsafe { GdiSurface::new(window.hwnd()) }.expect("a GDI surface");
-    // The buffer at the height the window is about to have, presented whole
-    // while the window is shorter: the copy stops at the window's last row.
     assert!(Glass::resize(&mut surface, W0, H1));
     let (_, ok) = surface.frame(&mut |buf| paint_into(buf, W0, &[], 9), &Commit::Whole);
     assert!(ok, "the whole present");
     assert!(!surface.owes_repaint(), "a presented window owes nothing");
     window.resize_unpumped(W0 as i32, H1 as i32);
-    // What aterm's `RedrawRequested` reads to present an unchanged frame.
     assert!(surface.owes_repaint(), "the gained rows are owed");
-    // Nothing new: one pixel of damage, as aterm presents a frame equal to
-    // the last.
     let (age, ok) = surface.frame(&mut |_| {}, &Commit::Damage(vec![rect(0, 0, 1, 1)]));
     assert_eq!((age, ok), (1, true), "the one-pixel present");
     assert!(!surface.owes_repaint(), "the present paid what was owed");

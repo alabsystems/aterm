@@ -1,34 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lane-bus xdnd <window> <uri> <marks>`: a drag source of the XDND protocol
-//! (version 5, freedesktop.org's "Drag-and-Drop Protocol for the X Window
-//! System") that drags one file over the X window `<window>` of the display
-//! `DISPLAY` names, twice:
-//!
-//! 1. a hover that leaves: `XdndEnter`, `XdndPosition` at the window's
-//!    centre, the data the target asks for (`<uri>` as `text/uri-list`), a
-//!    second `XdndPosition`, then `XdndLeave`;
-//! 2. a hover that drops: the same, then `XdndDrop`, and the target's
-//!    `XdndFinished`.
-//!
-//! The target answers every `XdndPosition` with an `XdndStatus`, and handles
-//! one client's events in the order the server delivered them, so an answer
-//! says the target has handled everything sent before it: a hover's second
-//! status follows the data it read, and the drop's first status follows the
-//! leave (its own data still unanswered). At those two points the source
-//! creates `<marks>/hovering` and `<marks>/left` and waits for
-//! `<marks>/hovering.seen` and `<marks>/left.seen`, so the lab can photograph
-//! the window between. Each answer is a line `<key> <value>` in
-//! `<marks>/report`, also printed.
-//!
-//! Only the part of the X11 core protocol (X Window System Protocol, X11R7.7) a
-//! source needs, spoken directly: a little-endian client on the display's unix
-//! socket, with no authorization (the lane's Xvfb and Xwayland run without
-//! `-auth`). Not x11rb: the stack this records is the one LW.6-7 replace
-//! (docs/AUDIT-third-party-2026-10-15.md), and the probe must not be built
-//! from it. Every byte the server sends is untrusted: a short or malformed
-//! reply is an error, never a panic.
+//! Direct X11 XDND v5 drag-and-drop source for `lane-bus xdnd`.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -40,22 +13,19 @@ use std::time::{Duration, Instant};
 /// A wait for an answer that must come: a hang detector, never a budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// A wait for the lab's photograph. The lab's own waits are one-minute hang
-/// detectors, so this one is longer.
+/// A wait for the lab's photograph.
 const LAB: Duration = Duration::from_secs(600);
 
 /// How often a wait for a marker polls, and how long one socket read blocks.
 const POLL: Duration = Duration::from_millis(100);
 
-/// The largest reply this source accepts (a property of a few atoms is all it
-/// reads); a larger length is a malformed reply.
+/// The largest reply this source accepts (a property of a few atoms is all it reads).
 const MAX_REPLY: usize = 1 << 20;
 
 /// The XDND version this source speaks.
 const VERSION: u32 = 5;
 
-/// What went wrong: no X server to speak to (the lane reads NOT RUN), or a
-/// fault in the drag.
+/// What went wrong: no X server to speak to (the lane reads NOT RUN), or a fault in the drag.
 #[derive(Debug)]
 pub(crate) enum Error {
     NoServer(String),
@@ -140,8 +110,7 @@ fn socket_path(display: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(format!("/tmp/.X11-unix/X{number}")))
 }
 
-/// The connection setup a little-endian client sends: protocol 11.0, no
-/// authorization.
+/// The connection setup a little-endian client sends: protocol 11.0, no authorization.
 const SETUP: [u8; 12] = [b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// What the setup reply says that a source needs.
@@ -156,8 +125,7 @@ struct Setup {
     max_keycode: u8,
 }
 
-/// Read a whole setup reply (its 8-byte head, then the head's length in
-/// words).
+/// Read a whole setup reply (its 8-byte head, then the head's length in words).
 fn parse_setup(reply: &[u8]) -> Result<Setup, String> {
     match reply.first() {
         Some(1) => {}
@@ -200,8 +168,7 @@ fn parse_setup(reply: &[u8]) -> Result<Setup, String> {
     })
 }
 
-/// A request: its opcode, its one-byte data field, and its body after the
-/// 4-byte head (padded here to whole words).
+/// A request: its opcode, its one-byte data field.
 pub(crate) fn request(opcode: u8, data: u8, body: &[u8]) -> Vec<u8> {
     let words = (4 + pad4(body.len())) / 4;
     let mut r = Vec::with_capacity(words * 4);
@@ -229,17 +196,14 @@ fn intern_atom(name: &str) -> Vec<u8> {
 /// `CreateWindow` (1): an unmapped 1x1 `InputOnly` child of `parent`.
 fn create_window(wid: u32, parent: u32) -> Vec<u8> {
     let mut body = words(&[wid, parent]);
-    // x, y, width, height, border-width, class (InputOnly = 2).
     for v in [0u16, 0, 1, 1, 0, 2] {
         body.extend_from_slice(&v.to_le_bytes());
     }
-    // visual (CopyFromParent), value-mask (none).
     body.extend_from_slice(&words(&[0, 0]));
     request(1, 0, &body)
 }
 
-/// `GetProperty` (20) of `property` on `window`, any type, its first 1024
-/// words, not deleted.
+/// `GetProperty` (20) of `property` on `window`, any type, its first 1024 words, not deleted.
 fn get_property(window: u32, property: u32) -> Vec<u8> {
     request(20, 0, &words(&[window, property, 0, 0, 1024]))
 }
@@ -258,8 +222,7 @@ fn set_selection_owner(owner: u32, selection: u32) -> Vec<u8> {
     request(22, 0, &words(&[owner, selection, 0]))
 }
 
-/// `SendEvent` (25) with an empty event mask, `propagate` false: the server
-/// sends `event` to the client that created `destination`.
+/// `SendEvent` (25) with an empty event mask, `propagate` false.
 fn send_event(destination: u32, event: &[u8; 32]) -> Vec<u8> {
     let mut body = words(&[destination, 0]);
     body.extend_from_slice(event);
@@ -292,7 +255,7 @@ fn client_message(window: u32, type_: u32, data: [u32; 5]) -> [u8; 32] {
     e
 }
 
-/// A `SelectionNotify` event (31). `property` 0 (None) refuses the request.
+/// A `SelectionNotify` event (31).
 fn selection_notify(
     time: u32,
     requestor: u32,
@@ -432,8 +395,7 @@ impl X {
         Ok(())
     }
 
-    /// The next packet off the wire: an event or error (32 bytes), or a
-    /// reply with its extra bytes.
+    /// The next packet off the wire: an event or error (32 bytes), or a reply with its extra bytes.
     fn packet(&mut self, deadline: Instant) -> Result<Vec<u8>, Error> {
         let mut head = [0u8; 32];
         self.fill(&mut head, deadline)?;
@@ -451,16 +413,14 @@ impl X {
         Ok(p)
     }
 
-    /// Send a request without awaiting anything: one with no reply, whose
-    /// error the next [`X::call`] reads.
+    /// Send a request without awaiting anything ([`X::call`]).
     pub(crate) fn send(&mut self, req: &[u8]) -> Result<u16, Error> {
         self.sock.write_all(req).map_err(|e| fault(e.to_string()))?;
         self.seq = self.seq.wrapping_add(1);
         Ok(self.seq)
     }
 
-    /// Send a request that has a reply, and read the reply, keeping the
-    /// events that come first.
+    /// Send a request that has a reply, and read the reply, keeping the events that come first.
     pub(crate) fn call(&mut self, req: &[u8]) -> Result<Vec<u8>, Error> {
         let seq = self.send(req)?;
         let deadline = Instant::now() + HANG;
@@ -507,7 +467,6 @@ impl X {
 
     fn new_id(&mut self) -> u32 {
         let mask = self.setup.id_mask;
-        // The lowest set bit of the mask is the step between ids.
         let step = 1u32.checked_shl(mask.trailing_zeros()).unwrap_or(0);
         self.next_id = self.next_id.wrapping_add(step);
         self.setup.id_base | (self.next_id & mask)
@@ -571,8 +530,7 @@ fn answer(a: &Atoms, accepted: bool, action: u32) -> String {
     format!("accept={} action={}", u8::from(accepted), a.name(action))
 }
 
-/// The drag: the connection, the atoms, the source and target windows, and
-/// where the report goes.
+/// The drag: the connection, the atoms, the source and target windows, and where the report goes.
 struct Drag {
     x: X,
     a: Atoms,
@@ -611,8 +569,7 @@ impl Drag {
         self.message("XdndPosition", [self.src, 0, packed, 0, copy])
     }
 
-    /// Answer a data request: the uri as `text/uri-list`, anything else
-    /// refused. What was asked, as the report prints it.
+    /// Answer a data request: the uri as `text/uri-list`, anything else refused.
     fn serve(&mut self, request: &Event) -> Result<String, Error> {
         let Event::SelectionRequest {
             time,
@@ -648,9 +605,7 @@ impl Drag {
         })
     }
 
-    /// Wait for the target's next `XdndStatus`, answering a data request
-    /// that comes first (or holding it, when `hold`). The status, and what
-    /// was asked meanwhile.
+    /// Waits for the target's next `XdndStatus`, optionally answering or holding data requests.
     fn status(&mut self, hold: bool) -> Result<(String, Option<String>), Error> {
         let deadline = Instant::now() + HANG;
         let status = self.a.id("XdndStatus");
@@ -751,7 +706,6 @@ pub(crate) fn run(target: u32, uri: &str, marks: &Path) -> Result<(), Error> {
         held: None,
     };
     d.say("aware", &aware)?;
-    // A hover that leaves.
     d.enter()?;
     d.position()?;
     let (status, asked) = d.status(false)?;
@@ -765,8 +719,6 @@ pub(crate) fn run(target: u32, uri: &str, marks: &Path) -> Result<(), Error> {
     }
     hand_over(marks, "hovering")?;
     d.message("XdndLeave", [src, 0, 0, 0, 0])?;
-    // A hover that drops: the first status says the leave was handled, and
-    // the data stays unanswered until the lab has seen the window then.
     d.enter()?;
     d.position()?;
     let (status, asked) = d.status(true)?;
@@ -849,8 +801,6 @@ mod tests {
         let mut r = vec![1, 0, 11, 0, 0, 0, 0, 0];
         r.extend_from_slice(&words(&[0, 0x0020_0000, 0x001f_ffff, 0]));
         r.extend_from_slice(&5u16.to_le_bytes()); // vendor length
-        // maximum-request-length, one screen, two formats, four bytes of
-        // image facts, keycodes 8 to 255, four unused.
         r.extend_from_slice(&[0, 0, 1, 2, 0, 0, 0, 0, 8, 255, 0, 0, 0, 0]);
         r.extend_from_slice(b"Xorg\0\0\0\0"); // vendor, padded to 8
         r.extend_from_slice(&[0; 16]); // two formats

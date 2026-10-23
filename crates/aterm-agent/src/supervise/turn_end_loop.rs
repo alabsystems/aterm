@@ -813,7 +813,11 @@ impl<C: Ctl> Session<'_, C> {
             self.scope_limit_conversation(reader.program(), opts.idle_host.is_some(), screen.seq);
         }
         let mut reading = reader.read(&screen.rows, Some(screen.cursor_col));
-        let stopped = self.limit_stopped(&reading);
+        // Gemini CLI's usage-limit dialog answered `Stop` by another hand: the
+        // error it leaves is that limit ([`Self::limit_stopped_adopt`]).
+        self.limit_stopped_adopt(&reading, opts);
+        self.limit_stopped_seat(&reading, &screen.rows);
+        let stopped = self.limit_stopped(&reading, &screen.rows);
         if let Some(s) = &stopped {
             reading.phase = Phase::Limited {
                 message: s.wall.message.clone(),
@@ -1374,6 +1378,13 @@ impl<C: Ctl> Session<'_, C> {
         seq: u64,
         opts: &SuperviseOpts,
     ) {
+        // A screen-alone agent's relaunch under a limit: its start-up is no
+        // work, and the limit holds it only on a seat vouched for — the
+        // host's own relaunch, or the account its screen names
+        // ([`TurnEndState::relaunch_startup`]).
+        let host = opts.idle_host.as_ref();
+        self.turn_end
+            .relaunch_startup(r, now, || host.is_some_and(|h| h.relaunch_owed()));
         let awaited = self.turn_end.account_answer_awaited(r);
         self.point_said = r.said_tail.as_deref().filter(|_| !r.said_cut).map(|tail| {
             (
@@ -1704,8 +1715,17 @@ impl<C: Ctl> Session<'_, C> {
         let stopped = || {
             aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
         };
+        let program = self.reader(rows).program();
         if !limit_dialog && !stopped() {
-            self.limit_retry = None;
+            self.limit_dialog_read = None;
+            // …unless the turn-end policy still waits on that limit (the
+            // error read as it, a relaunch since: [`Self::limit_ladder_kept`]),
+            // or the agent left the tab while the dialog was held, and this
+            // is no agent's point or its relaunch's first
+            // ([`Self::limit_retry_away`]).
+            if !self.limit_ladder_kept() && !self.limit_retry_away(program, rows, opts) {
+                self.limit_retry = None;
+            }
         }
         self.draft_held = None;
         if self.claim.watching_behind().is_some() {
@@ -1740,8 +1760,31 @@ impl<C: Ctl> Session<'_, C> {
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
         self.fold_point(&mut r, now, point.screen.seq, opts);
+        self.limit_episode_folded(point);
         self.task_seed(opts)?;
         self.decide_to_act(r, opts, now, &point.screen)
+    }
+
+    /// THE LIMIT EPISODE AFTER `point`'s FOLD ([`Self::turn_end_at_point`],
+    /// [`Self::turn_end_now`]): where the point is neither Gemini CLI's
+    /// usage-limit dialog nor the error its `Stop` leaves, and the fold
+    /// ended the policy's wait on the limit (work past it), the dialog's
+    /// ladder ends with it — save while the agent is away. A relaunch's
+    /// start-up the policy took as the limit is the track's from here
+    /// ([`Self::limit_retry_back`]).
+    fn limit_episode_folded(&mut self, point: &Turn) {
+        let rows = &point.screen.rows;
+        let limit_dialog = point.phase == Phase::Prompt
+            && self
+                .reader(rows)
+                .prompt(rows)
+                .is_some_and(|p| p.kind == aterm_phase::PromptKind::UsageLimit);
+        let stopped =
+            aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w));
+        if !limit_dialog && !stopped && !self.limit_ladder_kept() && !self.limit_retry_is_away() {
+            self.limit_retry = None;
+        }
+        self.limit_retry_back();
     }
 
     /// THE WORK OF THE TURN THE ACT AWAITED BEGAN, no read since it was typed
@@ -2069,6 +2112,12 @@ impl<C: Ctl> Session<'_, C> {
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
         self.fold_point(&mut r, now, turn.screen.seq, opts);
+        // The limit episode this fold may have ended, and the badge it
+        // carried off its screen with it (B1 of the review of walls-3).
+        self.limit_episode_folded(&turn);
+        if self.limit_badge_off_ended() {
+            self.close_box(turn.screen.seq, review)?;
+        }
         self.task_seed(opts)?;
         self.probe_shut(&turn, ProbeGate::NotNew, None, review)?;
         let action = self.decide_to_act(r, opts, now, &turn.screen)?;
@@ -3106,6 +3155,39 @@ impl<C: Ctl> Session<'_, C> {
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
             Some(typed) => Ok(typed),
             None => s.type_guarded(point, text, rule, review),
+        })
+    }
+
+    /// THE OCCUPANCY DOOR'S LINE TYPED AT A BREAK (`docs/DESIGN-harness-occupancy-2026-10-20.md`
+    /// §2.1, §5 row 1), under the owner's `prompt` alone (`_grant`: only
+    /// [`crate::supervise::config::Occupancy::grant`] makes one): [`Self::type_fenced`] under
+    /// the hand, ONLY. `None`: the read cannot be fenced (no generation or caret, or a host
+    /// without the `if-gen=` fences), and nothing is written — a break's write is never the
+    /// unfenced guarded submit, which no person count holds ([`Self::type_text`]'s fallback).
+    /// `Some(false)`: a fence or a person stopped it, as `type_fenced` says.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "OccupancyDoor",
+            action = "Type",
+            project = "conformance_occupancy::project"
+        )
+    )]
+    pub(super) fn type_fact(
+        &mut self,
+        _grant: &crate::supervise::config::PromptGrant,
+        point: &Turn,
+        text: &str,
+        rule: &str,
+        review: &mut dyn Review,
+    ) -> Result<Option<bool>, Fail> {
+        use crate::supervise::occupancy::fault::{Fault, armed};
+        self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
+            Some(typed) => Ok(Some(typed)),
+            None if armed(Fault::DoorGuardedFallback) => {
+                s.type_guarded(point, text, rule, review).map(Some)
+            }
+            None => Ok(None),
         })
     }
 

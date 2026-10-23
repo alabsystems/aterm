@@ -203,6 +203,10 @@ impl aterm_converge::Item for Bound<'_> {
         self.item.stood_aside()
     }
 
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.item.read_aside()
+    }
+
     fn stands_aside(&self) -> Option<StoodAside> {
         self.item.stands_aside(self.sys, self.ctx)
     }

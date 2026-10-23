@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The X11 CPU presenter: the frame in a shared-memory segment the server
-//! reads by descriptor (MIT-SHM AttachFd, then ShmPutImage per damaged
-//! rectangle), or, on a server without MIT-SHM 1.2, the pixels sent whole by
-//! PutImage. It draws through the window's own connection, the libxcb one
-//! under winit's Xlib `Display`, as softbuffer 0.4.8's X11 backend did; this
-//! replaces it (docs/AUDIT-third-party-2026-10-15.md, linux-windowing LW.6).
-//!
-//! Its present protocol is softbuffer's, so the pixels on the window are what
-//! they were: one buffer, which the server may still be reading after a
-//! present. A GetInputFocus sent after the ShmPutImages is answered only once
-//! they are done, so the next acquire waits for that reply before handing
-//! the buffer out again. Errors of the drawing requests are discarded, as
-//! softbuffer discarded them, so a window destroyed under a present costs a
-//! frame, not the session.
+//! X11 CPU presenter using MIT-SHM `AttachFd`/`ShmPutImage` with `PutImage` fallback.
 
 use std::num::NonZeroU32;
 use std::ops::{Deref, DerefMut};
@@ -40,8 +27,7 @@ pub(crate) enum X11PresentError {
     Visual(u32),
     /// A size past X11's 16-bit coordinates.
     Size(u32, u32),
-    /// A damage rectangle past X11's 16-bit coordinates (softbuffer's
-    /// `DamageOutOfRange`).
+    /// A damage rectangle past X11's 16-bit coordinates (softbuffer's `DamageOutOfRange`).
     Damage(DamageRect),
     /// The transport or the server refused.
     X11(aterm_x11::Error),
@@ -82,8 +68,7 @@ struct Segment {
 }
 
 enum Store {
-    /// MIT-SHM, at the extension's major opcode. `pending` is the sequence of
-    /// the GetInputFocus sent after the last present's ShmPutImages.
+    /// MIT-SHM, at the extension's major opcode.
     Shm {
         major: u8,
         seg: Option<Segment>,
@@ -102,19 +87,14 @@ pub(crate) struct X11Presenter {
     store: Store,
     size: Option<(u16, u16)>,
     presented: bool,
-    /// Holds the winit window, and with it the Xlib display `conn` borrows;
-    /// dropped last.
+    /// Holds the winit window, and with it the Xlib display `conn` borrows; dropped last.
     _window: Arc<Window>,
 }
 
-// SAFETY: the connection is libxcb's, which is thread-safe; the segment is
-// owned. The presenter moves between threads only with its window state.
+// SAFETY: The connection is libxcb's, which is thread-safe; the segment is owned.
 unsafe impl Send for X11Presenter {}
 
-/// The pixel layouts the presenter can draw with: a 24- or 32-bit visual
-/// whose 32-bit pixels are `0x00RRGGBB` in this client's byte order, as
-/// softbuffer's `supported_visuals` accepted them. The format and visual
-/// must both belong to the depth observed on this window.
+/// Pixel layouts supported by the X11 presenter.
 fn visual_supported(setup: &Setup, visual: u32, window_depth: u8) -> bool {
     let pixels_are_words = setup
         .pixmap_formats
@@ -150,8 +130,7 @@ fn visual_supported(setup: &Setup, visual: u32, window_depth: u8) -> bool {
     })
 }
 
-/// A rectangle as ShmPutImage takes it (source `x`, `y`, `width`, `height`,
-/// then the same corner as the destination), or `None` past 16 bits.
+/// Converts a damage rectangle into 16-bit `ShmPutImage` coordinates, or `None` on overflow.
 fn shm_rect(rect: &DamageRect) -> Option<(u16, u16, u16, u16, i16, i16)> {
     let fits = |v: u32| u16::try_from(v).ok();
     let (x, y) = (fits(rect.x)?, fits(rect.y)?);
@@ -165,8 +144,7 @@ fn shm_rect(rect: &DamageRect) -> Option<(u16, u16, u16, u16, i16, i16)> {
     ))
 }
 
-/// Whether the server takes AttachFd: MIT-SHM 1.2, and a 4 KiB segment
-/// attached and detached without error (a remote server cannot map it).
+/// Whether the server takes AttachFd.
 fn shm_major(conn: &Connection) -> Option<u8> {
     let ext = conn.extension(shm::NAME).ok()??;
     let version = conn
@@ -202,8 +180,7 @@ impl X11Presenter {
         if xid == 0 {
             return Err(X11PresentError::NotX11);
         }
-        // SAFETY: winit's live `Display *`, which `_window` keeps open for
-        // as long as this presenter (and so this connection) lives.
+        // SAFETY: Winit's live `Display *`.
         let conn = unsafe { Connection::from_xlib_display(display) }?;
         let geometry = conn.send(xproto::get_geometry(xid))?;
         let visual = match (visual != 0).then_some(visual) {
@@ -295,8 +272,7 @@ impl X11Presenter {
         Ok(())
     }
 
-    /// Wait until the server has read the last present, then hand the
-    /// buffer out.
+    /// Wait until the server has read the last present, then hand the buffer out.
     pub(crate) fn buffer_mut(&mut self) -> Result<X11Frame<'_>, X11PresentError> {
         if let Store::Shm { pending, .. } = &mut self.store
             && let Some(seq) = pending.take()
@@ -317,9 +293,6 @@ impl X11Presenter {
         };
         match &mut self.store {
             Store::Wire(buf) => {
-                // softbuffer sent the whole frame on this path, whatever the
-                // damage; so does this, in bands the server's request limit
-                // takes (BIG-REQUESTS or not).
                 let row_bytes = usize::from(w) * 4;
                 let limit = self.conn.maximum_request_bytes().saturating_sub(32);
                 let rows = (limit / row_bytes.max(1)).clamp(1, usize::from(h));
@@ -349,8 +322,6 @@ impl X11Presenter {
                 let Some(seg) = seg else {
                     return Ok(());
                 };
-                // Every rectangle is checked before one is sent: a refused
-                // present sends nothing, and the caller's next frame is whole.
                 if let Some(bad) = damage.iter().find(|r| shm_rect(r).is_none()) {
                     return Err(X11PresentError::Damage(*bad));
                 }
@@ -398,8 +369,6 @@ impl Drop for X11Presenter {
                 if let Ok(c) = self.conn.send_void(shm::detach(*major, seg.id)) {
                     drop(c);
                 }
-                // The server has finished with it (the wait above); unmapped
-                // here, after the detach is queued.
                 drop(seg.mem);
             }
         }
@@ -410,14 +379,7 @@ impl Drop for X11Presenter {
     }
 }
 
-/// A window's X11 presenter as the GL arm's [`aterm_gpu::FrameSink`], which
-/// posts the window's frames through it where a `GLXWindow` would stall the
-/// X server at every resize (NVIDIA's GLX under a compositing manager;
-/// `aterm-gpu`'s `gl::surface`). The presenter is made when the arm attaches
-/// the sink, over MIT-SHM only: a frame a post sends whole on the wire
-/// would cost the socket more than the `GLXWindow` it replaces. The segment
-/// keeps the whole frame, so a post writes and sends only what changed: a
-/// keystroke's row, not a near-maximized window's 18 MB.
+/// A window's X11 presenter as the GL arm's [`aterm_gpu::FrameSink`].
 pub(crate) struct X11FrameSink {
     window: Arc<Window>,
     presenter: Option<X11Presenter>,
@@ -479,9 +441,7 @@ impl aterm_gpu::FrameSink for X11FrameSink {
     }
 }
 
-/// The rectangle a post of a `width` x `height` frame draws and sends: its
-/// `damage` clamped to the frame where the segment holds the last post
-/// (`held`: one was made at this size), else the whole frame.
+/// The rectangle a post of a `width` x `height` frame draws and sends.
 fn post_rect(damage: Option<[u32; 4]>, held: bool, (width, height): (u32, u32)) -> [u32; 4] {
     damage
         .filter(|_| held)

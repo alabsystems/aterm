@@ -3,24 +3,10 @@
 // Author: Andrew Yates
 
 //! X11 named color lookup table for OSC color specifications.
-//!
-//! Provides case-insensitive lookup of the standard X11 `rgb.txt` color names
-//! (140 named colors). Used by `ColorPalette::parse_color_spec` to support
-//! named color arguments in OSC 4/10/11/12 sequences (e.g., `OSC 4;1;red ST`).
-//!
-//! Implementation: sorted array of `(&str, [u8; 3])` pairs with binary search.
-//! All names are stored lowercase; input is lowercased before lookup. No heap
-//! allocation is needed at lookup time.
 
 use crate::Rgb;
 
 /// The full X11 named color table (140 entries), sorted by lowercase name.
-///
-/// Values sourced from the X11 `rgb.txt` / CSS Color Module Level 4 named
-/// color list. All names are lowercase for case-insensitive matching.
-///
-/// Note: "grey" variants are included alongside "gray" variants per X11
-/// convention (both spellings map to the same RGB value).
 #[rustfmt::skip]
 const X11_COLORS: &[(&str, [u8; 3])] = &[
     ("aliceblue",            [240, 248, 255]),
@@ -174,42 +160,25 @@ const X11_COLORS: &[(&str, [u8; 3])] = &[
 ];
 
 /// Look up an X11 named color (case-insensitive).
-///
-/// Returns `Some(Rgb)` if the name matches one of the 140 standard X11/CSS
-/// named colors, `None` otherwise. The lookup lowercases the input and uses
-/// binary search on the sorted table.
 // Skip: the table search closure drives absent std iterator bodies; a miss returns None.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn lookup(name: &str) -> Option<Rgb> {
-    // Fast reject: X11 names are 3-20 chars, all ASCII.
     if name.is_empty() || name.len() > 24 || !name.is_ascii() {
         return None;
     }
 
-    // Lowercase into a stack buffer to avoid heap allocation.
-    // Longest X11 name is "lightgoldenrodyellow" (20 chars).
     let mut buf = [0u8; 24];
     let len = name.len();
-    // Zip the fixed 24-byte buffer with the input so the write index is bounded
-    // by the buffer (never > 24) — `name.len() <= 24` was checked above, so this
-    // writes exactly `buf[..len]`, identical to the old indexed loop.
     for (slot, &b) in buf.iter_mut().zip(name.as_bytes()) {
         *slot = b.to_ascii_lowercase();
     }
-    // Byte-wise key comparison: `&str` ordering IS the byte ordering of its
-    // UTF-8 representation, so `binary_search_by` on `n.as_bytes()` visits the
-    // same entries and returns the same result as the old `&str` search — the
-    // strict `str::from_utf8` round-trip (a hardened utf8_reject boundary,
-    // even though the buffer is provably ASCII here) drops out entirely.
     let key = buf.get(..len)?;
 
     X11_COLORS
         .binary_search_by(|&(n, _)| n.as_bytes().cmp(key))
         .ok()
         .and_then(|idx| {
-            // `idx` comes from `binary_search`, always in range; the total `get`
-            // discharges the slice bound without changing behaviour.
             let &(_, [r, g, b]) = X11_COLORS.get(idx)?;
             Some(Rgb::new(r, g, b))
         })
@@ -242,7 +211,6 @@ mod tests {
 
     #[test]
     fn lookup_grey_variants() {
-        // Both "gray" and "grey" spellings should work
         assert_eq!(lookup("gray"), lookup("grey"));
         assert_eq!(lookup("darkgray"), lookup("darkgrey"));
         assert_eq!(lookup("lightgray"), lookup("lightgrey"));

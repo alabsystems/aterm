@@ -2,24 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Sharing services through launchd: Remote Apple Events (design §5.1).
-//!
-//! Remote Login and Screen Sharing are not settings here. Remote Login is how the controller
-//! reaches the Mac at all, and Screen Sharing turned on through launchd listens but is
-//! view-only (design §1.6), so both are person steps the `person` family probes; a
-//! baseline that names them in `[sharing]` is refused with that reason.
-//!
-//! A service is **on** when launchd's override database enables its label and the job is
-//! loaded, and **off** when it is disabled and not loaded. A label the override database
-//! does not list takes its plist's `Disabled` key (launchd's default is enabled). Measured
-//! in the macOS 27.0 VM, as root over SSH:
-//!
-//! * `launchctl print-disabled system` prints `"<label>" => enabled|disabled` rows;
-//!   `com.apple.AEServer` is not among them on a fresh Mac, and its plist
-//!   (`/System/Library/LaunchDaemons/com.apple.eppc.plist`) says `Disabled = true`;
-//! * `launchctl print system/<label>` exits 0 for a loaded job and 113 (`Could not find
-//!   service`) otherwise;
-//! * `launchctl bootout` of a job that is not loaded exits 3 (`No such process`), which is
-//!   the state wanted; `launchctl bootstrap` of a loaded or disabled job exits 5.
 
 use super::{Ctx, Item};
 use crate::model::{Probe, Read};
@@ -73,17 +55,15 @@ pub const SCREEN_SHARING: Service = Service {
 pub struct Table {
     /// `system/com.apple.AEServer` on (enabled and loaded) or off (disabled and not loaded).
     pub remote_apple_events: Option<bool>,
-    /// Refused whatever its value: Remote Login is a person step (`[person] remote_login`),
-    /// and turning it off would cut the Mac off from the controller. Kept so the refusal
-    /// can say why instead of "unknown field".
+    /// Refused whatever its value: Remote Login is a person step (`[person] remote_login`), and
+    /// turning it off would cut the Mac off from the controller.
     pub remote_login: Option<bool>,
-    /// Refused whatever its value: only the System Settings switch grants Screen Sharing
-    /// control (design §1.6), so it is a person step (`[person] screen_sharing`).
+    /// Refused whatever its value: only the System Settings switch grants Screen Sharing control
+    /// (design §1.6), so it is a person step (`[person] screen_sharing`).
     pub screen_sharing: Option<bool>,
 }
 
 /// The items `table` asks for.
-///
 /// # Errors
 /// `remote_login` or `screen_sharing` named, with the reason.
 pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -142,8 +122,8 @@ pub fn parse_print_disabled(text: &str) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// Whether launchd will run `service`: its row in the override database, or, when it has
-/// none, the plist's `Disabled` key (no key = enabled).
+/// Whether launchd will run `service`: its row in the override database, or, when it has none, the
+/// plist's `Disabled` key (no key = enabled).
 #[must_use]
 pub fn enabled(sys: &dyn System, service: &Service) -> Read<bool> {
     let cmd = Cmd::new(LAUNCHCTL).args(["print-disabled", "system"]);
@@ -159,9 +139,6 @@ pub fn enabled(sys: &dyn System, service: &Service) -> Read<bool> {
     {
         return Read::Value(on);
     }
-    // A row for the label in words this does not know (older launchd printed `=> true`
-    // for disabled) is an override nobody read, not "no override": the plist's default
-    // would then be a guess.
     let quoted = format!("\"{}\" =>", service.label);
     if let Some(row) = text.lines().find(|l| l.contains(&quoted)) {
         return Read::Unusable(format!("{} answered {:?}", cmd.display(), row.trim()));
@@ -375,7 +352,6 @@ mod tests {
             );
         assert_eq!(enabled(&sys, &REMOTE_APPLE_EVENTS), Read::Value(false));
         assert_eq!(enabled(&sys, &REMOTE_LOGIN), Read::Value(true));
-        // A plist with no Disabled key is enabled (plutil's 27.0 answer for a missing key).
         let sys = Fake::root();
         sys.on("/bin/launchctl print-disabled system", Ran::ok(VM_PRINT_DISABLED))
             .on(
@@ -459,7 +435,6 @@ mod tests {
 
     #[test]
     fn turning_it_off_tolerates_a_bootout_of_a_job_that_is_not_loaded() {
-        // Enabled in the override database but not loaded: a half state.
         let enabled_now = format!("{VM_PRINT_DISABLED}\t\t\"com.apple.AEServer\" => enabled\n");
         let disabled_now = format!("{VM_PRINT_DISABLED}\t\t\"com.apple.AEServer\" => disabled\n");
         let sys = Fake::root();

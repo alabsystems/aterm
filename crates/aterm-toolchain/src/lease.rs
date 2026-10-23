@@ -130,10 +130,13 @@ impl Subject {
                     _ => None,
                 });
                 let found = match (parts.next(), parts.next(), parts.next()) {
-                    (Some(STORE_DIR | COMPAT_DIR), Some(program), Some(build))
-                        if build.bytes().all(|b| b.is_ascii_digit()) =>
-                    {
-                        build.parse().ok().and_then(|b| Self::build(program, b))
+                    (Some(STORE_DIR | COMPAT_DIR), Some(program), Some(raw_build)) => {
+                        let build = raw_build
+                            .strip_suffix(crate::build_cache::NOINDEX)
+                            .unwrap_or(raw_build);
+                        (build.bytes().all(|b| b.is_ascii_digit()) && !build.is_empty())
+                            .then(|| build.parse().ok().and_then(|b| Self::build(program, b)))
+                            .flatten()
                     }
                     (Some(VIEWS_DIR), Some(name), _) => Self::view(name),
                     _ => None,
@@ -158,7 +161,7 @@ pub struct Lease {
 impl Lease {
     /// What the lease is on.
     #[must_use]
-    pub fn subject(&self) -> &Subject {
+    pub const fn subject(&self) -> &Subject {
         &self.subject
     }
 
@@ -420,7 +423,7 @@ pub enum Holders {
 impl Holders {
     /// Whether the subject must be treated as in use.
     #[must_use]
-    pub fn in_use(&self) -> bool {
+    pub const fn in_use(&self) -> bool {
         !matches!(self, Self::Free)
     }
 

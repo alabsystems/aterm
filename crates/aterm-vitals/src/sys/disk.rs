@@ -1,23 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WALKER SEAM of `sys disk` and `sys tab` (design §10.4, §10.5, §13.2,
-//! §13.6): what the disk walker knows of a scope's folders, as plain values
-//! the views print.
-//!
-//! The host hands every [`super::Root`] a [`RootSize`] and the scope a
-//! [`DiskTotals`] (`Ctx::disk`). A host that runs no walker leaves each root
-//! [`RootSize::NotSampled`] and `Ctx::disk` `None`, so every size reads
-//! `unavailable(not_sampled)` and never 0; a host whose walker is measuring
-//! fills them from its board (`sys_host::disk_roots` in aterm-gui is the one
-//! place that does). `sys disk` never walks on request: a cold root answers
-//! `state=walking` with `walked_entries=` and the last complete figure.
-//!
-//! The words: a complete root prints its allocated bytes bare; a walking one
-//! prints what the walk has summed so far as a lower bound (`≥…`, in JSON
-//! `{"v": n, "bound": "at_least", "cause": "walking"}`); a root the walker
-//! will not measure prints its refusal word (`protected`, `remote`,
-//! `removable`, `dataless`, `other_user`, `too_broad`).
+//! THE WALKER SEAM of `sys disk` and `sys tab` (design §10.4, §10.5, §13.2, §13.6): what the disk
+//! walker knows of a scope's folders, as plain values the views print.
 
 use super::json::Jv;
 
@@ -32,8 +17,7 @@ pub struct RootSizes {
     pub entries: u64,
     /// The largest direct entry count of any folder in it.
     pub direct_entries_max: u32,
-    /// The allocation's move between two complete walks, bytes per second
-    /// (negative: freed); `None` until two walks exist.
+    /// The allocation's move between two complete walks, bytes per second (negative: freed).
     pub growth_bps: Option<i64>,
     /// Seconds since that walk ended.
     pub age_s: Option<u64>,
@@ -56,9 +40,8 @@ pub enum RootSize {
     },
     /// The last walk reached its end.
     Complete(RootSizes),
-    /// Not measured, and why: one of the disk unavailable words
-    /// (`protected`, `remote`, `removable`, `dataless`, `other_user`,
-    /// `too_broad`).
+    /// Not measured, and why: one of the disk unavailable words (`protected`, `remote`,
+    /// `removable`, `dataless`, `other_user`, `too_broad`).
     NotMeasured(&'static str),
 }
 
@@ -74,8 +57,8 @@ impl RootSize {
         }
     }
 
-    /// The sizes that speak for the root: the complete walk's, else the last
-    /// complete one behind a running walk.
+    /// The sizes that speak for the root: the complete walk's, else the last complete one behind a
+    /// running walk.
     #[must_use]
     pub fn sizes(&self) -> Option<&RootSizes> {
         match self {
@@ -95,8 +78,8 @@ impl RootSize {
         }
     }
 
-    /// `alloc_bytes=` as a record value: bare when complete, `≥n` while a
-    /// walk runs, else `unavailable(<why>)`.
+    /// `alloc_bytes=` as a record value: bare when complete, `≥n` while a walk runs, else
+    /// `unavailable(<why>)`.
     #[must_use]
     pub fn alloc_text(&self) -> String {
         match self {
@@ -145,8 +128,7 @@ impl RootSize {
         self.figure_text(|s| s.entries)
     }
 
-    /// `growth_bps=`: the complete walk's, else the last one's behind a
-    /// running walk.
+    /// `growth_bps=`: the complete walk's, else the last one's behind a running walk.
     #[must_use]
     pub fn growth_text(&self) -> String {
         match self.sizes().and_then(|s| s.growth_bps) {
@@ -157,7 +139,6 @@ impl RootSize {
 
     fn growth_why(&self) -> &'static str {
         match self {
-            // Two complete walks give a growth; one gives none yet.
             Self::Complete(_) => "warming",
             other => other.why(),
         }
@@ -236,8 +217,8 @@ pub struct HugeDirFact {
     pub root: Option<usize>,
 }
 
-/// A scope's disk balance from the walker: over the outermost roots,
-/// `total = exclusive + shared`, each folder once.
+/// A scope's disk balance from the walker: over the outermost roots, `total = exclusive + shared`,
+/// each folder once.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DiskTotals {
     /// Bytes of the outermost roots.
@@ -246,8 +227,7 @@ pub struct DiskTotals {
     pub exclusive: u64,
     /// …that two or more tabs claim.
     pub shared: u64,
-    /// A walk is queued or running for one of them: the figures are lower
-    /// bounds.
+    /// A walk is queued or running for one of them: the figures are lower bounds.
     pub walking: bool,
     /// Σ growth of the complete outermost roots, bytes per second.
     pub growth_bps: Option<i64>,
@@ -272,9 +252,8 @@ pub fn bytes_word(b: u64) -> String {
     }
 }
 
-/// The scope's sentence clause for its roots' sizes: `15.3 GB exclusive ·
-/// growing 7.4 MB/s`, `≥2.1 GB exclusive (walking)`, or
-/// `sizes unavailable(not_sampled)` without a walker.
+/// The scope's sentence clause for its roots' sizes: `15.3 GB exclusive · growing 7.4 MB/s`, `≥2.1
+/// GB exclusive (walking)`, or `sizes unavailable(not_sampled)` without a walker.
 #[must_use]
 pub fn totals_clause(totals: Option<&DiskTotals>, bps_word: impl Fn(f64) -> String) -> String {
     let Some(t) = totals else {
@@ -400,7 +379,6 @@ mod tests {
             o.get("last_complete_alloc_bytes"),
             Some(&Jv::u(7_050_000_000))
         );
-        // Queued: nothing summed yet.
         let q = RootSize::Walking {
             walked_entries: 0,
             partial_alloc: None,

@@ -2,40 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! A Cargo test binary's own per-user root, so no test reaches the person's.
-//!
-//! A test that resolves a per-user path without naming one got the person's: on
-//! 2026-10-18 an aterm-gui unit test read the live window's token and dialled its
-//! control socket four times a run (the window logged each as a refused
-//! connection), and the same suite made directories in the person's state, log and
-//! config folders and read their `aterm.toml` and themes. So in a test binary every
-//! per-user resolver — [`crate::control_socket_dir`] here, and
-//! `aterm_types::dirs`' state, data, log and config folders — answers under
-//! [`scratch_root`] instead, unless the test named its own (`$XDG_RUNTIME_DIR`,
-//! `$ATERM_STATE_HOME`, `$XDG_CONFIG_HOME`).
-//!
-//! A test binary is what Cargo builds for `cargo test`: an executable named
-//! `<crate>-<16 hex digits>` in `<target>/<profile>/deps/` ([`is_test_binary`]), in a
-//! build with debug assertions. Nothing else is: the `aterm` an integration test
-//! runs is its uplifted copy, `<target>/<profile>/aterm`, which a test isolates with
-//! its own environment, and a build without debug assertions (every shipped one)
-//! compiles the check out.
-//!
-//! The root is `<temp>/aterm-tu-<uid>/<pid>-<stamp>`, made `0700` at first use; every
-//! root sits in that one private per-user directory, so the sweeps list roots and never
-//! the temp dir. At first use every root of a dead process goes, and at exit (`exit(3)`,
-//! unix) this process's own and every dead one's. A root is taken back only when its
-//! owner is provably gone: its pid is this process's at first use (its own root is not
-//! made yet) or at exit, or no live process has it. A forked child that exits leaves its
-//! parent's.
 
 use std::ffi::OsStr;
 use std::path::Path;
 #[cfg(debug_assertions)]
 use std::path::PathBuf;
 
-/// This test binary's per-user root (module docs), made at the first call; `None` in
-/// any other process, and when the root cannot be made or its directory is not this
-/// user's own (the resolvers then answer the person's paths, as before).
+/// This test binary's per-user root (module docs), made at the first call.
 #[must_use]
 pub fn scratch_root() -> Option<&'static Path> {
     #[cfg(debug_assertions)]
@@ -56,8 +29,7 @@ pub fn scratch_root() -> Option<&'static Path> {
     }
 }
 
-/// Whether `exe` is a Cargo test binary: `deps/<name>-<16 lowercase hex digits>`
-/// (`.exe` on Windows). A pure reading of the path.
+/// Whether `exe` is a Cargo test binary.
 #[must_use]
 pub fn is_test_binary(exe: &Path) -> bool {
     let in_deps = exe
@@ -79,9 +51,9 @@ pub fn is_test_binary(exe: &Path) -> bool {
     in_deps && executable && named
 }
 
-/// Whether `dir` is the login session's runtime directory, `/run/user/<uid>`
-/// (systemd's `pam_systemd` exports it to every process of a desktop session): an
-/// inherited `$XDG_RUNTIME_DIR` naming the person's own, never one a test chose.
+/// Whether `dir` is the login session's runtime directory, `/run/user/<uid>` (systemd's
+/// `pam_systemd` exports it to every process of a desktop session): an inherited `$XDG_RUNTIME_DIR`
+/// naming the person's own, never one a test chose.
 #[must_use]
 pub fn is_login_runtime_dir(dir: &OsStr) -> bool {
     #[cfg(unix)]
@@ -105,11 +77,6 @@ pub fn is_login_runtime_dir(dir: &OsStr) -> bool {
 fn claim(temp: &Path) -> Option<PathBuf> {
     let roots = roots_dir(temp)?;
     sweep(&roots);
-    // The stamp makes the name unique per process instance: a recycled pid never
-    // lands in a dead run's root even where a sweep failed part-way. Short, as the
-    // whole path is: a socket path under it must stay inside `sun_path`'s 104 bytes
-    // (`$TMPDIR` is 49 on macOS, `aterm-tu-<uid>/` 13 more, `/run/aterm-<pid>.sock`
-    // up to 22 more).
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.subsec_nanos());
@@ -212,8 +179,8 @@ fn sweep_at_exit(roots: &Path) {
         /// `stdlib.h`, declared inline as `aterm-gui`'s process scratch declares it.
         fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
     }
-    // SAFETY: registers a plain `extern "C"` function with no captured state; a failed
-    // registration only leaves the root to the next test binary's first-use sweep.
+    // SAFETY: registers a plain `extern "C"` function with no captured state; a failed registration
+    // only leaves the root to the next test binary's first-use sweep.
     unsafe { atexit(at_exit) };
 }
 
@@ -221,7 +188,6 @@ fn sweep_at_exit(roots: &Path) {
 #[cfg(all(not(unix), debug_assertions))]
 fn sweep_at_exit(_roots: &Path) {}
 
-// Debug builds only, as the root itself is: a release test build has no root.
 #[cfg(all(test, debug_assertions))]
 mod tests {
     #[cfg(unix)]
@@ -285,7 +251,6 @@ mod tests {
         let temp = aterm_tempfile::TempDir::new().expect("a temp dir");
         let temp = temp.path();
         let me = std::process::id();
-        // The parent of this test process outlives it; pid 0 is never a process.
         let parent = std::os::unix::process::parent_id();
         let dir = |name: String| {
             let path = temp.join(name);

@@ -390,8 +390,20 @@ pub(crate) fn init_base(applies: bool) -> aterm_machines::init::Base {
     base.items.push(Box::new(AiAccountsItem));
     aterm_machines::init::Base {
         clt: command_line_tools(),
+        targo: Some(Arc::new(targo)),
         ..base
     }
+}
+
+/// The toolset's `targo` for `develop.workspace-tools@<path>`: the `bin/targo` shim of the
+/// atpkg store (the shim, so its own exports apply), once it resolves into the store.
+#[cfg(target_os = "macos")]
+fn targo() -> Result<std::path::PathBuf, String> {
+    const INSTALL: &str = "the toolset's targo is not installed: `aterm pkg install \
+                           --default-set` installs it";
+    let layout = atpkg::store::resolve_configured().ok_or(INSTALL)?;
+    atpkg::ops::which(&layout, "targo").ok_or(INSTALL)?;
+    Ok(layout.bin_dir().join("targo"))
 }
 
 /// `base.ai.accounts`: converges `accounts.toml` and `fleet-accounts.toml`
@@ -568,6 +580,7 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
             items,
             held: None,
             clt: None,
+            targo: None,
         };
     }
     match atpkg::lock::try_lock_store(&ground.layout) {
@@ -575,11 +588,13 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
             items,
             held: Some(Box::new(lock)),
             clt: None,
+            targo: None,
         },
         Err(why @ atpkg::lock::StoreLockError::Contended(_)) => Base {
             items: aterm_converge::standing_aside(items, &StoodAside::Lock(why.to_string())),
             held: None,
             clt: None,
+            targo: None,
         },
         Err(why) => Base {
             items: aterm_converge::held_back(
@@ -588,6 +603,7 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
             ),
             held: None,
             clt: None,
+            targo: None,
         },
     }
 }

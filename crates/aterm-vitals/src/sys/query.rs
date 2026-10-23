@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `sys` grammar (§13.1):
-//!
-//! ```text
-//! sys [<view>] [scope=<pane|tab|window|aterm|global>] [instances=all]
-//!     [top=<n>] [depth=<d>] [fresh=<ms>] [since=<cursor>] [--json] [caller=<sid>]
-//! sys name job=<id>|task=<id>
-//! <view> := overview | tab | aterm | global | jobs | cores | gpu | mem | disk | procs
-//! ```
-//!
-//! `scope=` is refused on the scope views (`overview`, `tab`, `aterm`,
-//! `global`); `top=` is 1–64 (8 by default); `depth=` belongs to `disk`;
-//! `fresh=` below 250 ms reads as 250 except `fresh=0`, which forces a sample;
-//! `instances=all` is accepted on `overview`, `aterm`, `global`, `cores`,
-//! `gpu`, `mem`, and on `procs` with `scope=aterm`. `caller=` is the advisory
-//! session the client runs in (`$ATERM_PARENT_SESSION_ID`), which decides
-//! whether paths print; it is hygiene, not a boundary.
+//! Grammar and query parser for the `sys` control verb.
 
 /// The usage line every refusal of the grammar answers.
 pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs] \
@@ -25,9 +10,9 @@ pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gp
 
 /// The rows a view lists by default.
 pub const TOP_DEFAULT: usize = 8;
-/// …and at most.
+/// Maximum rows a view lists.
 pub const TOP_MAX: usize = 64;
-/// `fresh=` below this (other than 0) reads as this.
+/// Minimum nonzero `fresh=` interval in milliseconds.
 pub const FRESH_MIN_MS: u64 = 250;
 
 /// A view.
@@ -91,8 +76,7 @@ impl View {
         Self::ALL.into_iter().find(|v| v.word() == w)
     }
 
-    /// The scope the view reads when `scope=` is not given; `None` for the
-    /// scope views, which take no `scope=`.
+    /// Returns the default scope for `self`, or `None` for scope views.
     #[must_use]
     pub fn default_scope(self) -> Option<ScopeArg> {
         match self {
@@ -143,8 +127,7 @@ impl ScopeArg {
     }
 }
 
-/// A reply's cursor, `<ep>.<seq>`: the instance epoch in hex and the
-/// snapshot sequence in decimal.
+/// Snapshot cursor `<ep>.<seq>` with hex epoch and decimal sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cursor {
     /// The instance epoch.
@@ -174,7 +157,7 @@ impl std::fmt::Display for Cursor {
     }
 }
 
-/// `sys name`'s target (Tier B, §11.8).
+/// Target of a `sys name` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NameTarget {
     /// A job id.
@@ -227,12 +210,10 @@ fn sid_word(w: &str) -> Option<String> {
 }
 
 impl SysQuery {
-    /// Parse the arguments after `sys`.
+    /// Parses the arguments after `sys`.
     ///
     /// # Errors
-    ///
-    /// [`USAGE`] for an unknown view or key, `scope=` on a scope view, a bad
-    /// `top=`, `depth=` off `disk`, `instances=all` where it is not taken.
+    /// [`USAGE`] for an unknown view or key or invalid `scope=`, `top=`, `depth=`, or `instances=`.
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         let mut q = Self {
             view: View::Overview,
@@ -325,10 +306,7 @@ impl SysQuery {
         self.scope.or(self.view.default_scope())
     }
 
-    /// Whether the request reads only aggregates or the target's own rows: a
-    /// Scoped `Read` on the target. Every other form (the `aterm` view,
-    /// `procs`/`jobs` beyond the target's tab, `disk` of aterm or the machine,
-    /// `instances=all`, `name`) is Owner-only (§13.3).
+    /// Returns whether the request reads only aggregates or the target session's own rows.
     #[must_use]
     pub fn target_rows_only(&self) -> bool {
         if self.instances_all || self.name.is_some() {
@@ -347,8 +325,7 @@ impl SysQuery {
         }
     }
 
-    /// The oldest snapshot the view accepts without `fresh=` (design §6.4):
-    /// cores 1 s, volumes 10 s, everything else 2 s.
+    /// Returns the default snapshot freshness threshold in milliseconds for `self.view`.
     #[must_use]
     pub fn freshness_default_ms(&self) -> u64 {
         match self.view {

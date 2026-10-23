@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared support for the GPU parity suites: channel extractors, delta
-//! comparators, and the CPU+GPU backend constructors.
+//! Shared support for the GPU parity suites.
 
 #![allow(dead_code)] // each test binary uses its own subset of the kit
 
@@ -18,9 +17,7 @@ pub fn bb(p: u32) -> i32 {
     (p & 0xff) as i32
 }
 
-/// Render until the frame stops changing (at most `SETTLE_LIMIT` extra renders) and return the
-/// last one. It does not remove the fallback-face race (a chain that has not arrived yet is
-/// already a fixed point, drawing `.notdef`); [`font_settled`], applied by `backends`, does.
+/// Render until the frame stops changing (at most `SETTLE_LIMIT` extra renders) and return the last one.
 pub fn settled_cpu(cpu: &mut Renderer, input: &aterm_render::RenderInput) -> Frame {
     let mut last = cpu.render_input(input);
     for _ in 0..SETTLE_LIMIT {
@@ -85,9 +82,7 @@ pub fn count_exceeding_frame(a: &Frame, b: &Frame, tol: i32) -> usize {
     n
 }
 
-/// The face every renderer here is built on: the checked-in JetBrains Mono
-/// fixture, so a frame is the same on every host and no suite depends on the
-/// machine's fonts. Passed as the family, the window's `--font` seam.
+/// Checked-in JetBrains Mono fixture path.
 pub const FIXTURE_FONT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aterm-render/tests/fixtures/jetbrains-mono.ttf"
@@ -99,19 +94,11 @@ pub const FIXTURE_FONT: &str = concat!(
 fn gpu_on(font: &str, px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     let ctx = aterm_gpu::GpuContext::new()
         .unwrap_or_else(|e| aterm_spec::host::could_not_run(format!("no GPU: {e}")));
-    // On Linux the renderer draws, presents and reads back through the
-    // first-party GL arm (docs/AUDIT-third-party-2026-10-15.md GW.4), as on
-    // macOS through Metal: both are armed at construction.
     aterm_gpu::GpuRenderer::from_parts(ctx, cpu_on(font, px, theme), Some(font.into()), theme)
         .expect("the GPU renderer assembles on an acquired device")
 }
 
-/// Move `g` onto the wgpu oracle arm: on macOS and Linux a renderer draws on
-/// its first-party arm (Metal, GL), so a suite that reads the wgpu offscreen,
-/// drives wgpu-typed seams (blits, stand-in textures, taps, the allocator) or
-/// checks the WGSL that ships on Windows and wasm asks for the oracle. A no-op
-/// where wgpu is the renderer. Only a build carrying the oracle arm (the
-/// `--features wgpu-oracle` lane on macOS and Linux) has it.
+/// Move `g` onto the wgpu oracle arm.
 #[cfg(wgpu_arm)]
 pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
     #[cfg(target_os = "macos")]
@@ -122,10 +109,7 @@ pub fn disarm_for_oracle(g: &mut aterm_gpu::GpuRenderer) {
     let _ = g;
 }
 
-/// End the calling test as could-not-run unless this host ships a
-/// colour-emoji face: every macOS and Windows does, a Linux host when Noto
-/// Color Emoji is installed. Read from the files, never from a frame, so a
-/// renderer that lost its colour glyphs fails rather than blaming the host.
+/// End the calling test as could-not-run unless this host ships a colour-emoji face.
 pub fn require_host_colour_emoji() {
     let noto = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
     if !cfg!(any(target_os = "macos", windows)) && !std::path::Path::new(noto).is_file() {
@@ -139,21 +123,17 @@ fn cpu_on(font: &str, px: f32, theme: Theme) -> Renderer {
         .unwrap_or_else(|| panic!("{font} does not load"))
 }
 
-/// The CPU and GPU renderers under test, both on [`FIXTURE_FONT`] and
-/// font-settled ([`font_settled`]).
+/// The CPU and GPU renderers under test, both on [`FIXTURE_FONT`] and font-settled.
 pub fn backends(px: f32, theme: Theme) -> (Renderer, aterm_gpu::GpuRenderer) {
     backends_with_font(std::path::Path::new(FIXTURE_FONT), px, theme)
 }
 
-/// A CPU renderer at `px`/`theme` on [`FIXTURE_FONT`], for a suite that builds
-/// its own oracle beside a pair.
+/// A CPU renderer at `px`/`theme` on [`FIXTURE_FONT`].
 pub fn cpu(px: f32, theme: Theme) -> Renderer {
     cpu_on(FIXTURE_FONT, px, theme)
 }
 
-/// A GPU renderer at `px`/`theme` on [`FIXTURE_FONT`]. Not font-settled: a
-/// suite that compares it against another renderer settles it itself (or uses
-/// [`backends`]).
+/// A GPU renderer at `px`/`theme` on [`FIXTURE_FONT`].
 pub fn gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     gpu_on(FIXTURE_FONT, px, theme)
 }
@@ -166,9 +146,7 @@ pub fn wgpu_oracle(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     g
 }
 
-/// [`backends`], with both renderers built on the font file at `font`, passed as the family
-/// (the window's `--font` / `font_family` seam, `from_system_with_family`), so no environment
-/// variable is involved.
+/// [`backends`], with both renderers built on the font file at `font`.
 pub fn backends_with_font(
     font: &std::path::Path,
     px: f32,
@@ -179,9 +157,7 @@ pub fn backends_with_font(
     font_settled(cpu_on(family, px, theme), gpu)
 }
 
-/// Block both renderers on their lazy fallback-chain parses, so later renders use a final chain
-/// and the CJK face cannot land between a test's two arms (CPU draws 日本, GPU `.notdef`).
-/// `Renderer::ensure_fallback` takes its path list when it spawns, so the parse happens once.
+/// Block both renderers on their lazy fallback-chain parses.
 pub fn font_settled(
     mut cpu: Renderer,
     mut gpu: aterm_gpu::GpuRenderer,
@@ -191,37 +167,26 @@ pub fn font_settled(
     (cpu, gpu)
 }
 
-/// A second, independent GPU renderer for a test that already holds a pair,
-/// font-settled like the pair.
+/// A second, independent GPU renderer, font-settled like [`backends`].
 pub fn independent_gpu(px: f32, theme: Theme) -> aterm_gpu::GpuRenderer {
     let mut gpu = gpu(px, theme);
     gpu.debug_block_on_lazy_fallbacks();
     gpu
 }
 
-/// [`backends`] for the additive parity suites (glow, nova): forces the
-/// deterministic fontdue rasterizer and turns off the GPU-only bloom and
-/// shimmer, so the comparison covers the shared base path.
+/// [`backends`] for the additive parity suites using the fontdue rasterizer.
 pub fn backends_fontdue(px: f32, theme: Theme) -> (Renderer, aterm_gpu::GpuRenderer) {
-    // Byte-exact additive parity needs fontdue: CoreText's crisp edges turn the ≤8 CPU/GPU
-    // sub-pixel difference into a full-channel divergence under a One/One glow, while fontdue's
-    // soft edges absorb it. Set once, before any renderer in this binary is built.
     static FORCE_FONTDUE: std::sync::Once = std::sync::Once::new();
     FORCE_FONTDUE.call_once(|| {
         aterm_log::env::set("ATERM_RASTERIZER", "fontdue");
     });
     let mut gpu = gpu(px, theme);
-    // Bloom (GPU-only, additive on top of the base; see the `bloom_*` tests) and heat shimmer
-    // (wall-clock; `heat_shimmer.rs`) are off, so the comparison covers the shared base path.
     gpu.set_bloom(false);
     gpu.set_shimmer(false);
-    // Font-settled for the same reason [`backends`] is.
     font_settled(cpu_on(FIXTURE_FONT, px, theme), gpu)
 }
 
-/// The byte-exact text ground the overlay-stream parity suites composite over: a hidden-cursor
-/// `rows`×`cols` terminal whose rows `block_rows` each carry 30 procedural full blocks (█).
-/// Blocks render identically on both backends, so a stream's delta over this base is its own.
+/// Hidden-cursor `rows`×`cols` terminal whose rows `block_rows` carry 30 full blocks.
 pub fn block_text_term(
     rows: usize,
     cols: usize,
@@ -235,10 +200,7 @@ pub fn block_text_term(
     term
 }
 
-/// The cached-path no-ghosting + dirty-gate pin the sprite suites make, on both backends: frame
-/// `a` primes the caches; `b` moves the sprite (the GPU gate must miss, and each backend's
-/// cached repaint must equal a fresh full render, so the vacated bands re-cleared); `c` repeats
-/// `b` and must take the GPU dirty gate. `moved` and `settled` name the sprite in failures.
+/// Assert cached-path no-ghosting and dirty-gate behaviour across three frames.
 pub fn assert_moved_then_settled(
     (cpu, gpu): (&mut Renderer, &mut aterm_gpu::GpuRenderer),
     (px, theme): (f32, Theme),
@@ -259,7 +221,6 @@ pub fn assert_moved_then_settled(
         "a moved {moved} must MISS the GPU dirty gate (real re-render)"
     );
 
-    // Fresh ground truths (throwaway caches / a fresh GPU renderer).
     let cpu_b_fresh = cpu.render_input(b).pixels;
     assert_eq!(
         cpu_b_cached, cpu_b_fresh,
@@ -273,7 +234,6 @@ pub fn assert_moved_then_settled(
         "GPU dirty-row path must repaint the moved {moved} with no ghosting"
     );
 
-    // Settled: byte-equal sprites + same atlas version ⇒ the GPU gate hits.
     let hits_before = gpu.gate_hits();
     let _ = gpu.render_input_cached(&mut win_gpu, c);
     assert!(
@@ -282,34 +242,7 @@ pub fn assert_moved_then_settled(
     );
 }
 
-// Byte-exact CPU==GPU parity for the source-over streams: where it is pinned, and where a
-// one-LSB miss is waived.
-//
-// Several tests require delta 0 between CPU and GPU frames of the source-over streams
-// (`fs_fire_over`, `fs_rain_glow_over`, the source-over bed, the ribbon train). That holds on
-// Apple-silicon GPUs; the Intel and AMD GPUs of x86_64 Macs store some source-over pixels one
-// LSB off (the additive streams stay exact), and so does Windows: an AMD Radeon 780M under
-// DX12 missed by one in the fire and veil Over, the ribbon train and the gradient bed
-// (2026-10-17, its additive streams exact). The fixed-function blend's precision is the
-// API's to choose, and Windows has no Apple GPU.
-//
-// Mesa's software rasterizer on Linux, llvmpipe for GL and lavapipe for Vulkan (both name
-// their device `llvmpipe`), misses by one in the fire and veil Over too: on the GL arm, and on
-// lavapipe through the rows' `_cpu_vs_wgpu_oracle` twins, on aarch64 and x86_64 (the Linux
-// lane, Mesa 25.2.8, 2026-10-19). Probed on llvmpipe's GLES, it blends a unorm8 target in
-// 8-bit fixed point, rounding each product on its own as `(t + (t >> 8) + 0x80) >> 8` with
-// `t = x·y`, then adding with saturation. Every one of the 16,777,216 (src, dst, alpha) cases
-// of a `SRC_ALPHA, ONE_MINUS_SRC_ALPHA` blend matched that law, and 4,121,116 of them sit one
-// below or above the single rounding the CPU's `over_rgb` takes, none further
-// (`docs/measured/linux-gpu-rows-2026-10-19.md`). So [`assert_byte_exact`] reports a
-// one-LSB miss on stderr and passes on x86_64 macOS, on Windows and on an `llvmpipe`
-// adapter, and 2 or more still fails; everywhere else (Apple GPUs, and any Linux GPU, none
-// of which has run here) it asserts delta 0. Callers still gate on
-// `GpuRenderer::additive_is_byte_exact` first.
-
-/// `assert_eq!(delta, 0, "{message}")`, except where [`waived_on`] names the
-/// host or adapter: there a one-LSB miss prints its report line and fails
-/// nothing, and a larger miss fails with the caller's message.
+/// Assert `delta == 0`, or at most `WAIVED_LSB` where [`waived_on`] applies.
 #[track_caller]
 pub fn assert_byte_exact(
     test: &str,
@@ -323,9 +256,6 @@ pub fn assert_byte_exact(
         return;
     }
     let (adapter, backend) = gpu.adapter();
-    // On Linux a renderer draws on the GL arm, armed at construction, even
-    // where the context is the oracle's wgpu one; a test that disarmed it
-    // ([`disarm_for_oracle`]) drew on wgpu, and the label names which arm drew.
     #[cfg(target_os = "linux")]
     let backend = if gpu.last_frame_on_gl() {
         "the GL arm"
@@ -336,8 +266,6 @@ pub fn assert_byte_exact(
         assert_eq!(delta, 0, "{message}");
         return;
     };
-    // The stderr handle rather than `eprintln!`, which libtest captures and
-    // drops for a passing test: a waived pin must show in every run.
     let line = format!(
         "{test}: {what}: CPU vs GPU max per-channel delta {delta} on {adapter} ({backend}) — not \
          asserted byte-exact on {waived}: pinned on Apple GPUs, and this GPU's source-over \
@@ -370,26 +298,14 @@ fn waived_on(adapter: &str) -> Option<&'static str> {
     }
 }
 
-/// The byte-exact comparisons of one CPU-vs-GPU parity test.
-///
-/// The byte-exact comparison holds only where the offscreen is sRGB
-/// ([`aterm_gpu::GpuRenderer::additive_is_byte_exact`]): on a downlevel adapter
-/// the additive and blended streams land in linear. Every other property a
-/// test checks (gate misses, non-vacuity, drained frames, sizes) holds on any
-/// adapter. So a test asks [`ByteExact::holds`] before each byte-exact
-/// assertion and runs everything else; on a downlevel adapter the comparisons
-/// it could not make are remembered, and when the test would otherwise pass it
-/// ends COULD NOT RUN naming them (when the gate drops), never a pass with a
-/// SKIP printed.
+/// Gate for byte-exact comparisons of one CPU-vs-GPU parity test.
 #[derive(Debug, Default)]
 pub struct ByteExact {
     deferred: std::cell::RefCell<Vec<String>>,
 }
 
 impl ByteExact {
-    /// Whether `gpu` composites byte-exact with the CPU, so the caller asserts
-    /// the comparison `what`. When it does not, `what` is deferred to the
-    /// COULD NOT RUN this gate ends the test with.
+    /// Whether `gpu` composites byte-exact with the CPU, deferring `what` when not.
     pub fn holds(&self, gpu: &aterm_gpu::GpuRenderer, what: &str) -> bool {
         let exact = gpu.additive_is_byte_exact();
         if !exact {
@@ -402,7 +318,6 @@ impl ByteExact {
 impl Drop for ByteExact {
     fn drop(&mut self) {
         let deferred = self.deferred.get_mut();
-        // A test already failing keeps its own failure.
         if !deferred.is_empty() && !std::thread::panicking() {
             aterm_spec::host::could_not_run(format!(
                 "{}: this adapter renders to a downlevel (non-sRGB) offscreen, where the add \
@@ -413,8 +328,7 @@ impl Drop for ByteExact {
     }
 }
 
-/// End the calling test COULD NOT RUN unless `gpu` composites byte-exact with
-/// the CPU (an sRGB offscreen); `what` names the comparison it cannot make.
+/// End the calling test COULD NOT RUN unless `gpu` composites byte-exact with the CPU.
 pub fn byte_exact_or_could_not_run(gpu: &aterm_gpu::GpuRenderer, what: &str) {
     if !gpu.additive_is_byte_exact() {
         aterm_spec::host::could_not_run(format!(

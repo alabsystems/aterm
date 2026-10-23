@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A pane-focus chord on an arrow claims its key only while a pane lies that way
-//! (`keybinding::resolve_chord`, asking `App::focus_pane_would_move`), driven
-//! through the shipping `on_key` with real winit events. On a one-pane tab, a
-//! zoomed pane or at the edge of a split, Alt+←/→ reaches the program as
-//! `ESC[1;3D` / `ESC[1;3C`, the word motion aterm's shell integrations bind, and
-//! is booked as a forwarded press, so its repeats and its release follow it there.
-//! With a pane that way the chord moves focus and the program sees nothing. A
-//! pane-focus chord off the arrows (`ctrl+j`) always keeps its key.
+//! Tests for pane-focus arrow chord pass-through when no pane lies in that direction.
 
 use super::{PhysicalReleaseTrace, take_physical_release_trace};
 use crate::{App, PhysicalPressOwner, WindowId};
@@ -212,7 +205,6 @@ fn at_the_edge_of_a_split_or_zoomed_the_chord_passes_through() {
     let (mut app, wid) = app_with_alt_arrow_pane_focus();
     let right_pane = app.split_active_stub_tab(wid);
 
-    // The right pane of a side-by-side split: nothing to its right, above or below.
     for arrow in [RIGHT, UP, DOWN] {
         press(&mut app, wid, arrow);
         assert_eq!(
@@ -230,7 +222,6 @@ fn at_the_edge_of_a_split_or_zoomed_the_chord_passes_through() {
         release(&mut app, wid, arrow);
     }
 
-    // Zoomed, the pane fills the window and has no neighbour: Alt+← passes through.
     app.toggle_pane_zoom();
     press(&mut app, wid, LEFT);
     assert_eq!(focus(&app, wid), right_pane);
@@ -238,12 +229,11 @@ fn at_the_edge_of_a_split_or_zoomed_the_chord_passes_through() {
     release(&mut app, wid, LEFT);
     app.toggle_pane_zoom();
 
-    // Unzoomed, the left pane is there again and takes the key…
     press(&mut app, wid, LEFT);
     assert_eq!(focus(&app, wid), 0);
     assert!(consumed(&app, wid, LEFT));
     release(&mut app, wid, LEFT);
-    // …and from it, ← is the edge: word motion in the left pane's program.
+
     press(&mut app, wid, LEFT);
     assert_eq!(focus(&app, wid), 0);
     assert_eq!(forwarded(&app, LEFT), (0, LEFT.alt_bytes.to_vec()));
@@ -291,7 +281,6 @@ fn a_passed_through_press_keeps_its_repeats_and_release() {
     );
     assert!(owner(&app, LEFT).is_none(), "the hold is over");
 
-    // Negative control: in a split, the same hold is the GUI's.
     let right_pane = app.split_active_stub_tab(wid);
     press(&mut app, wid, LEFT);
     assert_eq!(focus(&app, wid), 0);
@@ -404,7 +393,6 @@ fn a_ctrl_letter_pane_focus_binding_never_hands_its_byte_to_the_shell() {
     app.windows.get_mut(&wid).expect("window").mods = ModifiersState::CONTROL;
     let session = app.front_terminal(wid).expect("terminal").session;
 
-    // Unbound: the press reaches the program as LF.
     app.on_key(wid, ctrl_j(ElementState::Pressed));
     let Some(PhysicalPressOwner::Forwarded {
         session: to,
@@ -442,7 +430,6 @@ fn a_ctrl_letter_pane_focus_binding_never_hands_its_byte_to_the_shell() {
         Some(PhysicalReleaseTrace::Forwarded { .. })
     ));
 
-    // Bound to pane focus with no pane below: claimed, and the program sees nothing.
     app.keybindings = crate::keybinding::Keybindings::resolved(Some(
         &[("ctrl+j".to_string(), "focus_pane_down".to_string())]
             .into_iter()

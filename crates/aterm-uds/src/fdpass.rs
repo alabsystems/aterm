@@ -181,7 +181,7 @@ mod scm {
         const SOL_LOCAL: i32 = 0;
         const LOCAL_PEERPID: i32 = 0x002;
 
-        pub fn msghdr(
+        pub const fn msghdr(
             iov: *mut super::IoVec,
             iov_len: usize,
             control: *mut u8,
@@ -202,11 +202,11 @@ mod scm {
             }
         }
 
-        pub fn control_len(msg: &MsgHdr) -> usize {
+        pub const fn control_len(msg: &MsgHdr) -> usize {
             msg.msg_controllen as usize
         }
 
-        pub fn msg_flags(msg: &MsgHdr) -> i32 {
+        pub const fn msg_flags(msg: &MsgHdr) -> i32 {
             msg.msg_flags
         }
 

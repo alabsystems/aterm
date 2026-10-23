@@ -170,12 +170,12 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
     let header = |name: &str| crate::header_in(&head.headers, name);
     let chunked =
         header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let mut body = Vec::new();
     if !chunked && !head.malformed {
         let length = header("content-length")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0)
             .min(BODY_MAX);
-        let mut body = Vec::new();
         let _ = (&mut reader).take(length).read_to_end(&mut body);
     }
     let req = Request {
@@ -183,6 +183,7 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         method: head.method,
         target: head.target,
         headers: head.headers,
+        body,
         chunked,
         malformed: head.malformed,
     };
@@ -253,6 +254,8 @@ fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>)
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
         301 => "Moved Permanently",
         302 => "Found",
         304 => "Not Modified",

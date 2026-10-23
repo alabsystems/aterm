@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Shared vendor-file readers and matchers for deterministic fixtures and the
-//! explicit vendor-drift bench. No vendor executable is started.
+//! Shared vendor-file readers and matchers for deterministic fixtures and the explicit vendor-drift
+//! bench.
 
 use crate::anchors::*;
 
-/// Whether `needle` occurs in `hay` (Boyer-Moore-Horspool: a 225 MB binary
-/// is scanned in a fraction of a second per needle, where a window-by-
-/// window compare took most of a minute for the table).
+/// Whether `needle` occurs in `hay`.
 pub(crate) fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     let n = needle.len();
     if n == 0 {
@@ -31,10 +29,7 @@ pub(crate) fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// The version a `--version` line names: a dotted one (`2.1.286 (Claude
-/// Code)`, `codex-cli 0.130.0`, agy's bare `1.4.0`), or Muse Code's with
-/// its revision, `x.y.z-R<n>.<s>` — `Muse Code 1.4.9 (1.4.9-R6297.1)`
-/// names both, and the revision is the build its anchors were read on.
+/// The version a `--version` line names.
 pub(crate) fn version_in(text: &str) -> Option<String> {
     let dotted = |v: &str| {
         v.split('.').count() >= 2
@@ -59,32 +54,7 @@ pub(crate) fn contains(bytes: &[u8], needle: &str) -> bool {
     contains_bytes(bytes, needle.as_bytes())
 }
 
-/// THE LIMIT RESET'S TEMPLATES, WHOLE, as the 2.1.304 bundle spells them
-/// — a `·` as its `\xB7` escape, a value as its `{placeholder}` — each
-/// built from the rows the readers match by (`crate::reset`) and named
-/// by what it is: the grant row, the confirmation's title, yes, body
-/// and detail, the early lines' tail, the answers a reader tells apart
-/// (the spent line, the still-walled one, the kept line's head, the
-/// lifted and login lines), the three switches of the bundle's that say
-/// which kind each word is — `X()`'s `{kind}`, `ce()`'s count noun for
-/// the five-hour kind, `Mt()`'s `{done}` (`crate::reset::ResetKind`
-/// reads each word as that kind) — the two rules the readers read the
-/// kinds' words back by: `ce()`'s count grammar (`no …s`, `1 …`, `n …s`)
-/// and `Kg`'s `{Kind}` (the first letter upper-cased); and `Yn`'s
-/// `{limits}`, the confirmation's body, which `reset_limit_name` and
-/// `limits_of` read back: its limit names, the model limits' names it
-/// strips ` limit` from (`jie`), and its `X limit` / `a, b and c limits`
-/// join.
-///
-/// [`missing`] looks for each side of a `·` on its own, and the kinds'
-/// names, the confirmation's two joins (`now`, `left`, `use by`) and the
-/// heads `Use a`, `Yes, use my` and `kept` are words a build that
-/// rewords the reset still carries elsewhere. A template is ONE literal
-/// of the vendor's table (a switch, one function's body), so a reworded
-/// one is missing — and what a rewording costs is every row, every
-/// confirmation or every answer of the reset read as none of its own:
-/// refused, the wall's one attempt with it, or a spent reset recorded as
-/// failed.
+/// THE LIMIT RESET'S TEMPLATES, WHOLE, as the 2.1.304 bundle spells them.
 pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     use crate::reset::ResetKind;
     let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
@@ -98,8 +68,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
         .split(" · ")
         .next()
         .expect("the detail's join opens with its word");
-    // A switch over the kinds' ids in the bundle's own order, each
-    // returning `word(kind)`.
     let switch = |word: &dyn Fn(ResetKind) -> String| {
         let cases: String = [
             ResetKind::Session,
@@ -157,12 +125,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
             "five-hour count noun",
             format!("\"session\"?\"{}\":", anchor("reset.kind.session_count")),
         ),
-        // `ce()`'s grammar of `{kindResets}`, which `ResetKind::resets_of`
-        // reads back (`no <noun>s`, `1 <noun>`, `<n> <noun>s`), and `Kg`'s
-        // `{Kind}`, the kind's first letter upper-cased, which the kept
-        // and still-walled lines are read by (`ResetKind::capital`):
-        // byte for byte, the bundle's minified names and all, so a build
-        // that rewords either, or only renames them, is named.
         (
             "kind count grammar",
             "return s===0?`no ${d}s`:s===1?`1 ${d}`:`${s} ${d}s`}".to_string(),
@@ -193,10 +155,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
         ),
         ("lifted line", escaped("reset.lifted")),
         ("login line", format!("{} \\xB7 ", anchor("reset.login"))),
-        // `Yn`'s `{limits}`: each window's name as `reset_limit_name`
-        // reads it back (a Fable give-back's own `Fable` aside), the
-        // model limits' names (`jie`'s, less ` limit`), and the join
-        // `limits_of` splits.
         (
             "limit names",
             format!(
@@ -226,14 +184,6 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     .into_iter()
     .map(|(name, text)| (name, vec![text]))
     .collect();
-    // `Yn`'s strip of ` limit` off the model limits' names, in either of the
-    // bundle's spellings: 2.1.306 and older strip it at the call,
-    // `.replace(/ limit$/,"")`; 2.1.307 calls a suffix helper,
-    // `Iy(<name>," limit")`, whose body strips exactly that suffix. Each row
-    // holds in a build that holds one of its spellings: the call row by the
-    // strip at the call or the helper's argument there, the helper row by the
-    // strip at the call or the helper's body (the helper's name is the
-    // minifier's, so the two rows are not tied by it).
     const REPLACE: &str = ".replace(/ limit$/,\"\")";
     let call = |strip: &str| format!("{strip});break;case\"seven_day_sonnet\":");
     templates.extend([
@@ -252,8 +202,7 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     templates
 }
 
-/// The names of the `templates` that `bytes` hold whole in none of their
-/// spellings.
+/// The names of the `templates` that `bytes` hold whole in none of their spellings.
 pub(crate) fn missing_templates(
     bytes: &[u8],
     templates: &[(&'static str, Vec<String>)],
@@ -265,8 +214,7 @@ pub(crate) fn missing_templates(
         .collect()
 }
 
-/// A rollout key no Codex build or rollout holds: the key tests'
-/// negative control.
+/// A rollout key no Codex build or rollout holds: the key tests' negative control.
 pub(crate) const PLANTED_ROLLOUT_KEY: &[Anchor] = &[Anchor {
     id: "rollout.planted",
     text: "turn_context_planted_by_no_build",

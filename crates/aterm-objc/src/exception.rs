@@ -39,7 +39,7 @@ impl Contained {
     /// Returns the 1-based ordinal assigned by [`report`], or `0` if unreported.
     #[inline]
     #[must_use]
-    pub(crate) fn ordinal(self) -> u64 {
+    pub(crate) const fn ordinal(self) -> u64 {
         self.ordinal
     }
 }
@@ -289,7 +289,7 @@ pub unsafe trait InertZero: Sized {}
 /// Returns the all-zero inert value of `R`.
 #[inline]
 #[must_use]
-pub fn inert<R: InertZero>() -> R {
+pub const fn inert<R: InertZero>() -> R {
     // SAFETY: `InertZero` guarantees all-zero bytes are a valid `R`.
     unsafe { MaybeUninit::<R>::zeroed().assume_init() }
 }

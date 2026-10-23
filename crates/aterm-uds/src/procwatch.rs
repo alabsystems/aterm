@@ -348,21 +348,21 @@ impl ProcWatch {
 
     /// Return the watched shell's PID.
     #[must_use]
-    pub fn shell(&self) -> i32 {
+    pub const fn shell(&self) -> i32 {
         self.shell
     }
 
     /// Children the cap left unwatched, so far (each counted once).
     #[cfg(target_vendor = "apple")]
     #[must_use]
-    pub fn overflow(&self) -> u64 {
+    pub const fn overflow(&self) -> u64 {
         self.tracked.overflow
     }
 
     /// See the Darwin twin: nothing is watched here.
     #[cfg(not(target_vendor = "apple"))]
     #[must_use]
-    pub fn overflow(&self) -> u64 {
+    pub const fn overflow(&self) -> u64 {
         0
     }
 
@@ -559,7 +559,7 @@ fn delete(fd: &std::os::fd::OwnedFd, pid: i32) {
 
 /// An all-zero kevent slot.
 #[cfg(target_vendor = "apple")]
-fn empty_event() -> kq::Kevent {
+const fn empty_event() -> kq::Kevent {
     kq::Kevent {
         ident: 0,
         filter: 0,

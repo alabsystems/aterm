@@ -1,27 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A password held in memory only: `enroll` asks the admin's password once, on the terminal,
-//! and feeds it to each Mac's `ssh` login and `sudo` through pipes (design §4.2).
-//!
-//! Where a password could leak, and what keeps it out:
-//!
-//! - **argv and the environment** (`ps` shows both): a [`Secret`] reaches a child only as its
-//!   standard input, a pipe written before the child starts ([`super::System::run_fed`]). The
-//!   `SSH_ASKPASS` helper `ssh` runs (`crate::askpass`) reads it from there too.
-//! - **disk**: nothing writes it. The buffer is `mlock`ed, best effort (`RLIMIT_MEMLOCK`
-//!   bounds it), so it stays out of swap where the kernel allows; macOS encrypts swap anyway.
-//!   Before it is read, `RLIMIT_CORE` goes to zero ([`no_core_dumps`]) in the controller and
-//!   in the askpass helper, so neither, nor `ssh`, which inherits it, can leave a core file.
-//! - **logs, errors, `Debug`**: `Debug` prints `Secret(<redacted>)`; there is no `Display`,
-//!   `Clone` or `Serialize`, and the test arm records a fed command by its display alone.
-//! - **memory after use**: one fixed boxed buffer, never a growing `String`, whose
-//!   reallocations would leave copies behind; it is scrubbed with volatile writes on drop
-//!   (the hand-rolled `zeroize`, as `atpkg-keys`' master phrase is: this workspace carries
-//!   no `zeroize`).
-//! - **the screen**: the terminal's echo is off while it is typed, and put back by a guard on
-//!   every ordinary path; Ctrl-C (or SIGTERM, SIGHUP) during the prompt is caught, the echo
-//!   put back, and the prompt answers [`std::io::ErrorKind::Interrupted`].
+//! In-memory password buffer fed via pipe ([`Secret`], [`no_core_dumps`]).
+//! Used by [`super::System::run_fed`] and returns [`std::io::ErrorKind::Interrupted`] on signals.
 
 use std::io;
 
@@ -71,14 +52,10 @@ impl Secret {
         self.len == 0
     }
 
-    /// Read one line from `input` into a new secret: up to the first `\n` (not kept), or to
-    /// the end of `input`. `None` when `input` ended before any byte. Bytes after the line
-    /// are left unread only as far as `input` buffers nothing itself (a pipe or a terminal
-    /// read one byte at a time).
+    /// Read one line from `input` into a new secret.
     ///
     /// # Errors
-    /// The read's error, or [`io::ErrorKind::InvalidInput`] for a line longer than
-    /// [`SECRET_MAX`].
+    /// The read's error, or [`io::ErrorKind::InvalidInput`] for a line longer than [`SECRET_MAX`].
     pub fn read_line(input: &mut dyn io::Read) -> io::Result<Option<Self>> {
         let mut secret = Self::empty();
         let mut any = false;
@@ -86,7 +63,6 @@ impl Secret {
             let mut byte = [0_u8; 1];
             let n = match input.read(&mut byte) {
                 Ok(n) => n,
-                // A signal the read was interrupted by, not a person's stop ([`StopSignal`]).
                 Err(e) if e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none() => {
                     continue;
                 }
@@ -106,7 +82,6 @@ impl Secret {
             scrub(&mut byte);
             secret.len += 1;
         }
-        // A line typed at a terminal in CRLF mode, or pasted from one.
         if secret.bytes().last() == Some(&b'\r') {
             secret.len -= 1;
             if let Some(cr) = secret.bytes.get_mut(secret.len) {
@@ -138,13 +113,10 @@ fn too_long() -> io::Error {
     )
 }
 
-/// Overwrite `buf` with zeroes in a way the optimizer may not delete: a loop of plain stores
-/// into a buffer about to be freed is a dead store the compiler may remove; volatile writes
-/// are not, and the fence keeps them before the free.
+/// Overwrite `buf` with zeroes in a way the optimizer may not delete.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        // SAFETY: `b` is a live, uniquely borrowed `u8` from a mutable slice: a one-byte
-        // volatile write to it is in bounds and unaliased.
+        // SAFETY: `b` is a live, uniquely borrowed `u8` from a mutable slice.
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -152,8 +124,7 @@ fn scrub(buf: &mut [u8]) {
 
 /// Keep `buf` out of swap, best effort (the result is ignored: `RLIMIT_MEMLOCK` may refuse).
 fn lock(buf: &[u8]) {
-    // SAFETY: `buf` is a live borrow, so its pointer and length name mapped memory for the
-    // call; `mlock` neither reads nor writes it.
+    // SAFETY: `buf` is a live borrow, so its pointer and length name mapped memory for the call.
     unsafe {
         let _ = libc::mlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
@@ -161,34 +132,25 @@ fn lock(buf: &[u8]) {
 
 /// Undo [`lock`] before the buffer is freed.
 fn unlock(buf: &[u8]) {
-    // SAFETY: as in `lock`; unlocking a range that was never locked is a harmless error.
+    // SAFETY: As in `lock`; unlocking a range that was never locked is a harmless error.
     unsafe {
         let _ = libc::munlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
 }
 
-/// Keep this process, and every child it starts from now on (`ssh`, the askpass helper `ssh`
-/// runs: a child inherits the limit), from writing a core file, which would hold the password
-/// in the clear (`mlock` keeps memory out of swap, not out of a core). Soft and hard limits
-/// both go to zero, so no child raises it again; a process holding a password wants no core.
-/// Best effort: the result is ignored.
+/// Sets `RLIMIT_CORE` to zero for this process and its children.
 pub fn no_core_dumps() {
     let none = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: a live, initialized `rlimit`, which the call only reads.
+    // SAFETY: A live, initialized `rlimit`, which the call only reads.
     unsafe {
         let _ = libc::setrlimit(libc::RLIMIT_CORE, &raw const none);
     }
 }
 
-/// [`super::System::ask`]'s live arm: write `prompt` to the controlling terminal
-/// (`/dev/tty`, never standard input or output, so no redirection captures the answer) and
-/// read one line there, with echo off when `secret` (and, first, no core file from this
-/// process or its children: [`no_core_dumps`]). `None` for an empty line or the end of
-/// input. A stop signal (Ctrl-C) during the read puts the echo back and answers
-/// [`io::ErrorKind::Interrupted`].
+/// [`super::System::ask`]'s live arm ([`no_core_dumps`], [`io::ErrorKind::Interrupted`]).
 pub(super) fn ask_tty(prompt: &str, secret: bool) -> io::Result<Option<Secret>> {
     use std::io::Write as _;
     use std::os::unix::io::AsRawFd as _;
@@ -204,10 +166,6 @@ pub(super) fn ask_tty(prompt: &str, secret: bool) -> io::Result<Option<Secret>> 
     if unsafe { libc::isatty(fd) } != 1 {
         return Err(io::Error::other("/dev/tty is not a terminal"));
     }
-    // Echo off before the prompt shows: the person (or a pty driver) types only once it has,
-    // and the flush that turning echo off does then discards nothing typed for it. Turned off
-    // after the prompt, an answer quick enough was echoed and then thrown away (measured with
-    // `expect` in the VM: the read then waited forever).
     let echo = if secret {
         Some(EchoOff::new(fd)?)
     } else {
@@ -220,14 +178,12 @@ pub(super) fn ask_tty(prompt: &str, secret: bool) -> io::Result<Option<Secret>> 
     drop(stops);
     drop(echo);
     if secret {
-        // The Enter that ended the line was not echoed.
         let _ = tty.write_all(b"\n");
     }
     Ok(line?.filter(|s| !s.is_empty()))
 }
 
-/// One line from the terminal `tty`, a byte at a time, waking every quarter second to notice
-/// a stop signal the handler noted (it sets `SA_RESTART`, so a blocked read would not return).
+/// Reads one line from `tty` a byte at a time, polling for stop signals.
 fn read_tty_line(tty: &mut std::fs::File, fd: i32) -> io::Result<Option<Secret>> {
     struct Polled<'a>(&'a mut std::fs::File, i32);
     impl io::Read for Polled<'_> {
@@ -241,8 +197,7 @@ fn read_tty_line(tty: &mut std::fs::File, fd: i32) -> io::Result<Option<Secret>>
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                // SAFETY: one live, initialized `pollfd`, for a call that only writes its
-                // `revents`.
+                // SAFETY: `pfd` is a valid initialized `pollfd`.
                 let ready = unsafe { libc::poll(&raw mut pfd, 1, 250) };
                 if ready > 0 {
                     return self.0.read(buf);
@@ -259,8 +214,7 @@ fn read_tty_line(tty: &mut std::fs::File, fd: i32) -> io::Result<Option<Secret>>
     Secret::read_line(&mut Polled(tty, fd))
 }
 
-/// The payload that marks an `Interrupted` as a person's stop (Ctrl-C at the prompt), which
-/// [`Secret::read_line`] does not retry as it does a bare interrupted read.
+/// The payload that marks an `Interrupted` as a person's stop (Ctrl-C at the prompt).
 #[derive(Debug)]
 struct StopSignal;
 
@@ -280,8 +234,7 @@ struct EchoOff {
 
 impl EchoOff {
     fn new(fd: i32) -> io::Result<Self> {
-        // SAFETY: all-zero is a valid `termios` (plain integers and an array); it is read
-        // only after `tcgetattr` filled it.
+        // SAFETY: All-zero is a valid `termios` (plain integers and an array).
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         // SAFETY: `fd` is an open terminal and `saved` a live out-parameter of its type.
         if unsafe { libc::tcgetattr(fd, &raw mut saved) } != 0 {
@@ -289,7 +242,7 @@ impl EchoOff {
         }
         let mut quiet = saved;
         quiet.c_lflag &= !libc::ECHO;
-        // SAFETY: the same descriptor, and a fully initialized copy with one flag cleared.
+        // SAFETY: The same descriptor, and a fully initialized copy with one flag cleared.
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw const quiet) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -299,9 +252,7 @@ impl EchoOff {
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        // SAFETY: the descriptor is still open (the caller's `File` outlives this guard) and
-        // `saved` is the snapshot `new` took. `TCSANOW`: what was typed after the line (an
-        // answer to the next prompt) is kept.
+        // SAFETY: `fd` is still open and `saved` is the snapshot from `new`.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.saved);
         }
@@ -335,10 +286,10 @@ mod tests {
     #[test]
     fn a_process_that_holds_a_password_writes_no_core_and_its_children_neither() {
         no_core_dumps();
-        // SAFETY: all-zero is a valid `rlimit`; `getrlimit` fills it.
+        // SAFETY: All-zero is a valid `rlimit`; `getrlimit` fills it.
         let mut now: libc::rlimit = unsafe { std::mem::zeroed() };
         now.rlim_cur = libc::RLIM_INFINITY;
-        // SAFETY: a live out-parameter of the right type.
+        // SAFETY: A live out-parameter of the right type.
         assert_eq!(
             unsafe { libc::getrlimit(libc::RLIMIT_CORE, &raw mut now) },
             0

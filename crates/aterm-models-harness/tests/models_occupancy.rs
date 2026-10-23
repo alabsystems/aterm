@@ -16,8 +16,8 @@
 
 use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
+use aterm_spec::interp;
 use aterm_spec::walk::walk;
-use aterm_spec::{interp, verify};
 
 /// Each mutant, its dial, the law it was written to break, and the autopilot it breaks it under.
 const MUTANTS: [(&str, i64, &str, i64); 22] = [
@@ -59,7 +59,7 @@ fn alone(m: &Model, keep: &str) -> Model {
 }
 
 #[test]
-fn occupancy_door_proves_and_catches() {
+fn occupancy_door_fires_exactly_its_committed_moves() {
     let mut fired = std::collections::BTreeSet::new();
     for mode in [0, 1, 2] {
         let m = under(mode);
@@ -77,12 +77,6 @@ fn occupancy_door_proves_and_catches() {
             "{action} fires with no mutant on exactly when it is no mutant: {fired:?}"
         );
     }
-    verify::prove_and_catch_scalar(
-        &occupancy_door_model(),
-        "occupancy door: a line only at a break, past every guard, once an episode, the \
-         upgrade's notice first but under a wake, raised by K looks, a hold's clock never \
-         restarted and never ended by the harness's own line",
-    );
 }
 
 /// Each mutant breaks the law it was written to break, alone, and the committed door keeps it.
@@ -155,9 +149,9 @@ fn a_nudge_goes_once_at_a_break_under_cruise_only() {
 }
 
 /// F11, DECIDED UPGRADE-FIRST: with the upgrade's notice due (`IdleHost::upgrade_due`, asked only
-/// after the grant), a nudge waits and the notice is the break's one line; the next break has
-/// the nudge. A wake outranks the notice: under Land it goes with the notice still due, and the
-/// notice does not.
+/// after the grant), a nudge waits and the notice is the break's one line, an act untaken until
+/// the agent takes it; the next read after that has the nudge. A wake outranks the notice:
+/// under Land it goes with the notice still due, and the notice does not.
 #[test]
 fn the_upgrade_notice_goes_first_but_under_a_wake() {
     let m = under(1);
@@ -182,6 +176,22 @@ fn the_upgrade_notice_goes_first_but_under_a_wake() {
         ],
     );
     assert!(!m.action_enabled("Type", &noticed), "one line a door");
+    // The notice stands untaken past its door: a later read of the same break has no line
+    // until the agent takes it (the safety review's F-A).
+    let untaken = walk(
+        &m,
+        &[
+            "Break",
+            "HoldAges",
+            "OpenNudge",
+            "Intend",
+            "UpgradeDue",
+            "UpgradeTypes",
+            "IdleRead",
+        ],
+    );
+    assert_eq!(untaken["untaken"], 1, "{untaken:?}");
+    assert!(!m.action_enabled("Type", &untaken), "{untaken:?}");
     let next = walk(
         &m,
         &[
@@ -191,6 +201,7 @@ fn the_upgrade_notice_goes_first_but_under_a_wake() {
             "Intend",
             "UpgradeDue",
             "UpgradeTypes",
+            "ActTaken",
             "IdleRead",
         ],
     );

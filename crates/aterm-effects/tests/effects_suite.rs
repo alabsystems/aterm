@@ -85,6 +85,7 @@ mod pet_follows_a_running_caret;
 mod pet_holds_through_a_torn_frame;
 mod pet_position_authority;
 mod pet_resident_standoff;
+mod pet_rests_off_the_printed_line;
 mod pet_typing_beside_its_guess;
 mod phrase_pause_gaps;
 mod rainbow_kitty_v2_frame_cost;

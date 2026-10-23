@@ -44,7 +44,7 @@ pub enum PanelRenderer {
 impl PanelRenderer {
     /// Returns the left-margin column indent for this renderer.
     #[must_use]
-    pub fn column(self) -> usize {
+    pub const fn column(self) -> usize {
         match self {
             PanelRenderer::Fullscreen => 3,
             PanelRenderer::Inline => 2,

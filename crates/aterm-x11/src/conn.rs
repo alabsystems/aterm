@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The transport: a libxcb connection, either this crate's own
-//! ([`Connection::connect`]) or the one under an Xlib `Display` someone else
-//! owns ([`Connection::from_xlib_display`], the window's, which the CPU
-//! presenter draws through).
-//!
-//! Requests go to libxcb whole (`XCB_REQUEST_RAW`): [`crate::proto`] encodes
-//! them, so libxcb only numbers, queues and writes them, and passes their
-//! descriptors. Every request is sent `XCB_REQUEST_CHECKED`, so its error
-//! comes back to the caller who waits for it, never into the event queue,
-//! which on a shared Xlib connection belongs to Xlib. A cookie dropped
-//! without its answer discards it. This is the shape x11rb's `XCBConnection`
-//! gave softbuffer, which this replaces.
-//!
-//! libxcb is thread-safe: one thread may block in
-//! [`Connection::wait_for_event`] while others send and wait for replies.
+//! The transport.
 
 use std::ffi::{CStr, c_int, c_uint, c_void};
 use std::fmt;
@@ -32,8 +18,7 @@ use crate::sys::{self, Iovec, ProtocolRequest, REQUEST_CHECKED, REQUEST_RAW, Xcb
 /// Why a request, reply or connection failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// libxcb or libX11-xcb is not on this machine (or this platform has no
-    /// loader).
+    /// libxcb or libX11-xcb is not on this machine (or this platform has no loader).
     Load(aterm_dl::Error),
     /// The connection is broken: libxcb's `XCB_CONN_*` code.
     Connection(c_int),
@@ -74,11 +59,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    /// Whether this is the connection's transport failing: libxcb's
-    /// `XCB_CONN_ERROR`, which it sets when a read finds end of file or a read
-    /// or write on the socket fails (the server died, was killed or reset the
-    /// connection). Its other `XCB_CONN_CLOSED_*` codes are reasons of its own
-    /// to close a connection whose server is still there.
+    /// Whether this is the connection's transport failing.
     #[must_use]
     pub const fn is_transport_failure(&self) -> bool {
         matches!(self, Error::Connection(XCB_CONN_ERROR))
@@ -118,9 +99,9 @@ pub struct Connection {
     max_request_bytes: OnceLock<usize>,
 }
 
-// SAFETY: libxcb serializes every call on a connection with its own lock
-// (xcb.h: "the XCB connection is thread-safe"); the struct's other fields are
-// immutable or behind a Mutex / OnceLock.
+// SAFETY: libxcb serializes every call on a connection with its own lock (xcb.h: "the XCB
+// connection is thread-safe"); the struct's other fields are immutable or behind a Mutex /
+// OnceLock.
 unsafe impl Send for Connection {}
 // SAFETY: as above.
 unsafe impl Sync for Connection {}
@@ -135,21 +116,19 @@ impl fmt::Debug for Connection {
 }
 
 impl Connection {
-    /// Connect to `display` (`$DISPLAY` when `None`). Returns the connection
-    /// and the screen number the display name chose.
+    /// Connect to `display` (`$DISPLAY` when `None`).
     pub fn connect(display: Option<&CStr>) -> Result<(Connection, usize), Error> {
         let xcb = sys::xcb().map_err(Error::Load)?;
         let mut screen: c_int = 0;
         let name = display.map_or(std::ptr::null(), CStr::as_ptr);
-        // SAFETY: a NUL-terminated name or null, and a live out-parameter.
-        // xcb_connect never returns null: a failed connect is an error object.
+        // SAFETY: a NUL-terminated name or null, and a live out-parameter. xcb_connect never
+        // returns null: a failed connect is an error object.
         let raw = unsafe { (xcb.connect)(name, &mut screen) };
         let raw = NonNull::new(raw).ok_or(Error::Connection(1))?;
         // SAFETY: the connection xcb_connect returned.
         let code = unsafe { (xcb.has_error)(raw.as_ptr()) };
         if code != 0 {
-            // SAFETY: an error connection is still disconnected (freed) by
-            // xcb_disconnect, once.
+            // SAFETY: an error connection is still disconnected (freed) by xcb_disconnect, once.
             unsafe { (xcb.disconnect)(raw.as_ptr()) };
             return Err(Error::Connection(code));
         }
@@ -162,9 +141,7 @@ impl Connection {
         Ok((conn, screen))
     }
 
-    /// The XCB connection under an Xlib `Display`, borrowed: dropping the
-    /// value leaves it open.
-    ///
+    /// The XCB connection under an Xlib `Display`, borrowed: dropping the value leaves it open.
     /// # Safety
     /// `display` is a live `Display *` that outlives the returned value.
     pub unsafe fn from_xlib_display(display: NonNull<c_void>) -> Result<Connection, Error> {
@@ -173,19 +150,13 @@ impl Connection {
         // SAFETY: the caller's live display.
         let raw = unsafe { (x11_xcb.get_xcb_connection)(display.as_ptr()) };
         let raw = NonNull::new(raw).ok_or(Error::Connection(1))?;
-        // SAFETY: Xlib's connection, which the caller keeps alive; not ours
-        // to disconnect.
+        // SAFETY: Xlib's connection, which the caller keeps alive; not ours to disconnect.
         unsafe { Connection::adopt(xcb, raw, false) }
     }
 
     /// Wrap a raw `xcb_connection_t *`.
-    ///
     /// # Safety
-    /// `raw` is a live connection that outlives the value; with `owned`,
-    /// nothing else may disconnect it once adoption begins. If loading
-    /// libxcb fails, the caller retains ownership. Once libxcb is loaded,
-    /// `owned` transfers ownership even if reading the setup returns an
-    /// error: that error disconnects it, as a successful value does on drop.
+    /// `raw` is a live connection that outlives the value.
     pub unsafe fn from_raw(raw: NonNull<c_void>, owned: bool) -> Result<Connection, Error> {
         let xcb = sys::xcb().map_err(Error::Load)?;
         // SAFETY: the caller's contract.
@@ -199,8 +170,8 @@ impl Connection {
         raw: NonNull<c_void>,
         owned: bool,
     ) -> Result<Connection, Error> {
-        // SAFETY: a live connection; the setup lives as long as it does and
-        // starts with its own length field.
+        // SAFETY: a live connection; the setup lives as long as it does and starts with its own
+        // length field.
         let setup = (|| -> Result<Setup, Error> {
             // SAFETY: the caller's live connection and libxcb's complete setup.
             unsafe {
@@ -217,8 +188,8 @@ impl Connection {
             Ok(setup) => setup,
             Err(error) => {
                 if owned {
-                    // SAFETY: ownership was admitted at entry; no Connection
-                    // was constructed, so this is its sole disconnect.
+                    // SAFETY: ownership was admitted at entry; no Connection was constructed, so
+                    // this is its sole disconnect.
                     unsafe { (xcb.disconnect)(raw.as_ptr()) };
                 }
                 return Err(error);
@@ -235,8 +206,7 @@ impl Connection {
         Ok(conn)
     }
 
-    /// The raw `xcb_connection_t *`, for code that hands it to a C library
-    /// (Vulkan's WSI).
+    /// The raw `xcb_connection_t *`, for code that hands it to a C library (Vulkan's WSI).
     pub fn as_raw(&self) -> NonNull<c_void> {
         self.raw
     }
@@ -283,8 +253,7 @@ impl Connection {
         }
     }
 
-    /// The longest request the server takes, in bytes (BIG-REQUESTS enabled
-    /// when the server has it; the first call is a round trip).
+    /// The longest request the server takes, in bytes.
     pub fn maximum_request_bytes(&self) -> usize {
         *self.max_request_bytes.get_or_init(|| {
             // SAFETY: a live connection.
@@ -308,8 +277,7 @@ impl Connection {
         self.send_void_with_fds(req, Vec::new())
     }
 
-    /// Send a request whose descriptors travel with it (MIT-SHM AttachFd).
-    /// libxcb closes them once they are sent.
+    /// Send a request whose descriptors travel with it. libxcb closes them once they are sent.
     pub fn send_void_with_fds(
         &self,
         req: Request<Void>,
@@ -332,7 +300,6 @@ impl Connection {
         } else {
             bytes
         };
-        // libxcb reads vector[-1] and vector[-2]: two spare slots first.
         let mut iov = [
             Iovec {
                 base: std::ptr::null_mut(),
@@ -355,14 +322,14 @@ impl Connection {
         };
         let flags = REQUEST_RAW | REQUEST_CHECKED;
         let sequence = if fds.is_empty() {
-            // SAFETY: a live connection; `iov[2]` and the request outlive the
-            // call, and libxcb only reads the bytes (RAW: it writes no field).
+            // SAFETY: a live connection; `iov[2]` and the request outlive the call, and libxcb only
+            // reads the bytes (RAW: it writes no field).
             unsafe { (self.xcb.send_request64)(self.raw.as_ptr(), flags, &mut iov[2], &request) }
         } else {
             let mut raw: Vec<c_int> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
             let n = c_uint::try_from(raw.len()).map_err(|_| Error::RequestTooLarge)?;
-            // SAFETY: as above, plus descriptors this call hands to libxcb,
-            // which closes them (also on failure).
+            // SAFETY: as above, plus descriptors this call hands to libxcb, which closes them (also
+            // on failure).
             unsafe {
                 (self.xcb.send_request_with_fds64)(
                     self.raw.as_ptr(),
@@ -381,8 +348,7 @@ impl Connection {
         Ok(sequence)
     }
 
-    /// Wait for the reply to request `sequence` (sent with [`Connection::send`]
-    /// and released with [`Cookie::detach`]).
+    /// Wait for the reply to request `sequence`.
     pub fn wait_reply<R: Reply>(&self, sequence: u64) -> Result<R, Error> {
         let bytes = self.wait_reply_bytes(sequence)?;
         Ok(R::parse(&bytes)?)
@@ -390,8 +356,7 @@ impl Connection {
 
     fn wait_reply_bytes(&self, sequence: u64) -> Result<Vec<u8>, Error> {
         let mut err: *mut u8 = std::ptr::null_mut();
-        // SAFETY: a live connection, a sequence this connection issued, and
-        // a live out-parameter.
+        // SAFETY: a live connection, a sequence this connection issued, and a live out-parameter.
         let reply = unsafe { (self.xcb.wait_for_reply64)(self.raw.as_ptr(), sequence, &mut err) };
         if let Some(e) = NonNull::new(err) {
             // SAFETY: libxcb's malloc'd 32-byte error packet, freed here.
@@ -406,8 +371,8 @@ impl Connection {
             self.status()?;
             return Err(Error::Connection(1));
         };
-        // SAFETY: a malloc'd reply packet: 32 bytes, then `4 * length` more
-        // (the length at offset 4), which libxcb read whole.
+        // SAFETY: a malloc'd reply packet: 32 bytes, then `4 * length` more (the length at offset
+        // 4), which libxcb read whole.
         unsafe {
             let head = std::slice::from_raw_parts(reply.as_ptr(), 32);
             let length = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
@@ -420,12 +385,9 @@ impl Connection {
         }
     }
 
-    /// Wait for a void request's error, if any (sent with
-    /// [`Connection::send_void`], released with [`VoidCookie::detach`]).
+    /// Wait for a void request's error, if any.
     pub fn check(&self, sequence: u64) -> Result<(), Error> {
         let cookie = sys::VoidCookie {
-            // libxcb's checked-void call takes the low 32 bits and widens
-            // them against its own counter.
             sequence: sequence as c_uint,
         };
         // SAFETY: a live connection and a sequence it issued.
@@ -443,7 +405,7 @@ impl Connection {
         unsafe { (self.xcb.discard_reply64)(self.raw.as_ptr(), sequence) }
     }
 
-    /// The next event, blocking. An error is the connection's.
+    /// The next event, blocking.
     pub fn wait_for_event(&self) -> Result<Vec<u8>, Error> {
         // SAFETY: a live connection.
         let ev = unsafe { (self.xcb.wait_for_event)(self.raw.as_ptr()) };
@@ -469,7 +431,6 @@ impl Connection {
     }
 
     /// The extension `name`'s opcodes, or `None` when the server lacks it.
-    /// Asked once per connection (QueryExtension), then cached.
     pub fn extension(&self, name: &'static [u8]) -> Result<Option<QueryExtensionReply>, Error> {
         let mut cache = self
             .extensions
@@ -486,8 +447,7 @@ impl Connection {
 }
 
 impl Connection {
-    /// Intern every name in one round trip (all requests first, then the
-    /// replies), in order.
+    /// Intern every name in one round trip (all requests first, then the replies), in order.
     pub fn intern_atoms(&self, names: &[&[u8]]) -> Result<Vec<crate::proto::Atom>, Error> {
         let cookies = names
             .iter()
@@ -510,9 +470,6 @@ impl Drop for Connection {
 }
 
 /// Copy `len` bytes of a libxcb packet out and free it.
-///
-/// # Safety
-/// `p` is a malloc'd buffer of at least `len` bytes.
 unsafe fn take_packet(p: NonNull<u8>, len: usize) -> Vec<u8> {
     // SAFETY: the caller's contract.
     let out = unsafe { std::slice::from_raw_parts(p.as_ptr(), len) }.to_vec();
@@ -524,9 +481,6 @@ unsafe fn take_packet(p: NonNull<u8>, len: usize) -> Vec<u8> {
 /// An event packet without the `full_sequence` word libxcb inserts at byte
 /// 32: 32 bytes, plus a GenericEvent's `4 * length` (which libxcb stores
 /// after that word).
-///
-/// # Safety
-/// `p` is an event libxcb returned (36 bytes, plus a GenericEvent's tail).
 unsafe fn take_event(p: NonNull<u8>) -> Vec<u8> {
     // SAFETY: at least `xcb_generic_event_t` (36 bytes).
     let head = unsafe { std::slice::from_raw_parts(p.as_ptr(), 36) };
@@ -534,8 +488,7 @@ unsafe fn take_event(p: NonNull<u8>) -> Vec<u8> {
     if head[0] & 0x7f == crate::proto::event::GENERIC_EVENT {
         let length = u32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
         if let Some(extra) = usize::try_from(length).ok().and_then(|l| l.checked_mul(4)) {
-            // SAFETY: libxcb read the event's `4 * length` bytes after the
-            // 36-byte struct.
+            // SAFETY: libxcb read the event's `4 * length` bytes after the 36-byte struct.
             out.extend_from_slice(unsafe { std::slice::from_raw_parts(p.as_ptr().add(36), extra) });
         }
     }
@@ -544,8 +497,7 @@ unsafe fn take_event(p: NonNull<u8>) -> Vec<u8> {
     out
 }
 
-/// A sent request's pending reply. Dropped unanswered, the reply is
-/// discarded when it arrives.
+/// A sent request's pending reply.
 pub struct Cookie<'c, R: Reply> {
     conn: &'c Connection,
     sequence: u64,
@@ -560,13 +512,12 @@ impl<R: Reply> Cookie<'_, R> {
 
     /// Wait for and parse the reply.
     pub fn reply(self) -> Result<R, Error> {
-        // Consumed here: its Drop must not discard what is about to be read.
         let me = std::mem::ManuallyDrop::new(self);
         me.conn.wait_reply(me.sequence)
     }
 
-    /// Give up the cookie, keeping the reply pending under its sequence
-    /// number for [`Connection::wait_reply`].
+    /// Give up the cookie, keeping the reply pending under its sequence number for
+    /// [`Connection::wait_reply`].
     pub fn detach(self) -> u64 {
         std::mem::ManuallyDrop::new(self).sequence
     }
@@ -578,8 +529,7 @@ impl<R: Reply> Drop for Cookie<'_, R> {
     }
 }
 
-/// A sent void request's pending error. Dropped unchecked, the error (if any)
-/// is discarded.
+/// A sent void request's pending error.
 pub struct VoidCookie<'c> {
     conn: &'c Connection,
     sequence: u64,
@@ -597,8 +547,8 @@ impl VoidCookie<'_> {
         me.conn.check(me.sequence)
     }
 
-    /// Give up the cookie, keeping the error pending under its sequence
-    /// number for [`Connection::check`] or [`Connection::discard`].
+    /// Give up the cookie, keeping the error pending under its sequence number for
+    /// [`Connection::check`] or [`Connection::discard`].
     pub fn detach(self) -> u64 {
         std::mem::ManuallyDrop::new(self).sequence
     }

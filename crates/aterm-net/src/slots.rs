@@ -161,7 +161,7 @@ pub(crate) struct Slots {
 
 impl Slots {
     /// No slot held yet: at most `capacity`.
-    pub(crate) fn new(capacity: usize, grace: Duration) -> Self {
+    pub(crate) const fn new(capacity: usize, grace: Duration) -> Self {
         Self {
             held: Mutex::new(Vec::new()),
             freed: Condvar::new(),

@@ -1093,6 +1093,172 @@ fn a_screen_that_moves_between_read_and_write_writes_nothing() {
     }
 }
 
+/// Claude's redraw cut by the PTY's burst: the screen cleared and one row drawn, no composer yet.
+const HALF_FRAME: &str = "\x1b[?2026h\x1b[H\x1b[2J\u{23FA} working";
+
+/// [`HALF_FRAME`] on `session`'s engine, the frame unfinished.
+fn half_frame(app: &App, session: u64) {
+    feed(app, session, HALF_FRAME.as_bytes());
+    let term = app.pool.get(session).expect("session").term.clone();
+    assert!(
+        crate::term_lock(&term).frame_unfinished_at(Instant::now()),
+        "precondition: the frame is unfinished"
+    );
+}
+
+/// The rest of [`HALF_FRAME`]: Claude's screen, `typed` in its composer, and the close.
+fn rest_of_frame(app: &App, session: u64, typed: &str) {
+    draw_claude(app, session, MANUAL);
+    if !typed.is_empty() {
+        echo(app, session, CARET, typed);
+    }
+    feed(app, session, b"\x1b[?2026l");
+}
+
+/// A CLICK ON HALF A FRAME IS REFUSED `Moved` and types nothing; once the frame closes a click types.
+#[test]
+fn a_click_on_half_a_frame_is_refused_as_claude_drawing() {
+    let (mut app, wid, session, mut reader) = idle();
+    half_frame(&app, session);
+    assert_eq!(
+        app.press_slash(wid, session, Slash::TopEffort(true)),
+        Err(SlashRefusal::Moved)
+    );
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "nothing typed on half a frame"
+    );
+    assert_eq!(
+        said(&app, wid, session).as_deref(),
+        Some("Claude was drawing; click again")
+    );
+    rest_of_frame(&app, session, "");
+    app.press_slash(wid, session, Slash::TopEffort(true))
+        .expect("the whole frame's click types");
+    assert_eq!(pty(&mut reader, 1), b"/");
+}
+
+/// A TYPED PRESS WAITS THROUGH HALF A FRAME, then enters once the frame closes.
+#[test]
+fn a_typed_press_waits_through_half_a_frame() {
+    let (mut app, wid, session, mut reader) = idle();
+    let slash = Slash::TopEffort(true);
+    app.press_slash(wid, session, slash).expect("begun");
+    assert_eq!(pty(&mut reader, 1), b"/");
+    echo(&app, session, CARET, "/");
+    let at = Instant::now();
+    app.advance_slash_presses(at);
+    assert_eq!(pty(&mut reader, rest(slash).len()), rest(slash));
+    half_frame(&app, session);
+    app.advance_slash_presses(at);
+    assert_eq!(ended(&app, session), None, "no stop on half a frame");
+    assert!(matches!(stage(&app, session), Some(Stage::Typed { .. })));
+    assert!(pty(&mut reader, 0).is_empty(), "nothing written");
+    rest_of_frame(&app, session, &slash.text());
+    app.advance_slash_presses(at);
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(pty(&mut reader, 1), b"\r", "the whole frame's Enter");
+}
+
+/// AN ENTERED PICKER PRESS IS NOT DONE ON HALF A FRAME, which shows no composer either.
+#[test]
+fn an_entered_picker_press_is_not_done_on_half_a_frame() {
+    let (mut app, wid, session, mut reader) = idle();
+    app.press_slash(wid, session, Slash::ModelPicker)
+        .expect("begun");
+    assert_eq!(pty(&mut reader, 1), b"/");
+    echo(&app, session, CARET, "/");
+    let at = Instant::now();
+    app.advance_slash_presses(at);
+    assert_eq!(pty(&mut reader, 5), b"model");
+    feed(
+        &app,
+        session,
+        "\x1b[24;1H\x1b[2K  \u{276F} /model   Set the AI model".as_bytes(),
+    );
+    echo(&app, session, CARET, "/model");
+    app.advance_slash_presses(at);
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(pty(&mut reader, 1), b"\r");
+    assert_eq!(stage(&app, session), Some(Stage::Entered));
+    half_frame(&app, session);
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(ended(&app, session), None, "not Done on half a frame");
+    assert_eq!(stage(&app, session), Some(Stage::Entered));
+    rest_of_frame(&app, session, "");
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(
+        stage(&app, session),
+        Some(Stage::Entered),
+        "still awaiting the answer"
+    );
+    draw_measured(
+        &mut app,
+        wid,
+        session,
+        include_str!("../../aterm-phase/src/fixtures/claude-2.1.304-top-model-picker-120col.txt"),
+        |_| {},
+    );
+    app.advance_slash_presses(at + QUIET);
+    assert_eq!(ended(&app, session), Some(SlashEnd::Done));
+}
+
+/// THE FOOTER'S PRESS NEVER WAITS FOR A FRAME: one opened between its read and its write refuses it `Moved`.
+#[test]
+fn the_footer_press_never_waits_for_a_frame_on_the_event_loop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mut app, wid, session, mut reader) = idle();
+    let (term, watchers) = {
+        let entry = app.pool.get(session).expect("session");
+        (entry.term.clone(), entry.ctx.watchers.clone())
+    };
+    watchers.bind_frame(&term);
+    crate::term_lock(&term).apply_config(&aterm_core::config::TerminalConfig {
+        sync_timeout_ms: 60_000,
+        ..Default::default()
+    });
+    let hook_term = term.clone();
+    let mut once = true;
+    crate::claude_slash::BETWEEN_READ_AND_WRITE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            if std::mem::take(&mut once) {
+                crate::term_lock(&hook_term).process(HALF_FRAME.as_bytes());
+            }
+        }));
+    });
+    let done = AtomicBool::new(false);
+    let (result, waited) = std::thread::scope(|s| {
+        let watching = s.spawn(|| {
+            let waited = aterm_spec::wait::until_within(
+                Duration::from_secs(60),
+                "the press answers, or waits",
+                || {
+                    if watchers.count() > 0 {
+                        Some(true)
+                    } else {
+                        done.load(Ordering::Acquire).then_some(false)
+                    }
+                },
+            );
+            if waited {
+                // A press that waits is let go: Claude finishes its frame.
+                let mut t = crate::term_lock(&term);
+                t.process(b"\x1b[?2026l");
+                drop(t);
+                watchers.ring_watchers();
+            }
+            waited
+        });
+        let result = app.press_slash(wid, session, Slash::TopEffort(true));
+        done.store(true, Ordering::Release);
+        (result, watching.join().expect("the watcher"))
+    });
+    crate::claude_slash::BETWEEN_READ_AND_WRITE.with(|hook| *hook.borrow_mut() = None);
+    assert!(!waited, "the event loop waited for Claude's frame");
+    assert_eq!(result, Err(SlashRefusal::Moved));
+    assert!(pty(&mut reader, 0).is_empty(), "nothing written");
+}
+
 /// ONE ATERM INPUT PER SESSION: a mode return in flight refuses the press,
 /// and a press in flight refuses the mode light's click, each typing
 /// nothing.

@@ -49,6 +49,11 @@ pub const VERBS: &[Verb] = &[
         does: "sign staged manifests with this machine's key and verify them",
     },
     Verb {
+        name: "upload",
+        synopsis: "upload <staging|public> <repo> <tag> <file>…",
+        does: "replace assets of a standing release, as that owner's token (the signing ceremony's re-upload)",
+    },
+    Verb {
         name: "index",
         synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
         does: "publish the next signed index as a typed delta over the verified head",
@@ -109,6 +114,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack-package" => artifact::package::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),
         "sign" => artifact::sign::run(ctx, rest),
+        "upload" => artifact::upload::run(ctx, rest),
         "index" => channel::index::run(ctx, rest),
         "mirror" => channel::mirror::run(ctx, rest),
         "publish-group" => channel::group::run(ctx, rest),

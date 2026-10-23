@@ -2,17 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Which cwd report sets a tab's folder, through the REAL reader
-//! (docs/DESIGN-cwd-reports-2026-10-19.md): `attach_reader_inner`, the gather
-//! and parse pipeline every session runs, on a real pseudo-terminal whose slave
-//! the test writes as the shell and its programs. The engine's rule
-//! (`aterm-core`'s `reported_cwd_tests`) reads two host words, and this binds
-//! the reader's: the foreground group of each slice against the shell's pid
-//! (`Terminal::set_foreground_job`, set per slice) and the program probe
-//! (`SessionFactory::program_probe`, installed at attach). Both probes are
-//! scripted, as `foreground_handback_conformance` scripts `fg_probe`: the
-//! foreground group is a static the test moves where a shell would call
-//! `tcsetpgrp`, and the probe answers from the start time the test gives the
-//! shell's one child.
+//! (docs/DESIGN-cwd-reports-2026-10-19.md): `attach_reader_inner`, the gather and parse pipeline
+//! every session runs, on a real pseudo-terminal whose slave the test writes as the shell and its
+//! programs.
 
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -86,8 +78,8 @@ impl Rig {
         app.session_factory.fg_gone = |_, _, _| false;
         app.session_factory.program_probe = scripted_program;
         let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
-        // SAFETY: a zeroed termios is a valid out-slot for tcgetattr, then
-        // cfmakeraw/tcsetattr on the test-owned slave fd.
+        // SAFETY: a zeroed termios is a valid out-slot for tcgetattr, then cfmakeraw/tcsetattr on
+        // the test-owned slave fd.
         unsafe {
             let mut tio: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut tio), 0, "tcgetattr");
@@ -155,17 +147,6 @@ impl Drop for Rig {
 }
 
 /// THE READER SAYS WHO HOLDS THE TERMINAL. At a signing shell's prompt:
-///
-/// - a program a key binding started in a group of its own (a zsh widget, a
-///   bash `bind -x`, a fish binding) holds the foreground while it writes, so
-///   its report sets the folder, and the shell's next output, written while
-///   the shell holds the foreground again, brings the prompt's folder back;
-/// - a report the shell's own group writes while it holds the foreground (a
-///   background job's) is a stray, dropped;
-/// - a program the shell keeps in its own group (PowerShell's, started by a
-///   PSReadLine key handler) is seen by the program probe the reader installs
-///   for the shell's pid: its report lands, and the folder comes back with the
-///   first output after it is gone.
 #[test]
 fn the_reader_lets_a_key_bound_programs_report_set_the_folder_while_it_runs() {
     let rig = Rig::attach();
@@ -192,14 +173,12 @@ fn the_reader_lets_a_key_bound_programs_report_set_the_folder_while_it_runs() {
     );
     assert_eq!(rig.cwd().as_deref(), Some("/home/me"));
 
-    // A key-bound program in its own group, holding the foreground.
     rig.write(JOB, &osc7("/srv/app"), "<job>");
     assert_eq!(
         rig.cwd().as_deref(),
         Some("/srv/app"),
         "the program's report"
     );
-    // It exits; the shell redraws its line.
     rig.write(SHELL, b"\r$ ", "<redraw>");
     assert_eq!(
         rig.cwd().as_deref(),
@@ -207,11 +186,9 @@ fn the_reader_lets_a_key_bound_programs_report_set_the_folder_while_it_runs() {
         "the prompt's folder"
     );
 
-    // A stray while the shell holds the foreground.
     rig.write(SHELL, &osc7("/elsewhere"), "<stray>");
     assert_eq!(rig.cwd().as_deref(), Some("/home/me"), "a stray is dropped");
 
-    // A program in the shell's own group, started since the prompt.
     CHILD_STARTED.store(u64::MAX, Ordering::SeqCst);
     rig.write(SHELL, &osc7("/srv/logs"), "<own-group>");
     assert_eq!(

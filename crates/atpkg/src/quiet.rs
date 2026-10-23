@@ -43,7 +43,7 @@ pub struct FlipGate<'a> {
 }
 
 /// The table a [`FlipGate::NOW`] never reads.
-fn no_table() -> Option<Vec<PathBuf>> {
+const fn no_table() -> Option<Vec<PathBuf>> {
     None
 }
 
@@ -75,7 +75,7 @@ pub enum Busy {
 impl Busy {
     /// Whether the flip may land now.
     #[must_use]
-    pub fn is_quiet(&self) -> bool {
+    pub const fn is_quiet(&self) -> bool {
         matches!(self, Self::Quiet)
     }
 
@@ -221,7 +221,7 @@ const MAX_RECORD_BYTES: usize = 64 * 1024;
 impl Deferral {
     /// When the wait ends whatever is using the toolchain.
     #[must_use]
-    pub fn ceiling_at(&self) -> i64 {
+    pub const fn ceiling_at(&self) -> i64 {
         self.since.saturating_add(CEILING_SECS)
     }
 

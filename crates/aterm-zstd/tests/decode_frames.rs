@@ -1,23 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! [`aterm_zstd::Decoder`] on frames built here, byte by byte or by
-//! [`frame::write_raw`]: what the recorded CLI frames (cli_decode.rs,
-//! sweep.rs) cannot hold, because no encoder writes it.
-//!
-//! * every raw frame, at each Frame_Content_Size width and block boundary,
-//!   decodes to exactly its content, alone and back to back;
-//! * damage is refused with the rule it breaks, and the checksum is what
-//!   catches a flipped content byte (without it the same flip decodes, to
-//!   the wrong bytes: the negative control);
-//! * hand-made headers past a limit (window, dictionary, reserved bit,
-//!   content size) and a match past the declared window are refused.
-//!
-//! Until docs/AUDIT-third-party-2026-10-15.md ZC.6 took libzstd out of the
-//! graph, libzstd 1.5.7 decoded the same raw frames and refused the same
-//! damaged and hand-made ones beside this decoder (tests/libzstd.rs and
-//! tests/decode_libzstd.rs at 13f0e82be); it accepted the two valid
-//! window-limit frames below with the same bytes.
+//! [`aterm_zstd::Decoder`] tests on raw, damaged, and hand-built frames.
 
 use std::io::{self, Read};
 
@@ -76,7 +60,6 @@ fn every_raw_frame_decodes_to_its_content() {
             let f = raw(&content, checksum);
             let what = format!("len {len} {checksum:?}");
             assert!(ours(&f).expect(&what) == content, "{what}");
-            // Read through `Decoder::new`'s own buffer, 4 KiB at a time.
             let mut stepped = Vec::new();
             let mut decoder = Decoder::new(&f[..]);
             let mut buf = vec![0u8; 4096];
@@ -111,7 +94,6 @@ fn damaged_raw_frames_are_refused() {
     for &len in &[1, 300, BLOCK_MAX + 1] {
         let content = noise(len, 3);
         let good = raw(&content, Checksum::Xxh64);
-        // The content's last byte sits just before the checksum.
         let last_content = good.len() - 5;
         assert_eq!(good[last_content], content[len - 1]);
 
@@ -143,7 +125,6 @@ fn damaged_raw_frames_are_refused() {
             "len {len}: {e}"
         );
 
-        // No checksum: the same flip decodes, to the wrong bytes.
         let mut unchecked = raw(&content, Checksum::Omitted);
         let last = unchecked.len() - 1;
         unchecked[last] ^= 0x80;
@@ -193,7 +174,6 @@ fn hand_made_headers_are_refused() {
         let mut f = MAGIC.to_le_bytes().to_vec();
         f.push(descriptor);
         f.extend(rest);
-        // One empty last raw block.
         f.extend([1, 0, 0]);
         f
     };
@@ -231,12 +211,10 @@ fn hand_made_headers_are_refused() {
         let e = ours(&zst).unwrap_err();
         assert_eq!(refusal(&e), Some(&want), "{what}: {e}");
     }
-    // Overrun: a raw block of 2 bytes in a frame that declares 1.
     let mut f = MAGIC.to_le_bytes().to_vec();
     f.extend([0x20, 1, 2 << 3 | 1, 0, 0, b'a', b'b']);
     let e = ours(&f).unwrap_err();
     assert!(matches!(refusal(&e), Some(DecodeError::Corrupt(_))), "{e}");
-    // Window log 27 is accepted.
     assert!(ours(&header(0x00, &[17 << 3])).is_ok());
 }
 

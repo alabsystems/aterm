@@ -150,7 +150,7 @@ pub struct Floor {
 
 impl Floor {
     /// The floor of a version known only by its seq and digest.
-    pub fn version(seq: u64, digest: [u8; 32]) -> Floor {
+    pub const fn version(seq: u64, digest: [u8; 32]) -> Floor {
         Floor {
             seq,
             digest,
@@ -269,7 +269,7 @@ struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
-    fn new(text: &'a str) -> Self {
+    const fn new(text: &'a str) -> Self {
         Lines {
             text,
             pos: 0,

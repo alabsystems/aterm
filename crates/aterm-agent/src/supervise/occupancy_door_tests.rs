@@ -207,7 +207,8 @@ fn day_on(
             }
             s.clock_marks = Some((s.fx.mono(), at_ms));
             before(&mut s, seq);
-            s.host_steps_in_background(&screen_at(seq, drawn(seq)), &mut since, cfg, review);
+            s.host_steps_in_background(&screen_at(seq, drawn(seq)), &mut since, cfg, review)
+                .expect("the break's step");
         }
         let noted = if attended {
             person.noted.clone()
@@ -304,7 +305,9 @@ fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
 
 /// THE DOOR RUNS ON HOSTED, UNATTENDED LOOPS UNDER A POLICY WHOSE OCCUPANCY IS NOT OFF ALONE (F2):
 /// the same 40 minutes that would nudge under observe book and say nothing with no host, with a
-/// person attending, with no policy, or under `off`.
+/// person attending, with no policy, or under `off`. Under `prompt` the due line goes to the
+/// write instead of a would-be row (`occupancy_write_tests.rs`): here the host's `status` names
+/// no person's stamp, which the write reads as someone, so nothing is typed.
 #[test]
 fn the_door_is_open_on_hosted_unattended_loops_only() {
     let reads = every(0, 40 * 60, 300);
@@ -327,11 +330,15 @@ fn the_door_is_open_on_hosted_unattended_loops_only() {
         ..observe.clone()
     };
     let p = run("door-prompt", true, Some(prompt), false);
+    assert!(p.would.is_empty(), "prompt books no would-be row");
+    let status = |r: &String| r.split(' ').find(|w| !w.starts_with('@')) == Some("status");
+    let unread: Vec<&String> = p.requests.iter().filter(|r| !status(r)).collect();
     assert_eq!(
-        p.would, open.would,
-        "prompt books as observe: no write path"
+        unread,
+        open.requests.iter().collect::<Vec<_>>(),
+        "its write read the status and typed nothing"
     );
-    assert_eq!(p.requests, open.requests, "and types nothing");
+    assert!(p.requests.len() > open.requests.len());
     let off = SupervisorConfig {
         occupancy: Occupancy::Off,
         ..observe.clone()
@@ -428,7 +435,8 @@ fn the_board_is_asked_at_most_once_a_look() {
                     &mut since,
                     Some(&opts.policy),
                     &mut heard,
-                );
+                )
+                .expect("the break's step");
             }
         }
         assert_eq!(host.asks(), 1, "the second judgment reused the query");
@@ -722,9 +730,11 @@ fn successor_run(body: &str, now_ms: i64, later_ms: i64, settle: Duration) -> Su
         s.hold_seed_from(body, start, now_ms, false, &opts.policy, &heard);
         let mut since = None;
         let mut at_ms = now_ms;
-        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(1, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         skip(&clock, &mut at_ms, later_ms);
-        s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard);
+        s.host_steps_in_background(&screen_at(2, break_screen()), &mut since, cfg, &mut heard)
+            .expect("the break's step");
         heard.noted
     };
     let would = would_rows(&path).split_off(before);
@@ -844,7 +854,8 @@ fn each_hold_says_its_own_verdicts() {
                 &mut since,
                 cfg,
                 &mut heard,
-            );
+            )
+            .expect("the break's step");
         }
         s.took(5, cfg, &mut heard);
         since = None;
@@ -857,7 +868,8 @@ fn each_hold_says_its_own_verdicts() {
                 &mut since,
                 cfg,
                 &mut heard,
-            );
+            )
+            .expect("the break's step");
         }
         heard.noted
     };
@@ -1068,6 +1080,88 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
         matches!(report.verdict, Verdict::Diverged(_)),
         "{}",
         report.render()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `prompt` TAPE FROM A BUILD WITH NO WRITE REPLAYS AS IT WAS RECORDED (the safety review's
+/// F-B): a build with no `host.occupancy_pace` door (1b's) read `prompt` as `observe`, so its due
+/// line is the would-be row it booked, and no `status` read is asked of the tape. The fixture is
+/// a hosted watch recorded under `observe` whose header then says `prompt` and names no door the
+/// write added. NEGATIVE CONTROL: the same header naming this build's doors replays the write,
+/// whose `status` read the tape does not hold: DIVERGED.
+#[test]
+fn a_prompt_tape_from_a_build_with_no_write_replays_as_observe() {
+    use crate::supervise::tape::recover::recover;
+    use crate::supervise::tape::replay::{Options, replay};
+    use crate::supervise::tape::report::Verdict;
+    use crate::supervise::tape::testing::written;
+
+    let (dir, ledger) = ledger_at("door-pre-write-tape");
+    let board = Board::reading(OccupancyReading::default());
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&board) as Arc<dyn IdleHost>),
+        ledger: Some(ledger.clone()),
+        journal: Some(dir.join("journal.jsonl")),
+        ..hosted(35 * 60)
+    };
+    assert_eq!(opts.policy.occupancy, Occupancy::Observe);
+    let mut m = Mock::new(vec![break_screen()]);
+    m.stall_sleep = Some(Duration::from_secs(60));
+    let run = record_watch(&mut m, &opts, |s| {
+        s.set_approval_ledger(Some(ledger.clone()));
+    });
+    assert_eq!(would_rows(&ledger).len(), 1, "the nudge's would-be row");
+    let header = run.header.encode();
+    let items = recover(&run.tape.reframed(&header)).items;
+    let replayed = |header: &str| {
+        replay(&written(header, &items), &Options::default())
+            .expect("replayed")
+            .verdict
+    };
+    assert_eq!(replayed(&header), Verdict::Reproduced);
+    let write_doors = [
+        "host.occupancy_pace",
+        "host.upgrade_due",
+        "host.break_taken",
+    ];
+    let rewritten = |strip: bool| -> String {
+        header
+            .lines()
+            .map(|line| {
+                let line = if line == "occupancy=observe" {
+                    "occupancy=prompt".to_string()
+                } else if let Some(doors) = line.strip_prefix("host_doors=")
+                    && strip
+                {
+                    let kept: Vec<&str> = doors
+                        .split(' ')
+                        .filter(|d| !write_doors.contains(d))
+                        .collect();
+                    format!("host_doors={}", kept.join(" "))
+                } else {
+                    line.to_string()
+                };
+                format!("{line}\n")
+            })
+            .collect()
+    };
+    let older = rewritten(true);
+    assert!(older.lines().any(|l| l == "occupancy=prompt"), "{older}");
+    let doors: Vec<&str> = older
+        .lines()
+        .find_map(|l| l.strip_prefix("host_doors="))
+        .expect("the header names its doors")
+        .split(' ')
+        .collect();
+    assert!(
+        doors.contains(&"host.occupancy") && !doors.contains(&"host.occupancy_pace"),
+        "{doors:?}"
+    );
+    assert_eq!(replayed(&older), Verdict::Reproduced);
+    assert!(
+        matches!(replayed(&rewritten(false)), Verdict::Diverged(_)),
+        "this build's doors under prompt: the write"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

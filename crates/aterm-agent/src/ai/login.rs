@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SIGN-IN, through each vendor's own flow, on a terminal a person is at (design §8).
-//!
-//! * Claude Code: ONLY accounts v2's renewal. With no renewable own row it asks for the
-//!   account's email, lists the machine's own login with `aterm harness accounts
-//!   adopt-default`, then runs `aterm harness accounts renew`: a staging home, the email
-//!   hint, the browser profile, the one check in the staging home, then the binding. aterm
-//!   never signs in a live Claude home, and records nothing of Claude's: accounts does.
-//! * A CLI whose login signs the current one out first (Codex revokes it) runs only when it
-//!   is already signed out.
-//! * Each flow runs from an empty run directory, with the tab's environment less the CLI's
-//!   credential variables, then its status read, on the login it just made.
-//!
-//! Nothing here runs under an agent: a sign-in is a person's act.
+//! Interactive vendor CLI sign-in flows.
 
 use std::io::Write;
 use std::path::Path;
@@ -50,8 +38,7 @@ pub fn agent_marker(var: &dyn Fn(&str) -> Option<String>) -> Option<&'static str
 /// What a sign-in came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Done {
-    /// The status read says it is signed in (`Some(method)`), or accounts v2 renewed it
-    /// (`None`).
+    /// The status read says it is signed in (`Some(method)`), or accounts v2 renewed it (`None`).
     SignedIn(Option<&'static str>),
     /// The flow ended and nothing could read whether a login was made.
     NotChecked,
@@ -63,7 +50,7 @@ pub enum Done {
     Refused(String),
 }
 
-/// What a sign-in needs of the machine. Injected: tests run no vendor and no `aterm`.
+/// What a sign-in needs of the machine.
 pub struct Host<'a> {
     /// The child processes.
     pub runner: &'a dyn Runner,
@@ -81,8 +68,7 @@ pub struct Host<'a> {
     pub ask: &'a dyn Fn(&str) -> Option<String>,
 }
 
-/// The environment a sign-in runs with: the tab's (the AI-variable strip), less the CLI's
-/// credential variables, plus its home variable when one is set.
+/// The environment a sign-in runs with.
 #[must_use]
 pub fn sign_in_env(
     c: &Connector,
@@ -118,7 +104,6 @@ pub enum Said {
 }
 
 /// Reads a status run against its closed grammar, error output first (Codex prints there).
-/// Whatever follows a known prefix (an API key's masked fragment) is dropped here.
 #[must_use]
 pub fn read_status(status: &Status, ran: &Result<Ran, RunFailed>) -> Said {
     let ran = match ran {
@@ -147,11 +132,8 @@ fn as_args(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_string()).collect()
 }
 
-/// Claude Code's sign-in: accounts v2's renewal, after listing the machine's own login
-/// with its email where it has none.
+/// Claude Code's sign-in.
 fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
-    // Accounts v2 renews only the default home's login; under a home of its own the
-    // vendor keys the login by that home, which no renewal here touches.
     if let Some(dir) = (h.var)(
         super::connector::CLAUDE
             .home
@@ -230,7 +212,7 @@ fn claude(h: &Host<'_>, f: &Facts, out: &mut dyn Write) -> Done {
     }
 }
 
-/// Signs `row`'s CLI in. `out` gets what the person is told.
+/// Signs `row`'s CLI in.
 #[must_use]
 pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done {
     let c = f.connector;
@@ -288,7 +270,6 @@ pub fn sign_in(h: &Host<'_>, f: &Facts, row: &Row, out: &mut dyn Write) -> Done 
     if let Err(why) = &exited {
         return Done::Failed(format!("{} could not be started: {why}", c.id));
     }
-    // Read whatever the exit: a person quits a TUI with Ctrl-C.
     let Some(status) = after else {
         return Done::NotChecked;
     };

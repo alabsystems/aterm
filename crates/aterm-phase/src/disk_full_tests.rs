@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tests for the disk-full notice reader. The notification's place and its
-//! glyph are read off the screen MEASURED on 2.1.304
-//! ([`TRANSCRIPT_DEGRADED_EACCES_2_1_304`], whose code is `EACCES`: the
-//! mapped words are swapped for each code the bundle maps); the other
-//! notices are built from the anchors (the drift canary holds those to the
-//! store binary), never typed here as prose, on synthetic screens.
+//! Tests for the disk-full notice reader.
 
 use super::*;
 use crate::anchors::anchor_text;
@@ -157,7 +152,6 @@ fn the_notification_reads_under_the_composer_and_in_the_live_zone() {
         &format!("  {}", notice("disk quota exceeded — EDQUOT")),
     );
     assert_eq!(disk_full(&quota).map(|d| d.code), Some(Code::Edquot));
-    // An unmapped code is drawn alone in the parentheses.
     let bare = busy(&[], "", &format!("  {}", notice("ENOSPC")));
     assert_eq!(disk_full(&bare).map(|d| d.code), Some(Code::Enospc));
 }
@@ -183,7 +177,6 @@ fn the_same_words_anywhere_else_are_not_the_notice() {
         let r = busy(&[], "", &format!("  {}", notice(other)));
         assert_eq!(disk_full(&r), None, "{other}");
     }
-    // No composer on the screen: nothing is placed, nothing is read.
     assert_eq!(disk_full(&rows(&[&full])), None);
 }
 
@@ -210,9 +203,6 @@ fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
     quoted.insert(4, format!("⏺ {tool} /private/tmp is full, it said."));
     assert_eq!(disk_full(&quoted), None);
 
-    // A row of an EARLIER turn — a person's message drawn since — is an
-    // incident since answered: not read. The same row under that message
-    // is.
     let mut earlier = r.clone();
     earlier.insert(6, "❯ keep going".to_string());
     assert_eq!(disk_full(&earlier), None);
@@ -220,7 +210,6 @@ fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
     this_turn.insert(3, "❯ keep going".to_string());
     assert_eq!(disk_full(&this_turn).map(|d| d.row), Some(5));
 
-    // A path that merely says `quota` is no EDQUOT; `disk quota` is.
     let mut path = busy(&[], "", "  ? for shortcuts");
     path.insert(
         4,

@@ -534,6 +534,13 @@ impl Terminal {
         Some(since.checked_add(super::FRAME_HANG).unwrap_or(since))
     }
 
+    /// The DEC 2026 timeout (`TerminalConfig::sync_timeout_ms`): the longest a reply's read waits for an unfinished frame, never [`FRAME_HANG`](super::FRAME_HANG).
+    #[inline]
+    #[must_use]
+    pub const fn sync_timeout(&self) -> std::time::Duration {
+        self.sync_timeout_duration
+    }
+
     /// Whether the screen holds a DEC 2026 frame closed by `?2026l` with no content motion since.
     #[inline]
     #[must_use]

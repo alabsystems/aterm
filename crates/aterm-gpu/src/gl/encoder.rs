@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Frame encoding on the GL arm: the verbs `device_layer::FrameEncoder` and
-//! `FramePass` forward to.
-//!
-//! GL executes as it is called, so a [`GlFrame`] is the context held current
-//! for one frame's encode and `submit` is a flush. The pass vocabulary is
-//! wgpu's, with wgpu's semantics, so `renderer.rs::run_frame_plan` drives this
-//! arm unchanged:
-//!
-//! * a pass attaches one texture; `Clear` writes every texel whatever the
-//!   previous pipeline's write mask or scissor was (GL's clear obeys both, so
-//!   the pass lifts them first), then the optional scissor applies to draws;
-//! * a pipeline switch sets program, vertex array, blend and write mask;
-//! * a draw refuses without a pipeline, and without a stream on a row that
-//!   reads one, instead of drawing garbage;
-//! * a copy is `glCopyTexSubImage2D` from the source's framebuffer, the call
-//!   wgpu's GL backend makes, and refuses an overlapping same-texture copy.
+//! Frame encoding on the GL arm: the verbs `device_layer::FrameEncoder` and `FramePass` forward to.
 
 use super::device::{Current, GlDevice};
 use super::ffi::{self, GLenum};
@@ -55,10 +40,7 @@ impl<'s> GlFrame<'s> {
         })
     }
 
-    /// Open a pass over `target`. `srgb` picks the view: on a texture with
-    /// both views ([`GlTexture::views`]) it switches the sRGB encode and the
-    /// linear blend on or off; a texture stored sRGB without views always
-    /// encodes (the downlevel plan).
+    /// Open a pass over `target`.
     pub(crate) fn begin_pass<'e>(
         &'e mut self,
         target: &GlTexture,
@@ -70,8 +52,8 @@ impl<'s> GlFrame<'s> {
         let fbo = target.fbo(&self.cur)?;
         let gl = self.cur.gl();
         let encode = if target.views { srgb } else { true };
-        // SAFETY: the context is current (the frame's guard); the framebuffer
-        // and buffer names belong to it; the clear colour is four floats.
+        // SAFETY: the context is current (the frame's guard); the framebuffer and buffer names
+        // belong to it; the clear colour is four floats.
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
             (gl.viewport)(0, 0, target.width as i32, target.height as i32);
@@ -104,9 +86,7 @@ impl<'s> GlFrame<'s> {
         })
     }
 
-    /// Copy a `width` x `height` rect of `src` at `src_origin` into `dst` at
-    /// `dst_origin`. Both rects must lie inside their textures, and a copy
-    /// within one texture must not overlap itself.
+    /// Copy a `width` x `height` rect of `src` at `src_origin` into `dst` at `dst_origin`.
     pub(crate) fn copy_rect(
         &mut self,
         src: &GlTexture,
@@ -140,8 +120,8 @@ impl<'s> GlFrame<'s> {
         }
         let fbo = src.fbo(&self.cur)?;
         let gl = self.cur.gl();
-        // SAFETY: the context is current; both rects checked inside their
-        // textures; the source framebuffer is complete.
+        // SAFETY: the context is current; both rects checked inside their textures; the source
+        // framebuffer is complete.
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, dst.name);
@@ -159,8 +139,7 @@ impl<'s> GlFrame<'s> {
         self.cur.check("texture copy")
     }
 
-    /// End the frame: flush its commands to the driver. The context is
-    /// released when the frame drops.
+    /// End the frame: flush its commands to the driver.
     pub(crate) fn submit(self) -> Result<(), String> {
         // SAFETY: the context is current.
         unsafe { (self.cur.gl().flush)() };
@@ -169,8 +148,7 @@ impl<'s> GlFrame<'s> {
 }
 
 impl GlPass<'_, '_> {
-    /// Bind `buf` as the uniform block at `binding` for the pass's later draws
-    /// (a present's crown binds its own block inside the blit's pass).
+    /// Bind `buf` as the uniform block at `binding` for the pass's later draws.
     #[inline]
     pub(crate) fn bind_uniform(&mut self, buf: &GlBuffer, binding: u32) {
         // SAFETY: the context is current; the buffer belongs to it.
@@ -179,8 +157,7 @@ impl GlPass<'_, '_> {
         }
     }
 
-    /// Scissor the pass's later draws to `(x, y, w, h)` (top-left rows, as
-    /// every texture of the arm stores them), or lift the scissor.
+    /// Scissor the pass's later draws to ``, or lift the scissor.
     #[inline]
     pub(crate) fn set_scissor(&mut self, scissor: Option<(u32, u32, u32, u32)>) {
         let gl = self.frame.cur.gl();
@@ -228,10 +205,7 @@ impl GlPass<'_, '_> {
         });
     }
 
-    /// Bind `tex` with `sampler` at texture unit `unit`. `raw` samples an
-    /// sRGB-stored texture without the decode (the Unorm view's read); only a
-    /// filtered sample honours it (`texelFetch` always decodes, so no twin
-    /// fetches a view texture with it; see `shaders/blit.glsl`).
+    /// Bind `tex` with `sampler` at texture unit `unit`.
     #[inline]
     pub(crate) fn bind_texture(
         &mut self,
@@ -241,8 +215,8 @@ impl GlPass<'_, '_> {
         raw: bool,
     ) {
         let gl = self.frame.cur.gl();
-        // SAFETY: the context is current; names belong to it; unit < the
-        // GLES 3.0 minimum of 16 (BindSpec slots are 0).
+        // SAFETY: the context is current; names belong to it; unit < the GLES 3.0 minimum of 16
+        // (BindSpec slots are 0).
         unsafe {
             (gl.active_texture)(ffi::GL_TEXTURE0 + unit);
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
@@ -258,9 +232,7 @@ impl GlPass<'_, '_> {
         }
     }
 
-    /// Bind the per-draw instance stream into the current pipeline's vertex
-    /// array. A stream the pass cannot take (no pipeline yet, or a row that
-    /// reads none) leaves it unstreamed, and the next draw refuses by name.
+    /// Bind the per-draw instance stream into the current pipeline's vertex array.
     #[inline]
     pub(crate) fn set_stream(&mut self, buf: &GlBuffer) {
         let Some(bound) = self.bound.as_mut() else {
@@ -271,17 +243,15 @@ impl GlPass<'_, '_> {
         };
         bound.stream = true;
         let cur = &self.frame.cur;
-        // SAFETY: the context is current; the pipeline's vertex array is bound
-        // (set_pipeline) and the stream buffer is bound just below.
+        // SAFETY: the context is current; the pipeline's vertex array is bound (set_pipeline) and
+        // the stream buffer is bound just below.
         unsafe {
             (cur.gl().bind_buffer)(ffi::GL_ARRAY_BUFFER, buf.name);
             specify_instance_layout(cur, &layout);
         }
     }
 
-    /// Draw `instances` instances of `vertices` vertices with the current
-    /// pipeline (6 for a quad list, 4 for the tray strip, 3 for a fullscreen
-    /// triangle).
+    /// Draw `instances` instances of `vertices` vertices with the current pipeline.
     #[inline]
     pub(crate) fn draw(&mut self, vertices: u32, instances: u32) -> Result<(), String> {
         let bound = self.bound.ok_or("gl: a draw with no pipeline")?;
@@ -292,11 +262,9 @@ impl GlPass<'_, '_> {
             ));
         }
         let gl = self.frame.cur.gl();
-        // SAFETY: the context is current; program, vertex array and (for a
-        // streamed row) the instance attributes are specified.
+        // SAFETY: the context is current; program, vertex array and (for a streamed row) the
+        // instance attributes are specified.
         unsafe { (gl.draw_arrays_instanced)(bound.mode, 0, vertices as i32, instances as i32) };
-        // No per-draw error read on the hot path: GL keeps the first error,
-        // and the frame's `submit` reports it.
         Ok(())
     }
 }

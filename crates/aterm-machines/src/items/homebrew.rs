@@ -468,11 +468,11 @@ struct Package {
 }
 
 impl Package {
-    fn flag(&self) -> &'static str {
+    const fn flag(&self) -> &'static str {
         if self.cask { "--cask" } else { "--formula" }
     }
 
-    fn what(&self) -> &'static str {
+    const fn what(&self) -> &'static str {
         if self.cask { "cask" } else { "formula" }
     }
 }

@@ -119,7 +119,7 @@ macro_rules! bind {
 
             /// Whether PHOSPHOR matrix rain is enabled.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn matrix_rain_enabled(&self) -> bool {
+            pub const fn matrix_rain_enabled(&self) -> bool {
                 self.effects.matrix_rain_enabled()
             }
 
@@ -226,7 +226,7 @@ macro_rules! bind {
             }
 
             /// Reduced motion for PRISM WAKE: amplitude pins to zero, a full reset, so `is_effects_active` settles.
-            pub fn set_output_streak_reduced_motion(&mut self, on: bool) {
+            pub const fn set_output_streak_reduced_motion(&mut self, on: bool) {
                 self.note_host_visual_change();
                 self.effects.set_output_streak_reduced_motion(on);
             }
@@ -245,7 +245,7 @@ macro_rules! bind {
 
             /// Whether the sparkle-words master is currently on.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn sparkle_words_enabled(&self) -> bool {
+            pub const fn sparkle_words_enabled(&self) -> bool {
                 self.effects.sparkle_enabled()
             }
 
@@ -372,18 +372,18 @@ macro_rules! bind {
 
             /// Whether the resident pet is enabled (the host's opt-in, not whether it is drawn; see `cursor_pet_alpha`).
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn cursor_pet_enabled(&self) -> bool {
+            pub const fn cursor_pet_enabled(&self) -> bool {
                 self.effects.cursor_pet_enabled()
             }
 
             /// The alpha the last `render` drew the pet with: `0` = nothing drawn, up to `255` for a fully present cat.
             #[cfg_attr(target_arch = "wasm32", $export(getter))]
-            pub fn cursor_pet_alpha(&self) -> u8 {
+            pub const fn cursor_pet_alpha(&self) -> u8 {
                 self.effects.cursor_pet_alpha()
             }
 
             /// The pointer's position in frame px (the canvas's device pixels, chrome and message band included); feed every `mousemove`.
-            pub fn note_pointer_px(&mut self, x: f32, y: f32) {
+            pub const fn note_pointer_px(&mut self, x: f32, y: f32) {
                 // Bump only when the pointer moved, or every mousemove would reopen the gate.
                 if self.effects.note_pointer_px(x, y) {
                     self.note_host_visual_change();
@@ -391,7 +391,7 @@ macro_rules! bind {
             }
 
             /// The pointer left the surface (`mouseleave`): the pet stops watching and settles.
-            pub fn note_pointer_leave(&mut self) {
+            pub const fn note_pointer_leave(&mut self) {
                 // Bump only on the real edge (see `note_pointer_px`).
                 if self.effects.note_pointer_leave() {
                     self.note_host_visual_change();

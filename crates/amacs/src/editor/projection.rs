@@ -127,19 +127,19 @@ pub struct EditorLines<'a> {
 
 impl<'a> EditorLines<'a> {
     /// Derive every answer from the bytes, allocation-free.
-    pub fn scanning(text: &'a str) -> Self {
+    pub const fn scanning(text: &'a str) -> Self {
         Self { text, starts: None }
     }
 
     /// Answer from a [`line_starts`] index built for exactly this `text`.
-    pub fn indexed(text: &'a str, starts: &'a [usize]) -> Self {
+    pub const fn indexed(text: &'a str, starts: &'a [usize]) -> Self {
         Self {
             text,
             starts: Some(starts),
         }
     }
 
-    pub fn text(&self) -> &'a str {
+    pub const fn text(&self) -> &'a str {
         self.text
     }
 

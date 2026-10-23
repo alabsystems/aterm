@@ -725,7 +725,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 34);
+    assert_eq!(Chain::every().len(), 42);
     assert!(
         Chain::every()
             .iter()
@@ -7098,6 +7098,12 @@ fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
     assert!(!notice_gone(Harness::Claude, &cancelled));
     let rows = |t: &str| t.lines().map(str::to_string).collect::<Vec<_>>();
     assert_eq!(claude_composer(&rows(&scrolled)).as_deref(), Some(""));
+    // CONTROLS: the composer's draft is read off the named rule's frame, and
+    // a screen with no frame has none.
+    let drafted = scrolled.replace("❯\u{a0}\n", "❯\u{a0}hello\n");
+    assert_eq!(claude_composer(&rows(&drafted)).as_deref(), Some("hello"));
+    let frameless = scrolled.replace(&"─".repeat(144), "");
+    assert_eq!(claude_composer(&rows(&frameless)), None);
     assert!(armed.contains(CLAUDE_CANCEL.armed) && !armed.contains(CLAUDE_CANCEL.cancelled));
     assert!(cancelled.contains(CLAUDE_CANCEL.cancelled));
     let typed = scrolled.replace("❯\u{a0}\n", &format!("❯\u{a0}{CLAUDE_HIDE_COMMAND}\n"));
@@ -7184,4 +7190,88 @@ fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_t
     let (w, why) = w2(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("ESCALATED"), "{why}");
+}
+
+#[path = "forever_walls_tests.rs"]
+mod walls;
+
+/// W2'S HIDE (and W5's switch, W9's relaunch) GOES ON ONCE THE LOOP WAITS ON
+/// THE WALL, WHICHEVER SIDE OF THE WALL'S POINT ITS WAIT IS WRITTEN
+/// ([`waits_on_the_wall`]): Gemini CLI's per-day dialog's ladder is written
+/// as its badge is raised, before the point's `EVENT prompt` (measured,
+/// `z1gd`, where the hide never chose `Stop`), and the account dialog's
+/// wait after it. NEGATIVE CONTROLS: a wait of another seq, the take
+/// window's wait for the worker, a wait before the land act, and no land act
+/// at all hold the hide back. Muse Code's wall is two points, its API error
+/// and then its notice, and the wait on the second is the wall's (measured,
+/// `y3rl-muse`); both held by the take window alone hold the hide back.
+#[test]
+fn the_hide_waits_on_the_walls_wait_either_side_of_its_point() {
+    let ladder = "WAITING seq=38891 until=2026-10-22T11:47:18Z rule=limit-retry@v1 Gemini CLI's \
+                  usage limit names no reset: Keep trying is pressed on the back-off ladder";
+    let event = "EVENT prompt seq=38891 kind=usage-limit classify=- command=-";
+    let land = "CONTINUED seq=36822 rule=land@v1 [aterm harness] Autopilot is Land:";
+    let seen = |lines: &[(i64, &str)]| Seen {
+        journal: lines.iter().map(|&(t, l)| j(t, l)).collect(),
+        ..Seen::default()
+    };
+    // measured: the ladder's wait, its badge, then the point
+    assert!(waits_on_the_wall(&seen(&[
+        (124_300, land),
+        (125_100, ladder),
+        (125_200, "ESCALATED seq=38891 attention=OK"),
+        (125_200, event),
+    ])));
+    // the account dialog's: the point, then its wait
+    assert!(waits_on_the_wall(&seen(&[
+        (124_300, land),
+        (125_000, event),
+        (125_100, ladder),
+    ])));
+    // NEGATIVE CONTROLS. A wait of another screen:
+    let other = ladder.replace("seq=38891", "seq=36822");
+    assert!(!waits_on_the_wall(&seen(&[
+        (124_300, land),
+        (125_100, &other),
+        (125_200, event),
+    ])));
+    // the take window's wait for the worker to take the act:
+    let take = "WAITING seq=38891 until=x the worker to take the land@v1 act";
+    assert!(!waits_on_the_wall(&seen(&[
+        (124_300, land),
+        (125_100, take),
+        (125_200, event),
+    ])));
+    // the wait written before the land act was typed:
+    assert!(!waits_on_the_wall(&seen(&[
+        (124_000, ladder),
+        (124_300, land),
+        (125_200, event),
+    ])));
+    // no land act:
+    assert!(!waits_on_the_wall(&seen(&[
+        (125_100, ladder),
+        (125_200, event)
+    ])));
+    // Muse Code's two points (measured, `y3rl-muse`): its API error held by
+    // the take window alone, then its notice waited on to the reset
+    let error = "EVENT limited seq=2483 message=model failed: API error 429: The usage limit has \
+                 been reached (usage_limit_reached) reset=-";
+    let notice = "EVENT limited seq=2827 message=Usage limit reached · /upgrade for increased \
+                  limits, or wait for usage to reset at 7:46 AM reset=7:46 AM";
+    let take_error = "WAITING seq=2483 until=x the worker to take the land@v1 act";
+    let take_notice = "WAITING seq=2827 until=x the worker to take the land@v1 act";
+    let resets = "WAITING seq=2827 until=2026-10-22T14:47:08Z usage-session resets";
+    let muse = [
+        (124_700, land),
+        (126_200, error),
+        (126_200, take_error),
+        (127_300, notice),
+        (127_300, take_notice),
+    ];
+    let mut waited = muse.to_vec();
+    waited.push((156_500, resets));
+    assert!(waits_on_the_wall(&seen(&waited)));
+    // NEGATIVE CONTROL: both points held by the take window alone
+    assert!(!waits_on_the_wall(&seen(&muse)));
 }

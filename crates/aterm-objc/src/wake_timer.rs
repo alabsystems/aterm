@@ -69,14 +69,14 @@ impl WakePlan {
     }
 
     /// The timer's callout ran: whatever it was armed for is used up.
-    pub fn fired(&mut self) {
+    pub const fn fired(&mut self) {
         if self.armed.is_some() {
             self.spent = true;
         }
     }
 
     /// No wake wanted (`ControlFlow::Wait`).
-    pub fn stop(&mut self) -> WakeArm {
+    pub const fn stop(&mut self) -> WakeArm {
         if self.armed.is_none() {
             return WakeArm::Keep;
         }

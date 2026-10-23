@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The harness card's fx layers on the GPU against the CPU
-//! (`docs/DESIGN-card-engine-2026-10-19.md` §7 "B, the card": byte
-//! comparisons in-process, one `RenderInput` through the CPU and the GPU
-//! arm): a card's two layers — the border and the trail Under in window
-//! space, the kitty, its rim and the stars Over in grid space, as
-//! `harness_card::CardFrame::layers` lays them — are byte-exact (delta 0)
-//! over a background-filled ground, at two cell sizes, on a dark ground
-//! (additive light) and a light one (source-over ink), through every frame
-//! of an episode (the ride-in, the burst) and the settled frame; the
-//! settled frame replayed is byte-exact with no fx byte uploaded, and so is
-//! the settled frame moved a row up by an inline scroll and the frame under
-//! a tab menu's occluder. CONTROL: the comparator sees the kitty moved by one
-//! pixel on the GPU's input alone.
-//!
-//! No GPU: COULD NOT RUN.
+//! CPU/GPU byte-parity tests for `harness_card` fx layers.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,8 +18,7 @@ use crate::common::{self, max_channel_delta};
 const ROWS: usize = 12;
 const COLS: usize = 80;
 
-/// The card's box: its three rows and the line's, the trail from past the
-/// text to the kitty, which stands three rows tall.
+/// The card's box.
 const BOX_ROWS: u16 = 4;
 const BOX_COLS: u16 = 51;
 const TRAIL: (u16, u16) = (22, 30);
@@ -42,16 +27,13 @@ const KITTY_COL: u16 = 30;
 /// The card's name in the frame's layers.
 const CARD: u64 = 7;
 
-/// A wait for something that must happen (an episode's end) is a hang
-/// detector, never a budget: more frames than any episode has.
+/// A wait for something that must happen (an episode's end) is a hang detector, never a budget.
 const FRAMES_MAX: usize = 400;
 
 /// Flow steps compared after the intro: the card flows on while it may animate.
 const FLOW_STEPS: usize = 3;
 
-/// A hidden-cursor terminal whose every cell is the ground `bg` (an SGR
-/// background, `None`: the theme's): background fills only, byte-equal on
-/// both renderers, so any delta is the card's.
+/// A hidden-cursor terminal whose every cell is the ground `bg` (`None` uses the theme's).
 fn ground_term(bg: Option<&str>) -> Terminal {
     let mut t = Terminal::new(ROWS as u16, COLS as u16);
     t.process(b"\x1b[?25l");
@@ -65,8 +47,7 @@ fn ground_term(bg: Option<&str>) -> Terminal {
     t
 }
 
-/// The card's scene with its banner on grid row `top`, as the app lays it
-/// for a pane that fills the window.
+/// The card's scene with its banner on grid row `top`.
 fn scene(cpu: &Renderer, top: u16, dark: bool, ground: u32) -> CardScene {
     let (cw, ch) = cpu.cell_size();
     let px = |v: usize| i32::try_from(v).expect("a pixel");
@@ -161,9 +142,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
             card.arm(t0, 0x5eed_ca4d);
             let mut now = t0;
             let (mut drawn, mut flowed) = (0, 0);
-            // The intro, frame by frame, then the flow's first steps (the card
-            // flows on while it may animate, f9b86bc658), then the settled
-            // frame a held card draws.
             loop {
                 let frame = card.draw(now, &at, true, &mut frames);
                 let input = input_with(&mut t, layers(&frame, &at, &cpu), Vec::new());
@@ -212,7 +190,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 0,
                 "{what}: settled"
             );
-            // Replayed: the same contents, nothing uploaded.
             let replayed = card
                 .replay(&at, false, &frames)
                 .expect("a settled card replays");
@@ -233,7 +210,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 0,
                 "{what}: a replayed card uploads nothing"
             );
-            // An inline scroll: the settled frame a row up, replayed.
             let up = scene(&cpu, top - 1, dark, ground);
             let moved = card
                 .replay(&up, false, &frames)
@@ -253,7 +229,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 0,
                 "{what}: scrolled"
             );
-            // Under a tab menu's occluder over the kitty and the border.
             let (cw, ch) = cpu.cell_size();
             let (pad, grid_top) = (cpu.pad(), cpu.grid_top());
             let menu = PxRect::new(
@@ -273,7 +248,6 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                 0,
                 "{what}: occluded"
             );
-            // CONTROL: the kitty a pixel right on the GPU's input alone.
             let mut nudged = settled_layers.clone();
             for l in nudged.iter_mut().filter(|l| l.slot == FxSlot::Over) {
                 l.offset.0 += 1;

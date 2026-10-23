@@ -969,6 +969,9 @@ fn sample_engine_events(
     }
 }
 
+/// One wake's frames for one watched target. Content on an unfinished DEC 2026 frame is put off to
+/// its hang detector ([`Paces::frame`]), never waited for: a DELTA has no word for half a frame, and
+/// the connection's other targets wait behind this one. A closing watch reads it as it stands.
 fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Vec<Frame> {
     #[cfg(test)]
     crate::work_counts::watch_visited();
@@ -978,10 +981,18 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
     let mut frames = Vec::new();
     let mut out = String::new();
 
-    if streams.wants_content() {
+    'content: {
+        if !streams.wants_content() {
+            break 'content;
+        }
         let mut look = watch.src.frame.look_frame();
         let (t_us, seq, alt, gap, advance, cur, text, rows, cells_etag, styled) = {
             let t = crate::term_lock(&watch.term);
+            if !watch.closing && crate::frame_unfinished_now(&t) {
+                watch.pace.frame = t.frame_hang_deadline();
+                break 'content;
+            }
+            watch.pace.frame = None;
             let t_us = crate::metrics::now_us();
             let seq = t.content_seq();
             let alt = t.is_alternate_screen();
@@ -1351,16 +1362,18 @@ pub(crate) const CONTENT_PACE: Duration = Duration::from_millis(16);
 /// The least time between two `events` reads that the PTY reader's wakes drive on one watch.
 pub(crate) const EVENTS_PACE: Duration = CONTENT_PACE;
 
-/// One watch's paced reads: its content streams' ([`CONTENT_PACE`]) and its `events` digest's ([`EVENTS_PACE`]).
+/// One watch's paced reads: its content streams' ([`CONTENT_PACE`]) and its `events` digest's ([`EVENTS_PACE`]), and a content read put off for an unfinished frame.
 #[derive(Default)]
 pub(crate) struct Paces {
     content: ReadPace,
     events: ReadPace,
+    /// A content read put off for an unfinished DEC 2026 frame, owed with no ring at its per-run hang detector.
+    frame: Option<Instant>,
 }
 
 impl Paces {
     fn due(&self) -> Option<Instant> {
-        let content = self.content.due(CONTENT_PACE);
+        let content = self.content.due(CONTENT_PACE).or(self.frame);
         let events = self.events.due(EVENTS_PACE);
         content.into_iter().chain(events).min()
     }
@@ -1630,8 +1643,9 @@ fn pass_streams(
     recorded: bool,
     now: Instant,
 ) -> Option<TargetStreams> {
-    let content =
-        streams.wants_content() && pace.content.visit(now, dirty, CONTENT_PACE) == Some(true);
+    let frame_due = pace.frame.is_some_and(|hang| now >= hang);
+    let content = streams.wants_content()
+        && pace.content.visit(now, dirty || frame_due, CONTENT_PACE) == Some(true);
     let events = streams.events
         && if recorded {
             pace.events.read_now(now);
@@ -5289,6 +5303,153 @@ mod tests {
             sink.hung_up,
             "B's selection reached the wire though A rang before every pass: {:?}",
             sink.wire
+        );
+    }
+
+    /// One target's unfinished frame holds up no other target's push, and none is pushed half.
+    #[test]
+    fn an_unfinished_frame_on_one_target_holds_up_no_other_targets_push() {
+        let store = crate::session_store::new_store();
+        let (a, b) = (
+            crate::session_store::test_handle(1),
+            crate::session_store::test_handle(2),
+        );
+        {
+            let mut t = crate::term_lock(&a.term);
+            t.process(b"\x1b[?2026h\x1b[H\x1b[2Jbefore\x1b[?2026l");
+            t.process(b"\x1b[?2026h\x1b[H\x1b[2Jhalf");
+            assert!(t.frame_unfinished_at(Instant::now()), "precondition");
+        }
+        crate::term_lock(&b.term).process(b"ready");
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            g.register(a.clone());
+            g.register(b.clone());
+        }
+        let targets = [target_of(&a), target_of(&b)];
+        // Whether A's frame was still open at B's DELTA, and A's rows, in wire order.
+        let mut b_while_a_unfinished = None;
+        let mut order = Vec::new();
+        let mut a_rows: Vec<String> = Vec::new();
+        let mut a_left = 0usize;
+        let mut sink = Scripted::new(|line: &str| {
+            if a_left > 0 {
+                a_left -= 1;
+                a_rows.push(line.to_string());
+                return a_left > 0 || !a_rows.iter().any(|row| row == "full");
+            }
+            let Some(header) = line.strip_prefix("DELTA ") else {
+                return true;
+            };
+            let (tag, rows) = (
+                header.split(' ').next().unwrap_or_default(),
+                header.rsplit(' ').next().and_then(|n| n.parse().ok()),
+            );
+            order.push(tag.to_string());
+            match tag {
+                "1" => a_left = rows.unwrap_or(0),
+                "2" if b_while_a_unfinished.is_none() => {
+                    let mut t = crate::term_lock(&a.term);
+                    b_while_a_unfinished = Some(t.frame_unfinished_at(Instant::now()));
+                    t.process(b"\r\nfull\x1b[?2026l");
+                    drop(t);
+                    a.ctx.watchers.ring_watchers();
+                }
+                _ => {}
+            }
+            true
+        });
+        push_loop_with_peer_probe(
+            &store,
+            &targets,
+            PushScopes {
+                streams: TargetStreams {
+                    screen: true,
+                    ..Default::default()
+                },
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
+            PushOptions::default(),
+            "OK\n",
+            &mut sink,
+            hang_detector("A's whole frame on the wire"),
+        );
+        let (hung_up, wire) = (sink.hung_up, std::mem::take(&mut sink.wire));
+        drop(sink);
+        assert!(hung_up, "A's whole frame reached the wire: {wire:?}");
+        assert_eq!(order, ["2", "1"], "B first, then A once: {wire:?}");
+        assert_eq!(
+            b_while_a_unfinished,
+            Some(true),
+            "B was pushed while A's frame was unfinished"
+        );
+        assert_eq!(a_rows.first().map(String::as_str), Some("half"));
+        assert_eq!(a_rows.get(1).map(String::as_str), Some("full"));
+    }
+
+    /// A put-off push comes due at its frame's hang detector, with no ring.
+    #[test]
+    fn a_put_off_push_comes_due_at_its_frames_hang_detector() {
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        crate::term_lock(&term).process(b"\x1b[?2026h\x1b[H\x1b[2Jhalf");
+        let screen = TargetStreams {
+            screen: true,
+            ..Default::default()
+        };
+        let mut w = watch_on(1, &term);
+        let t0 = Instant::now();
+        assert_eq!(
+            pass_streams(screen, &mut w.pace, true, false, t0),
+            Some(screen)
+        );
+        assert!(
+            frames_for_watch(&mut w, screen, true).is_empty(),
+            "half a frame is not pushed"
+        );
+        let hang = crate::term_lock(&term)
+            .frame_hang_deadline()
+            .expect("an unfinished frame");
+        assert_eq!(w.pace.frame, Some(hang), "owed at the hang detector");
+        assert_eq!(
+            next_wait(std::slice::from_ref(&w), t0, false),
+            Some(hang.saturating_duration_since(t0)),
+            "the detector bounds the wait"
+        );
+        let before = hang
+            .checked_sub(Duration::from_millis(1))
+            .expect("an instant before the detector");
+        assert_eq!(
+            pass_streams(screen, &mut w.pace, false, false, before),
+            None,
+            "nothing before it"
+        );
+        assert_eq!(
+            pass_streams(screen, &mut w.pace, false, false, hang),
+            Some(screen),
+            "the content at it, with no ring"
+        );
+    }
+
+    /// A closing watch's last pass pushes an unfinished frame as it stands: no burst will close it.
+    #[test]
+    fn a_closing_watchs_last_pass_pushes_an_unfinished_frame_as_it_stands() {
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        crate::term_lock(&term).process(b"\x1b[?2026h\x1b[H\x1b[2Jhalf");
+        assert!(
+            crate::term_lock(&term).frame_unfinished_at(Instant::now()),
+            "precondition: the frame is unfinished"
+        );
+        let screen = TargetStreams {
+            screen: true,
+            ..Default::default()
+        };
+        let mut closing = watch_on(2, &term);
+        closing.closing = true;
+        let last = wake_text(&mut closing, screen, false);
+        assert!(
+            last.starts_with("DELTA ") && last.contains("\nhalf"),
+            "a closing watch's last pass, as the frame stands: {last:?}"
         );
     }
 

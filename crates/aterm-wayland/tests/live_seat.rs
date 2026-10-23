@@ -1,41 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seat and selection helpers against a compositor with a real seat:
-//! headless Mutter, whose seat a RemoteDesktop session gives a keyboard and a
-//! pointer (`lane-bus seat`, a second process the test starts and paces
-//! through files). This client maps a maximized toplevel and hears, in order:
-//! the keyboard's capability, keymap, repeat settings and focus; the keys
-//! `a` and `b` as evdev 30 and 48, pressed then released; a pointer frame
-//! with the press of the left button. Then, with the button still held:
-//!
-//! - the clipboard: a source this client offers becomes the selection, and
-//!   reading the selection's offer through the compositor gives its bytes;
-//! - the first negative control: a source set with the same serial replaces
-//!   nothing (a selection takes a serial newer than the current one's), and
-//!   the first's bytes are still what a read gives;
-//! - after one more key (`c`, a newer serial) a second source replaces it:
-//!   the first is cancelled, and the second's bytes are what a read gives;
-//! - the second negative control: a second client, which the keyboard is not
-//!   on, offers a selection with that serial; Mutter cancels that source and
-//!   the first client's selection stands, its bytes unchanged;
-//! - the primary selection, the same way;
-//! - a drag from the held button: the drag enters this client's surface with
-//!   the source's types, is accepted, moves, drops, and its offer is taken
-//!   over from the device, its bytes read and the drop finished, which the
-//!   source hears;
-//! - a finger: the session's touchscreen (Mutter places it in a screencast
-//!   stream of the monitor, which `lane-bus seat` records; its first tap
-//!   makes the device and no client hears it) goes down on the surface,
-//!   moves and lifts, and the touch hears down, motion and up, each in a
-//!   frame, with one id.
-//!
-//! Then the session ends and the seat's capabilities go, the devices
-//! released with no protocol error. The seats, the devices and the sources
-//! hand what they hear to sinks on one shared book, as the winit fork hands
-//! them its inbox. It runs where the Linux lane names its
-//! Mutter and lane-bus (`LANE_SEAT_WAYLAND_DISPLAY`, `LANE_SEAT_MUTTER_PID`,
-//! `LANE_SEAT_BUS`); elsewhere it says SKIP and returns.
+//! Live Wayland seat, selection, drag, and touch tests against headless Mutter.
 
 #![cfg(target_os = "linux")]
 
@@ -121,7 +87,7 @@ fn touch(dir: &Path, name: &str) {
 }
 
 fn memfd(len: usize) -> OwnedFd {
-    // SAFETY: a fresh memfd, sized for this test.
+    // SAFETY: A fresh memfd, sized for this test.
     unsafe {
         let fd = libc::memfd_create(c"aterm-wayland-seat".as_ptr(), libc::MFD_CLOEXEC);
         assert!(fd >= 0);
@@ -139,7 +105,7 @@ struct Heard {
     requests: Vec<(&'static str, SourceEvent)>,
 }
 
-/// The book every helper's sink writes to.
+/// Shared event log that every helper sink writes into.
 #[derive(Clone, Default)]
 struct Ears(Arc<Mutex<Heard>>);
 
@@ -186,8 +152,7 @@ impl Ears {
     }
 }
 
-/// Answer every `send` source `name` was asked for with `bytes`; the other
-/// requests, by name.
+/// Answer every `send` source `name` was asked for with `bytes`; the other requests, by name.
 fn serve(ears: &Ears, name: &str, bytes: &[u8]) -> Vec<String> {
     let mut other = Vec::new();
     for event in ears.requests(name) {
@@ -202,10 +167,7 @@ fn serve(ears: &Ears, name: &str, bytes: &[u8]) -> Vec<String> {
     other
 }
 
-/// Read what `reader` gets once `queue` has carried the request to the
-/// source and the source answered with `bytes`; the source's other requests
-/// go to `heard`. A source may be asked more than once: Mutter 46 asked each
-/// selection source once more than this test read it (measured).
+/// Dispatches `queue`, answers the source with `bytes`, and returns what `reader` receives.
 fn read_through(
     queue: &Queue,
     reader: std::io::Result<std::io::PipeReader>,
@@ -216,8 +178,6 @@ fn read_through(
     let reader = reader.expect("a pipe to read");
     queue.roundtrip().expect("the request reaches the source");
     heard.extend(serve(ears, source, bytes));
-    // The read waits for the compositor to close the pipe: on a thread of its
-    // own, under the hang detector.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(read_limited(reader, 1 << 16));
@@ -229,7 +189,6 @@ fn read_through(
 
 /// The client's state: a maximized toplevel and the seat helpers.
 struct Client {
-    // Dropped in this order: the registry, its queue, then the display.
     registry: Registry,
     queue: Queue,
     display: OwnedDisplay,
@@ -238,8 +197,7 @@ struct Client {
 impl Client {
     fn connect(lane: &Lane) -> Client {
         let display = OwnedDisplay::connect(Some(&lane.display)).expect("Mutter's display");
-        // SAFETY: Client drops registry, queue, then display; all dispatch
-        // and object teardown is serialized on this test thread.
+        // SAFETY: Client drops registry, queue, then display.
         let queue = Queue::new(unsafe { display.display() }).unwrap();
         let registry = Registry::new(&queue).unwrap();
         Client {
@@ -277,7 +235,7 @@ fn a_real_seat_reaches_the_helpers() {
     eprintln!("seats: {infos:?}");
     let seat = infos.first().expect("Mutter has a seat").id;
     let seat_proxy = seats.proxy(seat).unwrap();
-    // SAFETY: the live seat, outliving the devices (dropped first below).
+    // SAFETY: The live seat, outliving the devices (dropped first below).
     let (device, primary_device) = unsafe {
         (
             Device::new(&clipboard, seat_proxy, ears.drags()).unwrap(),
@@ -285,12 +243,11 @@ fn a_real_seat_reaches_the_helpers() {
         )
     };
 
-    // A maximized toplevel, so the seat's pointer is over it wherever it is.
-    // SAFETY: the compositor bound above.
+    // SAFETY: The toplevel is maximized beneath the seat pointer.
     let surface = unsafe { wl_compositor::create_surface(compositor) }.unwrap();
-    // SAFETY: a fresh surface with no role, outliving the toplevel.
+    // SAFETY: A fresh surface with no role, outliving the toplevel.
     let toplevel = unsafe { Toplevel::new(&shell, surface, c"aterm seat", c"aterm.seat") }.unwrap();
-    // SAFETY: the live toplevel and surface.
+    // SAFETY: The live toplevel and surface.
     unsafe {
         xdg_toplevel::set_maximized(toplevel.toplevel());
         wl_surface::commit(surface);
@@ -312,8 +269,7 @@ fn a_real_seat_reaches_the_helpers() {
     let (w, h) = (configure.width, configure.height);
     let len = usize::try_from(w * h * 4).unwrap();
     let fd = memfd(len);
-    // SAFETY: live objects of this test, each destroyed once at its end or
-    // left to the display's.
+    // SAFETY: Live Wayland objects destroyed once when the test ends.
     let (pool, buffer) = unsafe {
         let pool = wl_shm::create_pool(shm, fd.as_raw_fd(), i32::try_from(len).unwrap()).unwrap();
         let buffer =
@@ -330,29 +286,24 @@ fn a_real_seat_reaches_the_helpers() {
         "mapped cleanly"
     );
 
-    // The seat: Mutter adds the keyboard with the session's first key.
     let pace = aterm_tempfile::tempdir().unwrap();
     let file = |n: &str| pace.path().join(n).display().to_string();
     let steps = [
         format!("wait:{}", file("focused")),
         "tap:a".into(),
         "tap:b".into(),
-        // Mutter adds the pointer with the session's first motion, which the
-        // client hears only once it has bound the pointer it announces.
         "move:3,3".into(),
         format!("wait:{}", file("bound")),
         "move:3,3".into(),
         format!("wait:{}", file("pointed")),
         "press:left".into(),
         format!("wait:{}", file("fresh")),
-        // A newer serial for the second selection.
         "tap:c".into(),
         format!("wait:{}", file("dragging")),
         "move:6,6".into(),
         "move:6,6".into(),
         "release:left".into(),
         format!("touch:{}", file("released")),
-        // A finger, in the monitor's pixels, on the maximized surface.
         format!("wait:{}", file("touchable")),
         "finger-down:100,100".into(),
         "finger-move:120,130".into(),
@@ -465,15 +416,12 @@ fn a_real_seat_reaches_the_helpers() {
     );
     let press_serial = press(&log).unwrap();
     assert!(seats.pointer_button_serial(seat) == Some(press_serial));
-    // The same serial and the live pointer, lent for a request (the winit fork's move,
-    // resize and window menu are made this way).
     let lent = seats.with_seat(seat, |r| (r.seat, r.pointer, r.pointer_button_serial));
     assert_eq!(
         lent,
         Some((seat_proxy, seats.pointer(seat), Some(press_serial)))
     );
 
-    // The clipboard, through the compositor and back.
     let serial = seats.latest_serial(seat).expect("the seat gave a serial");
     let first = Source::new(&clipboard, &[TEXT], 0, ears.source("first")).unwrap();
     device.set_selection(Some(&first), serial);
@@ -491,8 +439,6 @@ fn a_real_seat_reaches_the_helpers() {
         &mut heard,
     );
     assert_eq!(got, b"LANE-SEL-1");
-    // The negative control of the serial: a selection set with a serial no
-    // newer than the current selection's is ignored, the first standing.
     let stale = Source::new(&clipboard, &[TEXT], 0, ears.source("stale")).unwrap();
     device.set_selection(Some(&stale), serial);
     a.queue.roundtrip().unwrap();
@@ -507,9 +453,7 @@ fn a_real_seat_reaches_the_helpers() {
     );
     assert_eq!(got, b"LANE-SEL-1", "the first selection stands");
     drop(stale);
-    // What the replaced source was asked goes with it (its descriptors close).
     drop(ears.requests("stale"));
-    // A key, and the serial it brings, replaces it.
     touch(pace.path(), "fresh");
     pump(&a.queue, "the key c", || {
         log.extend(ears.input());
@@ -536,7 +480,6 @@ fn a_real_seat_reaches_the_helpers() {
         "the second source's bytes, not the first's"
     );
 
-    // The negative control: a client the keyboard is not on.
     {
         let b = Client::connect(&lane);
         let b_ears = Ears::default();
@@ -568,7 +511,6 @@ fn a_real_seat_reaches_the_helpers() {
     );
     assert_eq!(got, b"LANE-SEL-2");
 
-    // The primary selection.
     let prim = Source::new(&primary, &[TEXT], 0, ears.source("prim")).unwrap();
     primary_device.set_selection(Some(&prim), newer);
     pump(&a.queue, "the primary selection", || {
@@ -585,10 +527,9 @@ fn a_real_seat_reaches_the_helpers() {
     );
     assert_eq!(got, b"LANE-PRIMARY");
 
-    // A drag from the held button, onto this client's own surface.
     let copy = wl_data_device_manager::dnd_action::COPY;
     let dragged = Source::new(&clipboard, &[URI_LIST], copy, ears.source("dragged")).unwrap();
-    // SAFETY: the live surface the pointer pressed on.
+    // SAFETY: The target surface is a live Wayland surface.
     assert!(unsafe { device.start_drag(Some(&dragged), surface, None, press_serial) });
     let mut drag_log = Vec::new();
     pump(&a.queue, "the drag's enter", || {
@@ -630,8 +571,6 @@ fn a_real_seat_reaches_the_helpers() {
             .any(|e| matches!(e, DragEvent::Motion { .. })),
         "the drag moved over the surface"
     );
-    // The dropped offer, taken over from the device (as the winit fork reads a drop): read,
-    // then finished, which the source hears.
     let dropped = device.take_dropped().expect("the drop carried an offer");
     assert!(device.take_dropped().is_none(), "a drop is taken over once");
     let got = read_through(
@@ -650,7 +589,6 @@ fn a_real_seat_reaches_the_helpers() {
     eprintln!("drag source heard: {heard:?}");
     assert!(heard.iter().any(|e| e == "DropPerformed"), "{heard:?}");
 
-    // The finger: the touchscreen came with the session's first tap.
     pump(&a.queue, "the seat's touch", || {
         log.extend(ears.input());
         seats
@@ -673,7 +611,6 @@ fn a_real_seat_reaches_the_helpers() {
             .iter()
             .any(|e| matches!(e, TouchEvent::Up { .. }))
     });
-    // The up's frame, when the compositor sends one.
     a.queue.roundtrip().unwrap();
     log.extend(ears.input());
     let finger = touches(&log);
@@ -712,7 +649,6 @@ fn a_real_seat_reaches_the_helpers() {
         "{finger:?}"
     );
 
-    // The session ends: its devices go, and the seat's helpers release theirs.
     touch(pace.path(), "done");
     let t0 = Instant::now();
     let status = loop {
@@ -724,7 +660,6 @@ fn a_real_seat_reaches_the_helpers() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "lane-bus seat: {status:?}");
-    // The touch's capability goes with the rest.
     pump(&a.queue, "the seat without devices", || {
         log.extend(ears.input());
         seats.infos().iter().all(|s| s.capabilities == 0)
@@ -736,7 +671,7 @@ fn a_real_seat_reaches_the_helpers() {
     drop((dragged, prim, second, first));
     drop((device, primary_device, clipboard, primary));
     drop(toplevel);
-    // SAFETY: this test's objects, each destroyed once.
+    // SAFETY: This test's objects, each destroyed once.
     unsafe {
         wl_surface::destroy(surface);
         aterm_wayland::protocols::wayland::wl_buffer::destroy(buffer);

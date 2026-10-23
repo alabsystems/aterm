@@ -40,7 +40,7 @@ pub type Width = fn(char) -> usize;
 
 /// One column per char.
 #[must_use]
-pub fn one_cell(_: char) -> usize {
+pub const fn one_cell(_: char) -> usize {
     1
 }
 
@@ -54,13 +54,13 @@ pub struct Span {
 impl Span {
     /// The columns it takes.
     #[must_use]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.end.saturating_sub(self.start)
     }
 
     /// Whether it takes none.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -122,7 +122,7 @@ pub enum Elapsed {
 impl Elapsed {
     /// The clock's `(ms, res_ms)`, `None` for a word.
     #[must_use]
-    pub fn clock(&self) -> Option<(u64, u32)> {
+    pub const fn clock(&self) -> Option<(u64, u32)> {
         match *self {
             Elapsed::Clock { ms, res_ms } => Some((ms, res_ms)),
             _ => None,
@@ -235,7 +235,7 @@ impl PanelRow {
 
     /// An agent's or workflow's row.
     #[must_use]
-    pub fn is_task(&self) -> bool {
+    pub const fn is_task(&self) -> bool {
         matches!(self.kind, RowKind::Agent | RowKind::Workflow)
     }
 }
@@ -278,7 +278,7 @@ impl AgentsPanel {
 
     /// Whether it holds no row.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 

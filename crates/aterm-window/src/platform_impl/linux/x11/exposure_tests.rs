@@ -4,22 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A redraw the X server asked for is dispatched as one. The server sends `Expose` when it holds
-//! nothing of what part of a window showed (a VT switch, NVIDIA's video-memory purge, a
-//! compositor's unredirection); upstream turned it into the same `RedrawRequested` as the
-//! application's own requests, and aterm's redraw path skips a frame whose content did not
-//! change, so the window stayed as the server left it until a cell moved (the desk audit, GNOME
-//! 46 on Xorg, 2026-10-22). Here `platform::x11::redraw_is_exposure` is `true` while the redraw
-//! an Expose asked for is dispatched, also when the application asked for the window's redraw in
-//! the same loop turn (one event carries both), and `false` for the application's redraw alone
-//! and outside the dispatch.
-//!
-//! The Expose comes from a stand-in on its own connection (SendEvent to the hidden window, whose
-//! creator receives it). The negative controls: without the mark in `EventProcessor::expose`,
-//! or with the redraw loop of `single_iteration` dispatching every redraw plainly, the Expose's
-//! redraw reads `false`.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! X11 tests for `redraw_is_exposure` on server `Expose` events.
 
 use std::time::{Duration, Instant};
 
@@ -38,8 +23,7 @@ const HANG: Duration = Duration::from_secs(60);
 /// `Expose`'s event code.
 const EXPOSE: u8 = 12;
 
-/// Pump `event_loop` once, for at most `timeout`, noting whether each `RedrawRequested` was
-/// dispatched as an exposure.
+/// Pump `event_loop` once.
 fn pump(event_loop: &mut EventLoop<()>, redraws: &mut Vec<bool>, timeout: Duration) {
     event_loop.pump_events(Some(timeout), |event, _| {
         if let Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } = event {
@@ -75,7 +59,6 @@ fn a_redraw_the_server_asked_for_is_dispatched_as_an_exposure() {
         stand_in.send(xproto::get_input_focus()).unwrap().reply().expect("the stand-in's sync");
     };
     let mut redraws = Vec::new();
-    // Whatever the window's creation asked for.
     window.xconn.sync_with_server().expect("the window's round trip");
     pump(&mut event_loop, &mut redraws, Duration::ZERO);
     redraws.clear();
@@ -96,8 +79,6 @@ fn a_redraw_the_server_asked_for_is_dispatched_as_an_exposure() {
     until(&mut redraws, 2, "the Expose's redraw");
     assert_eq!(redraws, [false, true], "the Expose's redraw is one");
 
-    // Both in one loop turn: the Expose queued before the loop looks, the application's
-    // request beside it.
     expose();
     window.xconn.sync_with_server().expect("the window's round trip");
     window.request_redraw();

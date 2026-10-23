@@ -2,53 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The argv0 aliases of the one `aterm` binary: the names an install lays beside it, each a
-//! link onto it, which it dispatches on when run under that name.
-//!
-//! [`ALIASES`] is the one list every Rust reader shares: the release bundle lays it in
-//! `Contents/MacOS` (`aterm-release`'s `bundle::ARGV0_ALIASES` re-exports it, and the dev
-//! bundle reads it there). Programs that cannot import a Rust constant keep hand copies, and
-//! a change here is made in each of them too:
-//!
-//! - `tools/install.sh`: `STORE_ALIASES` and the `for alias in $STORE_ALIASES` loop that
-//!   links it;
-//! - the `$aliases = @(` lines of `apps/aterm-win/build.ps1` and `apps/aterm-win/install.ps1`,
-//!   spelled with `.exe`; Windows lays the CLI names only, so `aterm-askpass` and `aterm-gui`
-//!   (there the windowed image, a file of its own) are not in them;
-//! - the `Get-Process` lists of `apps/aterm-win/install.ps1` and
-//!   `apps/aterm-win/uninstall.ps1`;
-//! - the prose in `apps/aterm-win/build.ps1`: the dist layout's `argv0 alias` rows in its
-//!   header and the tool rows of the README it writes into the dist;
-//! - the symlink sentence of `README.md` (the one ending `are symlinks onto it.`).
-//!
-//! The lists among them (`STORE_ALIASES`, both `$aliases`, both `Get-Process` lists and the
-//! README sentence) each carry a comment naming this constant.
+//! The argv0 aliases of the one `aterm` binary.
 
-/// The argv0 aliases every bundle carries in `Contents/MacOS`, each a symlink onto the
-/// one `aterm` binary, which dispatches on the name it is run as. `aterm-link` is spawned
-/// BY NAME out of `[fabric] command`, so a shipped install must carry it too.
-///
-/// Plain names: no directory and no `.exe` (a Windows reader appends it).
+/// The argv0 aliases every bundle carries in `Contents/MacOS`, each a symlink onto the one `aterm`
+/// binary, which dispatches on the name it is run as.
 pub const ALIASES: [&str; 12] = [
     "aterm-cli",
     "aterm-ctl",
     "atpkg",
-    // abrew — aterm's Homebrew (`docs/DESIGN-abrew-2026-10-19.md`): both spellings,
-    // the short one shells and the reroute stub name, the long one the atpkg bin name.
     "abrew",
     "atpkg-abrew",
-    // agh, aterm's GitHub client (docs/DESIGN-agh-2026-10-19.md).
     "agh",
     "aterm-fleet",
     "aterm-drive",
-    // The `SUDO_ASKPASS` helper `sudo` runs with no tty
-    // (`docs/DESIGN-sudo-askpass-2026-10-15.md`): an argv0 alias because `sudo`
-    // execs it as `[path, prompt]` with no room for a verb.
     "aterm-askpass",
     "aterm-link",
     "aterm-gui",
-    // amacs, aterm's editor (`aterm edit`, `docs/DESIGN-amacs-2026-10-19.md` §8.1): an
-    // argv0 alias because `$EDITOR` names one executable, run with the file and no verb.
     "amacs",
 ];
 

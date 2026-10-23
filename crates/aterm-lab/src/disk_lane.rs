@@ -1,40 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `disk-lane`: the disk awareness live lane (design
-//! `docs/DESIGN-disk-awareness-2026-10-17.md` §6.4) — a real aterm, never the
-//! owner's, acting on a scratch volume.
-//!
-//! 1. A named skip where `hdiutil` is not there or this host has under
-//!    [`HOST_FREE_MIN`] free: the lane must not be what fills the disk.
-//! 2. An 8 GiB sparse APFS image, attached `-nobrowse` (no Finder window on a
-//!    desktop a person uses) at a mount point outside `/Volumes` (discovery
-//!    never looks under `/Volumes`); the instance's `HOME` is a folder on it.
-//! 3. `[disk] warn_free_gib = 6`, `auto_free_gib = 5`, tier 3 on: `ok` from 6
-//!    GiB, `low` 5-6, `short` 4-5, an emergency under 4.
-//! 4. Fixtures, every file and folder dated [`IDLE_DAYS`] back but what a case
-//!    writes today: `idle/` (its build directory idle, `doc/` and `criterion/`
-//!    at its root), `recent-index/` (its git index written now), `edited/` (a
-//!    working-tree file written now), `locked/` (a cargo lock this process
-//!    holds), `linked/` (`~/.local/bin/tool` links into its `target/`), and the
-//!    build cache of `gone/ws`, a workspace nested in a checkout that is gone.
-//!    Then a ballast file fills the volume to about 4.5 GiB free.
-//! 5. `status disk=` reads `short`; `await sys free>=5GiB` answers `OK sys`;
-//!    the journal's removals run in tier order; the kept set is exactly what
-//!    the witnesses keep: the four checkouts' `deps/` whole (tier 2 took their
-//!    idle `incremental/` but the locked one's), `idle/`'s profile emptied and
-//!    kept with its lock files, its `doc/` and `criterion/` untouched, the gone
-//!    workspace's cache removed.
-//! 6. Filled past the emergency, the journal shows the reserve released before
-//!    anything else of that pass.
-//! 7. The instance ends by its process group; the image is detached and
-//!    removed with the world.
-//!
-//! Each wait in the lane is a one-minute hang detector. The lane is run by
-//! hand, never by a default test run: reading inside an attached image can
-//! raise macOS's removable-volume consent dialog where the terminal that runs
-//! it lacks Full Disk Access (one did on 2026-10-17, atpkg's `stage_dmg`).
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -160,8 +126,6 @@ fn fill(path: &Path, bytes: u64) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         left -= n as u64;
     }
-    // Ordered, not durable: the image is scratch and nothing here must outlive
-    // a power loss; the lane reads the volume's free space next.
     aterm_durable::ordered(&f).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -281,10 +245,10 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
 }
 
-/// `disk-lane`: the lane (the module docs).
+/// Run the `disk-lane` disk awareness live lane.
 ///
 /// # Errors
-/// Usage, or the world, the image or the instance could not be made.
+/// Returns an error on invalid usage or if the world, image, or instance cannot be created.
 pub fn cmd_disk_lane(args: &[String]) -> Res {
     stop::install();
     let mut a = args.to_vec();
@@ -295,7 +259,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
             "disk-lane: unexpected '{extra}' ({LAB} help)"
         )));
     }
-    // 1. The named skips.
     if !Path::new("/usr/bin/hdiutil").exists() {
         println!("disk-lane: NOT RUN (skip: no hdiutil on this host)");
         return Ok(3);
@@ -312,7 +275,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         }
     }
     let aterm = resolve_aterm(aterm).map_err(|e| Fail::exit(3, e))?;
-    // 2. The world, its HOME on the image.
     let disk: Vec<String> = DISK.iter().map(|l| (*l).to_owned()).collect();
     let mut world = World::new(&config_after(CONFIG_OFF, true, &disk))?;
     if keep {
@@ -327,7 +289,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         home.display()
     );
 
-    // 4. The fixtures.
     for c in CHECKOUTS {
         lay_checkout(&home.join(c))?;
     }
@@ -350,16 +311,12 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     )
     .map_err(|e| format!("link: {e}"))?;
     backdate(&home, IDLE_DAYS)?;
-    // Written today: the git index of one checkout, a source file of another.
     touch_now(&home.join("recent-index/.git/index"))?;
     touch_now(&home.join("edited/src/main.rs"))?;
-    // The reserve, laid as the watch lays it (it writes its own only far
-    // above the floor, which an 8 GiB volume never is).
     fill(
         &home.join("Library/Caches/aterm/disk-reserve.noindex/reserve"),
         256 << 20,
     )?;
-    // A build holding the locked checkout's lock: this process.
     let lock = std::fs::File::open(home.join("locked/target/debug/.cargo-lock"))
         .map_err(|e| format!("lock: {e}"))?;
     #[expect(
@@ -368,7 +325,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
     )]
     let held = lock.try_lock();
     held.map_err(|e| format!("cannot take the lock: {e:?}"))?;
-    // The ballast: to about 4.5 GiB free.
     let free = free_on(&home).ok_or("the image's free space could not be read")?;
     let target = (9 << 30) / 2;
     if free > target {
@@ -379,7 +335,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
         free_on(&home).unwrap_or(0) >> 20
     );
 
-    // The instance.
     let mut inst = Instance::start(
         &world,
         Launch {
@@ -420,7 +375,6 @@ pub fn cmd_disk_lane(args: &[String]) -> Res {
 /// Steps 5 and 6 (the module docs) against the running `inst`.
 fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<(), String> {
     let ls = inst.ctl(&["ls"]);
-    // `ls` rows: `<window> <tab> <sid> …`; the session id is the `s-` word.
     let sid = ls
         .stdout
         .split_whitespace()
@@ -428,11 +382,8 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
         .map(str::to_owned)
         .ok_or_else(|| format!("no session in `ls`: {}", ls.stdout))?;
     let at = format!("@{sid}");
-    // The shell names its working directory (OSC 7), as an integrated shell does.
     let osc = "printf '\\033]7;file://localhost%s\\007' \"$PWD\"\n".to_string();
     let _ = inst.ctl_stdin(&[&at, "send", "--stdin"], osc.as_bytes());
-    // The board maps the session at the watch's next look: a demand-free wait
-    // for the volume's own level (one minute at most) needs no session row.
     let deadline = Instant::now() + MUST;
     let mut status = String::new();
     while Instant::now() < deadline {
@@ -480,7 +431,6 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
         matches!(field(&after, "disk"), Some("low" | "ok")),
         || format!("disk={:?}", field(&after, "disk")),
     );
-    // The journal.
     let ledger = home
         .join("Library/Application Support/aterm/harness")
         .join(aterm_agent::harness::cli::HARNESS)
@@ -544,7 +494,6 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
             .exists(),
         String::new,
     );
-    // 6. Past the emergency: the reserve goes first.
     let free = free_on(home).ok_or("free space could not be read")?;
     let target = 3 << 30;
     if free > target {

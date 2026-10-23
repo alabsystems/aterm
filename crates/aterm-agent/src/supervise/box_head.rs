@@ -156,7 +156,7 @@ fn unsearched(r: &CtlReply) -> Unsearched {
         let n = words.next().and_then(decimal);
         let words: Vec<&str> = words
             .take_while(|w| !w.starts_with('('))
-            .filter(|w| !w.starts_with("screen_first="))
+            .filter(|w| !w.starts_with("screen_first=") && !w.starts_with("frame="))
             .collect();
         match words.as_slice() {
             [] => Unsearched::Nothing,

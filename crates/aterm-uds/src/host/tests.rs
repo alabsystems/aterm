@@ -257,7 +257,10 @@ fn the_refusal_names_its_provider() {
         "{python}"
     );
     let zstd = tool("zstd").refusal();
-    assert!(zstd.contains("aterm provides none: S12's"), "{zstd}");
+    assert!(
+        zstd.contains("aterm provides none: only a rostered publish host"),
+        "{zstd}"
+    );
     let cc = tool("cc").refusal();
     assert!(
         cc.contains("`aterm init --only base.clt` installs them")

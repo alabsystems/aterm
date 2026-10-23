@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The X11 wire codec: requests encoded to bytes, replies, events and errors
-//! parsed from them. No connection, no I/O, no platform: every function here
-//! is pure, so the codec is held to x11rb-protocol 0.13.2's own encodings on
-//! any host (`tests/recorded/`).
-//!
-//! Byte order is the client's native one, as libxcb and x11rb choose at
-//! connection setup; a request's bytes are what goes on that wire. A request
-//! too long for the 16-bit length field gets a length of 0 here, as
-//! x11rb-protocol writes it, and the transport rewrites it in the
-//! BIG-REQUESTS form ([`big_request`]).
-//!
-//! Every parser takes bytes another process wrote (the X server, or a client
-//! through `SendEvent` and properties). It returns [`ParseError`] on a short or
-//! inconsistent packet. Reads use checked slice bounds; fixed-width
-//! protocol counts may reserve bounded initial vector capacity before a
-//! later field read refuses a short packet.
+//! Pure X11 wire request encoder and reply/event/error parser.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -85,8 +70,7 @@ pub mod atom {
 pub enum ParseError {
     /// The packet ends before a field it must hold.
     Short,
-    /// A field holds a value the protocol does not allow there (the wrong
-    /// packet type, a length that disagrees with another field).
+    /// A field holds a value the protocol does not allow.
     Invalid,
 }
 
@@ -138,11 +122,7 @@ impl<R> fmt::Debug for Request<R> {
     }
 }
 
-/// Rewrite `bytes` (a whole request, length field 0 when it is longer than
-/// 16 bits can say) in the BIG-REQUESTS form: a zero length field, then the
-/// 32-bit length in units of 4 bytes, which counts the extra word. A request
-/// that fits is returned unchanged. `None` when the request is not a whole
-/// number of words or too long even for 32 bits.
+/// Rewrites `bytes` into BIG-REQUESTS form when it exceeds 16-bit word length.
 pub fn big_request(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.len() < 4 || !bytes.len().is_multiple_of(4) {
         return None;
@@ -161,7 +141,7 @@ pub fn big_request(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Bytes of padding that bring `len` to a multiple of four.
-pub(crate) fn pad4(len: usize) -> usize {
+pub(crate) const fn pad4(len: usize) -> usize {
     (4 - (len % 4)) % 4
 }
 
@@ -169,8 +149,7 @@ pub(crate) fn pad4(len: usize) -> usize {
 pub(crate) struct Writer(Vec<u8>);
 
 impl Writer {
-    /// A core request (`data` is the request's one-byte field) or an
-    /// extension request (`opcode` the major opcode, `data` the minor).
+    /// Starts a request with `opcode`, `data` byte, and a zero length placeholder.
     pub(crate) fn new(opcode: u8, data: u8) -> Writer {
         let mut b = Vec::with_capacity(32);
         b.extend_from_slice(&[opcode, data, 0, 0]);
@@ -207,8 +186,7 @@ impl Writer {
         self
     }
 
-    /// Pad to a word, write the length in words (0 when it does not fit 16
-    /// bits: see [`big_request`]).
+    /// Pads the request to a 4-byte word boundary and writes its 16-bit word length.
     pub(crate) fn finish<R>(&mut self) -> Request<R> {
         let mut bytes = std::mem::take(&mut self.0);
         bytes.resize(bytes.len() + pad4(bytes.len()), 0);
@@ -228,7 +206,7 @@ pub(crate) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(b: &'a [u8]) -> Reader<'a> {
+    pub(crate) const fn new(b: &'a [u8]) -> Reader<'a> {
         Reader { b, pos: 0 }
     }
 
@@ -283,9 +261,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The common head of a reply: checks the packet type (1) and that the packet
-/// holds the `4 * length` bytes past 32 its length field promises. Returns
-/// the reader positioned after the length field, and the data byte.
+/// Validates the 32-byte reply header and packet length, returning `(reader, data, length)`.
 pub(crate) fn reply_head(bytes: &[u8]) -> Result<(Reader<'_>, u8, u32), ParseError> {
     let mut r = Reader::new(bytes);
     let kind = r.u8()?;
@@ -306,9 +282,7 @@ pub(crate) fn reply_head(bytes: &[u8]) -> Result<(Reader<'_>, u8, u32), ParseErr
     Ok((r, data, length))
 }
 
-/// A request's value list: the mask and the values in ascending bit order,
-/// each four bytes on the wire whatever its type (CreateWindow,
-/// ChangeWindowAttributes, ConfigureWindow, CreateGC).
+/// Mask-ordered 32-bit request value list.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ValueList {
     values: Vec<(u32, u32)>,
@@ -320,8 +294,7 @@ impl ValueList {
         ValueList::default()
     }
 
-    /// Set the value of the field whose mask bit is `bit` (one bit set).
-    /// A second set of one bit replaces the first.
+    /// Sets or replaces the value for single-bit mask `bit`.
     pub fn set(mut self, bit: u32, value: u32) -> ValueList {
         match self.values.binary_search_by_key(&bit, |&(b, _)| b) {
             Ok(i) => self.values[i].1 = value,

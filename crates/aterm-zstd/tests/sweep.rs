@@ -1,26 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The ZC.4 differential, on recorded answers (docs/AUDIT-third-party-2026-10-15.md
-//! ZC.6): the level sweep the lane had libzstd's encoder write at run time,
-//! recorded once from the zstd 1.5.7 CLI (`recorded/sweep-zstd-1.5.7.tsv`
-//! says how), and libzstd's verdict on every bit flip of the flip lane
-//! (`recorded/flips-libzstd-1.5.7.tsv`). libzstd decoded every frame to its
-//! answer and gave every flip its verdict in this file until ZC.6 took it out
-//! of the graph (13f0e82be); [`aterm_zstd::Decoder`] is held to them:
-//!
-//! * every frame, at every level from `--fast=5` to `--ultra -22`, with the
-//!   checksum and the content size each on and off, decodes to its input,
-//!   alone, as one stream of all of them, and among skippable and empty
-//!   frames;
-//! * the frames hold every block type, literals type and sequence table mode
-//!   ([`Census`] walks them with its own parser), so the agreement cannot
-//!   rest on raw blocks alone;
-//! * every cut of a frame is an early end, never a panic;
-//! * every flipped bit gets libzstd's verdict: refused where libzstd refused,
-//!   the input where libzstd decoded the input, and libzstd's own bytes where
-//!   it decoded something else (or a refusal, in the one way the decoders
-//!   are allowed to part; see [`bit_flips_get_libzstd_s_recorded_verdicts`]).
+//! Recorded-answer differential tests holding [`aterm_zstd::Decoder`] to `zstd` 1.5.7.
 
 use crate::support;
 
@@ -120,8 +101,6 @@ fn skippable(n: u8, payload: &[u8]) -> Vec<u8> {
 #[test]
 fn multi_frame_streams_with_skippable_and_empty_frames() {
     let rows = sweep();
-    // A words frame at --fast=5 with its content size, one at -17 without,
-    // and two frames of nothing: `words:0`'s, with its checksum and without.
     let pick = |spec: &str, command: &str| {
         rows.iter()
             .find(|r| r.input == spec && r.command == command)
@@ -153,7 +132,6 @@ fn multi_frame_streams_with_skippable_and_empty_frames() {
     let only_skippable = [skippable(1, b"x"), skippable(2, b"")].concat();
     assert_eq!(ours(&only_skippable).expect("only skippable frames"), b"");
     assert_eq!(ours(b"").unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
-    // A skippable frame that claims more than is there is an early end.
     let short = &skippable(3, b"0123")[..10];
     assert_eq!(
         ours(short).unwrap_err().kind(),
@@ -303,24 +281,10 @@ fn verdict(decoded: &io::Result<Vec<u8>>, input: &[u8]) -> (u8, Option<String>) 
 /// libzstd refused, so does this decoder; where it decoded the input, so
 /// does this one; where it decoded other bytes, this one decodes the same
 /// bytes, or refuses with `InvalidData`.
-///
-/// That refusal is the one way the decoders may part: this decoder holds
-/// rules of RFC 8878 that libzstd does not, each listed in [`Decoder`]'s
-/// docs. Damaged Huffman literals are one: libzstd's double-symbol (X2)
-/// decoder clamps an over-read at a stream's last symbol ("ugly hack; works
-/// only because it's the last symbol", huf_decompress.c
-/// `HUF_decodeLastSymbolX2`), where this one holds every stream to its exact
-/// length. A flipped offset or window descriptor that puts a match past the
-/// declared window is another: libzstd reaches as far as its buffer. Each
-/// such case is a frame libzstd decoded to the WRONG bytes; refusing a frame
-/// that decodes right, or accepting one libzstd refused, fails the test.
-/// With a checksum, whatever is accepted is the input.
 #[test]
 fn bit_flips_get_libzstd_s_recorded_verdicts() {
     let mut mismatches = Vec::new();
     let (mut agreed, mut accepted, mut refused_damage) = (0, 0, 0);
-    // Each frame's flips decode on their own core; the tallies and the
-    // disagreements are summed in the frames' order.
     for (a, b, c, m) in support::on_every_core(&flips(), |f| {
         let mut mismatches = Vec::new();
         let (mut agreed, mut accepted, mut refused_damage) = (0, 0, 0);

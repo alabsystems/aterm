@@ -1,25 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The mouse-selection lifecycle of `aterm_selection::TextSelection`: a press
-//! starts a selection, a drag moves its far end, the release completes it, a
-//! shift-click extends a completed one, and clearing ends it.
+//! Formal model of the mouse-selection lifecycle in `aterm_selection::TextSelection`.
 
 use aterm_spec::derive::*;
 
-/// `TextSelection`'s five lifecycle calls, each callable in every phase and a no-op
-/// outside the phase it belongs to.
-///
-/// `phase` is `TextSelection::state()` (0 None, 1 InProgress, 2 Complete); `end` is which
-/// point the far anchor holds (0 the press, 1 the drag, 2 the shift-click). The state also
-/// observes the last call: `last` (0 none, 1 Start, 2 Update, 3 Complete, 4 Extend,
-/// 5 Clear), `pre` the phase it ran in, `moved` whether it moved the far anchor. Each
-/// invariant reads one call's rule off that observer.
-///
-/// `Buggy = 1` drops each call's phase check: a drag moves the anchor after release, a
-/// release with nothing pressed completes, a shift-click mid-drag jumps the anchor, and
-/// clearing spares a completed selection. Tier-1:
-/// `aterm-selection/tests/conformance_text_selection.rs`.
+/// `TextSelection`'s five lifecycle calls.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn text_selection_lifecycle_model() -> Model {

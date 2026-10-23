@@ -10,7 +10,10 @@
 //!   upload is a no-op if its manifest is byte-identical and a refusal otherwise (the
 //!   manifest carries the tarball's sha256, so equal manifests are equal packs);
 //! * the staging release is created as a prerelease, or its assets replaced
-//!   (`Replace::Clobber`) to converge a partial publish.
+//!   (`Replace::Clobber`) to converge a partial publish;
+//! * the `upload` verb ([`run`]) replaces assets of a release that already stands, on the
+//!   staging or the public owner, as that owner's token: the Linux lane's signing ceremony
+//!   re-uploads a manifest and its signature with it.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::host::{HostError, Replace};
 
 /// Before a `--upload` pack builds anything, check the staging owner's token file is there:
-/// uploads write as that token, never gh's own login, so without it the pack would build
+/// uploads write as that token and never anonymously, so without it the pack would build
 /// and sign only to be refused at the first write.
 ///
 /// # Errors
@@ -31,10 +34,62 @@ pub fn token_preflight(ctx: &Ctx) -> Result<()> {
     }
     Err(Error::refused(format!(
         "--upload needs the staging owner's token at {} (every pack is uploaded to {} first, \
-         and gh's own login never writes) — nothing built",
+         and a write never goes anonymously) — nothing built",
         ctx.shown(&ctx.tokens.staging),
         ctx.accounts.staging
     )))
+}
+
+/// `upload <staging|public> <repo> <tag> <file>…`: replace (or add) each file's asset on the
+/// release `tag` of that owner's `repo`, as that owner's token. The release must stand; this
+/// creates none.
+///
+/// # Errors
+///
+/// A usage error for a missing operand or an unknown owner; a refusal for a file over the
+/// per-asset ceiling or the host's refusal; a could-not-run when the owner cannot be reached.
+pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
+    let [owner, repo, tag, files @ ..] = args else {
+        return Err(Error::usage(
+            "upload needs <staging|public> <repo> <tag> <file>…",
+        ));
+    };
+    if files.is_empty() {
+        return Err(Error::usage("upload needs at least one file"));
+    }
+    let (host, slug) = match owner.as_str() {
+        "staging" => (&ctx.hosts.staging, ctx.staging_slug(repo)),
+        "public" => (&ctx.hosts.channel, ctx.public_slug(repo)),
+        other => {
+            return Err(Error::usage(format!(
+                "upload: the owner is `staging` or `public`, not `{other}`"
+            )));
+        }
+    };
+    let files: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    for f in &files {
+        let len = std::fs::metadata(f)
+            .map_err(|e| Error::io(format!("stat {}", f.display()), &e))?
+            .len();
+        if len > aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND {
+            return Err(Error::refused(format!(
+                "{} is {len} bytes, over the release host's 2 GiB per-asset limit",
+                f.display()
+            )));
+        }
+    }
+    match host.upload(&slug, tag, &files, Replace::Clobber) {
+        Ok(()) => {
+            println!("uploaded {} asset(s) to {slug} {tag}", files.len());
+            Ok(())
+        }
+        Err(HostError::Unreachable(why)) => {
+            Err(Error::cannot_run(format!("upload to {slug} {tag}: {why}")))
+        }
+        Err(e) => Err(Error::refused(format!(
+            "upload to {slug} {tag} failed: {e}"
+        ))),
+    }
 }
 
 /// The release tag of one program build.

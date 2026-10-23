@@ -105,9 +105,7 @@ impl<'a> Git<'a> {
     }
 
     /// The commit `reference` names: `GET commits?sha={reference}&per_page=1`.
-    ///
     /// # Errors
-    ///
     /// NotFound when there is none.
     pub fn resolve(&self, reference: &str) -> Result<CommitObject> {
         let call = self
@@ -125,11 +123,8 @@ impl<'a> Git<'a> {
         }
     }
 
-    /// Commits, in GitHub's order, at most `limit`: `GET commits` with `sha`, `path`, `since`
-    /// and `author` as given, `per_page = min(limit, 100)`.
-    ///
+    /// Commits, in GitHub's order, at most `limit`.
     /// # Errors
-    ///
     /// The walk's error.
     pub fn log(
         &self,
@@ -164,14 +159,9 @@ impl<'a> Git<'a> {
             .map_err(|e| e.with_repo(self.slug.to_string()))
     }
 
-    /// `base...head`. A probe-confirmed NotFound whose message starts `No common ancestor` is
-    /// `NoMergeBase`.
-    ///
+    /// `base...head`.
     /// # Errors
-    ///
-    /// Usage for a base or head with a `.` or `..` part, before any request (`segment` hides
-    /// the part behind an encoded `/`, which a front end that decodes `%2F` first would
-    /// resolve off this repository's route; no git ref holds one); the call's error.
+    /// Usage for a base or head with a `.` or `..` part, before any request; the call's error.
     pub fn compare(&self, base: &str, head: &str) -> Result<CompareResult> {
         path::refuse_dot_segment("base", base)
             .and_then(|()| path::refuse_dot_segment("head", head))
@@ -195,31 +185,22 @@ impl<'a> Git<'a> {
     }
 
     /// Branches, sorted by name, `opts.limit` after the sort.
-    ///
     /// # Errors
-    ///
     /// The walk's error.
     pub fn branches(&self, opts: &ListOpts) -> Result<Listing<BranchObject>> {
         self.names("/branches", opts, |branch: &BranchObject| &branch.name)
     }
 
     /// Tags, sorted by name, `opts.limit` after the sort.
-    ///
     /// # Errors
-    ///
     /// The walk's error.
     pub fn tags(&self, opts: &ListOpts) -> Result<Listing<TagObject>> {
         self.names("/tags", opts, |tag: &TagObject| &tag.name)
     }
 
-    /// The tree of `reference` (the default branch when `None`, one extra request):
-    /// `GET git/trees/{ref}`, `?recursive=1` when `recursive`. Each entry keeps its raw JSON.
-    ///
+    /// The tree of `reference`: `GET git/trees/{ref}`, `?recursive=1` when `recursive`.
     /// # Errors
-    ///
-    /// Usage for a ref with a `.` or `..` part, before any request (a server that normalised
-    /// the path would resolve it off this repository's route; no git ref holds one); the
-    /// calls' errors.
+    /// Usage for a ref with a `.` or `..` part, before any request; the calls' errors.
     pub fn tree(&self, reference: Option<&str>, recursive: bool) -> Result<TreeObject> {
         if let Some(reference) = reference {
             path::refuse_dot_segment("ref", reference)

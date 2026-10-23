@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `aos` verb's main-thread half (`docs/DESIGN-aos-hosted-execution-2026-10-21.md`
-//! §5): the front window's momentum glow (`ws.fx.cursor_mut().momentum`, an
-//! [`aterm_effects::aos_momentum::MomentumHost`]) attached, paused, repaired, resumed,
-//! detached, read and traced. Every method takes the instant it acts at, so a test pins
-//! it; the `Wake::Aos` handler passes `Instant::now()`, which is no earlier than any
-//! instant the host already handed the glow (every key, frame and scheduler query reads
-//! the clock where it is made, on this thread).
-//!
-//! # Reconciling a publication
-//!
-//! A commit ([`App::aos_repair_at`]) installs the candidate's code and replayed state
-//! as one value, and delivers each key queued during the pause to that pair once, in
-//! order, before it returns: all inside this one main-thread call, so no frame and no
-//! scheduler query sees anything in between. The host then:
-//!
-//! * **requests a redraw** of the window, so the next frame is ticked by the accepted
-//!   pair. Its fingerprint joins the frame's repaint key, so a frame that changes the
-//!   glow presents (the previous overlay's rows are damaged with the new one's), and a
-//!   glow past its cold instant clears on that frame even where no lane would wake it
-//!   (an unfocused window past its typed wake);
-//! * **re-plans the effect lane from the accepted state** on the same turn: winit's
-//!   `about_to_wait` follows every user event and plans each window's lane
-//!   (`plan_terminal_effect_lane_with_recording`, the lane's one planner) from the glow
-//!   as it now is. A settling glow under the published code names its wake there, so the
-//!   lane a stranded glow parked is armed again and runs to the clearing frame. This
-//!   module never asks the glow for a wake itself: each such question is a recorded
-//!   scheduler observation (design §2 item 6), owned by the planner.
-//!
-//! A resume (the pending update rejected, the queue delivered to the old pair) and a
-//! detach reconcile the same way.
+//! Main-thread host operations for the `aos` verb on the front window's momentum glow.
 
 use std::time::Instant;
 
@@ -55,8 +26,7 @@ pub(crate) struct AosWindow {
     attaches: u64,
 }
 
-/// Why an `aos` ask did nothing. Nothing is changed by any of them, with one
-/// exception [`App::aos_repair_at`] names.
+/// Reason an `aos` operation was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AosRefusal {
     /// No window is in front.
@@ -106,7 +76,7 @@ pub(crate) struct Resumed {
     pub(crate) delivered: Vec<Result<MomentumObservation, StepRefusal>>,
 }
 
-/// The exported trace, decoded back ([`App::aos_trace_at`]).
+/// Decoded summary of an exported trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TraceSummary {
     pub(crate) window: WindowId,
@@ -147,9 +117,7 @@ impl App {
         }
     }
 
-    /// `aos attach`: starts hosting the front window's glow under `code` at `now` (the
-    /// recording epoch: checkpoint C0 and an empty log whose epoch counts this window's
-    /// attaches). Answers the glow's status after it.
+    /// Starts hosting the front window's glow under `code` at `now`.
     pub(crate) fn aos_attach_at(
         &mut self,
         code: MomentumCode,
@@ -163,13 +131,11 @@ impl App {
         let momentum = &mut ws.fx.cursor_mut().momentum;
         momentum.aos_attach(now, code, &build, ws.aos.attaches);
         let status = momentum.aos_status();
-        // A re-attach over a pending update rejected it: its queue went to the old pair.
         self.aos_reconcile(id);
         Ok((id, status))
     }
 
-    /// `aos pause`: pauses the glow at this step boundary, recording a final scheduler
-    /// query at `now` on the window's effect lane interval. Answers the expected head.
+    /// Pauses the front window's glow at `now` and returns the expected head.
     pub(crate) fn aos_pause_at(&mut self, now: Instant) -> Result<(WindowId, Head), AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
@@ -178,15 +144,11 @@ impl App {
         Ok((id, head))
     }
 
-    /// `aos repair`: publishes `code` over the front window's glow, pausing it at `now`
-    /// first if it runs, then reconciles the host (module docs).
+    /// Publishes `code` over the front window's glow, pausing it at `now` first if running.
     ///
     /// # Errors
     ///
-    /// The boundary's refusal. When this call paused the glow itself, a refused repair
-    /// resumes it (the old code runs on; nothing can have queued within this call), so a
-    /// refusal leaves the glow as the call found it except for the pause's recorded
-    /// query. A glow the caller paused stays paused, its queue whole.
+    /// Returns [`AosRefusal`] if no window is in front or the publish boundary refuses.
     pub(crate) fn aos_repair_at(
         &mut self,
         code: MomentumCode,
@@ -218,8 +180,7 @@ impl App {
         }
     }
 
-    /// `aos resume`: rejects the pending update; the old pair resumes and is handed each
-    /// queued input once, in order.
+    /// Rejects a pending update and resumes the previous code over queued inputs.
     pub(crate) fn aos_resume_now(&mut self) -> Result<Resumed, AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
@@ -238,8 +199,7 @@ impl App {
         })
     }
 
-    /// `aos detach`: stops hosting; the live state moves back whole and the shipped
-    /// engine runs it directly again (a pending update is rejected first).
+    /// Stops hosting the front window's glow and returns its status.
     pub(crate) fn aos_detach_now(&mut self) -> Result<(WindowId, MomentumAosStatus), AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get_mut(&id).ok_or(AosRefusal::NoWindow)?;
@@ -261,10 +221,7 @@ impl App {
         Ok((id, ws.fx.cursor().momentum.aos_status()))
     }
 
-    /// `aos trace`: the exported trace (identity, encoded checkpoint, encoded log),
-    /// decoded back under the window's recording epoch and beside the checkpoint it extends,
-    /// and summarized, so the answer is what a replay elsewhere would read. A log that is
-    /// torn or does not end with its seal is refused; the counts are of the decoded log.
+    /// Exports, decodes, and summarizes the front window's trace.
     pub(crate) fn aos_trace_now(&self) -> Result<TraceSummary, AosRefusal> {
         let id = self.aos_front()?;
         let ws = self.windows.get(&id).ok_or(AosRefusal::NoWindow)?;

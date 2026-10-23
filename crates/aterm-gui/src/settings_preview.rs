@@ -7875,6 +7875,11 @@ mod tests {
         let (base, _) = build_terminal_specimen_input(&spec, Theme::default());
         let scene = CursorScene::new(&spec, Theme::default(), None);
         let row = prompt_row(&base);
+        // A cold start under the line the preview's warm cycles type under
+        // (the last command, scrolled up over the prompt): a flame kept in
+        // its row under a line of text burns its own colour, cooler than a
+        // flame in the air, so a cold start in the air is not the measure.
+        let base = scroll_previous_line(&base, row);
         let geom = Geom {
             cw: 8,
             ch: 17,

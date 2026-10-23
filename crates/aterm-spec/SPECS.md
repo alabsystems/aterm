@@ -260,15 +260,15 @@ a fairness lasso → `liveness-obligations-sound`, otherwise the walk → `model
 
 ```tsv
 file	test	primary	also
-crates/aterm-models-core/tests/derived_keeper.rs	keeper_death_judgement_proves_and_catches	model-strict	registered-model-sound, model-laws, mutant-table-catch, law:keeper-brake-and-death
+crates/aterm-models-core/tests/derived_keeper.rs	keeper_death_judgement_fires_every_committed_move	model-strict	model-laws, mutant-table-catch, law:keeper-brake-and-death
 crates/aterm-models-core/tests/derived_keeper.rs	keeper_death_judgement_the_defects_are_caught_on_every_invariant	mutant-table-catch	registered-model-sound, model-laws, model-strict, law:keeper-brake-and-death
 crates/aterm-models-core/tests/derived_keeper.rs	keeper_death_judgement_walks_the_ends	model-laws	registered-model-sound, model-strict, mutant-table-catch, law:keeper-brake-and-death
-crates/aterm-models-core/tests/derived_keeper.rs	keeper_relaunch_brake_proves_and_catches	model-strict	registered-model-sound, model-laws, mutant-table-catch, law:keeper-brake-and-death
+crates/aterm-models-core/tests/derived_keeper.rs	keeper_relaunch_brake_fires_every_committed_move	model-strict	model-laws, mutant-table-catch, law:keeper-brake-and-death
 crates/aterm-models-core/tests/derived_keeper.rs	keeper_relaunch_brake_the_defects_are_caught_on_every_invariant	mutant-table-catch	registered-model-sound, model-laws, model-strict, law:keeper-brake-and-death
 crates/aterm-models-core/tests/derived_keeper.rs	keeper_relaunch_brake_walks_the_lifecycles	model-laws	registered-model-sound, model-strict, mutant-table-catch, law:keeper-brake-and-death
 crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_a_release_from_one_of_two_claimants_keeps_the_copy	model-laws	registered-model-sound, model-strict, mutant-table-catch, law:keeper-custody
 crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_an_offer_returns_when_its_link_drops	model-laws	registered-model-sound, model-strict, mutant-table-catch, law:keeper-custody
-crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_proves_and_catches	model-strict	registered-model-sound, model-laws, mutant-table-catch, law:keeper-custody
+crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_fires_every_committed_move	model-strict	model-laws, mutant-table-catch, law:keeper-custody
 crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_the_defects_are_caught_on_every_invariant	mutant-table-catch	registered-model-sound, model-laws, model-strict, law:keeper-custody
 crates/aterm-models-core/tests/derived_keeper.rs	pty_keeper_custody_walks_the_lifecycles	model-laws	registered-model-sound, model-strict, mutant-table-catch, law:keeper-custody
 crates/aterm-models-core/tests/derived_kernels.rs	ascii_grapheme_fast_path_model_proves_and_catches_mutant	model-strict	registered-model-sound

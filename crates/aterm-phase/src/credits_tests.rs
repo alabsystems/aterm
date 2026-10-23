@@ -72,7 +72,6 @@ fn the_measured_credits_notices_read_as_credits_in_use() {
 /// where the window is a model's) is the one credits started on, its reset
 /// the model's, and names the model, in place of the measured started
 /// notice's row; its head naming no reset names the model and no start.
-/// NEGATIVE CONTROL: the bare lasting notice names neither.
 #[test]
 fn the_per_model_notice_names_its_model_and_its_reset() {
     let rows = screen(CREDITS_STARTED_2_1_300);
@@ -121,7 +120,6 @@ fn a_model_billed_to_credits_with_no_dialog_reads_as_credits_in_use() {
     let rows = screen(CREDITS_IN_USE_2_1_300);
     let mode = row_of(&rows, "auto mode on");
     let width = 110;
-    // On the mode row's right where it fits, else on a row of its own.
     let on_mode = |notice: &str| {
         let lead = "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
         let room = width - 2 - lead.chars().count();
@@ -214,7 +212,6 @@ fn credits_words_anywhere_else_are_no_credits() {
         None,
         "the control: the footer without the notice"
     );
-    // A tool's output and the model's reply, quoting the notice at the edge.
     let width = 110;
     let edge = |lead: &str| {
         format!(
@@ -226,8 +223,6 @@ fn credits_words_anywhere_else_are_no_credits() {
     for row in [edge("  ⎿  "), edge("⏺ "), edge("     ")] {
         assert_eq!(in_use(&with_row(bare.clone(), reply, &row)), None, "{row}");
     }
-    // A statusLine of the person's own on the footer's first row: its words on
-    // the left, something else right of them; and alone, short of the edge.
     let left = format!(
         "  Now using usage credits{:>w$}",
         "◐ medium · /effort",
@@ -238,8 +233,6 @@ fn credits_words_anywhere_else_are_no_credits() {
         in_use(&with_row(bare.clone(), mode, "  Now using usage credits")),
         None
     );
-    // A message a person queued under the status row, quoting it at the
-    // edge (the fullscreen renderer's notice row is the same place).
     let full = screen(CREDITS_IN_USE_FULLSCREEN_2_1_300);
     let notice = row_of(&full, "Now using usage credits");
     let queued = format!("❯ {:>106}", "Now using usage credits");
@@ -249,10 +242,8 @@ fn credits_words_anywhere_else_are_no_credits() {
         None,
         "the control: the live zone without the notice"
     );
-    // No status row over the live zone: nothing above the composer is read.
     let done = row_of(&full, "done 8:44 AM");
     assert_eq!(in_use(&with_row(full, done, "")), None);
-    // No frame: the footer's notice is no composer's.
     let top = rows
         .iter()
         .position(|r| r.starts_with('─'))

@@ -1,32 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOLD'S CLOCK (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.1, with the red-team's
-//! F5): how long a session has waited on its own background work, and whether the agent said so.
-//! Pure: every instant is the loop's monotonic milliseconds, carried by the event that has one.
-//!
-//! * IT OPENS at the first SETTLED background read with no hold open (a break of the agent's own
-//!   background work that stood the loop's settle, drawn or carried), at that break's start.
-//! * NOTHING THE HARNESS TYPED ENDS OR RESTARTS IT: a line typed at a break
-//!   ([`HoldEvent::HarnessLine`]), its live turn, the point that ends its answer, and a new break
-//!   after it. Nor does a short idle read with no point (on 10-19 the screen read idle in 24 short
-//!   windows, the longest 8.5 min: a clock restarted at each never reaches 2 h, §7's
-//!   `RestartClock`).
-//! * IT CLOSES at the EDGE from a break (or a point) into a live turn the harness did not type —
-//!   the agent's own wake, a person's message, a manager's turn — and at a DECIDED POINT whose
-//!   action types or escalates, or that finds no background work on the screen. A point that
-//!   decides nothing while the work still shows keeps it (F5). Only the edge is classified: every
-//!   later read of the same live turn is the agent's continuing work.
-//! * IT IS DECLARED by a line starting `WAITING:` in the agent's last words at a settled
-//!   background read after a line the harness typed ([`waiting_declared`]). The words set one
-//!   bit and are never kept.
+//! THE HOLD'S CLOCK (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.1, with the red-team's F5):
+//! how long a session has waited on its own background work, and whether the agent said so.
 
 /// What the loop saw, in the order it saw it ([`HoldClock::step`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldEvent {
-    /// A read of the agent's own background work with its turn over: the break began at
-    /// `since_ms` (the loop's first read of it since the last read that was no break), this read
-    /// is at `now_ms`, and `settled` once the break has stood the loop's settle.
+    /// A read of the agent's own background work with its turn over: the break began at `since_ms`
+    /// (the loop's first read of it since the last read that was no break), this read is at
+    /// `now_ms`, and `settled` once the break has stood the loop's settle.
     Background {
         /// When the break began.
         since_ms: i64,
@@ -38,21 +21,19 @@ pub enum HoldEvent {
     /// The harness typed a line into the session at a break (the upgrade's notice, its release):
     /// the turn that answers it is the harness's own, and so is the point that ends it.
     HarnessLine,
-    /// The agent's last words at a settled background read after a harness line: whether a line
-    /// of them starts `WAITING:` ([`waiting_declared`]). Asked only while [`HoldClock::wants_tail`].
+    /// The agent's last words at a settled background read after a harness line: whether a line of
+    /// them starts `WAITING:` ([`waiting_declared`]).
     AnswerTail {
         /// A line starts `WAITING:`.
         waiting_line: bool,
     },
-    /// A read of a live turn (its spinner or busy footer, no break). `ours` when it is the answer
-    /// to an act or a line the harness typed and the agent had not taken yet.
+    /// A read of a live turn (its spinner or busy footer, no break).
     LiveTurn {
         /// The harness typed what this turn answers.
         ours: bool,
     },
-    /// A point the loop decided: `acts` when its action types, escalates or restarts (not
-    /// nothing, not a wait), `background` when the screen still shows the agent's own background
-    /// work.
+    /// A point the loop decided: `acts` when its action types, escalates or restarts (not nothing,
+    /// not a wait), `background` when the screen still shows the agent's own background work.
     DecidedPoint {
         /// The point's action types, escalates or restarts.
         acts: bool,
@@ -68,10 +49,10 @@ pub enum Close {
     Point,
     /// A live turn the harness did not type.
     Foreign,
-    /// The ledger's open hold was not this loop's to carry: nothing shows a loop watched it
-    /// until just before this one began — its row is older than the carry's gap, a row of
-    /// another rule followed it, Off was lifted since, or the agent's process began after it
-    /// (P3) — so it may have ended unseen. Only a seed closes this way.
+    /// The ledger's open hold was not this loop's to carry: nothing shows a loop watched it until
+    /// just before this one began — its row is older than the carry's gap, a row of another rule
+    /// followed it, Off was lifted since, or the agent's process began after it (P3) — so it may
+    /// have ended unseen.
     Stale,
 }
 
@@ -142,11 +123,7 @@ pub struct HoldClock {
 }
 
 impl HoldClock {
-    /// One event. `Some` when the hold opened, was declared or closed. `OccupancyDoor`'s
-    /// `IdleRead` is a background read of a new break with the hold open: it neither ends nor
-    /// restarts the hold. Its `HoldCloses` is a live turn's edge the harness did not type, or a
-    /// decided point that acts or finds no background work, and never the turn answering a
-    /// harness line or the point that ends that answer.
+    /// One event.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -200,7 +177,6 @@ impl HoldClock {
                 }
                 if !waiting_line {
                     // The answer's first break read nothing declared; a line its turn has not been
-                    // read answering may still be answered.
                     if self.answer == Answer::Running {
                         self.answer = Answer::None;
                     }
@@ -230,8 +206,6 @@ impl HoldClock {
             }
             HoldEvent::DecidedPoint { acts, background } => {
                 self.live = false;
-                // The point that ends the answer to the harness's own line: neither ends the
-                // hold nor restarts it (F5).
                 if std::mem::take(&mut self.answer) != Answer::None
                     && !super::fault::armed(super::fault::Fault::CloseAtTheAnswer)
                 {
@@ -248,8 +222,7 @@ impl HoldClock {
     }
 
     /// The hold a loop before this one left open, carried: open since `since_ms` (declared where
-    /// its row said so), last seen at `now_ms`. `None`, and nothing changed, where a hold is open
-    /// already.
+    /// its row said so), last seen at `now_ms`.
     pub fn seed(&mut self, since_ms: i64, declared: bool, now_ms: i64) -> Option<HoldChange> {
         if self.since_ms.is_some() {
             return None;
@@ -288,9 +261,9 @@ impl HoldClock {
         self.declared
     }
 
-    /// Whether the loop should read the agent's last words at this settled break and say what
-    /// they declare ([`HoldEvent::AnswerTail`]): a hold is open and a line the harness typed is
-    /// being answered.
+    /// Whether the loop should read the agent's last words at this settled break and say what they
+    /// declare ([`HoldEvent::AnswerTail`]): a hold is open and a line the harness typed is being
+    /// answered.
     #[must_use]
     pub fn wants_tail(&self) -> bool {
         self.since_ms.is_some() && self.answer != Answer::None
@@ -308,7 +281,7 @@ impl HoldClock {
 
 /// THE `WAITING:` READER: whether some line of the agent's last words (`said_tail`, a line a row,
 /// its marker and indentation stripped) starts `WAITING:` — exactly, in capitals, with its colon,
-/// at the line's start. The words are read for that one bit and never kept or typed back.
+/// at the line's start.
 #[must_use]
 pub fn waiting_declared(said_tail: &str) -> bool {
     said_tail
@@ -320,15 +293,15 @@ pub fn waiting_declared(said_tail: &str) -> bool {
 /// ([`seed_row_in`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeedRow {
-    /// The row's own stamp, unix ms: the last word of the loop that watched the hold, and what
-    /// an agent process launched after it never saw.
+    /// The row's own stamp, unix ms: the last word of the loop that watched the hold, and what an
+    /// agent process launched after it never saw.
     pub row_ms: i64,
     /// How long the hold had held at the row.
     pub held_ms: i64,
     /// The hold was declared.
     pub declared: bool,
-    /// A row of the session's under another rule (no fact's) follows it: the row is not the
-    /// last word of the loop that booked it, or a loop that did not watch the hold wrote since.
+    /// A row of the session's under another rule (no fact's) follows it: the row is not the last
+    /// word of the loop that booked it, or a loop that did not watch the hold wrote since.
     pub followed: bool,
 }
 
@@ -340,8 +313,8 @@ impl SeedRow {
     }
 }
 
-/// The reason a `fact-hold@v1` row carries: `hold=open held_ms=<n>[ declared]`,
-/// `hold=declared held_ms=<n>`, or `hold=closed why=<word> held_ms=<n>`.
+/// The reason a `fact-hold@v1` row carries: `hold=open held_ms=<n>[ declared]`, `hold=declared
+/// held_ms=<n>`, or `hold=closed why=<word> held_ms=<n>`.
 #[must_use]
 pub fn row_reason(change: &RowSaid) -> String {
     match *change {
@@ -381,17 +354,14 @@ pub enum RowSaid {
 }
 
 /// THE OPEN HOLD THE LEDGER TEXT `body` LEAVES SESSION `sid` (its rows alone, by `"sid":`): its
-/// last `fact-hold@v1` row, where that row says the hold is open or declared, and whether a row
-/// of the session's under a rule that is no fact's (`fact-…`) follows it ([`SeedRow::followed`]).
-/// `None` with no such row, or where the last one closed it. A row this build cannot read is
-/// passed over.
+/// last `fact-hold@v1` row, where that row says the hold is open or declared, and whether a row of
+/// the session's under a rule that is no fact's (`fact-…`) follows it ([`SeedRow::followed`]).
 #[must_use]
 pub fn seed_row_in(body: &str, sid: Option<&str>) -> Option<SeedRow> {
     let rule = super::super::facts::FactKind::Hold.rule();
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut last: Option<SeedRow> = None;
     for line in body.lines() {
-        // Only a hold row, or a row that may follow one, is read whole.
         if (last.is_none() && !line.contains(rule))
             || want.as_deref().is_some_and(|sid| !line.contains(sid))
         {

@@ -2,18 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! [`Connection`] against the session zbus 5.16.0 ran with a scripted bus
-//! (tests/recorded/zbus-5.16.0-session.tsv): the replayed bus answers with the
-//! recorded bytes, and everything aterm-dbus writes, from the SASL NUL to the
-//! last signal, must equal what zbus wrote.
-//!
-//! Over a socket that passes no descriptors (`nofd`) zbus's exchange is
-//! aterm-dbus's on every socket, so the two must match exactly. Over a unix
-//! socketpair zbus also negotiates descriptor passing, which aterm-dbus never
-//! does: that recording must differ by exactly the `NEGOTIATE_UNIX_FD` line
-//! and the bus's `AGREE_UNIX_FD`, and match once both are removed.
-//!
-//! Negative control: the same client claiming another uid writes a different
-//! first line, which the comparison catches.
+//! (tests/recorded/zbus-5.16.0-session.tsv): the replayed bus answers with the recorded bytes, and
+//! everything aterm-dbus writes, from the SASL NUL to the last signal, must equal what zbus wrote.
 
 #![cfg(unix)]
 
@@ -134,7 +124,6 @@ fn client(stream: CtlStream, uid: u32) {
         event_body("focused", 1, 0, Value::U32(0)),
     )
     .unwrap();
-    // The bus's NameAcquired arrived while the calls waited: kept, in order.
     let queued = conn.recv(Some(HANG)).unwrap().expect("NameAcquired");
     assert_eq!(
         (queued.member.as_deref(), queued.first_str()),

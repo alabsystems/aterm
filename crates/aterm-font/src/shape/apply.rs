@@ -6,14 +6,7 @@
 // the aterm project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! Matching glyph sequences: the skipping iterator (lookup flags, mark
-//! filtering sets, ZWJ/ZWNJ and default-ignorable skipping), input,
-//! backtrack and lookahead matching, (chained) context lookups with their
-//! nested lookups, and ligature formation with its component bookkeeping.
-//!
-//! Upstream asserts on a few internal invariants a malformed font can steer
-//! (a ligature component count running backwards, a recursed lookup that
-//! deleted past the match); here each one ends the lookup instead.
+//! Glyph sequence matching, contextual lookups, and ligature application.
 
 use super::ShapeFace;
 use super::buffer::{Buffer, GlyphInfo, glyph_props};
@@ -31,8 +24,7 @@ use crate::opentype_layout::{
 use crate::parser::LazyArray16;
 use aterm_grapheme::GeneralCategory;
 
-/// Match positions for one rule: indices into the buffer, the first glyph
-/// included. A rule never has more than [`MAX_CONTEXT_LENGTH`].
+/// Match positions for one rule as indices into the buffer, including the first glyph.
 pub(crate) type MatchPositions = [usize; MAX_CONTEXT_LENGTH];
 
 pub(crate) type MatchFn<'a> = dyn Fn(GlyphId, u16) -> bool + 'a;
@@ -72,7 +64,6 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
 
     #[inline]
     pub(crate) fn random_number(&mut self) -> u32 {
-        // minstd_rand.
         self.random_state = self.random_state.wrapping_mul(48271) % 2_147_483_647;
         self.random_state
     }
@@ -147,7 +138,6 @@ impl<'a, 'f> ApplyContext<'a, 'f> {
         let cur = self.buffer.cur_mut(0);
         let mut props = cur.glyph_props | glyph_props::SUBSTITUTED;
         if ligature {
-            // Only the last of a ligation and a multiplication counts.
             props |= glyph_props::LIGATED;
             props &= !glyph_props::MULTIPLIED;
         }
@@ -227,8 +217,6 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         SkippyIter {
             ctx,
             lookup_props: ctx.lookup_props,
-            // GSUB: ignore ZWNJ when matching context and asked to; ignore
-            // ZWJ when matching context, or when asked to.
             ignore_zwnj: context_match && ctx.auto_zwnj,
             ignore_zwj: context_match || ctx.auto_zwj,
             mask: if context_match {
@@ -329,7 +317,6 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
         if !self.ctx.check_glyph_property(info, self.lookup_props) {
             return MaySkip::Yes;
         }
-        // GSUB never ignores hidden glyphs (CGJ, Mongolian FVS, TAGs).
         if is_default_ignorable_info(info)
             && (self.ignore_zwnj || !is_zwnj(info))
             && (self.ignore_zwj || !is_zwj(info))
@@ -346,10 +333,7 @@ impl<'a, 'b, 'f> SkippyIter<'a, 'b, 'f> {
     }
 }
 
-/// Matches `input_len` more glyphs after the current one; on success
-/// returns the end of the match (one past its last glyph) and fills
-/// `positions[..=input_len]`, with the total ligature component count when
-/// `components` is asked for.
+/// Matches `input_len` more glyphs after the current one and returns the match end index.
 pub(crate) fn match_input(
     ctx: &ApplyContext,
     input_len: u16,
@@ -357,11 +341,6 @@ pub(crate) fn match_input(
     positions: &mut MatchPositions,
     components: Option<&mut u8>,
 ) -> Option<usize> {
-    // Ligatures cannot form across glyphs attached to different components
-    // of earlier ligatures (LAM,SHADDA,LAM,FATHA,HEH: when LAM,LAM,HEH
-    // ligate, SHADDA,FATHA must not), unless a ligature ligates with its own
-    // marks, or two marks of one ligature's components ligate while the
-    // ligature itself is skipped by mark filtering (harfbuzz#545).
     #[derive(PartialEq)]
     enum Ligbase {
         NotChecked,
@@ -389,7 +368,6 @@ pub(crate) fn match_input(
         let this_lig_comp = lig_comp(&this);
         if first_lig_id != 0 && first_lig_comp != 0 {
             // A first glyph attached to an earlier ligature's component: the
-            // rest must attach to the same component...
             if first_lig_id != this_lig_id || first_lig_comp != this_lig_comp {
                 // ...unless the ligature they attach to may be skipped.
                 if ligbase == Ligbase::NotChecked {
@@ -415,8 +393,6 @@ pub(crate) fn match_input(
                 }
             }
         } else if this_lig_id != 0 && this_lig_comp != 0 && this_lig_id != first_lig_id {
-            // A first glyph attached to no component: neither may the rest
-            // be, except to the first glyph itself.
             return None;
         }
         total_component_count = total_component_count.wrapping_add(lig_num_comps(&this));
@@ -670,7 +646,6 @@ fn apply_lookup(
     lookups: LazyArray16<SequenceLookupRecord>,
 ) {
     let mut count = input_len + 1;
-    // All positions are distances from the start of the *output* buffer.
     let backtrack_len = ctx.buffer.backtrack_len() as isize;
     let delta = backtrack_len - ctx.buffer.idx as isize;
     for position in positions.iter_mut().take(count) {
@@ -687,7 +662,6 @@ fn apply_lookup(
             continue;
         }
         let orig_len = ctx.buffer.backtrack_len() + ctx.buffer.lookahead_len();
-        // Earlier nested lookups may have deleted many glyphs.
         if positions[idx] >= orig_len {
             continue;
         }
@@ -705,27 +679,20 @@ fn apply_lookup(
         if delta == 0 {
             continue;
         }
-        // The nested lookup changed the length. Upstream assumes glyphs
-        // added right after the current position, or removed from the match
-        // positions after it.
         end += delta;
         if end < positions[idx] as isize {
-            // Never rewind past the current position (harfbuzz#1611).
             delta += positions[idx] as isize - end;
             end = positions[idx] as isize;
         }
-        // `next` is the position after the nested lookup's.
         let mut next = idx + 1;
         if delta > 0 {
             if delta as usize + count > MAX_CONTEXT_LENGTH {
                 break;
             }
         } else {
-            // delta is non-positive.
             delta = delta.max(next as isize - count as isize);
             next = (next as isize - delta) as usize;
         }
-        // Shift.
         let to = (next as isize + delta) as usize;
         if next > count || to + (count - next) > MAX_CONTEXT_LENGTH {
             break;
@@ -733,11 +700,9 @@ fn apply_lookup(
         positions.copy_within(next..count, to);
         next = to;
         count = (count as isize + delta) as usize;
-        // Fill in new entries.
         for j in idx + 1..next {
             positions[j] = positions[j - 1] + 1;
         }
-        // And fix up the rest.
         while next < count {
             positions[next] = (positions[next] as isize + delta) as usize;
             next += 1;
@@ -748,8 +713,7 @@ fn apply_lookup(
     }
 }
 
-/// Replaces the matched glyphs with `lig_glyph`, merging their clusters and
-/// renumbering the components of the marks between and after them.
+/// Replaces the matched glyphs with `lig_glyph`, merging clusters and renumbering mark components.
 pub(crate) fn ligate_input(
     ctx: &mut ApplyContext,
     count: usize,
@@ -758,12 +722,6 @@ pub(crate) fn ligate_input(
     total_component_count: u8,
     lig_glyph: GlyphId,
 ) {
-    // A base ligating with marks stays a base, so marks after it still
-    // attach (harfbuzz#1109). All-mark components make a mark ligature,
-    // which keeps its ligature id so it can attach to an earlier ligature
-    // (bugzilla 676343). Marks that followed components which were
-    // ligatures themselves move to the new ligature's components (bugzilla
-    // 437633).
     let buffer = &mut *ctx.buffer;
     buffer.merge_clusters(buffer.idx, match_end);
     let mut is_base_ligature = is_base_glyph(&buffer.info[positions[0]]);
@@ -820,11 +778,9 @@ pub(crate) fn ligate_input(
         last_lig_id = lig_id(cur);
         last_num_comps = lig_num_comps(cur);
         comps_so_far = comps_so_far.wrapping_add(last_num_comps);
-        // Skip the base glyph.
         buffer.idx += 1;
     }
     if !is_mark_ligature && last_lig_id != 0 {
-        // Renumber the components of any marks following.
         for i in buffer.idx..buffer.len {
             let info = &mut buffer.info[i];
             if last_lig_id != lig_id(info) {

@@ -591,7 +591,7 @@ impl TrialLauncher {
         }
     }
 
-    fn name(self) -> LaunchName {
+    const fn name(self) -> LaunchName {
         LaunchName {
             pid: self.pid,
             started: self.started,
@@ -834,7 +834,7 @@ impl WindowUnproven {
         )
     }
 
-    fn lapsed(&self, now: u64) -> bool {
+    const fn lapsed(&self, now: u64) -> bool {
         now.abs_diff(self.at) >= WINDOW_TRIAL_HEADLESS_WAIT.as_secs()
     }
 }
@@ -1076,12 +1076,16 @@ pub(crate) fn same_install_root(a: &Path, b: &Path) -> bool {
 }
 
 #[must_use]
-fn abandoned_preswap_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
+const fn abandoned_preswap_trial(
+    process_build: u64,
+    installed_build: u64,
+    armed_build: u64,
+) -> bool {
     installed_build == process_build && armed_build > process_build
 }
 
 #[must_use]
-fn dead_authority_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
+const fn dead_authority_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
     installed_build == process_build && armed_build < installed_build
 }
 
@@ -3271,7 +3275,7 @@ pub(crate) enum LeftRecord {
 }
 
 /// The boot's lane for a ready stage: a launched successor never swaps, and a replaceable launch swaps and execs.
-pub(crate) fn boot_image_lane(
+pub(crate) const fn boot_image_lane(
     image: crate::ImageReplacement,
     auto_apply: bool,
     record: LeftRecord,
@@ -3299,7 +3303,7 @@ pub(crate) enum RevertLane {
 }
 
 /// The crash-loop revert's lane by image class: only a LaunchServices-launched successor exits instead of re-executing the restored build.
-pub(crate) fn revert_lane(image: crate::ImageReplacement) -> RevertLane {
+pub(crate) const fn revert_lane(image: crate::ImageReplacement) -> RevertLane {
     match image {
         crate::ImageReplacement::LaunchedSuccessor => RevertLane::ExitInstead,
         crate::ImageReplacement::Replaceable | crate::ImageReplacement::WindowKeepsImage => {
@@ -3920,7 +3924,7 @@ enum BootHealthLane {
     CountOnly,
 }
 
-fn boot_health_lane(handoff_target: bool, attempts_after_launch: u32) -> BootHealthLane {
+const fn boot_health_lane(handoff_target: bool, attempts_after_launch: u32) -> BootHealthLane {
     if handoff_target && attempts_after_launch <= 1 {
         BootHealthLane::CountOnly
     } else {

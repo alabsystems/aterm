@@ -1,37 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The footer facts' slash press (`aterm-gui`'s `claude_slash`): a person's click on a fact
-//! types one of Claude Code's own commands into its composer — the probe `/` first, then the
-//! rest once the probe reads back, then aterm's own Enter once the whole command has read back
-//! and held still.
+//! Formal model of the footer facts' slash press (`aterm-gui`'s `claude_slash`).
 
 use aterm_spec::derive::*;
 
-/// One slash press. `phase` is the host's: `0` at rest, `1` probed (`/` written, the click's
-/// own write), `2` typed (the rest written), `3` entered (aterm's Enter written), `4` ended (a
-/// notice or a named stop on show). `composer` is Claude's: `0` empty, `1` holding what aterm
-/// typed, `2` other text (the person's draft, or what vim motions left). `echoed` says the
-/// composer reads back aterm's last write at the caret; `quiet` that it then held still for the
-/// quiet window. `vim` is a composer in vim NORMAL mode, which draws nothing for `/` and runs
-/// every other key as a motion; `boxed` a box or picker over the composer (a permission box
-/// mid-turn, a picker the person opened at rest); `busy` a live turn;
-/// `person` a key of the person's since the press's first write.
-///
-/// Host actions: `Click` (the probe, on the gesture, into an idle empty composer with no box),
-/// `Type` (the rest, once the probe read back), `Enter` (once the whole command read back and
-/// held still, the person's count unmoved), `Done` (Claude answered, or its picker is up),
-/// `Stop` (anything else, or a deadline: named), `Rest`. Claude's: `Echo`, `Settle`,
-/// `BoxOpens`/`BoxCloses`, `TurnStarts`/`TurnEnds`; the person's: `PersonTypes` (text into the
-/// composer), `PersonMoves` (a key that leaves its text as it is), `Clears`, `VimNormal`.
-///
-/// Laws: nothing typed over a draft (`NoTypeOverDraft`), into a box (`NoTypeIntoBox`) or while
-/// a turn is live (`NoTypeWhileBusy`); no key past the probe in vim NORMAL mode, where it runs
-/// as a motion (`NoMotionsInVim`); no Enter unless the composer read back aterm's whole
-/// command (`NoEnterUnlessOurEcho`) or after the person's key (`NoEnterAfterPerson`); a press
-/// that ends says how (`AStopIsNamed`). `Buggy = k` replays the k-th break: a click over a
-/// draft, into a box, mid-turn, the rest typed without the probe's read-back, an Enter without
-/// the command's, an Enter after the person's key, a stop that drops its name.
+/// Formal model for one Claude Code slash-command press from the footer facts.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_slash_press_model() -> Model {
@@ -197,10 +171,6 @@ mod tests {
                 "Buggy = {dial} breaks {law}: {broken:?}"
             );
         }
-        // And the registry's own sweep finds nothing: every action fires
-        // with no mutant on, and the `bound` is one no mutant breaks.
-        let faults = aterm_spec::verify::sweep_faults(&[model]);
-        assert!(faults.is_empty(), "{faults:?}");
     }
 
     /// The measured vim NORMAL trace (2.1.304): the probe draws nothing, so

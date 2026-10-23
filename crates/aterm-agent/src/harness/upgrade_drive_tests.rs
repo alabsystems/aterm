@@ -2833,6 +2833,10 @@ fn a_cell_reply_is_dim_only_by_its_attrs() {
     assert!(!cell_is_dim("ERR out of range"));
     assert!(!cell_is_dim("OK x 999999 111318"), "no attrs, no proof");
     assert!(!cell_is_dim(""));
+    assert!(
+        !cell_is_dim("OK x 999999 111318 dim frame=open"),
+        "a cell of an unfinished frame is no proof"
+    );
 }
 
 /// A control connection whose server answers each request with the next of
@@ -14951,9 +14955,16 @@ struct Parked {
     /// The stand-in agent, until a test takes it to reap it itself
     /// ([`Parked::reaped`]).
     agent: Option<aterm_uds::spawnfd::Child>,
+    /// The agent [`Parked::reaped`] handed to its reaping thread, until that
+    /// thread reaps it: the rig still ends it when the test did not.
+    handed: Option<Handed>,
     sf: SessionFile,
     asked: crate::harness::FakeInstanceLog,
 }
+
+/// A stand-in agent its reaping thread holds, and reaps only under this lock.
+#[cfg(unix)]
+type Handed = std::sync::Arc<std::sync::Mutex<Option<aterm_uds::spawnfd::Child>>>;
 
 #[cfg(unix)]
 impl Parked {
@@ -14974,6 +14985,7 @@ impl Parked {
             dir,
             opts,
             agent: Some(agent),
+            handed: None,
             sf,
             asked,
         }
@@ -15004,17 +15016,38 @@ impl Parked {
     /// The stand-in agent handed to a thread that reaps it the moment it ends
     /// and removes its session file, as Claude's own exit does, so a restart's
     /// wait for it to be gone ends on the event; says how it ended.
+    ///
+    /// The thread asks whether it ended under the lock the rig's drop takes to
+    /// kill it, so the agent a test never ended is ended with the rig, and the
+    /// signal reaches it before its reap, never a pid reused after.
     fn reaped(&mut self) -> std::sync::mpsc::Receiver<std::process::ExitStatus> {
-        let mut agent = self.agent.take().expect("the agent");
+        let agent = self.agent.take().expect("the agent");
         let file = self
             .opts
             .home
             .join(format!(".claude/sessions/{}.json", agent.id()));
+        let held: Handed = std::sync::Arc::new(std::sync::Mutex::new(Some(agent)));
+        self.handed = Some(std::sync::Arc::clone(&held));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(status) = agent.wait() {
-                let _ = std::fs::remove_file(&file);
-                let _ = tx.send(status);
+            loop {
+                let mut slot = held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(agent) = slot.as_mut() else { return };
+                match agent.try_wait() {
+                    Ok(Some(status)) => {
+                        *slot = None;
+                        drop(slot);
+                        let _ = std::fs::remove_file(&file);
+                        let _ = tx.send(status);
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+                drop(slot);
+                std::thread::sleep(Duration::from_millis(5));
             }
         });
         rx
@@ -15040,8 +15073,36 @@ impl Drop for Parked {
             let _ = agent.kill();
             let _ = agent.wait();
         }
+        if let Some(handed) = &self.handed
+            && let Some(agent) = handed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+        {
+            let _ = agent.kill();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A rig ends the stand-in agent it handed to [`Parked::reaped`] when the test
+/// did not: an agent the visit never signalled outlived its test, and the test
+/// binary, before.
+#[cfg(unix)]
+#[test]
+fn a_rig_ends_the_agent_it_handed_to_its_reaper() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut h = Parked::new("handed-ends", Answers::default(), St::default(), 3600);
+    let ended = h.reaped();
+    assert!(
+        ended.try_recv().is_err(),
+        "control: the agent runs until the rig ends"
+    );
+    drop(h);
+    let status = ended
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the rig ended its agent");
+    assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
 }
 
 /// The details of `opts`' ledger rows whose step is `step`.

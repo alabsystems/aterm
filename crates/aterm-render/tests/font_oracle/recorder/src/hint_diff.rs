@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hinter differential (TF.4 of docs/AUDIT-third-party-2026-10-15.md):
-//! every face this host has, hinted by skrifa 0.46.2 (`hint::Skrifa`) and by
-//! aterm-font's carve of it (`aterm_font::autohint`), glyph by glyph, the
-//! grid-fitted outline compared as an exact command stream (each
-//! coordinate's f32 bits). It reaches what the hinting corpus does not: the
-//! host's CFF and CFF2 faces, variable faces away from their default, and
-//! scripts other than the bundled faces'.
-//!
-//! The domain, fixed so a rerun measures the same thing:
-//!
-//! - faces: every `.ttf`, `.otf`, `.ttc` and `.otc` under [`face_files`]'s
-//!   roots: the system font directories of macOS (`/System/Library/Fonts`
-//!   with `Supplemental`, and `/Library/Fonts`), Linux (`/usr/share/fonts`)
-//!   and Windows (`C:\Windows\Fonts`), whichever this host has,
-//!   aterm-render's committed fonts (`assets/`, `tests/fixtures/`), and any
-//!   directory named after the aterm-render directory on the command line;
-//!   every face of a collection;
-//! - instances: the default, and on a variable face each axis alone at its
-//!   minimum and at its maximum, and `wght` 700 where the face has it;
-//! - sizes 11, 16 and 23 px; targets normal and light at every instance,
-//!   LCD at the default (the subpixel raster's only instance);
-//! - glyphs: every glyph of a face of at most 3,000, else every
-//!   `glyph_count / 3,000`th from 0.
+//! Hinter differential comparing `skrifa` and `aterm_font::autohint` outline command streams.
 
 use crate::hint::{Mode, PathPen, Skrifa};
 use crate::hint_raster::Hinter;
@@ -86,9 +64,7 @@ fn draw_carve(
     Some(h.hex())
 }
 
-/// Every font file under this host's system font directories (an absent one
-/// is skipped), aterm-render's committed fonts under `dir`, and `extra`,
-/// sorted. `budgets` walks the same files.
+/// Returns every font file under the host's system font directories, `dir`, and `extra`, sorted.
 pub(crate) fn face_files(dir: &str, extra: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let roots = [

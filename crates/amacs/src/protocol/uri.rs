@@ -118,7 +118,7 @@ fn percent_decode(value: &str) -> Result<String, UriError> {
 }
 
 /// One hex digit's value, either case.
-fn nibble(byte: u8) -> Option<u8> {
+const fn nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),

@@ -97,7 +97,7 @@ fn escape_requested_os(args: &[OsString]) -> bool {
         || stub::engaged(std::env::var(reroute_passthrough_env()).ok().as_deref())
 }
 
-fn reroute_passthrough_env() -> &'static str {
+const fn reroute_passthrough_env() -> &'static str {
     "__ATERM_REROUTE_PASSTHROUGH"
 }
 
@@ -270,7 +270,7 @@ fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
 /// A failed native attempt may already have retained an upgraded dependency.
 /// Keep a direct PassThrough eligible for the existing initial fallback;
 /// an ordinary failure conservatively forbids later whole-argv replay too.
-fn native_attempt_may_have_progress<T>(result: &Result<T, InstallError>) -> bool {
+const fn native_attempt_may_have_progress<T>(result: &Result<T, InstallError>) -> bool {
     !matches!(result, Err(InstallError::PassThrough(_)))
 }
 

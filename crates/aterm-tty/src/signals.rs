@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The signals a terminal program waits on beside its input: SIGWINCH (the window
-//! changed size), SIGTSTP (stop) and SIGCONT (continued)
-//! (docs/DESIGN-amacs-2026-10-19.md §5.1).
-//!
-//! Their handler raises a flag and writes one byte into a wake pipe that the program's
-//! `poll(2)` watches beside the terminal, the pattern of aterm-cli's `driver_unix.rs`: a
-//! flag alone is a lost wakeup when the signal lands between the loop's check and its
-//! `poll`. The pipe is made once per process and never closed, so a handler running at
-//! any moment never writes into a descriptor that later took its number.
-//!
-//! With ISIG off, C-z reaches the program as a key; [`suspend`] then puts the terminal
-//! back and stops the process as SIGTSTP's default would. A SIGTSTP sent from outside
-//! arrives as [`Signals::TSTP`] for the program to do the same. Either way the process
-//! comes back raw, with every mode set, and [`Signals::CONT`] pending.
+//! Terminal signal handling (`SIGWINCH`, `SIGTSTP`, `SIGCONT`) routed through a
+//! process-wide self-pipe.
 
 /// A set of the signals a terminal program waits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -71,6 +59,7 @@ mod unix {
     static WAKE_WR: AtomicI32 = AtomicI32::new(-1);
     /// A [`SignalWake`] is installed.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
+    // SIGTSTP remains ignored if it was ignored when the wake was installed.
     /// SIGTSTP was ignored when the wake was installed (a parent with no job control
     /// arranged it): it stays ignored, and [`suspend`] does not stop.
     static TSTP_IGNORED: AtomicBool = AtomicBool::new(false);
@@ -151,6 +140,7 @@ mod unix {
         was
     }
 
+    // SA_RESTART keeps blocking syscalls running; `poll` never restarts.
     /// Route `sig` to [`on_signal`], returning the disposition it replaced. SA_RESTART
     /// keeps the process's other blocking calls running through it; the loop's `poll`
     /// is never restarted, and the pipe holds the byte by then anyway.
@@ -256,10 +246,8 @@ mod unix {
         while unsafe { libc::read(rd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
     }
 
-    /// Put the terminal back and stop the process as SIGTSTP's default does: C-z, or a
-    /// SIGTSTP sent from outside ([`Signals::TSTP`]). Returns once SIGCONT has continued
-    /// the process, the terminal raw again with every mode `guard` had set. A process
-    /// whose SIGTSTP was ignored when the wake was installed is not stopped.
+    /// Restores terminal modes and stops the process via `SIGTSTP`, re-entering raw
+    /// mode after `SIGCONT`.
     ///
     /// # Errors
     /// Setting the terminal raw again failed.

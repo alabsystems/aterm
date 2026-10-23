@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::host::gh::GhCli;
+use crate::host::rest::RestHost;
 use crate::host::{Hosts, Slug};
 
 /// The private development owner packs are uploaded to before they are made public (the
@@ -116,8 +116,8 @@ impl Ctx {
             .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
         let tokens = Tokens::under(&home);
         let hosts = Hosts {
-            staging: Arc::new(GhCli::new(token_if_present(&tokens.staging))),
-            channel: Arc::new(GhCli::new(Some(tokens.channel))),
+            staging: Arc::new(RestHost::new(token_if_present(&tokens.staging))),
+            channel: Arc::new(RestHost::new(Some(tokens.channel))),
         };
         Ok(Self::new(
             &home,

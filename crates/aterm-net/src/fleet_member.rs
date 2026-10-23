@@ -2147,7 +2147,7 @@ pub enum Stage {
 impl Unreached {
     /// Whether it came before the peer proved itself — no name, no address, no connection, no handshake — so a second dial of that peer in the same deadline would fail the same way.
     #[must_use]
-    pub fn before_proof(&self) -> bool {
+    pub const fn before_proof(&self) -> bool {
         match self {
             Self::Handshake(_, FleetError::AddressBusy) => false,
             Self::Resolve(_)
@@ -2187,7 +2187,7 @@ impl Unreached {
 
     /// Whether a connect to the peer was tried: `false` for a name that did not resolve (or not in time), an address past the LAN that was never dialled, and a failure of this machine's own before any connect — none of which says anything of this machine's route into the LAN.
     #[must_use]
-    pub fn dialled(&self) -> bool {
+    pub const fn dialled(&self) -> bool {
         !matches!(
             self,
             Self::Resolve(_) | Self::Lookup(..) | Self::NotFleet(_) | Self::Local(_)
@@ -2968,7 +2968,7 @@ pub fn read_whole(
     (answers, book)
 }
 
-fn answered_at(fetched: &Result<Book, BookUnread>) -> Option<IpAddr> {
+const fn answered_at(fetched: &Result<Book, BookUnread>) -> Option<IpAddr> {
     match fetched {
         Ok(book) => Some(book.at),
         Err(

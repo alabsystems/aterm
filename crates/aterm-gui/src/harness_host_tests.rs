@@ -6945,6 +6945,7 @@ impl Acting {
                 jobs_board: Acts::inert().jobs_board,
                 program_check: Acts::inert().program_check,
                 occupancy: Acts::inert().occupancy,
+                occupancy_pace: Acts::inert().occupancy_pace,
                 resume: Arc::new(move |_, _, carry: CarryPoint| {
                     a9.landing.lock().unwrap().push(carry.land);
                     a9.onlys.lock().unwrap().push(carry.only);
@@ -15919,6 +15920,112 @@ fn a_workers_occupancy_reading_is_asked_for_its_own_session() {
     assert_eq!(worker("s-held").occupancy().held_slot_last_ms, Some(42));
     assert_eq!(worker("s-other").occupancy().held_slot_last_ms, None);
     assert_eq!(*asked.lock().unwrap(), ["s-held", "s-other"]);
+}
+
+/// A worker under its loop's occupancy door ([`Acts::due`] as `due`, its pace asks recorded).
+fn door_worker(agent: Program, due: Due, asked: &Arc<Mutex<Vec<String>>>) -> WorkerIdle {
+    use aterm_agent::supervise::occupancy::PaceGrant;
+    let mut hooks = hooks(
+        &Arc::new(World::default()),
+        Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+    );
+    let seen = Arc::clone(asked);
+    hooks.acts = Acts {
+        due: Arc::new(move |_| due),
+        occupancy_pace: Arc::new(move |sid, rule, since| {
+            seen.lock()
+                .unwrap()
+                .push(format!("{sid} {} {since}", rule.name()));
+            PaceGrant::Granted
+        }),
+        ..Acts::inert()
+    };
+    idle_host("s-door", agent, switched(&on()), hooks)
+}
+
+/// The loop's fact line at a break stamps the point offered, as the host's own step there does
+/// ([`IdleHost::break_taken`]).
+#[test]
+fn a_fact_line_at_a_break_stamps_the_point_offered() {
+    let idle = door_worker(Program::Claude, Due::No, &Arc::default());
+    assert_eq!(idle.points.last().1, 0, "nothing offered yet");
+    idle.break_taken();
+    assert_ne!(idle.points.last().1, 0);
+}
+
+/// The upgrade's notice is due exactly where the host's own step at a break would type it, its
+/// look's pause aside ([`IdleHost::upgrade_due`], F11); each gate alone keeps it not due.
+#[test]
+fn the_upgrades_notice_is_due_where_the_hosts_step_would_type_it() {
+    let asked = Arc::default();
+    let due = door_worker(Program::Claude, Due::Yes, &asked);
+    assert!(due.upgrade_due());
+    // Paused: the break's look waits, the notice is due all the same.
+    *due.background_at.lock().unwrap() = Some(Instant::now() + Duration::from_secs(600));
+    assert!(due.upgrade_due(), "a paused look");
+    // NEGATIVE CONTROLS, each alone.
+    assert!(
+        !door_worker(Program::Claude, Due::No, &asked).upgrade_due(),
+        "not due"
+    );
+    assert!(
+        !door_worker(Program::Codex, Due::Yes, &asked).upgrade_due(),
+        "no upgrade lane"
+    );
+    let stopped = door_worker(Program::Claude, Due::Yes, &asked);
+    stopped.stop.store(true, Ordering::SeqCst);
+    assert!(!stopped.upgrade_due(), "stopped");
+    let beside = door_worker(Program::Claude, Due::Yes, &asked);
+    *beside.beside.lock().unwrap() = Some("a self-claim".to_string());
+    assert!(!beside.upgrade_due(), "beside");
+    let mut off = SupervisorConfig::default();
+    off.set("upgrade", "false").unwrap();
+    let mut no_upgrade = door_worker(Program::Claude, Due::Yes, &asked);
+    no_upgrade.switches = switched(&off);
+    assert!(!no_upgrade.upgrade_due(), "upgrade off");
+}
+
+/// A fact line's pace is the board's for a worker that takes steps for its session; refused,
+/// with the board never asked, where it takes none (F10).
+#[test]
+fn a_fact_lines_pace_is_refused_where_the_worker_takes_no_step() {
+    use aterm_agent::supervise::occupancy::{PaceGrant, PaceRefusal, RuleId};
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let pace = |idle: &WorkerIdle| idle.occupancy_pace(RuleId::HoldRoom, 42);
+    // CONTROL: the board's answer, asked for this session's rule and hold.
+    assert_eq!(
+        pace(&door_worker(Program::Claude, Due::No, &asked)),
+        PaceGrant::Granted
+    );
+    assert_eq!(*asked.lock().unwrap(), ["s-door hold-room@v1 42"]);
+    asked.lock().unwrap().clear();
+    let stopped = door_worker(Program::Claude, Due::No, &asked);
+    stopped.stop.store(true, Ordering::SeqCst);
+    let beside = door_worker(Program::Claude, Due::No, &asked);
+    *beside.beside.lock().unwrap() = Some("a self-claim".to_string());
+    let owns = door_worker(Program::Claude, Due::No, &asked);
+    owns.owns.store(true, Ordering::SeqCst);
+    assert!(owns.owns_turn_end());
+    assert!(host_carries_relaunch(Program::Agy));
+    let carry = door_worker(Program::Agy, Due::No, &asked);
+    with_kept_of(&carry.kept, |k| k.carry_asked = true);
+    for (idle, why) in [
+        (stopped, PaceRefusal::Off),
+        (beside, PaceRefusal::Beside),
+        (owns, PaceRefusal::Owns),
+        (carry, PaceRefusal::CarryOwed),
+    ] {
+        assert_eq!(pace(&idle), PaceGrant::Refused(why));
+    }
+    assert!(
+        asked.lock().unwrap().is_empty(),
+        "{:?}",
+        asked.lock().unwrap()
+    );
+    // A carry-on this host does not carry refuses nothing.
+    let swept = door_worker(Program::Claude, Due::No, &asked);
+    with_kept_of(&swept.kept, |k| k.carry_asked = true);
+    assert_eq!(pace(&swept), PaceGrant::Granted);
 }
 
 /// The occupancy board keys each supervised session by its tab ([`board_sessions`]).
@@ -30562,6 +30669,89 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
         seen.iter()
             .any(|(s, _, seen)| *s == sid(&worker) && *seen == StartupSeen::Unread),
         "{seen:?}"
+    );
+}
+
+/// Half a frame is no screen for the startup judge: an unfinished frame reads as unread, as a busy lock does.
+#[test]
+fn the_startup_judge_reads_no_half_frame() {
+    use crate::session_timeline::AgentStamp;
+    use crate::task_record::{TaskMark, TaskState};
+    let store = crate::session_store::new_store();
+    let mark = |h: &crate::session_store::SessionHandle, state, why| {
+        let mut m = TaskMark::new(state);
+        m.why = why;
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .mark_task(&m, false, Instant::now(), 0);
+    };
+    let stalled = crate::session_store::test_handle(4);
+    mark(&stalled, TaskState::Stalled, Some("startup"));
+    stalled
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?2026h\x1b[H\x1b[2J% ");
+    let held = crate::session_store::test_handle(3);
+    mark(&held, TaskState::Working, Some("turn"));
+    held.ctx.timeline.lock().unwrap().publish_agent(
+        "unknown",
+        None,
+        None,
+        Some(Program::Claude),
+        AgentStamp {
+            generation: crate::control::ScreenGen { epoch: 0, seq: 1 },
+            fp: 1,
+        },
+    );
+    held.term
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?2026h\x1b[H\x1b[2JEnter to continue");
+    for h in [&stalled, &held] {
+        store.write().unwrap().register(h.clone());
+    }
+    // A worker's sid, its startup verdict, and a held worker's (unread, last row).
+    type Read = (String, StartupSeen, Option<(bool, Option<String>)>);
+    let read = || {
+        let mut out = startups_of(&store, &std::collections::HashSet::new());
+        out.sort_by(|a, b| a.sid.cmp(&b.sid));
+        out.into_iter()
+            .map(|w| {
+                let held = w.held.map(|h| (h.unread, h.last_row));
+                (w.sid, w.seen, held)
+            })
+            .collect::<Vec<Read>>()
+    };
+    let unfinished = read();
+    let find = |reads: &[Read], h: &crate::session_store::SessionHandle| {
+        reads
+            .iter()
+            .find(|(sid, _, _)| sid == h.sid.as_str())
+            .cloned()
+            .expect("listed")
+    };
+    assert_eq!(
+        find(&unfinished, &stalled).1,
+        StartupSeen::Unread,
+        "{unfinished:?}"
+    );
+    assert_eq!(
+        find(&unfinished, &held).2,
+        Some((true, None)),
+        "{unfinished:?}"
+    );
+    for h in [&stalled, &held] {
+        h.term.lock().unwrap().process(b"\x1b[?2026l");
+    }
+    let whole = read();
+    assert_ne!(find(&whole, &stalled).1, StartupSeen::Unread, "{whole:?}");
+    assert_eq!(
+        find(&whole, &held).2,
+        Some((false, Some("Enter to continue".to_string()))),
+        "{whole:?}"
     );
 }
 

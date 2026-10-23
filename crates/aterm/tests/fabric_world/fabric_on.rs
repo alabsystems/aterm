@@ -123,11 +123,12 @@ fn write_secret(s: &Scratch, bytes: &[u8], mode: u32) {
     chmod(&path, mode);
 }
 
-/// `aterm link broker <sock> <log> --secret-file <root>/mint.secret` — the
-/// GUARDED bus `on` deploys under launchd, started here instead; killed on
-/// drop.
+/// `aterm link broker <sock> <log> --secret-file <root>/mint.secret`, the guarded bus `on`
+/// deploys under launchd, started here through [`harness::spawn_broker`] instead; killed on drop.
 struct Broker {
-    child: Child,
+    child: aterm_uds::spawnfd::Child,
+    /// Held while it serves ([`harness::BrokerChild`]).
+    _lifeline: aterm_uds::lifeline::Lifeline,
 }
 
 impl Broker {
@@ -138,31 +139,30 @@ impl Broker {
     /// [`Broker::spawn`] with `extra` words after the secret (a
     /// `--durability`, as the manual's by-hand step 1 adds it).
     fn spawn_with(s: &Scratch, extra: &[&str]) -> Self {
-        use aterm_uds::spawnfd::InheritNothing as _;
         chmod(&s.root(), 0o700);
         let secret = s.root().join("mint.secret");
         if !secret.exists() {
             write_secret(s, &[0x6b; 32], 0o600);
         }
-        let mut child = Command::new(harness::aterm_to_launch())
-            .inherit_nothing()
-            .args([
-                "link",
-                "broker",
-                &s.sock(),
-                &s.path("root/bus.log"),
-                "--secret-file",
-                &secret.to_string_lossy(),
-            ])
-            .args(extra)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the broker");
-        let first = harness::first_line_within(&mut child, "the broker's readiness line");
-        assert_eq!(first.trim(), format!("listening {}", s.sock()));
-        Self { child }
+        let (sock, log) = (s.sock(), s.path("root/bus.log"));
+        let secret = secret.to_string_lossy().into_owned();
+        let mut args = vec![
+            sock.as_str(),
+            log.as_str(),
+            "--secret-file",
+            secret.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        let mut broker = harness::spawn_broker(&s.dir, &args, |cmd| {
+            cmd.stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null());
+        });
+        let first = harness::first_line_within(&mut broker.child, "its readiness line");
+        assert_eq!(first.trim(), format!("listening {sock}"));
+        Self {
+            child: broker.child,
+            _lifeline: broker.lifeline,
+        }
     }
 }
 
@@ -272,14 +272,10 @@ impl Gui {
 
 impl Drop for Gui {
     fn drop(&mut self) {
+        let launcher = harness::identity_of(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(pid) = std::fs::read_to_string(self.state.join("pid"))
-            .ok()
-            .and_then(|p| p.trim().parse::<i32>().ok())
-        {
-            harness::kill(pid, 9);
-        }
+        harness::end_bridge(&self.state, launcher);
     }
 }
 
@@ -942,6 +938,29 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         drop(broker);
     }
 }
+
+/// A FIFO made at `path` and held open for writing (never written) for as long as the
+/// handle lives: the lifeline of a broker a script starts with `--lifeline-fd 3
+/// 3<path`, which reads end-of-file once this process lets go of it or dies.
+fn held_fifo(path: &Path) -> std::fs::File {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a FIFO path");
+    // SAFETY: a NUL-terminated path, live for the call.
+    let made = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+    assert_eq!(
+        made,
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("hold {}: {e}", path.display()))
+}
+
 /// **LAUNCHD IS ASKED THROUGH A DERIVED LABEL, THE PLIST IS THE SCRIPT'S, AND
 /// A BROKER LAUNCHD DOES NOT MANAGE IS NEVER BOOTSTRAPPED OVER.** A FAKE
 /// `launchctl` on `$PATH` that behaves like the real one where it matters:
@@ -975,7 +994,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
                  [ -f \"$d/no-gui\" ] && exit 125\n\
                  basename \"$3\" .plist > \"$d/launchd.label\"\n\
                  rm -f \"$d/root/bus.sock\"\n\
-                 nohup '{bin}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" >/dev/null 2>&1 &\n\
+                 nohup '{bin}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" --lifeline-fd 3 3<\"$d/lifeline\" >/dev/null 2>&1 &\n\
                  printf '%s' \"$!\" > \"$d/launchd.pid\"\n\
                  exit 0 ;;\n\
                bootout)\n\
@@ -987,18 +1006,10 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     )
     .expect("fake launchctl");
     let path = format!("{}:/usr/bin:/bin", s.path("bin"));
-    struct Reap(String);
-    impl Drop for Reap {
-        fn drop(&mut self) {
-            if let Some(pid) = std::fs::read_to_string(&self.0)
-                .ok()
-                .and_then(|p| p.trim().parse::<i32>().ok())
-            {
-                harness::kill(pid, 9);
-            }
-        }
-    }
-    let _reap = Reap(pidfile.clone());
+    // The broker the fake `bootstrap` starts serves until `off` boots it out, and ends
+    // itself with this test however the test ends: its lifeline is this FIFO, which the
+    // test holds open for writing and never writes (`aterm_uds::lifeline`).
+    let _lifeline = held_fifo(&s.dir.join("lifeline"));
     let root = s.path("root");
     let label = format!(
         "systems.alab.astream-broker.{}",

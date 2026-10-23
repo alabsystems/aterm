@@ -270,7 +270,7 @@ pub enum TrialWitness {
 
 /// Whether the updater runs on this platform at all.
 #[must_use]
-pub fn enabled() -> bool {
+pub const fn enabled() -> bool {
     cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
@@ -1187,7 +1187,7 @@ impl SupersedeRefusal {
 
     /// Whether the refusal is about the moment rather than the disk.
     #[must_use]
-    pub fn is_for_now(&self) -> bool {
+    pub const fn is_for_now(&self) -> bool {
         matches!(self, Self::ForNow(_))
     }
 }
@@ -1339,7 +1339,7 @@ struct HealthAnnouncer {
 
 #[cfg(target_os = "macos")]
 impl HealthAnnouncer {
-    fn new(started: String) -> Self {
+    const fn new(started: String) -> Self {
         Self {
             started,
             announced: None,
@@ -3386,12 +3386,12 @@ impl UpdateStatus {
 
     /// Whether the ledger says update checks are persistently failing on the pipeline class.
     #[must_use]
-    pub fn is_failing_persistently(&self) -> bool {
+    pub const fn is_failing_persistently(&self) -> bool {
         self.failing_persistent
     }
 
     /// An empty (all-defaults) snapshot for the stub/fallback constructors.
-    fn empty(enabled: bool, current_build: u64, outcome: String) -> Self {
+    const fn empty(enabled: bool, current_build: u64, outcome: String) -> Self {
         Self {
             linux: None,
             enabled,

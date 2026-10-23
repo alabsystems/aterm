@@ -274,3 +274,33 @@ fn status_lines_and_rows_on_a_terminal_are_shown_not_obeyed() {
         "an honest server's encoded row is unchanged"
     );
 }
+
+/// A `text` read of an unfinished frame (`frame=open`) prints its rows and says so on stderr.
+#[test]
+fn a_half_frame_read_says_so_on_stderr() {
+    let seen = run(
+        Tty::Stdout,
+        &["text"],
+        "OK 2 frame=open\n⏺ On it.\n\n".as_bytes(),
+    );
+    assert_eq!(String::from_utf8_lossy(&seen.terminal), "⏺ On it.\n\n");
+    assert_eq!(
+        String::from_utf8_lossy(&seen.pipe),
+        "aterm-ctl: the program's frame was unfinished at the read (frame=open): its rows may \
+         be half a redraw; `await frame` and read again\n"
+    );
+    let seen = run(
+        Tty::Stdout,
+        &["text"],
+        "OK 2\n⏺ On it.\n❯ ready\n".as_bytes(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&seen.terminal),
+        "⏺ On it.\n❯ ready\n"
+    );
+    assert!(
+        seen.pipe.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&seen.pipe)
+    );
+}

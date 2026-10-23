@@ -1278,7 +1278,7 @@ pub fn pass_owed(layout: &crate::store::Layout, now_unix: u64) -> bool {
 
 /// Whether the process under a promise's owner pid, whose start time reads `now`, is the one the writer read as `born`: no recorded start time ⇒ the pid alone answers; another start time, or nothing under the pid (a zombie), ⇒ another process, or none; a start time the reader cannot read — a stub run in a sandbox that denies process-info, where `kill(pid, 0)` still answers ([`pid_alive`]) — says nothing, and the pid alone answers, as it does for `EPERM` there.
 #[must_use]
-pub fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool {
+pub const fn same_owner(born: Option<u64>, now: crate::platform::Birth) -> bool {
     use crate::platform::Birth;
     match (born, now) {
         (None, _) | (Some(_), Birth::Unreadable) => true,

@@ -169,7 +169,7 @@ pub enum QuestionFocus {
 impl QuestionDialog {
     /// A question named by its footer or its options alone, whose rows were not read.
     #[must_use]
-    pub(crate) fn unknown(why: &'static str) -> Self {
+    pub(crate) const fn unknown(why: &'static str) -> Self {
         Self {
             tabs: Vec::new(),
             submit_tab: false,
@@ -181,7 +181,7 @@ impl QuestionDialog {
 
     /// The question the tab asks.
     #[must_use]
-    pub fn question(&self) -> Option<&QuestionText> {
+    pub const fn question(&self) -> Option<&QuestionText> {
         match &self.form {
             QuestionForm::Single { question, .. }
             | QuestionForm::Multi { question, .. }
@@ -303,7 +303,7 @@ pub(crate) struct QShape {
 
 impl QShape {
     /// Only these rows, of a question that is not read whole.
-    fn unknown(why: &'static str, first: usize, last: usize, head_off_screen: bool) -> Self {
+    const fn unknown(why: &'static str, first: usize, last: usize, head_off_screen: bool) -> Self {
         Self {
             form: QForm::Unknown(why),
             tab_bar: None,
@@ -324,7 +324,7 @@ impl QShape {
     }
 
     /// A live question footer whose rows are none of the shapes read (one a later release draws).
-    pub(crate) fn fallback(first: usize, footer: usize) -> Self {
+    pub(crate) const fn fallback(first: usize, footer: usize) -> Self {
         Self {
             footer: Some(footer),
             ..Self::unknown(UNREAD, first, footer, true)

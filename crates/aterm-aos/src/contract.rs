@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The behavioural contract a run is judged by.
-//!
-//! # The law
-//!
-//! A repair is accepted because the candidate's run over the recorded inputs satisfies a
-//! *corrected* contract (plan §4, "Repair"), never because it is equivalent to the faulty
-//! code it replaces: its state, observations and schedule may differ on purpose. A contract
-//! is a pure judgement of `(inputs, run)`; it names the first cursor where a law fails.
-//!
-//! The contract is an artifact like any other ([`Contract::id`]), identified by the artifact
-//! id it declares. What a [`crate::publish::Boundary`] guarantees about it, exactly:
-//!
-//! * The boundary owns its contract: it is given once, to `Boundary::new`, and `prepare`
-//!   takes only the candidate. After construction, no caller of `prepare` or `commit` can
-//!   hand the boundary another judge, and every witness it builds records its own contract.
-//! * `prepare` refuses when the boundary's contract declares another artifact than the one the
-//!   task identity names (`ContractMismatch`); `commit` refuses a witness that names any other
-//!   contract (`WitnessMismatch("contract")`).
-//! * The constructor is trusted (first-party trust): a `Contract` impl that declares the
-//!   identity's contract id but judges leniently is not detected, by the boundary it is given
-//!   to or by another boundary with the same identity, ancestor, log and head that receives a
-//!   witness it built. That is the assumption every witness lists
-//!   ([`crate::evidence::TESTED_ASSUMPTIONS`]).
+//! Behavioural contracts and verdicts over replayed runs.
 
 use core::fmt;
 

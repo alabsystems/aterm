@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GitHub access over SSH: a per-host, per-user key the controller registers with the
-//! fleet's machine user (design §7).
-//!
-//! For each user the family makes `~/.ssh/aterm_github_ed25519`, a marked `Host github.com`
-//! block in `~/.ssh/config`, a marked block of GitHub's published host keys in
-//! `~/.ssh/known_hosts`, and git's global identity. Everything runs as the user (design
-//! §3.5): files are read with `/bin/cat` as the user and written with
-//! [`System::write_user_file`], so a link the user planted can never make root read or
-//! write anything the user could not.
+//! Per-host, per-user GitHub SSH key and host-key configuration ([`System::write_user_file`]).
 
 use super::{Ctx, Item};
 use crate::model::{Probe, Read, User};
@@ -40,31 +32,24 @@ pub const BLOCK_BEGIN: &str = "# >>> aterm-machines github";
 /// The last line of every block this family writes.
 pub const BLOCK_END: &str = "# <<< aterm-machines github";
 
-/// GitHub's published SSH host keys (`gh api meta --jq .ssh_keys`, 2026-10-16). Each hashes
-/// to the fingerprint GitHub documents in [`GITHUB_FINGERPRINTS`]; a test holds them together.
+/// GitHub's published SSH host keys (`gh api meta --jq .ssh_keys`, 2026-10-16).
 pub const GITHUB_HOST_KEYS: [&str; 3] = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
     "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
 ];
 
-/// The SHA-256 fingerprints GitHub documents for [`GITHUB_HOST_KEYS`], in the same order
-/// (docs.github.com, "GitHub's SSH key fingerprints").
+/// SHA-256 fingerprints documented by GitHub for [`GITHUB_HOST_KEYS`].
 pub const GITHUB_FINGERPRINTS: [&str; 3] = [
     "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
     "SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
     "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
 ];
 
-/// git from the Command Line Tools. `/usr/bin/git` is a shim that, without them, asks the
-/// person at the Mac to install them (VM: `xcode-select: note: No developer tools were found,
-/// requesting install.` and a dialog on the console), so this family runs this one directly,
-/// and only once it exists.
+/// git from the Command Line Tools.
 pub const CLT_GIT: &str = "/Library/Developer/CommandLineTools/usr/bin/git";
 
-/// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
-/// on a host without it (a Mac before the Command Line Tools; any other unix, where
-/// this crate builds but `aterm` never links it), never a spawn error read as a defect.
+/// For a test that runs the real [`CLT_GIT`], as the code it checks does.
 #[cfg(test)]
 pub(crate) fn need_clt_git() {
     if !Path::new(CLT_GIT).is_file() {
@@ -74,7 +59,7 @@ pub(crate) fn need_clt_git() {
     }
 }
 
-/// The item git's settings wait for (design §5's `after` edge).
+/// The item git's settings wait for .
 pub const CLT_ITEM: &str = "developer.command-line-tools";
 
 /// `ssh-keygen`, a real binary on every macOS (not a shim).
@@ -89,7 +74,7 @@ const MKDIR: &str = "/bin/mkdir";
 /// Removes the key, for the revert line.
 const RM: &str = "/bin/rm";
 
-/// The SSH URL git rewrites `https://github.com/` to.
+/// SSH URL prefix substituted for `https://github.com/`.
 const SSH_URL_KEY: &str = "url.git@github.com:.insteadOf";
 
 /// The prefix rewritten.
@@ -118,8 +103,7 @@ pub fn key_title(host: &str, user: &str) -> String {
     format!("aterm-machines:{host}:{user}")
 }
 
-/// An OpenSSH public key line's type and base64 body, when the body decodes to a key blob of
-/// that type. The comment is not part of the key.
+/// Extracts the key type and base64 body of a valid OpenSSH public key line.
 #[must_use]
 pub fn key_material(line: &str) -> Option<(String, String)> {
     let mut words = line.split_whitespace();
@@ -159,8 +143,7 @@ fn ensure_ssh_dir(sys: &dyn System, user: &User) -> Result<(), String> {
     }
 }
 
-/// A file at `path` that is a link, which this family never replaces (a dotfiles link would
-/// be cut); `None` when it is a file or absent.
+/// A file at `path` that is a link.
 fn linked(sys: &dyn System, path: &str) -> Option<String> {
     match sys.stat(Path::new(path)) {
         Ok(s) if s.symlink => Some(format!(
@@ -169,8 +152,6 @@ fn linked(sys: &dyn System, path: &str) -> Option<String> {
         _ => None,
     }
 }
-
-// ── the key ─────────────────────────────────────────────────────────────────────────────
 
 /// `~/.ssh/aterm_github_ed25519`, made by `ssh-keygen` as the user when missing.
 struct KeyItem {
@@ -255,8 +236,6 @@ impl Item for KeyItem {
         match self.state(sys) {
             Ok(KeyState::Whole(_)) => Ok(()),
             Ok(KeyState::Missing) => {
-                // Standard input is closed, so a key that appeared since the probe makes
-                // ssh-keygen's "Overwrite (y/n)?" read end-of-file and refuse (VM: exit 1).
                 let cmd = Cmd::new(SSH_KEYGEN)
                     .args(["-t", "ed25519", "-N", "", "-C"])
                     .arg(key_title(&self.host, &self.user.name))
@@ -306,7 +285,7 @@ impl Item for KeyItem {
         )
     }
 
-    /// The public key line, which the controller registers (design §7).
+    /// The public key line, which the controller registers .
     fn detail(&self, sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         match self.state(sys) {
             Ok(KeyState::Whole(line)) => Some(line),
@@ -314,8 +293,6 @@ impl Item for KeyItem {
         }
     }
 }
-
-// ── marked blocks ───────────────────────────────────────────────────────────────────────
 
 /// Where a block goes in its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,8 +303,7 @@ enum Place {
     Bottom,
 }
 
-/// The block in `text`, and the text without it. `Err` when a begin marker has no end
-/// marker: what follows it may be the person's own, so nothing is removed.
+/// The block in `text`, and the text without it.
 fn split_block(text: &str) -> Result<(Option<String>, String), String> {
     let mut lines = text.split_inclusive('\n');
     let mut rest = String::new();
@@ -363,9 +339,7 @@ fn join_block(rest: &str, block: &str, place: Place) -> String {
     }
 }
 
-/// The `~/.ssh/config` block. It sits first in the file and ends with `Host *`, so the
-/// options that followed it before still apply to every host, as options above any `Host`
-/// line do.
+/// The `~/.ssh/config` block.
 #[must_use]
 pub fn ssh_config_block() -> String {
     format!(
@@ -489,8 +463,6 @@ impl Item for BlockItem {
     }
 }
 
-// ── git ─────────────────────────────────────────────────────────────────────────────────
-
 /// One `git config --global` value.
 struct GitItem {
     user: User,
@@ -511,10 +483,6 @@ impl GitItem {
 
     fn read(&self, sys: &dyn System) -> Read<Vec<String>> {
         let get = if self.add { "--get-all" } else { "--get" };
-        // `git config` exits 1 for a key that is not set, with nothing printed. It also exits
-        // 1 with nothing on standard output when it cannot read the file (CLT 27's git, a
-        // `~/.gitconfig` at mode 000 or a directory there: `warning: unable to access
-        // '…/.gitconfig': Permission denied`), so a warning makes the read unusable.
         match sys.run(&self.git().args([get, self.key])) {
             Ok(ran) if ran.success() => Read::Value(ran.out().lines().map(str::to_owned).collect()),
             Ok(ran) if ran.status == Some(1) && ran.stdout.is_empty() && ran.stderr.is_empty() => {
@@ -600,9 +568,7 @@ impl Item for GitItem {
     }
 }
 
-/// The items `table` asks for, per user in `ctx.users`: the key, its `~/.ssh/config` block
-/// and GitHub's host keys (with `key = true`), then git's name, email and SSH rewrite.
-/// `{user}` fills with the user's short name and `{name}` with this host's inventory name.
+/// The items `table` asks for, per user in `ctx.users`.
 ///
 /// # Errors
 /// One line naming what cannot be expanded.
@@ -724,8 +690,7 @@ mod tests {
         len: 419,
     };
 
-    /// `ssh-keygen -t ed25519 -N '' -C aterm-machines:vm:admin -f …`'s public half, made as
-    /// the VM's admin through the user primitive.
+    /// Public key fixture generated by `ssh-keygen -t ed25519` on the VM.
     const PUB_VM: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJpFPtSPTOuLIj6oqQTj8ndNDVNHFp4renP47+wxFYao aterm-machines:vm:admin\n";
 
     /// `/bin/cat` of a missing file, as the VM's admin: exit 1.
@@ -792,7 +757,6 @@ mod tests {
         );
         item.apply(&sys, &ctx()).unwrap();
         assert!(sys.calls().iter().any(|c| c == keygen), "{:?}", sys.calls());
-        // ssh-keygen made both halves.
         sys.stat_of("/Users//alice/.ssh/aterm_github_ed25519", FILE);
         sys.on(&format!("alice$ /bin/cat {pub_key}"), Ran::ok(PUB_VM));
         assert!(matches!(item.probe(&sys, &ctx()), Probe::Ok { .. }));
@@ -857,7 +821,6 @@ mod tests {
             "the file keeps its mode: {:?}",
             sys.calls()
         );
-        // The read-back finds the block; a second apply would change nothing.
         let sys2 = Fake::root();
         sys2.on(&format!("alice$ /bin/cat {path}"), Ran::ok(&written));
         assert!(matches!(item.probe(&sys2, &ctx()), Probe::Ok { .. }));
@@ -966,7 +929,6 @@ mod tests {
         let sys = Fake::root();
         sys.stat_of(CLT_GIT, FILE);
         let get = format!("alice$ {CLT_GIT} config --global --get user.name");
-        // The probe gets the first answer, the read-back after the apply the second.
         sys.on(&get, Ran::exit(1, ""));
         sys.on(&get, Ran::ok("alice on lab-07\n"));
         let item = by_id("github.git-name@alice");
@@ -1002,7 +964,6 @@ mod tests {
         sys.stat_of(CLT_GIT, FILE);
         sys.on(
             &format!("alice$ {CLT_GIT} config --global --get user.name"),
-            // CLT 27's git on a `~/.gitconfig` holding `[user` (measured in a scratch HOME).
             Ran::exit(
                 128,
                 "fatal: bad config line 1 in file /Users//alice/.gitconfig",
@@ -1012,8 +973,6 @@ mod tests {
             by_id("github.git-name@alice").probe(&sys, &ctx()),
             Probe::Unusable { .. }
         ));
-        // CLT 27's git on a `~/.gitconfig` it cannot open (mode 000, measured in a scratch
-        // HOME): exit 1 and an empty standard output, like an unset key, but a warning.
         let sys = Fake::root();
         sys.stat_of(CLT_GIT, FILE);
         sys.on(
@@ -1098,8 +1057,6 @@ mod tests {
                 (result, sys.written(path).unwrap())
             };
 
-        // Admitted ordinary records still insert the managed block and keep all of
-        // the person's bytes at either insertion position.
         let ordinary = b"# owner sentinel\nHost private\n  User alice\n";
         for (id, path) in paths {
             let (result, written) = apply(id, path, ordinary, ordinary, None);
@@ -1112,9 +1069,6 @@ mod tests {
             );
         }
 
-        // The diagnostic reply is the exact successful tail a capped cat can return.
-        // The separate fixture fact records that this is not a whole-file witness;
-        // the old run lane ignores it and therefore overwrites the missing prefix.
         let tail = "#\n"
             .repeat(aterm_uds::deadline::OUTPUT_KEEP / 2)
             .into_bytes();

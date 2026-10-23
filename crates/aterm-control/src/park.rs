@@ -1,40 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! ONE PARK FOR EVERY BLOCKING CONTROL VERB. `await`, `ready`, a `turn`'s
-//! phases, `wait`, `await inbox`, `post --wait` and a paste's kernel receipt
-//! each wait on their own wake (a session's watchers, a condvar, a sink's
-//! drain) until an instant their own state names. (`await consent` parks on
-//! the consent state's publications for at most `CONSENT_EXIT_POLL` at a
-//! time, the poll that sees its session exit, so each of its parks is already
-//! one slice: aterm-gui's `control_privacy::run_consent_wait`.) Here, below
-//! the window crate beside [`crate::hangup`], so the fabric endpoint's waits
-//! (`aterm-gui-fabric`) and the dispatcher's park the same way.
-//!
-//! None of those wakes hears the client hang up, and a killed client must get
-//! its lane back within [`crate::hangup::HANGUP_POLL`]. So while the thread
-//! serves a socket connection, [`park`] cuts the wait into slices of
-//! [`Lane::slice`]. A slice that ends with no wake asks only whether the caller
-//! hung up ([`Lane::hung_up`]) and whether a flag the verb watches moved, and
-//! parks again for the rest. The verb's own look (a store, terminal, timeline
-//! or inbox read) runs on a wake, at the instant it named, or once to answer a
-//! hang-up, never on a bare slice. Off a serving lane the park is one wait.
+//! Sliced wait loop ([`park`], [`Lane::slice`]) beside [`crate::hangup`] that checks
+//! [`Lane::hung_up`] within [`crate::hangup::HANGUP_POLL`] for blocking control verbs.
 
 use std::sync::{Condvar, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The shortest park. A verb whose own instant has already passed still
-/// yields before it looks again, so a deadline that is named but does not
-/// fire cannot spin the lane.
+/// The shortest park.
 const MIN_PARK: Duration = Duration::from_millis(1);
 
 /// How a park asks after the caller of the connection its thread serves.
 #[derive(Clone, Copy)]
 pub struct Lane {
-    /// The longest one wait runs before the caller is asked after:
-    /// [`crate::hangup::hangup_park`], which is
-    /// [`crate::hangup::HANGUP_POLL`] while the thread serves a socket
-    /// connection and the whole park otherwise.
+    /// The longest one wait runs before the caller is asked ([`crate::hangup::hangup_park`]).
     pub slice: fn(Duration) -> Duration,
     /// Whether the caller hung up ([`crate::hangup::caller_hung_up`]).
     pub hung_up: fn() -> bool,
@@ -47,9 +26,7 @@ impl Lane {
         hung_up: crate::hangup::caller_hung_up,
     };
 
-    /// This lane for a park that finishes whether or not its caller is still
-    /// there. It still slices, so a flag the park watches is read between
-    /// slices, but it never asks after the caller.
+    /// This lane for a park that finishes whether or not its caller is still there.
     #[must_use]
     #[inline]
     pub const fn ignoring_hangup(self) -> Lane {
@@ -68,8 +45,7 @@ const fn never() -> bool {
 /// How a [`park`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Woke {
-    /// The wait was woken (a spurious wake counts), or the watched flag moved
-    /// between slices: look again.
+    /// The wait was woken (a spurious wake counts), or the watched flag moved between slices.
     Rang,
     /// The instant the verb named came.
     Due,
@@ -77,11 +53,7 @@ pub enum Woke {
     HungUp,
 }
 
-/// Park on `wait` until it wakes or `until` comes. `wait(bound)` parks for at
-/// most `bound` and answers `true` on a wake. A slice that ends with no wake
-/// short of `until` asks [`Lane::hung_up`], then `moved` (a flag the verb
-/// reads that rings no wake of its own), and nothing else, before it parks
-/// again for the rest.
+/// Park on `wait` until it wakes or `until` comes ([`Lane::hung_up`]).
 pub fn park(
     mut wait: impl FnMut(Duration) -> bool,
     until: Instant,
@@ -92,9 +64,6 @@ pub fn park(
 }
 
 /// [`park`] on `changed`, the condvar that signals the state `guard` guards.
-/// Each slice hands the condvar the guard and takes it back, so the caller's
-/// look before and after the park runs under the guard as before, and a slice
-/// that ends with no notify takes the lock only to ask after the caller.
 pub fn park_guarded<'a, T>(
     changed: &Condvar,
     guard: MutexGuard<'a, T>,
@@ -110,8 +79,7 @@ pub fn park_guarded<'a, T>(
     park_holding(guard, wait, until, lane, &|| false).0
 }
 
-/// The one slice loop: `held` is what each wait is handed and hands back (a
-/// condvar's guard, or nothing).
+/// The one slice loop.
 fn park_holding<S>(
     mut held: S,
     mut wait: impl FnMut(S, Duration) -> (S, bool),
@@ -207,7 +175,6 @@ mod tests {
         let woke = park(|b| sleep(&mut waits, b), until, lane, &|| true);
         assert_eq!((woke, waits), (Woke::Rang, 1), "a moved flag is a wake");
 
-        // NEGATIVE CONTROL: a wake ends the park before anything is asked.
         ASKS.store(0, Ordering::SeqCst);
         let unread = || -> bool { panic!("a wake reads no flag") };
         let woke = park(|_| true, until, hang_up, &unread);
@@ -249,7 +216,6 @@ mod tests {
                 aterm_spec::wait::until_within(MUST_HAPPEN, "the park to hold the condvar", || {
                     parked.load(Ordering::SeqCst).then_some(())
                 });
-                // The lock is free only once the park waits on the condvar.
                 *shared.0.lock().unwrap() = 7;
                 shared.1.notify_all();
             })

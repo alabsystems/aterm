@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `HarnessAccountKey` (aterm-models-harness `harness_account_key_model`): on
-//! every reachable state of the model, the real `accounts::note_reading` is
-//! handed what the state stands for at the host's read and takes exactly the
-//! step the model's `Read` takes.
-//!
-//! A state stands for: the account the home's profile names (`home`: the
-//! reading's key, A's or B's); the record (`key`, its key; `held`, the
-//! five-hour figure it holds — A's 10% or B's 60%, under one reset — or none;
-//! `gate`, the instant its key changed: none, 20 s before the read, or an hour
-//! before it); and the tap's file (`file`, A's figure or B's, `early`, served
-//! inside the bound after that instant — 10 s before the read, or 30 s after
-//! an hour-old change — else 5 s before the read). What is compared is every
-//! variable the real code decides: `key`, `held` and `gate` (the instant
-//! kept, read at the read's own clock against `KEY_ADOPT_S`).
-//!
-//! NEGATIVE CONTROLS: a record handed no instant of its key change (the gate
-//! blind) takes the old login's figure under the new key somewhere the model
-//! does not; so does a reading stamped by its late write, as the tap stamped a
-//! re-report before it kept the first report's stamp.
+//! Conformance test for `HarnessAccountKey` against `accounts::note_reading`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -182,7 +164,6 @@ fn the_real_record_takes_the_models_step_at_every_read() {
     assert!(states.len() > 10, "a walk worth the name: {}", states.len());
     let wrong = disagreements(&m, &keyed_at, &served_at);
     assert!(wrong.is_empty(), "{:?}", wrong.first());
-    // Each outcome of the read is reached.
     let reads = |pick: &dyn Fn(&S, &S) -> bool| {
         states.iter().any(|s| {
             let mut n = s.clone();
@@ -201,7 +182,6 @@ fn the_real_record_takes_the_models_step_at_every_read() {
         reads(&|s, n| s["gate"] == 2 && n["held"] == 1 && s["held"] == 2),
         "the new account's figure after the bound"
     );
-    // NEGATIVE CONTROLS.
     let blind = |_: &S| -> Option<i64> { None };
     let caught = disagreements(&m, &blind, &served_at);
     assert!(

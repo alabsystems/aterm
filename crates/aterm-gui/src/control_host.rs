@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! aterm-gui's [`SessionHost`]: a borrowed adapter over the `(term, proxy, watchers, …)` handles [`dispatch_session`](super::dispatch_session) has already resolved, so the verb bodies in `aterm-control` drive the real window with no extra ownership, allocation or lifetime.
+//! Its terminal accessors hand the verbs a whole frame ([`term_lock_whole`]); `blocks` and `wait` read the shell's marks as they stand.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +17,7 @@ use aterm_window::event_loop::EventLoopProxy;
 
 use crate::session_store::Store;
 use crate::session_watch::{Subscription, Watchers};
-use crate::{SessionCtx, Wake, term_lock};
+use crate::{SessionCtx, Wake, term_lock, term_lock_whole};
 
 pub(crate) struct GuiHost<'a> {
     /// The one session this host serves.
@@ -153,11 +154,23 @@ impl SessionHost for GuiHost<'_> {
     }
 
     fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
-        self.serves(sid).then(|| f(&term_lock(self.term)))
+        if !self.serves(sid) {
+            return None;
+        }
+        let t = term_lock_whole(self.term);
+        still_wanted(&t).then(|| f(&t))
     }
 
     fn with_terminal_mut<R>(&self, sid: u64, f: impl FnOnce(&mut Terminal) -> R) -> Option<R> {
-        self.serves(sid).then(|| f(&mut term_lock(self.term)))
+        if !self.serves(sid) {
+            return None;
+        }
+        let mut t = term_lock_whole(self.term);
+        still_wanted(&t).then(|| f(&mut t))
+    }
+
+    fn with_terminal_as_it_stands<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
+        self.serves(sid).then(|| f(&term_lock(self.term)))
     }
 
     /// Ended once the registry reads the session `Exited` or its fabric
@@ -207,12 +220,19 @@ impl SessionHost for GuiHost<'_> {
     }
 }
 
+/// Whether a verb acts on the hold [`term_lock_whole`] gave it: never on half a frame its caller hung up waiting for (`copy`, `select`, `mainscreen` act, and nobody reads the reply).
+fn still_wanted(t: &Terminal) -> bool {
+    !(crate::control::caller_hung_up() && crate::frame_unfinished_now(t))
+}
+
 /// Runs `aterm-control`'s verb matrix against this host, not only `MemoryHost`.
 #[cfg(test)]
 mod tests {
     use super::*;
     use aterm_control::conformance;
-    use aterm_control::selection::{cmd_select, cmd_selection};
+    use aterm_control::selection::{
+        cmd_blocks, cmd_blocks_json, cmd_select, cmd_selection, cmd_wait,
+    };
     use aterm_session::{EdgeTable, LaunchNonce, SessionId};
 
     use crate::session_store::{self, SessionHandle};
@@ -353,8 +373,15 @@ mod tests {
             host.with_terminal_mut(1, |t: &mut Terminal| t.text_selection_mut().clear())
                 .is_none()
         );
+        assert!(
+            host.with_terminal_as_it_stands(1, |t: &Terminal| t.rows())
+                .is_none()
+        );
         assert_eq!(cmd_selection(&host, 1), "ERR no such session\n");
         assert_eq!(cmd_select(&host, 1, "clear"), "ERR no such session\n");
+        assert_eq!(cmd_blocks(&host, 1, ""), "ERR no such session\n");
+        assert_eq!(cmd_blocks_json(&host, 1, ""), "ERR no such session\n");
+        assert_eq!(cmd_wait(&host, 1, "0"), "ERR no such session\n");
         assert!(cmd_selection(&host, 0).starts_with("OK "));
     }
 
@@ -364,7 +391,6 @@ mod tests {
     /// a legal directory there).
     #[test]
     fn a_block_cwd_is_the_native_path_the_cwd_verb_prints() {
-        use aterm_control::selection::{cmd_blocks, cmd_blocks_json};
         let blocks_cwd = |osc: &[u8]| {
             let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
             term_lock(&term).process(osc);
@@ -396,7 +422,6 @@ mod tests {
     /// A cmd block's cwd is the directory its command ran in.
     #[test]
     fn a_cmd_block_cwd_is_where_its_command_ran() {
-        use aterm_control::selection::cmd_blocks;
         let cwds = |cwd_after_start: bool| {
             let prompt = |dir: &str| {
                 let start = "\x1b]133;A\x1b\\";

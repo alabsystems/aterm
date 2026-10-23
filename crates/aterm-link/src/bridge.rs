@@ -342,7 +342,7 @@ impl EndpointHold {
         }
     }
 
-    fn fleet(self) -> bool {
+    const fn fleet(self) -> bool {
         matches!(self, Self::Fleet | Self::Both | Self::Unsaid)
     }
 }
@@ -650,7 +650,7 @@ fn sent_past_an_owed_ack(e: &io::Error) -> bool {
     true
 }
 
-fn face_name(source: Source) -> &'static str {
+const fn face_name(source: Source) -> &'static str {
     match source {
         Source::Fleet => "fleet",
         Source::Inbox => "inbox",
@@ -659,7 +659,7 @@ fn face_name(source: Source) -> &'static str {
     }
 }
 
-fn cut_reason(source: Source) -> &'static str {
+const fn cut_reason(source: Source) -> &'static str {
     match source {
         Source::Fleet => "cut-fleet",
         Source::Inbox => "cut-inbox",
@@ -805,15 +805,15 @@ fn commit_refusal_is_an_answer(then: &Then, answer: &io::Result<(u64, bool)>) ->
 }
 
 impl Then {
-    fn commits_through(&self, off: u64) -> bool {
+    const fn commits_through(&self, off: u64) -> bool {
         matches!(self, Then::Commit { upto, .. } if *upto >= off)
     }
 
-    fn is_commit(&self) -> bool {
+    const fn is_commit(&self) -> bool {
         matches!(self, Then::Commit { .. })
     }
 
-    fn waited_when_idle(&self) -> bool {
+    const fn waited_when_idle(&self) -> bool {
         matches!(self, Then::Post(_) | Then::Mirror { .. })
     }
 
@@ -884,14 +884,14 @@ enum Opens {
 }
 
 impl Opens {
-    fn reserve(self, max: u64) -> u64 {
+    const fn reserve(self, max: u64) -> u64 {
         match self {
             Opens::Topic | Opens::Mirror => max / SAY_RESERVE_DIVISOR,
             Opens::Lane => max / LANE_RESERVE_DIVISOR,
         }
     }
 
-    fn kept_for(self) -> &'static str {
+    const fn kept_for(self) -> &'static str {
         match self {
             Opens::Topic => "its sessions' faces and directed lanes",
             Opens::Lane => "its sessions' faces",
@@ -7575,7 +7575,7 @@ pub enum Route {
 impl Route {
     /// Returns the `reason=` refusal token for [`Self::Unroutable`] or [`Self::Ambiguous`].
     #[must_use]
-    pub fn reason(&self) -> &'static str {
+    pub const fn reason(&self) -> &'static str {
         match self {
             Route::Ambiguous => "ambiguous",
             Route::To(_) | Route::Exact(_) | Route::Unroutable => "unroutable",

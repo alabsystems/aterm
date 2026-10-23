@@ -546,6 +546,7 @@ impl CursorGlow {
                 born: now,
                 life: classic_ring_life(0.18, scale),
                 scale,
+                caret: Some((cr, cc)),
             });
         }
     }
@@ -598,8 +599,16 @@ impl CursorGlow {
                     // The beam lands like a cutting torch: a hard ablation shower.
                     ((8.0 + dist * 1.3) as usize).min(30)
                 } else if beam {
-                    // A warp leap stirs a modest wake of stardust along the rod:
-                    ((4.0 + dist * 0.5) as usize).min(14)
+                    // A jump is the steady tube arriving and leaving, and
+                    // nothing else: a leap's dust is the comet's (2026-10-22,
+                    // the owner: the beam must not borrow the comet's Return).
+                    // Fast typing coalesced into one move keeps the typing
+                    // shed below.
+                    if typing {
+                        1 + (self.heat * 4.0) as usize
+                    } else {
+                        0
+                    }
                 } else if comet {
                     // A leap sheds a meteor train along the swept vector,
                     ((5.0 + dist * 0.9) as usize).min(18)
@@ -1432,4 +1441,15 @@ const _: () = assert!(
 const _: () = assert!(
     CursorGlow::LASER_RIPPLE_OMEGA / std::f32::consts::TAU <= TWINKLE_FLASH_BOUND_HZ,
     "the laser ripple flashes over the WCAG 2.3.1 general-flash bound"
+);
+
+/// A fire tongue's height flicker (the dark tongues and the paper flame's)
+/// runs at its rate times the flame phase's speed, both at their most at
+/// full heat (the displayed heat is at most 1); its fastest stays under the
+/// same bound.
+const _: () = assert!(
+    (CursorGlow::TONGUE_FLICKER_RATE + CursorGlow::TONGUE_FLICKER_SPREAD)
+        * (CursorGlow::FLAME_PHASE_SPEED + CursorGlow::FLAME_PHASE_HEAT_SPEED)
+        <= TWINKLE_FLASH_BOUND_HZ,
+    "a fire tongue flickers over the WCAG 2.3.1 general-flash bound"
 );

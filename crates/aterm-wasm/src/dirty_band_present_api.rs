@@ -212,7 +212,7 @@ impl AtermTerminal {
 impl AtermTerminal {
     /// Number of dirty present bands from the last `render()`; `0` means the frame is
     /// unchanged, so skip the RGBA read and `putImageData`.
-    pub fn present_band_count(&self) -> u32 {
+    pub const fn present_band_count(&self) -> u32 {
         (self.present_bands.len() / 4) as u32
     }
 

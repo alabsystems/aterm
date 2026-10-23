@@ -2,23 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Decode the embedded lexicon at build time.
-//!
-//! Reads `data/lexicon.toml` and `data/exceptions.toml` through the same TOML
-//! shapes the run-time decoder uses (`src/raw.rs`) and writes
-//! `$OUT_DIR/builtin_lexicon.rs`: every `[[entry]]` as a `BuiltinEntry` in file
-//! order, and every `[[exception]]` word. A document that does not decode
-//! fails the build, naming the file.
-//!
-//! WHY: the launch's config-runtime worker builds the word lexicon before the
-//! first window can be armed (`config_join`), and decoding the 160 KB TOML was
-//! most of that build. Measured 2026-10-18: in one optimized test thread the
-//! build took 2.1 ms from the TOML and takes 0.35-0.44 ms from these rows; in a
-//! headless launch (probe builds, launcher spun 200 ms first, interleaved, n=12
-//! per arm and kind) the worker's span went 5.1-5.5 -> 0.9-1.2 ms, and it now
-//! ends 0.7-3.8 ms before the UI thread joins it, which waited 1.45 ms for it
-//! on a launch with state on disk. The rows themselves are unchanged:
-//! `Lexicon::build` compiles them as before.
+//! Build script that decodes `data/lexicon.toml` and `data/exceptions.toml` into `$OUT_DIR`.
 
 #[path = "src/raw.rs"]
 #[expect(

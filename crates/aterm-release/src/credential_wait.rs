@@ -2,23 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! A GIT CREDENTIAL HELPER WAITING FOR A PERSON IS ENDED, NOT WAITED ON.
-//!
-//! The release runs unattended, and git under it asks no person itself
-//! ([`ask_no_one`]: no terminal prompt and no askpass program, set by
-//! `release_steps::detach` for a step's child, which also gets a session of its own,
-//! and by `ledger::GitCli`). A credential helper can still wait for a person another
-//! way: `git credential-osxkeychain` asks the login keychain, and a locked
-//! keychain, or an item that asks before it answers this helper, puts up a dialog
-//! and waits on it. Nothing times that out: a `ship check --export` sat three hours
-//! on the engine's `git fetch` until the run's ceiling, and the fetch outlived it.
-//!
-//! A helper that can answer answers in well under a second, so one still running
-//! after [`PERSON_WAIT`] is waiting for someone. A [`Watch`] lists its child's
-//! process tree every few seconds while the child runs and ends such a helper with
-//! everything it started (`SIGTERM`, then `SIGKILL` at the next look for what is
-//! still there): a script helper's own child holds git's pipe as long as it lives.
-//! git then asks its next helper, or fails in its own words, and the release says
-//! what it ended on stderr.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -27,18 +10,12 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::process::{ProcessStart, read_process_start};
 
-/// Make `cmd`'s git ask no person: no prompt on a terminal (`GIT_TERMINAL_PROMPT=0`)
-/// and no askpass program. git runs an askpass before it looks at
-/// `GIT_TERMINAL_PROMPT`, and an editor's terminal exports one (`GIT_ASKPASS`) that
-/// opens an input box and waits there, unseen by a [`Watch`], which ends helpers only.
-/// Set but empty, `GIT_ASKPASS` also stands in for `core.askPass` and `SSH_ASKPASS`,
-/// so git asks none of them and, with no credential, fails in its own words.
+/// Make `cmd`'s git ask no person.
 pub fn ask_no_one(cmd: &mut aterm_uds::spawnfd::Command) -> &mut aterm_uds::spawnfd::Command {
     cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "")
 }
 
-/// How long a git credential helper may run before it is taken for one waiting on
-/// a person: a hang detector, never a budget.
+/// How long a git credential helper may run before it is taken for one waiting on a person.
 pub const PERSON_WAIT: Duration = Duration::from_secs(60);
 
 /// How often a [`Watch`] lists its child's process tree.
@@ -88,15 +65,9 @@ fn below(rows: &[Row<'_>], top: i32) -> BTreeSet<i32> {
     }
 }
 
-/// The git credential helpers running under `root` in a
-/// `ps -A -o pid=,ppid=,args=` listing, each with its name, the topmost of each
-/// chain only (git's `git credential-<name>` stands for the program it runs). A
-/// helper is the process git runs for a configured `<name>`, a
-/// `git-credential-<name>` program, or such a script under its interpreter
-/// (`/bin/sh /path/git-credential-<name> get`). Never the cache helper's daemon
-/// (`git-credential-cache--daemon`), which outlives every request by design, never
-/// a command string (`sh -c …`), and never `git credential fill`, which asks the
-/// helpers.
+/// The git credential helpers running under `root` in a `ps -A -o pid=,ppid=,args=` listing, each
+/// with its name, the topmost of each chain only (git's `git credential-<name>` stands for the
+/// program it runs).
 #[must_use]
 pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
     let rows = rows(listing);
@@ -128,9 +99,8 @@ pub fn helpers(listing: &str, root: i32) -> Vec<(i32, String)> {
         .collect()
 }
 
-/// `top` and every process below it in a `ps -A -o pid=,ppid=,args=` listing,
-/// each with its command line, in listing order. Command text alone does not
-/// distinguish a reused pid; the watch also retains each process's kernel start.
+/// `top` and every process below it in a `ps -A -o pid=,ppid=,args=` listing, each with its command
+/// line, in listing order.
 #[must_use]
 pub fn subtree(listing: &str, top: i32) -> Vec<(i32, String)> {
     let rows = rows(listing);
@@ -145,8 +115,6 @@ pub fn subtree(listing: &str, top: i32) -> Vec<(i32, String)> {
 fn helper_name(args: &str) -> Option<&str> {
     let mut words = args.split_whitespace();
     let mut program = basename(words.next()?);
-    // A script helper runs under its interpreter: its own name is the first
-    // operand. An option holding `c` runs a command string, not a script.
     while interpreter(program) {
         let env = program == "env";
         program = loop {
@@ -238,9 +206,7 @@ impl Seen {
     }
 }
 
-/// The watch on one child's credential helpers, for as long as this value lives:
-/// a thread that lists the child's tree every [`LOOK`] and ends a helper running
-/// [`PERSON_WAIT`] or longer. Dropping it stops the thread at once.
+/// The watch on one child's credential helpers, for as long as this value lives.
 pub struct Watch {
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -281,7 +247,6 @@ impl Watch {
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        // the thread's `recv_timeout` answers `Disconnected` at once
         self.stop = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -291,9 +256,6 @@ impl Drop for Watch {
 
 fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receiver<()>) {
     let mut seen = Seen::default();
-    // A helper's child can leave root's tree when its parent exits. Its original
-    // start record, rather than a matching command line at the same pid, is what
-    // permits escalation after that reparenting.
     let mut ended: Vec<(Identity, String)> = Vec::new();
     while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(look) {
         if !root.current() && ended.is_empty() {
@@ -302,9 +264,6 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
         let Some(listing) = listing() else {
             continue;
         };
-        // Already-TERM'd descendants can still hold git's output pipes after
-        // git itself exits. Their own retained identities authorize cleanup;
-        // root's death stops only discovery of new helpers.
         escalate(&mut ended, &listing, read_process_start, |pid| {
             end(pid, true)
         });
@@ -333,9 +292,6 @@ fn watch(root: Identity, wait: Duration, look: Duration, stopped: &mpsc::Receive
                 }
             }
             let pid = helper.pid;
-            // After the signal: a closed stderr must not keep the helper waiting.
-            // The remedy is a `fix:` line, as a refusal's is: a check that shows a
-            // run's fix lines (`verify export`) shows this one beside its own.
             let _ = writeln!(
                 std::io::stderr(),
                 "aterm-release: ended git's credential helper `{name}` (pid {pid}) and what it \
@@ -436,7 +392,6 @@ mod tests {
             helpers(LISTING, 500),
             named(&[(502, "osxkeychain"), (508, "x"), (510, "netrc"), (511, "y")])
         );
-        // another tree's helper, and a root with no tree, are no one's
         assert_eq!(helpers(LISTING, 600), named(&[(600, "store")]));
         assert!(helpers(LISTING, 999).is_empty());
     }
@@ -479,28 +434,20 @@ mod tests {
         assert!(seen.overdue(one(502), t0, wait).is_empty());
         assert!(seen.overdue(one(502), at(59), wait).is_empty());
         assert_eq!(seen.overdue(one(502), at(60), wait), one(502));
-        // gone, then back under the same pid: its wait starts again
         assert!(seen.overdue(Vec::new(), at(61), wait).is_empty());
         assert!(seen.overdue(one(502), at(62), wait).is_empty());
         assert!(seen.overdue(one(502), at(121), wait).is_empty());
         assert_eq!(seen.overdue(one(502), at(122), wait), one(502));
-        // a pid that now runs another helper is a new helper
         let other = vec![(process(502, 10), "store".to_string())];
         assert!(seen.overdue(other, at(123), wait).is_empty());
-        // Identical pid AND helper name with another start is a fresh wait,
-        // even when no intervening look observed the old helper disappear.
         let reused = vec![(process(502, 20), "store".to_string())];
         assert!(seen.overdue(reused.clone(), at(182), wait).is_empty());
         assert!(seen.overdue(reused.clone(), at(241), wait).is_empty());
         assert_eq!(seen.overdue(reused, at(242), wait).len(), 1);
-        // Escalation uses this same comparison: another `sleep 120` at the
-        // identical pid is no longer the child that received SIGTERM.
         let ended = process(503, 10);
         assert!(ended.matches(Some(process(503, 10).start)));
         assert!(!ended.matches(Some(process(503, 20).start)));
         assert!(!ended.matches(None));
-        // The original root 500 is gone and these children are reparented.
-        // Keep cleaning up the original pipe holder, never its reused pid.
         let mut ended = vec![
             (process(503, 10), "sleep 120".to_string()),
             (process(509, 10), "sleep 120".to_string()),
@@ -570,8 +517,6 @@ mod tests {
             dir.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        // An askpass that would answer, as one inherited from an editor's terminal
-        // does: git under the release must never run it.
         let askpass = dir.path().join("askpass");
         aterm_tempfile::stand_in(&askpass, "#!/bin/sh\n: > asked\necho answer\n")
             .expect("lay the askpass");
@@ -605,7 +550,6 @@ mod tests {
             .write_all(b"protocol=https\nhost=example.invalid\n\n")
             .expect("ask git");
         drop(stdin);
-        // hang detectors: git runs its helper, and the watch ends it
         let bound = Instant::now() + Duration::from_secs(60);
         while !dir.path().join("ran").exists() {
             if Instant::now() > bound {
@@ -637,7 +581,6 @@ mod tests {
             !dir.path().join("asked").exists(),
             "git ran an askpass after its helper was ended"
         );
-        // git's own failure, never a signal: the watch ends the helper, not git
         assert_eq!(
             status.code(),
             Some(128),

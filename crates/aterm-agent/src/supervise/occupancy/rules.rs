@@ -126,6 +126,9 @@ pub struct Guards {
     pub taskless: bool,
     /// The task is done and the person's own exchange holds it.
     pub exchange: bool,
+    /// A manager waits on the session: the fact is the manager's to carry, by a note no slice
+    /// writes yet.
+    pub managed: bool,
     /// The memory wall acts.
     pub memory: bool,
     /// The agent's route to its API is down.
@@ -145,6 +148,7 @@ impl Guards {
             draft: false,
             taskless: false,
             exchange: false,
+            managed: false,
             memory: false,
             reach_down: false,
             mode,
@@ -163,6 +167,7 @@ impl Guards {
             (self.draft, Guard::Draft),
             (self.taskless, Guard::Taskless),
             (self.exchange, Guard::Exchange),
+            (self.managed, Guard::Managed),
             (self.memory, Guard::Memory),
             (self.reach_down, Guard::Reach),
             (!modes(rule).contains(&self.mode), Guard::Autopilot),
@@ -420,22 +425,31 @@ pub struct WouldRow {
     pub held_ms: i64,
 }
 
-/// THE `fact-would@v1` ROWS OF SESSION `sid` in the ledger text `body`, oldest first: what a loop
-/// before this one booked, which [`Books`] seeds from. A row this build cannot read is passed
-/// over.
+/// THE LINES A LOOP BEFORE THIS ONE BOOKED for session `sid` in the ledger text `body`, oldest
+/// first, which [`Books`] seeds from: each `fact-would@v1` row (what `observe` would have typed),
+/// and each `fact-hold@v1` row `typed` that names its rule (what `prompt` typed: the door's
+/// outcome rows). A row this build cannot read is passed over.
 #[must_use]
 pub fn would_rows_in(body: &str, sid: Option<&str>) -> Vec<WouldRow> {
+    let hold = crate::supervise::facts::FactKind::Hold.rule();
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut rows = Vec::new();
     for line in body.lines() {
-        if !line.contains(WOULD_RULE) || want.as_deref().is_some_and(|sid| !line.contains(sid)) {
+        if !(line.contains(WOULD_RULE) || line.contains(hold))
+            || want.as_deref().is_some_and(|sid| !line.contains(sid))
+        {
             continue;
         }
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
             continue;
         };
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-        if text("sid").map(str::to_string) != want || text("rule_id") != Some(WOULD_RULE) {
+        let booked = match text("rule_id") {
+            Some(WOULD_RULE) => true,
+            Some(rule) => rule == hold && text("decision") == Some("typed"),
+            None => false,
+        };
+        if text("sid").map(str::to_string) != want || !booked {
             continue;
         }
         let (Some(row_ms), Some(reason)) = (

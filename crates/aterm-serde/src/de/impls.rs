@@ -637,7 +637,7 @@ struct ArrayVisitor<A> {
 struct ArrayInPlaceVisitor<'a, A: 'a>(&'a mut A);
 
 impl<A> ArrayVisitor<A> {
-    fn new() -> Self {
+    const fn new() -> Self {
         ArrayVisitor {
             marker: PhantomData,
         }

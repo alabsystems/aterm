@@ -136,8 +136,8 @@ pub fn valid_slug(slug: &str) -> bool {
     matches!(slug.split_once('/'), Some((o, r)) if ok(o) && ok(r))
 }
 
-/// Every release in `text`: one JSON document (a release list, one release, or `gh
-/// --slurp`'s list of pages) or `gh --paginate`'s pages written one after another.
+/// Every release in `text`: one JSON document (a release list, one release, or a list of
+/// pages) or pages written one after another.
 ///
 /// # Errors
 /// Text that is not JSON, or a top-level value that is not an array or an object.
@@ -239,7 +239,7 @@ fn asset_size(v: Option<&Value>) -> Option<u64> {
     }
 }
 
-/// One release object (the REST shape or `gh release view --json`'s).
+/// One release object (the REST shape).
 fn release(r: &Value) -> Option<Release> {
     r.as_object()?;
     let assets = r

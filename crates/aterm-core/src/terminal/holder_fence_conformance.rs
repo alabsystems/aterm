@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for `HolderFence` (`aterm_models_core::holder_fence_model`):
-//! the holder fence driven on the real [`Terminal`] over the model's whole
-//! reachable space.
-//!
-//! Every model action is a real step: a cut through
-//! [`Terminal::note_holder_cut`] (or [`Terminal::retire_holder_mark`]) with
-//! the incoming drawer's own lines, the shell's bytes, a width resize, or an
-//! escape sequence the grid's anchor hooks see (IL, an archival region
-//! scroll, a Kitty unscroll, ED 2, ED 3, the alternate-screen modes). Each
-//! writer draws only its own glyphs: drawer `A` its card `aaaa` and lines of
-//! `A` (`cccc`/`C` for every other instance), `B` its `b`/`B` (`d`/`D`), the
-//! shell `x`. So a cell names who wrote it, and the projection reads every
-//! model variable but the ghost `hurt` off the real fence and screen:
-//! whether a row in `A`'s spans holds another writer's glyph, whether its
-//! card row is still there, which rows its seal names, what lies from the
-//! main cursor on. While `A` is current the projection also asks the gate
-//! ([`HolderView::admits_rows`](super::HolderView::admits_rows), the model's
-//! `Admit`) about every row and requires its answer to be the spans'.
-//!
-//! The walk replays a real trace to every reachable state, drives every
-//! enabled step, and requires the model's successor under that very action.
-//! The negative controls switch each [`FenceKnob`] off and require the walk
-//! to be rejected at that knob's own action, and hold the shipped fence to
-//! each `Buggy` member of the model, which it must not match.
+//! Tier-1 conformance tests for `HolderFence` (`aterm_models_core::holder_fence_model`).
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -378,9 +355,7 @@ impl World {
                 self.cut(Some(d.token), CutKind::Exec, false);
                 self.draw_launch(d)?;
             }
-            // The shell's line, the cursor back at its start.
             Step::Rewind => self.write(b"xxxxxxxx\r"),
-            // The shell's line below the cursor, the cursor back above it.
             Step::Climb => self.write(b"\r\nxxxxxxxx\x1b[A\r"),
             Step::Settle => self.settle()?,
             Step::Scribble => {
@@ -400,7 +375,6 @@ impl World {
                 let d = self.a()?;
                 self.draw_line(d)?;
             }
-            // An insert-line on the row above A's open span.
             Step::BandMove => {
                 let start = {
                     let mark = self.mark_a()?;
@@ -419,8 +393,6 @@ impl World {
                 self.write(format!("\x1b[{};1H\x1b[L", row + 1).as_bytes());
                 self.settle()?;
             }
-            // The archival scroll of the region whose last row is the last
-            // row of A's newest span: the blank row comes in at its End.
             Step::Splice => {
                 let end = {
                     let mark = self.mark_a()?;
@@ -444,7 +416,6 @@ impl World {
                 let cols = if self.t.cols() == COLS { NARROW } else { COLS };
                 self.t.resize(ROWS, cols);
             }
-            // A Kitty unscroll, the cursor kept on its content.
             Step::Renumber => self.write(b"\x1b[1+T\x1b[B"),
             Step::Ed3 => self.write(b"\x1b[3J"),
             Step::FullClear => {
@@ -537,8 +508,6 @@ fn ink_from_cursor(g: &Grid) -> i64 {
 }
 
 /// The real state as the model's variables, `hurt` (a ghost) left out.
-/// While `A` is current, the gate's answer for every row the main grid
-/// keeps must be its spans' (the model's `Admit`).
 fn project(w: &World) -> Result<State, String> {
     let t = &w.t;
     let fence = t.holder_fence();
@@ -699,7 +668,6 @@ fn walk(model: &Model) -> Result<Coverage, String> {
                 .map_err(|why| format!("{step:?} after {path:?}: {why}"))?;
             let mut after = project(&w)
                 .map_err(|why| format!("{}: real {step:?} after {path:?}: {why}", model.name))?;
-            // The ghost is the model's own bookkeeping.
             after.insert("hurt", want["hurt"]);
             if &after != want {
                 return Err(format!(

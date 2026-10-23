@@ -36,23 +36,63 @@ pub struct ListenerId {
 /// The [`ListenerId`] of the socket `path` names now, a link followed. Read once a connection
 /// through `path` is up, it names the listener that accepted it, unless one was renamed over
 /// the path in between (which errs toward "the same listener"). `None` when nothing is there,
-/// it is not a socket, or the platform names no socket file (all but Unix).
+/// it is not a socket, it cannot be read, or the platform names no socket file (all but Unix).
 #[must_use]
 pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(ListenerId {
-        file: socket_file(&meta)?,
-        born: meta.created().ok(),
-    })
+    listener_read(path).ok().flatten()
+}
+
+/// [`listener_at`] with a failed read told from an absent socket: `Ok(None)` only when the
+/// read proves no socket is there (nothing at the path, a component that is no directory, or
+/// a file that is no socket), and `Err` when it failed otherwise (`EIO`, `ESTALE`, `EACCES`),
+/// which proves nothing either way.
+///
+/// # Errors
+/// The read's own, when it is not the path's absence.
+pub fn listener_read(path: impl AsRef<Path>) -> std::io::Result<Option<ListenerId>> {
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(socket_file(&meta).map(|file| ListenerId {
+            file,
+            born: meta.created().ok(),
+        })),
+        Err(e) if matches!(e.kind(), NotFound | NotADirectory) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether `path` still names the listener `then` was read from, read now (after whatever
 /// answered there answered). `true` when either reading is missing: the pid alone decides.
 #[must_use]
 pub fn still_names(path: impl AsRef<Path>, then: Option<ListenerId>) -> bool {
-    match (then, listener_at(path)) {
-        (Some(then), Some(now)) => then == now,
-        _ => true,
+    then.is_none_or(|then| names_now(path, then) != Named::Another)
+}
+
+/// What a path names now against a listener read there earlier ([`names_now`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// That listener still.
+    Same,
+    /// No socket: the file was unlinked, or something that is no socket is there.
+    Nothing,
+    /// Another socket file: a later bind at the path, or one renamed over it.
+    Another,
+    /// No answer: the read failed otherwise than by the path's absence ([`listener_read`]).
+    Unread,
+}
+
+/// What `path` names now against `bound`, the listener a server read there right after its
+/// own bind: for a server that ends itself once it can no longer be reached where it listens
+/// (`aterm link broker`). Strict where [`still_names`] is lenient: a read that proves nothing
+/// there is [`Named::Nothing`], never the same listener, and one that fails otherwise is
+/// [`Named::Unread`], never nothing.
+#[must_use]
+pub fn names_now(path: impl AsRef<Path>, bound: ListenerId) -> Named {
+    match listener_read(path) {
+        Ok(Some(now)) if now == bound => Named::Same,
+        Ok(Some(_)) => Named::Another,
+        Ok(None) => Named::Nothing,
+        Err(_) => Named::Unread,
     }
 }
 
@@ -123,6 +163,75 @@ mod tests {
         assert!(
             !still_names(&sock, Some(then)),
             "another bind, another listener"
+        );
+    }
+
+    /// A server's own path read strictly ([`names_now`]): its listener, then nothing once the
+    /// file is unlinked or a plain file stands there, then another once a second bind takes
+    /// the path. NEGATIVE CONTROL: the lenient reading, [`still_names`], calls the unlinked
+    /// path the same listener, so a server judging itself by it would serve on unreachable.
+    #[test]
+    fn a_server_reads_its_path_gone_or_taken() {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("uds-l.")
+            .tempdir()
+            .expect("scratch");
+        let dir = scratch.path();
+        let sock = dir.join("s.sock");
+        let first = crate::CtlListener::bind(&sock).expect("bind");
+        let bound = listener_at(&sock).expect("a socket");
+        assert_eq!(names_now(&sock, bound), Named::Same);
+
+        // The old file kept by a second name, as above: no rebind may reissue its inode.
+        std::fs::hard_link(&sock, dir.join("held")).expect("held");
+        std::fs::remove_file(&sock).expect("unlink");
+        assert_eq!(names_now(&sock, bound), Named::Nothing, "unlinked");
+        assert!(
+            still_names(&sock, Some(bound)),
+            "the lenient reading calls it the same"
+        );
+        std::fs::write(&sock, "").expect("a plain file in its place");
+        assert_eq!(names_now(&sock, bound), Named::Nothing, "no socket");
+
+        std::fs::remove_file(&sock).expect("unlink the plain file");
+        let _second = crate::CtlListener::bind(&sock).expect("rebind");
+        assert_eq!(names_now(&sock, bound), Named::Another, "another bind");
+        drop(first);
+    }
+
+    /// A read that fails otherwise than by the path's absence proves nothing: a socket whose
+    /// directory has lost its search bit reads [`Named::Unread`], never gone, and its own
+    /// listener again once the bit is back. NEGATIVE CONTROL: an absent path beside it reads
+    /// [`Named::Nothing`], so a server that took the denied read for one would end while its
+    /// socket file stood there.
+    #[test]
+    fn a_read_that_fails_is_no_answer() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("uds-l.")
+            .tempdir()
+            .expect("scratch");
+        let dir = scratch.path().join("d");
+        std::fs::create_dir(&dir).expect("dir");
+        let sock = dir.join("s.sock");
+        let _server = crate::CtlListener::bind(&sock).expect("bind");
+        let bound = listener_at(&sock).expect("a socket");
+        let mode = |bits| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bits)).expect("chmod");
+        };
+        mode(0o000);
+        let denied = listener_read(&sock);
+        let named = names_now(&sock, bound);
+        mode(0o700);
+        assert!(
+            denied.is_err(),
+            "a denied search fails the read: {denied:?}"
+        );
+        assert_eq!(named, Named::Unread, "a denied read");
+        assert_eq!(names_now(&sock, bound), Named::Same, "the search bit back");
+        assert_eq!(
+            names_now(scratch.path().join("absent"), bound),
+            Named::Nothing
         );
     }
 

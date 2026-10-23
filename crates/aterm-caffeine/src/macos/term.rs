@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SIGTERM: a person's quits the mug, the system's ends it as before.
-//!
-//! Activity Monitor's Quit sends the mug SIGTERM, not a quit Apple event, and so does `kill`.
-//! Left to its default action the signal ends the mug, and launchd's KeepAlive starts it again
-//! with the mode on: the mug a person quit came back. launchd sends SIGTERM too, from pid 1: a
-//! bootout (`aterm caffeine quit`, a job removed) and the end of a logout's or a shutdown's
-//! session, which keep the mode for the next login in this boot. A macOS 27.0 VM showed the two
-//! apart (2026-10-22): a probe's `si_pid` read Activity Monitor's pid for its Quit and 1 for a
-//! bootout.
-//!
-//! So while the mug runs, [`watch`] takes SIGTERM with a handler that reads its sender: the
-//! system's ([`sent_by_the_system`]) gets the default action at once, from the handler; any
-//! other sender's pid goes through a pipe to a thread of the watch's own, which hands it to the
-//! mug (Quit Caffeine's quit, on the main thread). The handler does only what a signal handler
-//! may: atomic loads and stores, `write`, `signal` and `raise`.
+//! SIGTERM handling: routes user signals to `quit` while letting system signals exit.
 
 use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, IntoRawFd as _};
@@ -25,7 +11,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 /// watches. Never closed once made, so a handler running at any moment writes into this pipe
 /// and never into a descriptor that later took its number.
 static WAKE: AtomicI32 = AtomicI32::new(-1);
-
 /// The pid of the latest person's SIGTERM, which the watch's thread hands on.
 static SENDER: AtomicI32 = AtomicI32::new(0);
 
@@ -47,11 +32,7 @@ impl Drop for Watching {
     }
 }
 
-/// Take SIGTERM until the returned [`Watching`] drops: a person's hands its sender's pid to
-/// `quit` on a thread of the watch's own; the system's ends the process as before. A `quit`
-/// that panics ends it as the default action would. `None`, with SIGTERM left as it was, when
-/// SIGTERM does not have its default action (a parent ignored it) or the pipe or the thread
-/// cannot be made.
+/// Installs the SIGTERM handler until the returned [`Watching`] is dropped.
 pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
     // SAFETY: all-zero is valid storage for the action; a null new action only reads.
     let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -61,7 +42,6 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
         return None;
     }
     let (mut reader, writer) = io::pipe().ok()?;
-    // The handler must never block on a full pipe, which holds a wake already.
     // SAFETY: `fcntl` reads and sets the status flags of the pipe's live write end.
     let nonblocking = unsafe {
         let flags = libc::fcntl(writer.as_raw_fd(), libc::F_GETFL);
@@ -76,7 +56,6 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
             let mut wakes = [0_u8; 64];
             loop {
                 match reader.read(&mut wakes) {
-                    // Every write end is gone: the watch was never made.
                     Ok(0) => return,
                     Ok(_) => {
                         let sender = SENDER.load(Ordering::Acquire);
@@ -93,10 +72,8 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
     WAKE.store(writer.as_raw_fd(), Ordering::Release);
     if !install() {
         WAKE.store(-1, Ordering::Release);
-        // Dropping the write end ends the thread.
         return None;
     }
-    // Kept open for good (`WAKE`).
     let _ = writer.into_raw_fd();
     Some(Watching { _private: () })
 }
@@ -153,8 +130,7 @@ fn set_default() {
     unsafe { libc::sigaction(libc::SIGTERM, &raw const default, std::ptr::null_mut()) };
 }
 
-/// End this process as SIGTERM's default action does: at once, or, from the handler, as soon
-/// as it returns (the signal is blocked until then).
+/// Terminates the process using SIGTERM's default action.
 pub(super) fn end_by_sigterm() {
     end_by(libc::SIGTERM);
 }
@@ -184,13 +160,10 @@ mod tests {
 
     /// The variable naming the one test a child of this test binary runs.
     const CHILD: &str = "ATERM_TEST_CAFFEINE_SIGTERM";
-
     /// The hang detector of every wait here.
     const HANG: Duration = Duration::from_secs(60);
-
     /// What the child prints just before it signals itself as launchd would.
     const ENDING: &str = "ending by the system's SIGTERM";
-
     /// The hand-over's pids, for the test waiting on them (`quit` is a plain `fn`).
     static HEARD: OnceLock<mpsc::Sender<libc::pid_t>> = OnceLock::new();
 
@@ -249,7 +222,6 @@ mod tests {
             "{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // A filter naming no test exits 0 too, having run nothing.
         assert!(
             stdout
                 .lines()

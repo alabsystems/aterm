@@ -1,24 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deterministic replay of a task's code over recorded inputs, and the first point where
-//! two runs differ.
-//!
-//! # The law
-//!
-//! [`replay`] folds `code.step` over the inputs from a start state, in order, and stops at
-//! the first [`StepRefusal`]: a refused input left the state untouched, and nothing after it
-//! runs. Because a step is a pure function of `(state, input)` and the effects it is handed
-//! back, the same code, start state, inputs and effect recording give the same [`Run`] —
-//! state, state digest, observations and observation chain — every time.
-//!
-//! The observation chain commits to every observation and where it happened:
-//! `chain₀ = Digest::of(b"aterm-aos-obs-v1\0", [])` and
-//! `chain' = Digest::of(b"aterm-aos-obs-v1\0", [chain, cursor (u64 LE), encoded observation])`.
-//!
-//! A replay never draws anything: it returns values. Whether its effects match the
-//! recording is the port's business ([`crate::effects::ShadowPort`]); a replay run under a
-//! shadow submits nothing live.
+//! Deterministic [`replay`] of task steps into a [`Run`] stopping at the first
+//! [`StepRefusal`] ([`crate::effects::ShadowPort`]).
 
 use core::fmt;
 
@@ -87,12 +71,7 @@ pub fn chain_link(chain: &Digest, cursor: u64, encoded_observation: &[u8]) -> Di
 /// The law name of a replay stopped because its cursors left the `u64` range.
 pub const CURSOR_EXHAUSTED: &str = "aos.cursor-exhausted";
 
-/// Runs `code` from `start` over `inputs` (whose first cursor is `first_cursor`), stopping at
-/// the first StepRefusal. `observation_chain` folds each encoded observation:
-/// chain' = Digest::of(b"aterm-aos-obs-v1\0", [chain, cursor, encoded observation]).
-///
-/// An input whose cursor would leave the `u64` range is not run: the replay stops there with
-/// a refusal under [`CURSOR_EXHAUSTED`].
+/// Runs `code` from `start` over `inputs` from `first_cursor` ([`CURSOR_EXHAUSTED`]).
 pub fn replay<S: Schema, C: Code<S>>(
     schema: &S,
     code: &C,
@@ -120,8 +99,6 @@ pub fn replay<S: Schema, C: Code<S>>(
         };
         match code.step(schema, &mut state, input, port) {
             Ok(obs) => {
-                // One encoder for the whole replay: each observation is a new encoding in
-                // the room the largest one before it took.
                 e.clear();
                 schema.encode_observation(&obs, &mut e);
                 chain = chain_link(&chain, at, e.as_bytes());
@@ -197,8 +174,7 @@ impl fmt::Display for Divergence {
 
 impl std::error::Error for Divergence {}
 
-/// The first point where `a` and `b` differ, in run order: an observation, then a refusal,
-/// then the observation count, then the end state. `None` when the runs are the same.
+/// The first point where `a` and `b` differ, in run order.
 #[must_use]
 pub fn first_divergence<S: Schema>(a: &Run<S>, b: &Run<S>) -> Option<Divergence> {
     for ((ca, oa), (cb, ob)) in a.observations.iter().zip(&b.observations) {

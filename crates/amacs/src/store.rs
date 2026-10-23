@@ -153,7 +153,7 @@ pub struct DocumentStore {
 }
 
 impl DocumentStore {
-    pub fn new(write: WriteCap) -> Self {
+    pub const fn new(write: WriteCap) -> Self {
         Self {
             next_id: 1,
             documents: BTreeMap::new(),

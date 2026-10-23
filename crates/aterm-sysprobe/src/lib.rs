@@ -135,7 +135,7 @@ pub struct QuietErrors {
 }
 
 /// Turn this thread's critical-error and open-file system boxes off until the answer drops: `SetThreadErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX)`, every other bit of the thread's mode kept and the old mode restored on drop — thread-scoped, never the process-wide `SetErrorMode`.
-pub fn quiet_errors() -> QuietErrors {
+pub const fn quiet_errors() -> QuietErrors {
     QuietErrors {
         #[cfg(windows)]
         _quiet: win_paths::quiet(),
@@ -146,7 +146,7 @@ pub fn quiet_errors() -> QuietErrors {
 /// The 8.3 short spelling of the existing `path` as the file system generated it (Windows' `GetShortPathNameW`: `C:\Users\ANDREW~1\x`), for a test that must start a process in, or report, a short-spelled path (`volumes::Table::long_spelling`'s callers' tests).
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+pub const fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
         win_paths::short_path(path)
@@ -161,7 +161,7 @@ pub fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
 /// Are this thread's critical-error and open-file system boxes both off now (`GetThreadErrorMode` holds both [`quiet_errors`] bits)? The seam a test reads inside a thread that must hold the guard.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn errors_quiet() -> bool {
+pub const fn errors_quiet() -> bool {
     #[cfg(windows)]
     {
         win_paths::errors_quiet()

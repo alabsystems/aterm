@@ -190,7 +190,7 @@ pub enum Unread {
 impl Unread {
     /// The wire word (`why=` of a reply).
     #[must_use]
-    pub fn word(&self) -> &'static str {
+    pub const fn word(&self) -> &'static str {
         match self {
             Unread::Remote => "remote",
             Unread::Automounted => "automounted",
@@ -364,7 +364,7 @@ pub(crate) fn long_spelling_in<'p>(
 
 /// Resolve 8.3 short names in an existing path via `GetLongPathNameW` on Windows (`None` elsewhere).
 #[must_use]
-pub fn long_name(path: &Path) -> Option<PathBuf> {
+pub const fn long_name(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         crate::win_paths::long_path(path).ok()

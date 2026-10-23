@@ -659,13 +659,13 @@ impl FailedMark {
 
     /// Whether this memo is the never-lapsing crash-loop quarantine rather than a timed backoff.
     #[must_use]
-    pub fn is_quarantine(&self) -> bool {
+    pub const fn is_quarantine(&self) -> bool {
         self.quarantined
     }
 
     /// Seconds until this memo stops suppressing, or 0 if it already.
     #[must_use]
-    pub fn retry_in_secs(&self, now: u64) -> u64 {
+    pub const fn retry_in_secs(&self, now: u64) -> u64 {
         self.retry_after.saturating_sub(now)
     }
 

@@ -1,39 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Every query aterm-font answers, over arbitrary bytes as a font file.
-//!
-//! ## Running
-//!
-//! STOCK EXCEPTION (Trust ships no cargo-fuzz and no libFuzzer runtime).
-//! On a stock nightly with cargo-fuzz, seeded with the faces the reader
-//! corpus records:
-//!
-//! ```bash
-//! cd crates/aterm-font
-//! mkdir -p fuzz/corpus/face
-//! cp ../aterm-render/tests/fixtures/*.ttf ../aterm-render/tests/fixtures/*.otf \
-//!    ../aterm-render/assets/game/Cinzel-var.ttf fuzz/corpus/face/
-//! cargo +nightly fuzz run face -- -max_total_time=600 -timeout=10
-//! ```
-//!
-//! ## Property
-//!
-//! A malformed font returns errors and `None`s: `Face::parse`, every
-//! variation (NaN and infinities included), cmap lookup and enumeration,
-//! names, OS/2 and the `MVAR`-varied line metrics, legacy kerning,
-//! advances, side bearings, origins, phantom points, `GSUB`/`GPOS` lookups
-//! and their subtables, `GDEF` classes, bitmap images, every glyph's outline
-//! into both sinks and every COLR glyph's paint graph never panic, and never
-//! run away (cmap enumeration stops at U+10FFFF and after one call per code
-//! point; charstring recursion and `glyf` composites are depth-limited; an
-//! extension subtable never wraps another; a COLR walk stops at its depth
-//! limit and after 2^16 paint tables). The shaper (`aterm_font::shape`, TF.6)
-//! shapes a ligature run, an Arabic word, marks and an emoji sequence on the
-//! same face, with and without features, under the same property, and
-//! parses every `GSUB` lookup of the face, before any applies, within
-//! aterm's own budget of 8 units per byte of the table (one unit per
-//! subtable and coverage entry parsed), however their offsets alias.
+//! Fuzz target exercising `aterm-font` queries over arbitrary font bytes.
+//! STOCK EXCEPTION: Trust ships no `cargo-fuzz` or libFuzzer runtime.
 
 #![no_main]
 
@@ -98,7 +67,6 @@ fuzz_target!(|data: &[u8]| {
         let Ok(mut face) = Face::parse(data, index) else {
             continue;
         };
-        // An instance from the input's own last bytes, so the fuzzer steers it.
         let axes: Vec<_> = face.variation_axes().into_iter().map(|a| a.tag).collect();
         for (i, tag) in axes.into_iter().enumerate() {
             let at = data.len().wrapping_sub(4 * (i + 1));
@@ -115,12 +83,6 @@ fuzz_target!(|data: &[u8]| {
                 let _ = sub.glyph_variation_index(0x41, 0xFE0F);
             }
         }
-        // Every (lookup, subtable) pair, up to 2^16 of them: lookup and
-        // subtable offsets may alias, so the pairs a table names grow as the
-        // square of its size, and an unbounded walk spends the run's time on
-        // re-reading one subtable (slow units of 2.3-2.4 s, 2026-10-19). The
-        // library's own walks are bounded by its `GSUB` budget
-        // (`work::LayoutWork`).
         let mut visits = 0u32;
         'walk: for table in [face.tables().gsub, face.tables().gpos]
             .into_iter()

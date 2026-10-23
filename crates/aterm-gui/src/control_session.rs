@@ -16,8 +16,7 @@ use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::{ExitActor, SessionHandle, SessionState, Store};
 use crate::session_timeline::{
-    AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, apply_meta_value, questions_usage,
-    write_session_meta,
+    AUTOPILOT_USAGE, MetaEdit, MetaField, MetaWriteError, questions_usage, write_session_meta,
 };
 use crate::turn_ledger::TurnBy;
 use crate::{SessionCtx, term_lock};
@@ -1405,6 +1404,8 @@ struct TypingHold {
     epoch: u64,
     person: u64,
     frame: Option<Frame>,
+    /// The `if-rows=` fence the first look deferred to this hold, judged on the first whole frame.
+    unvouched: Option<aterm_types::control_verbs::RowsFence>,
 }
 
 struct Frame {
@@ -1454,16 +1455,18 @@ impl TypingHold {
         terminal: &Terminal,
         ctx: &SessionCtx,
         rows: Option<aterm_types::control_verbs::RowsFence>,
+        unvouched: Option<aterm_types::control_verbs::RowsFence>,
     ) -> Self {
         Self {
             epoch: crate::control::screen_gen(terminal).epoch,
             person: ctx.human_input.seq(),
             frame: rows.and_then(|fence| Frame::of(terminal, fence)),
+            unvouched,
         }
     }
 
     fn look(
-        &self,
+        &mut self,
         terminal: &Terminal,
         ctx: &SessionCtx,
         sent_from: Option<aterm_core::grid::Cursor>,
@@ -1480,7 +1483,11 @@ impl TypingHold {
         };
         if terminal.sync_frame_unfinished() {
             Look::Wait
-        } else if !frame.holds(terminal, usize::from(cursor.row)) {
+        } else if self.unvouched.take().is_some_and(|fence| {
+            crate::frame_memo::ScreenText::of(terminal).rows_hash(fence.first, fence.last)
+                != Some(fence.hash)
+        }) || !frame.holds(terminal, usize::from(cursor.row))
+        {
             Look::Stop("changed")
         } else if (sent_from.is_some() && keys_unread(ctx)) || sent_from == Some(cursor) {
             // not yet moved the caret off where it went out from.
@@ -1491,7 +1498,7 @@ impl TypingHold {
     }
 
     fn held(
-        &self,
+        &mut self,
         term: &Arc<Mutex<Terminal>>,
         ctx: &SessionCtx,
         sub: &crate::session_watch::Subscription,
@@ -1524,7 +1531,6 @@ thread_local! {
 
 /// A test's hand at this thread's typing-hold waits: it plays the program there and answers the instant the wait is judged at (`None`: the clock).
 #[cfg(test)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn set_hold_wait_for_test(hand: Option<Box<dyn Fn() -> std::time::Instant>>) {
     HOLD_WAIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
 }
@@ -1899,6 +1905,7 @@ fn guarded_submit(
             ctx,
             enter,
             &fence,
+            crate::ReadOn::Committed,
             mark.map(|m| m.completion()),
         ) {
             GuardedInput::Pressed(Delivery::Full) => {
@@ -2116,6 +2123,7 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 }
 
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints).
+/// `if-rows=` never vouches for half a frame: a typed turn on an input frame judges it on the whole frame its [`TypingHold`] waits for, any other waits up to a control read's bound ([`crate::term_lock_whole_when`]). The composer look and the settled screen are read whole, which a hang-up does not cut short ([`crate::park::Lane::ignoring_hangup`]), ` frame=open` closing the verdict when the settled screen is not.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -2266,6 +2274,8 @@ pub(crate) fn cmd_turn(
     };
     let wait = |id, until| park(id, until, OnHangup::Abort);
     let wait_committed = |id, until| park(id, until, OnHangup::Finish);
+    // The reads a turn books after its commit: a hang-up must not cut them to half a frame.
+    let finishing = crate::park::Lane::SERVED.ignoring_hangup();
     let arm = |spec: WatcherSpec| -> Option<aterm_core::terminal::WatchId> {
         term_lock(term).watch(spec, Instant::now())
     };
@@ -2288,11 +2298,25 @@ pub(crate) fn cmd_turn(
     let mut hold: Option<TypingHold> = None;
     if if_gen.is_some() || if_rows.is_some() {
         let mut look = ctx.frame.look_frame();
-        let terminal = term_lock(term);
+        let typing = typed && !text.is_empty();
+        // Asked only of a frame unfinished within the read's bound: a typed turn that finds its
+        // input frame there lets its hold wait the frame out and judge the fence on the whole one,
+        // within the turn's deadline ([`TypingHold`]); no other fence vouches for an open frame.
+        let held_open = std::cell::Cell::new(false);
+        let waits = |t: &Terminal| {
+            held_open.set(typing && if_rows.and_then(|fence| Frame::of(t, fence)).is_some());
+            if_rows.is_some() && !held_open.get()
+        };
+        let terminal = crate::term_lock_whole_when(term, crate::park::Lane::SERVED, waits);
+        let unvouched = if_rows.filter(|_| held_open.get());
+        let held = typing.then(|| TypingHold::of(&terminal, ctx, if_rows, unvouched));
         let moved = if_gen
             .is_some_and(|generation| crate::control::screen_gen(&terminal) != generation)
             || if_rows.is_some_and(|fence| {
-                look.text(&terminal).rows_hash(fence.first, fence.last) != Some(fence.hash)
+                unvouched.is_none()
+                    && (crate::frame_unfinished_now(&terminal)
+                        || look.text(&terminal).rows_hash(fence.first, fence.last)
+                            != Some(fence.hash))
             });
         if moved {
             let seq = terminal.content_seq();
@@ -2300,7 +2324,7 @@ pub(crate) fn cmd_turn(
                 "OK 0 turn skipped reason=changed submitted=0 seq={seq} id={turn_id}\n"
             );
         }
-        hold = typed.then(|| TypingHold::of(&terminal, ctx, if_rows));
+        hold = held;
     }
 
     let halted = |landed: Option<(usize, usize)>| -> Option<String> {
@@ -2343,7 +2367,7 @@ pub(crate) fn cmd_turn(
                 if exited(store) {
                     return "ERR exited\n".to_string();
                 }
-                if let Some(h) = &hold {
+                if let Some(h) = &mut hold {
                     let digit = is_digit_key(&ev);
                     match h.held(
                         term,
@@ -2375,7 +2399,7 @@ pub(crate) fn cmd_turn(
             }
             if !remainder.is_empty() {
                 if let Some(Err(why)) = hold
-                    .as_ref()
+                    .as_mut()
                     .map(|h| h.held(term, ctx, &sub, None, cadence, deadline))
                 {
                     return typed_cut(term, why, typed_keys, 0, turn_id);
@@ -2412,7 +2436,7 @@ pub(crate) fn cmd_turn(
             Parked::Done(_) | Parked::Deadline | Parked::HungUp => {}
         }
         if let Some(Err(why)) = hold
-            .as_ref()
+            .as_mut()
             .map(|h| h.held(term, ctx, &sub, None, cadence, deadline))
         {
             return typed_cut(term, why, typed_keys, pasted_graphemes, turn_id);
@@ -2437,7 +2461,7 @@ pub(crate) fn cmd_turn(
         });
         let composer_key = if auto_mode && !submit_verify_block && read_as_claude(ctx) {
             let look = || {
-                let t = term_lock(term);
+                let t = crate::term_lock_whole_when(term, finishing, |_| true);
                 (composer_verify_key(&t, text), t.content_seq())
             };
             let wait = |after| {
@@ -2653,9 +2677,13 @@ pub(crate) fn cmd_turn(
     }
 
     let mut look = ctx.frame.look_frame();
-    let (seq, screen) = {
-        let t = term_lock(term);
-        (t.content_seq(), look.text(&t))
+    let (seq, screen, frame_open) = {
+        let t = crate::term_lock_whole_when(term, finishing, |_| true);
+        (
+            t.content_seq(),
+            look.text(&t),
+            crate::frame_unfinished_now(&t),
+        )
     };
     drop(look);
     let rows = screen.row_count();
@@ -2706,6 +2734,7 @@ pub(crate) fn cmd_turn(
         use std::fmt::Write as _;
         let _ = write!(verdict, " agent_rev={rev}");
     }
+    verdict.push_str(aterm_control::wire::frame_open_tail(frame_open));
     super::control_query::frame_rows_reply(screen.whole(), rows, &verdict, trim, 0)
 }
 
@@ -2949,29 +2978,10 @@ pub(crate) fn cmd_meta_by(
                     return (attention_set_usage(), false);
                 }
             }
-            match write_session_meta(ctx, typed, MetaEdit::Set(value), by) {
-                Ok(changed) => ("OK\n".to_string(), changed),
-                Err(MetaWriteError::NotAQuestionsPolicy) => {
-                    (format!("ERR {}\n", questions_usage()), false)
-                }
-                Err(MetaWriteError::Empty) if typed == MetaField::Questions => {
-                    (format!("ERR {}\n", questions_usage()), false)
-                }
-                Err(MetaWriteError::NotAnAutopilot) => (format!("ERR {AUTOPILOT_USAGE}\n"), false),
-                Err(MetaWriteError::Empty) if typed == MetaField::Autopilot => {
-                    (format!("ERR {AUTOPILOT_USAGE}\n"), false)
-                }
-                Err(MetaWriteError::Empty) => (meta_set_usage(), false),
-                Err(MetaWriteError::ForbiddenFormatting) => (
-                    format!(
-                        "ERR {field} must be single-line and contain no control, bidi, or invisible formatting characters\n"
-                    ),
-                    false,
-                ),
-                Err(MetaWriteError::TooLong { cap }) => {
-                    (format!("ERR {field} too long (max {cap} bytes)\n"), false)
-                }
-            }
+            meta_write_reply(
+                typed,
+                write_session_meta(ctx, typed, MetaEdit::Set(value), by),
+            )
         }
         Some("unset") => {
             let Some(field) = toks.next() else {
@@ -3002,11 +3012,37 @@ pub(crate) fn cmd_meta_by(
                     Err(refusal) => (refusal, false),
                 };
             }
-            let changed = apply_meta_value(ctx, field, None, by);
-            ("OK\n".to_string(), changed)
+            meta_write_reply(field, write_session_meta(ctx, field, MetaEdit::Clear, by))
         }
         Some(_) => (
             "ERR usage: meta [set <field> <text...> | unset <field>]\n".to_string(),
+            false,
+        ),
+    }
+}
+
+fn meta_write_reply(field: MetaField, result: Result<bool, MetaWriteError>) -> (String, bool) {
+    match result {
+        Ok(changed) => ("OK\n".to_string(), changed),
+        Err(MetaWriteError::HungUp) => (super::HUNG_UP_REPLY.to_string(), false),
+        Err(MetaWriteError::NotAQuestionsPolicy) => (format!("ERR {}\n", questions_usage()), false),
+        Err(MetaWriteError::Empty) if field == MetaField::Questions => {
+            (format!("ERR {}\n", questions_usage()), false)
+        }
+        Err(MetaWriteError::NotAnAutopilot) => (format!("ERR {AUTOPILOT_USAGE}\n"), false),
+        Err(MetaWriteError::Empty) if field == MetaField::Autopilot => {
+            (format!("ERR {AUTOPILOT_USAGE}\n"), false)
+        }
+        Err(MetaWriteError::Empty) => (meta_set_usage(), false),
+        Err(MetaWriteError::ForbiddenFormatting) => (
+            format!(
+                "ERR {} must be single-line and contain no control, bidi, or invisible formatting characters\n",
+                field.wire_name()
+            ),
+            false,
+        ),
+        Err(MetaWriteError::TooLong { cap }) => (
+            format!("ERR {} too long (max {cap} bytes)\n", field.wire_name()),
             false,
         ),
     }
@@ -3120,6 +3156,9 @@ fn attention_owned_reply(
     use crate::session_timeline::AttentionWriteError;
     match result {
         Ok(changed) => ("OK\n".to_string(), changed),
+        Err(AttentionWriteError::Meta(MetaWriteError::HungUp)) => {
+            (super::HUNG_UP_REPLY.to_string(), false)
+        }
         Err(AttentionWriteError::Meta(
             MetaWriteError::Empty
             | MetaWriteError::NotAQuestionsPolicy
@@ -3797,6 +3836,7 @@ impl Drop for DriftSlot {
 }
 
 /// `cast drift [max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` -> the counterfactual replay audit of this session's asciicast against its live screen (`aterm_control::cast_drift`, which owns the method and the wire): `OK <n> verdict=<clean|desync|unfaithful|unknown|empty> fidelity=… culprit=… … cut=<quiescent|racy> folds=<f> fold_events=<e> ms=<ms>` then `n` `run`/`row`/`cursor` lines, parse by key.
+/// The live screen is read whole ([`crate::term_lock_whole`]); a frame still unfinished at the read's bound leaves the cut racy.
 pub(crate) fn cmd_cast_drift(
     term: &Arc<Mutex<Terminal>>,
     frame: &crate::frame_memo::FrameSlot,
@@ -3832,14 +3872,15 @@ fn cast_drift_with(
     let (live, snapshot, quiescent) = loop {
         attempt += 1;
         let mut look = frame.look_frame();
-        let (text, cursor, alt, cut) = {
-            let t = term_lock(term);
+        let (text, cursor, alt, cut, whole) = {
+            let t = crate::term_lock_whole(term);
             let c = t.cursor();
             (
                 look.text(&t),
                 (c.row, c.col),
                 t.is_alternate_screen(),
                 crate::cast::CastCut::take(&t, &watermark),
+                !crate::frame_unfinished_now(&t),
             )
         };
         drop(look);
@@ -3849,7 +3890,8 @@ fn cast_drift_with(
             alt: Some(alt),
         };
         between();
-        let (snapshot, quiescent) = crate::cast::CastRecorder::snapshot_at(cast, &cut, catch_up);
+        let (snapshot, caught_up) = crate::cast::CastRecorder::snapshot_at(cast, &cut, catch_up);
+        let quiescent = caught_up && whole;
         if quiescent || attempt >= CAST_DRIFT_CUT_ATTEMPTS {
             break (live, snapshot, quiescent);
         }
@@ -4362,6 +4404,7 @@ pub(crate) fn typed_by(caller: &TurnBy, under: Option<&crate::Lease>) -> TurnBy 
 }
 
 /// Record a text the window harness types with `send` and submits with `key enter` into the ledger ([`crate::turn_ledger::STATUS_PRESSED`]): wherever the host fences `send`, the turn-end loop's continuation, done check and answers go out so (`aterm-agent`'s `Session::type_fenced`), never as a `turn`, and they are the harness's turns all the same.
+/// The Enter's `hash=` is read, only when it books a typed turn, on a whole frame no hang-up cuts short, as `turn`'s settled screen is.
 #[allow(
     clippy::too_many_arguments,
     reason = "the dispatch's resolved request and its reply, as every arm takes them"
@@ -4401,29 +4444,30 @@ pub(crate) fn ledger_typed_input(
             });
         }
         Some(conn) if verb == "key" && rest.trim() == "enter" => {
+            let Some(typed) = turns().take_typed().filter(|typed| typed.conn == conn) else {
+                return;
+            };
             let mut look = ctx.frame.look_frame();
             let (seq, screen_hash) = {
-                let t = term_lock(term);
+                let booked = crate::park::Lane::SERVED.ignoring_hangup();
+                let t = crate::term_lock_whole_when(term, booked, |_| true);
                 (t.content_seq(), look.text(&t).fnv())
             };
             drop(look);
-            let mut turns = turns();
-            if let Some(typed) = turns.take_typed().filter(|typed| typed.conn == conn) {
-                let record = crate::turn_ledger::TurnRecord {
-                    id: mint_turn_id(),
-                    started_ms: typed.started_ms,
-                    dur_ms: crate::turn_ledger::now_ms().saturating_sub(typed.started_ms),
-                    submitted: true,
-                    status: crate::turn_ledger::STATUS_PRESSED,
-                    text: typed.text,
-                    screen_hash,
-                    seq,
-                    arch: typed.arch,
-                    by: TurnBy::Harness,
-                    carried: false,
-                };
-                turns.record(record, mint_turn_id);
-            }
+            let record = crate::turn_ledger::TurnRecord {
+                id: mint_turn_id(),
+                started_ms: typed.started_ms,
+                dur_ms: crate::turn_ledger::now_ms().saturating_sub(typed.started_ms),
+                submitted: true,
+                status: crate::turn_ledger::STATUS_PRESSED,
+                text: typed.text,
+                screen_hash,
+                seq,
+                arch: typed.arch,
+                by: TurnBy::Harness,
+                carried: false,
+            };
+            turns().record(record, mint_turn_id);
         }
         _ => {
             turns().take_typed();
@@ -6223,6 +6267,33 @@ mod tests {
     }
 
     #[test]
+    fn cast_drift_calls_no_cut_quiescent_on_a_frame_still_unfinished() {
+        use std::time::Duration;
+        let (term, cast) = quiet_flapped_session();
+        let drift = || {
+            let reply = cmd_cast_drift(
+                &term,
+                &crate::frame_memo::FrameSlot::default(),
+                &cast,
+                aterm_core::grid::ResizePolicy::Native,
+                "",
+            );
+            reply.lines().next().expect("a header").to_string()
+        };
+        crate::cast::rig::burst(
+            &term,
+            &cast,
+            Duration::from_secs(2),
+            b"\x1b[?2026h\x1b[1;1Hhalf",
+        );
+        let head = drift();
+        assert!(head.contains(" cut=racy "), "{head}");
+        crate::cast::rig::burst(&term, &cast, Duration::from_secs(3), b"\x1b[?2026l");
+        let head = drift();
+        assert!(head.contains(" cut=quiescent "), "{head}");
+    }
+
+    #[test]
     fn cast_cut_is_consistent_without_sleeping() {
         use crate::cast::cut_probe;
         let (term, cast) = quiet_flapped_session();
@@ -6893,9 +6964,7 @@ mod update_anchor_tests {
                 &handle.term,
                 &crate::frame_memo::FrameSlot::default(),
                 super::super::control_query::TextArgs::default(),
-                None,
-                None,
-                0,
+                || (None, None, 0),
                 None,
                 None,
             )
@@ -6942,9 +7011,7 @@ mod update_anchor_tests {
                 &handle.term,
                 &crate::frame_memo::FrameSlot::default(),
                 super::super::control_query::TextArgs::default(),
-                None,
-                None,
-                0,
+                || (None, None, 0),
                 None,
                 None,
             )

@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TIER-1 FOR `AutopilotTimer` (`aterm_models_gui::autopilot_timer_model`;
-//! `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.3.8): the REAL index
-//! (`AutopilotTimers`), the window's writer, the wire (`meta set|unset
-//! autopilot … [until=]`), the App's wake (`on_meta_changed`, dropped before a
-//! successor's Commit by the real `admit_wake_before_commit`), the fire
-//! (`expire_autopilot_timers` → `session_timeline::fire_land_at`), the moved
-//! wall, the restore leaf's graft, the Commit's rebuild and a session's
-//! close, driven step by step on pinned clocks — every observed transition
-//! validated against the model's action of the same name (the interpreter,
-//! and `ty` where it is installed), and every invariant checked after it.
-//!
-//! NEGATIVE CONTROLS, each of which the same model must refuse: a fire that
-//! trusts its index (it loses to an in-flight Off), a same-word write that
-//! keeps the timer, a fire on the monotonic deadline alone after the clock
-//! was set back, and a Commit that skips the rebuild.
+//! Conformance tests for `AutopilotTimer` against `aterm_models_gui::autopilot_timer_model`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -334,7 +320,6 @@ impl TimerDrive {
         }
         let old_host = std::mem::replace(&mut self.host, host);
         old_host.shutdown_and_join();
-        // The session the leaf names: a pane of its own, closable alone.
         self.session = app.split_active_stub_tab(crate::WindowId(0));
         self.app = app;
         self.wake = false;
@@ -442,7 +427,6 @@ fn the_real_timer_conforms_to_its_model() {
     let mut d = TimerDrive::new();
     assert_eq!(d.state(), d.model.init_state(), "the model's start");
 
-    // The window arms; the time comes; Land.
     d.set_cruise_until();
     d.tick();
     d.tick();
@@ -451,7 +435,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // The wire arms; its wake; the fire.
     d.wire_store_until();
     d.apply_wake();
     d.tick();
@@ -461,8 +444,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // The race: armed; an Off stored over the wire, its wake held; the fire
-    // reads the store and writes nothing; the wake then lands.
     d.set_cruise_until();
     d.wire_hand("WireOff", "set autopilot off");
     d.tick();
@@ -473,13 +454,11 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // The same word cancels.
     d.set_cruise_until();
     d.wire_hand("WireCruise", "set autopilot cruise");
     d.apply_wake();
     assert_eq!((d.state()["land_at"], d.state()["idx"]), (0, 0));
 
-    // The clock set back under a due entry: no Land; the remainder indexed.
     d.set_cruise_until();
     d.tick();
     d.tick();
@@ -492,7 +471,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // Asleep through the time: the wall re-read, then the fire.
     d.set_cruise_until();
     d.sleep();
     d.sleep();
@@ -502,8 +480,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // A cold restore across the instant: carried, indexed due at once,
-    // landed.
     d.wire_store_until();
     d.apply_wake();
     d.close_and_restore();
@@ -515,8 +491,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // A seamless update: armed; the successor grafts and indexes; the time
-    // comes before its Commit and nothing fires; the Commit lands it.
     d.set_cruise_until();
     d.handoff_start();
     d.graft();
@@ -536,9 +510,6 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // Another update: a driver's Off on the successor before the graft wins
-    // for both halves; an arm over the wire before the Commit is indexed by
-    // its rebuild.
     d.set_cruise_until();
     d.handoff_start();
     d.wire_hand("WireOff", "set autopilot off");
@@ -565,20 +536,17 @@ fn the_real_timer_conforms_to_its_model() {
     d.clock_back();
     d.clock_back();
 
-    // Closed with a timer armed: its entry goes; nothing is due after.
     d.set_cruise_until();
     d.close_session();
     assert_eq!(d.app.autopilot_timer_deadline(), None);
     d.tick();
     d.tick();
 
-    // NEGATIVE CONTROLS on a fresh drive.
     let mut d = TimerDrive::new();
     d.set_cruise_until();
     d.wire_hand("WireOff", "set autopilot off");
     d.tick();
     d.tick();
-    // 1. A fire that trusts its index: Land written over the stored Off.
     let before = d.state();
     let ctx = d.ctx().unwrap();
     crate::session_timeline::apply_autopilot(
@@ -593,14 +561,12 @@ fn the_real_timer_conforms_to_its_model() {
     after.insert("fires", 1);
     after.insert("over_hand", 1);
     d.refuses(&before, &after, "Fire", "a fire that trusts its index");
-    // 2. A same-word write that keeps the timer.
     let mut d = TimerDrive::new();
     d.set_cruise_until();
     let before = d.state();
     {
         let ctx = d.ctx().unwrap();
         let mut meta = ctx.meta.lock().unwrap();
-        // The defect: the word compared alone, the timer kept.
         meta.autopilot = Some("cruise".into());
     }
     let mut after = d.state();
@@ -611,7 +577,6 @@ fn the_real_timer_conforms_to_its_model() {
         "WireCruise",
         "a same-word write that keeps the timer",
     );
-    // 3. A fire on the monotonic deadline alone, after the clock went back.
     d.tick();
     d.tick();
     d.clock_back();
@@ -635,7 +600,6 @@ fn the_real_timer_conforms_to_its_model() {
         "Fire",
         "a fire on the monotonic deadline alone",
     );
-    // 4. A Commit that skips the rebuild.
     let mut d = TimerDrive::new();
     d.set_cruise_until();
     d.handoff_start();

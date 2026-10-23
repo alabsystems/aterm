@@ -5,18 +5,7 @@
 // (see the repository NOTICE).
 
 //! A request for attention sets an unfocused X11 window's urgency hint (`WM_HINTS`' 0x100), the
-//! window's focus clears it, and a request while it has focus leaves it clear. mutter announces
-//! only the hint's change from unset to set ("“…” is ready"), and an X11 window manager never
-//! clears it, so upstream's hint, set and never cleared, made a window's first bell its last
-//! banner (the desk audit, GNOME 46 on Xorg, 2026-10-22). The negative controls: the clear taken
-//! out of `UnownedWindow::focused`, and the hint reads set after the focus; the focus check taken
-//! out of `request_user_attention`, and it reads set after the focused request.
-//!
-//! The focus is the one the event loop reports (`xinput2_focused` calls `focused` after it marks
-//! the window focused), stood in for here by those two steps, with no window manager to move it.
-//!
-//! It runs where `$DISPLAY` names an X server (the Linux lane's Xvfb); elsewhere it says SKIP and
-//! returns.
+//! window's focus clears it, and a request while it has focus leaves it clear.
 
 use aterm_x11::proto::xproto;
 use aterm_x11::Connection;

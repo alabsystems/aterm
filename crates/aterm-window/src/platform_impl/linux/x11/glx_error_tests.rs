@@ -4,21 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! An X error that a GLX request raises belongs to the GL renderer, which reads its failures
-//! from GLX's own answers. The error handler keeps such an error out of
-//! `XConnection::latest_error`. Otherwise the next window call's `check_errors` would take it for
-//! its own: on a server whose GLX makes no OpenGL ES 3.0 context, aterm-gpu's refused context
-//! would make the next window fail to open. The GLX request here is `glXMakeContextCurrent` with a
-//! drawable and no context, which GLX refuses with `BadMatch` under its own major opcode. An
-//! ordinary request's error (`GetAtomName` of `None`) is still the connection's. That read
-//! cannot change a resource belonging to another X client.
-//!
-//! The negative control: take the GLX check out of `x_error_callback`, and the sync after the GLX
-//! request returns GLX's `BadMatch`. Both errors land in the one connection the process's X11
-//! backend shares, which every other window test in this binary checks for errors, so the work
-//! runs in a child process: this test binary run again on this one test, with [`CHILD`] set.
-//!
-//! It runs where `$DISPLAY` names an X server; elsewhere it says SKIP and returns.
+//! X11 tests that GLX request errors stay out of `XConnection::latest_error` ([`CHILD`]).
 
 use std::ffi::{c_int, c_ulong, c_void};
 use std::time::{Duration, Instant};
@@ -64,7 +50,6 @@ fn a_glx_requests_error_is_not_the_next_window_calls() {
     let output = match output {
         Ok(output) => output,
         Err(error) => {
-            // A failed bounded reap does not prove the child is gone. Keep its cwd.
             let kept = scratch.keep();
             panic!("the child did not finish: {error:?}; scratch retained at {}", kept.display());
         },
@@ -80,8 +65,7 @@ fn a_glx_requests_error_is_not_the_next_window_calls() {
     assert!(stdout.contains(DONE), "the child never got through; {said}");
 }
 
-/// The child's work: the X11 backend's connection, a GLX request GLX refuses, a sync (the one a
-/// new window's creation ends with), then an ordinary request's error and a sync.
+/// The child's work.
 fn raise_a_glx_error_and_an_ordinary_one() {
     let event_loop = EventLoop::<()>::new_x11_any_thread().expect("an X11 loop on $DISPLAY");
     let PlatformActiveEventLoop::X(target) = &event_loop.window_target().p else {
@@ -91,32 +75,31 @@ fn raise_a_glx_error_and_an_ordinary_one() {
     if xconn.glx_major.is_none() {
         aterm_uds::host::could_not_run("$DISPLAY's X server has no GLX");
     }
-    // SAFETY: a NUL-terminated name.
+    // SAFETY: A NUL-terminated name.
     let lib = unsafe { libc::dlopen(c"libGLX.so.0".as_ptr(), libc::RTLD_LAZY) };
     if lib.is_null() {
         aterm_uds::host::could_not_run("no libGLX.so.0 (glvnd's GLX)");
     }
-    // SAFETY: a live handle and a NUL-terminated name.
+    // SAFETY: A live handle and a NUL-terminated name.
     let sym = unsafe { libc::dlsym(lib, c"glXMakeContextCurrent".as_ptr()) };
     assert!(!sym.is_null(), "libGLX.so.0 has glXMakeContextCurrent");
     type MakeContextCurrent =
         unsafe extern "C" fn(*mut ffi::Display, c_ulong, c_ulong, *mut c_void) -> c_int;
-    // SAFETY: glXMakeContextCurrent's GLX 1.3 signature.
+    // SAFETY: GlXMakeContextCurrent's GLX 1.3 signature.
     let make_current = unsafe { std::mem::transmute::<*mut c_void, MakeContextCurrent>(sym) };
-    // SAFETY: the backend's live display; its root window as both drawables.
+    // SAFETY: The backend's live display; its root window as both drawables.
     let root = unsafe { (xconn.xlib.XDefaultRootWindow)(xconn.display) };
-    // SAFETY: as above; a drawable with no context, which GLX refuses with `BadMatch`.
+    // SAFETY: As above; a drawable with no context, which GLX refuses with `BadMatch`.
     let made = unsafe { make_current(xconn.display, root, root, std::ptr::null_mut()) };
     assert_eq!(made, 0, "GLX refuses a drawable with no context");
     xconn.sync_with_server().expect("the GLX request's error is not the connection's");
 
     let mut atom: ffi::Atom = 0;
     let mut name = std::ptr::null_mut();
-    // SAFETY: the backend's live display and one-element input/output arrays. Atom None is
-    // never a defined atom; asking for its name raises BadAtom without changing any resource.
+    // SAFETY: The backend's live display and one-element input/output arrays.
     unsafe { (xconn.xlib.XGetAtomNames)(xconn.display, &mut atom, 1, &mut name) };
     if !name.is_null() {
-        // SAFETY: a name returned by XGetAtomNames is an Xlib allocation released by XFree.
+        // SAFETY: A name returned by XGetAtomNames is an Xlib allocation released by XFree.
         unsafe { (xconn.xlib.XFree)(name.cast()) };
     }
     let ordinary = xconn.sync_with_server().expect_err("an ordinary request's error is kept");

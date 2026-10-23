@@ -1,39 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SDK-DECLARATION PROBE behind `aterm_objc::cf` (`tests/cf_sdk.rs`),
-//! `aterm-cg` (`crates/aterm-cg/tests/cg_sdk.rs`) and `aterm-sysprobe`'s IOKit
-//! calls (`crates/aterm-sysprobe/tests/iokit_sdk.rs`): one instrument over each
-//! crate's own source, mounted by `#[path]` in each, so the grammar, the probe
-//! and the verdicts live here once.
-//!
-//! The subject is the named files' source: every `pub type`, `#[repr(C)]`
-//! struct, `pub const`, and `static` and `fn` in an `extern` block becomes
-//! `_Static_assert`s in one probe that clang compiles against the SDK for
-//! `arm64` and `x86_64`. Nothing is listed by hand, and
-//! [`the_parser_saw_every_declaration`] fails if a declaration is spelled in a
-//! way the parser skips.
-//!
-//! * **A prototype** is `__builtin_types_compatible_p` against the SDK
-//!   function's own type, with the Rust spelling translated mechanically:
-//!   `isize` -> `long`, `c_char` -> `char`, `*const T` -> `T const *`, an
-//!   opaque `__CFString` -> `struct __CFString`, a module alias -> the SDK
-//!   typedef of the same name.
-//!   C compatibility is exact where a call can go wrong: integer width and
-//!   signedness, pointer versus value, a struct's tag, `const` on a callback's
-//!   pointee (`void (*)(void *)` is not `void (*)(const void *)`).
-//! * **An alias** is the same check against its typedef, which is what makes
-//!   translating a Rust alias to the C name of the same spelling sound.
-//!   `#[cfg(target_arch)]` arms are checked under the matching `#if`.
-//! * **A struct** is mirrored field for field in C from its Rust field types —
-//!   C's layout of that list is `#[repr(C)]`'s by definition — and the mirror
-//!   must match the SDK struct in size, alignment, and each field's offset and
-//!   type. That covers `x86_64` without building Rust for it.
-//! * **A constant** must equal the SDK's, with a compatible type.
-//!
-//! The geometry types (`CGRect`, `CGPoint`) are `aterm_objc`'s own, held to the
-//! runtime's encodings by `abi.rs`; here they only have to be named alike.
-//! [`a_wrong_prototype_fails_the_probe_on_both_arches`] is the negative control.
+//! Shared clang SDK declaration probe ([`the_parser_saw_every_declaration`]).
+//! Verified against negative controls ([`a_wrong_prototype_fails_the_probe_on_both_arches`]).
 
 #![cfg(target_os = "macos")]
 
@@ -41,8 +10,7 @@ use std::path::Path;
 
 use crate::sdk_consts;
 
-/// The geometry types the subjects use but do not declare: spelled as
-/// the SDK typedef of the same name.
+/// The geometry types the subjects use but do not declare.
 const CRATE_GEOMETRY: [&str; 2] = ["CGRect", "CGPoint"];
 
 /// What one file declares, in source order.
@@ -66,16 +34,13 @@ struct Decls {
 fn subject(file: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file);
     let src = std::fs::read_to_string(&path).expect("the module is readable");
-    // `//`, `///` and `//!` comments out, newlines kept. Neither file has `//`
-    // inside a string; one that did would fail loudly as an unknown type.
     src.lines()
         .map(|l| l.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Split at `sep` where no `()`, `[]`, `{}` or `<>` is open. The `>` of `->`
-/// closes nothing.
+/// Split at `sep` where no `()`, `[]`, `{}` or `<>` is open.
 fn split_top(s: &str, sep: char) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0_i32;
@@ -102,8 +67,7 @@ fn split_top(s: &str, sep: char) -> Vec<String> {
         .collect()
 }
 
-/// The top-level items of a file: each ends at a `;` or at the `}` that closes
-/// its outermost brace, and keeps the attributes written before it.
+/// The top-level items of a file.
 fn items(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0_i32;
@@ -162,8 +126,7 @@ fn body(item: &str) -> &str {
     &item[open + 1..close]
 }
 
-/// `name: Type` -> `Type`; an unnamed `Type` is returned as is. A path's `::`
-/// is not a name separator.
+/// Strips an optional `name:` prefix from a parameter type.
 fn param_type(p: &str) -> String {
     let p = p.trim();
     match p.find(':') {
@@ -174,8 +137,7 @@ fn param_type(p: &str) -> String {
     }
 }
 
-/// `fn NAME(params) -> ret` (also an `extern "C" fn(params) -> ret` type):
-/// `(params, ret)`, `ret` being `()` when absent.
+/// `fn NAME(params) -> ret` (also an `extern "C" fn(params) -> ret` type).
 fn signature(s: &str) -> (Vec<String>, String) {
     let open = s.find('(').expect("a parameter list");
     let mut depth = 0;
@@ -220,7 +182,6 @@ fn parse(file: &str) -> Decls {
                 .push((name.trim().to_owned(), rhs.trim().to_owned(), gate));
         } else if let Some(r) = rest
             .strip_prefix("pub const ")
-            // A `pub const fn` is Rust of the crate's own, not a declaration.
             .filter(|r| !r.starts_with("fn "))
         {
             let (name, r) = r.split_once(':').expect("a typed const");
@@ -300,7 +261,6 @@ fn c_type(rust: &str, d: &Decls) -> String {
         return format!("{} *", typeof_(c_type(inner, d)));
     }
     if let Some(inner) = t.strip_prefix("Option<").and_then(|i| i.strip_suffix('>')) {
-        // Only a function pointer may be optional here: NULL is its `None`.
         assert!(
             inner.contains("fn("),
             "Option<{inner}> is not a nullable function pointer"
@@ -366,8 +326,7 @@ fn c_fn_type(params: &[String], ret: &str, d: &Decls) -> String {
     format!("__typeof__({}) ({})", c_type(ret, d), c_params(params, d))
 }
 
-/// The probe. `invert` names one function whose return type is replaced with
-/// `i8`, for the negative control.
+/// The probe.
 fn probe(d: &Decls, invert: Option<&str>) -> String {
     let mut s = String::from(
         "#include <CoreFoundation/CoreFoundation.h>\n\
@@ -459,9 +418,7 @@ pub struct Floor {
     pub opaque: usize,
 }
 
-/// Each `pub type`, `pub const`, `pub static` and C-named (`fn` + capital)
-/// function in `files` is a row, so none is skipped by a spelling the item
-/// grammar does not know; and the probe read at least `floor`.
+/// Asserts that the parser extracted every declaration in `files` and met `floor`.
 pub fn the_parser_saw_every_declaration(files: &[&str], floor: &Floor) {
     let d = subjects(files);
     let count = |needle: &str| -> usize {
@@ -503,8 +460,7 @@ pub fn the_parser_saw_every_declaration(files: &[&str], floor: &Floor) {
     );
 }
 
-/// Every declaration in `files` agrees with the SDK, on `arm64` and on
-/// `x86_64`.
+/// Every declaration in `files` agrees with the SDK, on `arm64` and on `x86_64`.
 pub fn every_declaration_matches_the_sdk_on_both_arches(files: &[&str]) {
     let d = subjects(files);
     let body = probe(&d, None);
@@ -517,8 +473,7 @@ pub fn every_declaration_matches_the_sdk_on_both_arches(files: &[&str]) {
     }
 }
 
-/// Negative control: the same probe with `row`'s return type wrong (`i8`)
-/// must fail on both arches, or a green run proves nothing.
+/// Negative control.
 pub fn a_wrong_prototype_fails_the_probe_on_both_arches(files: &[&str], row: &str) {
     let d = subjects(files);
     assert!(

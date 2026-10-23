@@ -2889,6 +2889,92 @@ fn a_resume_line_an_earlier_process_left_open_ends_after_the_settle() {
     assert_eq!(app.messages.digest().len(), 1, "still told of");
 }
 
+/// A LIMIT'S LINE NAMES THE AGENT ITS TABS RUN, OR NONE (X4 of the walls-3
+/// stage): a limit held unread past its reset (`Exception::unread_limit`) on
+/// a screen no reader names is titled `Limit still holds in tab 2`, tabs
+/// running different agents likewise, and a spend or bucket line `… limit
+/// reached`; one agent's tabs are named where the glass's six words hold the
+/// name and the place (`Codex`), the name dropped before the place where
+/// they do not (`Gemini CLI`, `Antigravity CLI`). Measured before: every one
+/// of them said `Claude`. NEGATIVE CONTROLS: Claude Code's tabs keep
+/// `Claude`, and `/goal`'s line, Claude Code's alone, keeps its words on
+/// any agent.
+#[test]
+fn a_limits_line_names_the_agent_its_tabs_run() {
+    let spot = |n: u16| mr::UpgradeSpot {
+        place: format!("in tab {n}"),
+        nav: None,
+    };
+    let title = |facts: &[(&str, u16, ExceptionKind, Program)]| {
+        let facts: Vec<_> = facts
+            .iter()
+            .map(|&(sid, n, kind, agent)| {
+                let exception = match kind {
+                    ExceptionKind::Futile => Exception::unread_limit(),
+                    _ => resume_exception(kind),
+                };
+                (sid.to_string(), exception, agent, spot(n))
+            })
+            .collect();
+        let entries = mr::resume_exceptions(&facts);
+        assert_eq!(entries.len(), 1);
+        entries[0].message().expect("passes the door").title
+    };
+    let futile = ExceptionKind::Futile;
+    assert_eq!(
+        title(&[("s-2", 2, futile, Program::Generic)]),
+        "Limit still holds in tab 2"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, futile, Program::Codex)]),
+        "Limit still holds Codex in tab 2"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, futile, Program::Gemini)]),
+        "Limit still holds in tab 2",
+        "`… Gemini CLI in tab 2` is seven words"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, ExceptionKind::Spend, Program::Codex)]),
+        "Account limit stops Codex in tab 2"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, ExceptionKind::Spend, Program::Generic)]),
+        "Account limit reached in tab 2"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, ExceptionKind::Bucket, Program::Agy)]),
+        "Model limit reached in tab 2"
+    );
+    assert_eq!(
+        title(&[
+            ("s-1", 1, futile, Program::Claude),
+            ("s-3", 3, futile, Program::Muse),
+        ]),
+        "Limit still holds in 2 tabs"
+    );
+    // CONTROLS: Claude Code's tabs say Claude; `/goal` is Claude Code's.
+    assert_eq!(
+        title(&[("s-2", 2, futile, Program::Claude)]),
+        "Limit still holds Claude in tab 2"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, ExceptionKind::Spend, Program::Claude)]),
+        "Account limit stops Claude in tab 2"
+    );
+    assert_eq!(
+        title(&[
+            ("s-1", 1, futile, Program::Claude),
+            ("s-3", 3, futile, Program::Claude),
+        ]),
+        "Limit still holds Claude in 2 tabs"
+    );
+    assert_eq!(
+        title(&[("s-2", 2, ExceptionKind::GoalCleared, Program::Generic)]),
+        "Claude lost its goal in tab 2"
+    );
+}
+
 /// The pure half: the same kind in two tabs is one entry whose title counts the tabs and whose
 /// detail names them, one tab keeps its own place and its `Show tab` button, and a lost login
 /// (`Now`) is no entry at all.

@@ -26,19 +26,19 @@ enum Kind {
 impl Stdio {
     /// A new pipe: the child holds one end, [`Child`] the other.
     #[must_use]
-    pub fn piped() -> Self {
+    pub const fn piped() -> Self {
         Self(Kind::Piped)
     }
 
     /// This process's own descriptor at that number.
     #[must_use]
-    pub fn inherit() -> Self {
+    pub const fn inherit() -> Self {
         Self(Kind::Inherit)
     }
 
     /// `/dev/null`.
     #[must_use]
-    pub fn null() -> Self {
+    pub const fn null() -> Self {
         Self(Kind::Null)
     }
 }
@@ -279,13 +279,13 @@ impl Command {
     }
 
     /// Start the child in process group `pgroup` (`0`: a new group of its own, led by the child) — `std::os::unix::process::CommandExt`'s.
-    pub fn process_group(&mut self, pgroup: i32) -> &mut Self {
+    pub const fn process_group(&mut self, pgroup: i32) -> &mut Self {
         self.pgroup = Some(pgroup);
         self
     }
 
     /// Start the child in a new session of its own (`setsid`), with no controlling terminal.
-    pub fn setsid(&mut self, setsid: bool) -> &mut Self {
+    pub const fn setsid(&mut self, setsid: bool) -> &mut Self {
         self.setsid = setsid;
         self
     }
@@ -297,7 +297,7 @@ impl Command {
     }
 
     /// Start the child STOPPED AT ITS EXEC (`true`): `spawn` returns once the kernel has exec'd the program — its image mapped and its code signature checked — and not one instruction of the program, nor of the dynamic loader before it, runs until [`Child::resume`].
-    pub fn start_suspended(&mut self, suspended: bool) -> &mut Self {
+    pub const fn start_suspended(&mut self, suspended: bool) -> &mut Self {
         self.suspended = suspended;
         self
     }

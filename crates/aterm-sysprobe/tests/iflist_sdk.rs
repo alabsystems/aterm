@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The interface list's Darwin layouts (`src/iflist.rs`) held to the SDK
-//! headers on both arches: every row of `iflist::SDK_ROWS` (a constant, a
-//! struct's size or alignment, a field's offset) becomes one
-//! `_Static_assert` that clang compiles against `net/if.h`, `net/if_var.h`,
-//! `net/if_dl.h`, `net/route.h`, `sys/sockio.h` and `sys/sysctl.h` for
-//! `arm64` and `x86_64`, through aterm-objc's shared probe
-//! (`crates/aterm-objc/tests/support/sdk_consts.rs`, mounted here). The
-//! decoder reads the kernel's messages at exactly these offsets, so a
-//! header that moved a field fails here, not in a wrong byte count.
-//!
-//! `a_wrong_offset_fails_the_probe_on_both_arches` is the negative control:
-//! the same probe with one row off by one must fail, or a green run proves
-//! nothing.
+//! SDK header layout checks for `iflist::SDK_ROWS`.
 
 #![cfg(target_os = "macos")]
 

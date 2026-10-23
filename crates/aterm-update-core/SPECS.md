@@ -7,6 +7,11 @@
 > deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
 > were taken before.
 
+> Status 2026-10-22 (init-system S15): `github_pages` moved here from aterm-machines, and the
+> publishers' REST lane `github_rest` is new; their specs `github-pages-whole-listing` and
+> `github-rest-lane` and their 12 tests are added below. The §1 kind and gap tables count the 73
+> specs. Other counts in this file were taken before.
+
 > Status 2026-10-16: this is the crate's migration worklist. The 71 specs below are each proved
 > through Trust/Clean about the compiled Rust function, and then the tests each one subsumes are deleted.
 > The 13 tests in §4 sample no spec of this crate. They are deleted or moved now, without waiting on a proof.
@@ -120,31 +125,33 @@ keeps-every-sealed-build	equivalence	handoff_policy::PolicyFile::keeps	For every
 adoption-decision	contract	handoff_policy::Adoption::of, handoff_policy::Adoption::policy	For every read and b. Adoption::of(read,b) is: None for Absent. Ignored(w) for Ignored(w). Ignored("not read just then: "++w) for Unread(w), so an unread policy is never followed. For Parsed(f): NotForThisBuild(f) if FB(f,b) = None, Follow(p) if FB(f,b) = Some(p) with asks(p), and None if FB(f,b) = Some(p) with !asks(p). policy(a) = Some(p) iff a = Follow(p). Corollary: of(read,b).policy() = Some(p) implies asks(p) and applies_to(p,b).	src/handoff_policy.rs::a_producer_follows_only_a_policy_that_asks_something_of_its_own_build	enum match, clone of PolicyFile, format!	0,1,3,4
 momentary-read-errors	contract	handoff_policy::is_momentary, handoff_policy::is_momentary_read_error, handoff_policy::unreadable, handoff_policy::judge	For every io::Error e. is_momentary(e) = is_momentary_read_error(e) <=> kind(e) in {Interrupted, WouldBlock, OutOfMemory} || raw_os_error(e) in {EMFILE, ENFILE, ENOMEM, ENOBUFS, EIO} (unix; EINTR and EAGAIN reach the set through their kinds). unreadable(e) = Moment("unreadable: "++e) if is_momentary(e), else File("unreadable: "++e). judge(p, read) is: Absent for Ok(None). Parsed(f) for Ok(Some(t)) when PolicyFile::parse(t) = Ok(f), and Ignored(p++": "++why) when it is Err(why). Ignored(p++": "++w) for Err(File(w)). Unread(p++": "++w) for Err(Moment(w)). So EACCES, EPERM, EISDIR and ENOTDIR are Ignored and EMFILE is Unread.	src/handoff_policy.rs::a_read_the_system_refused_for_now_is_unread_and_a_file_error_is_ignored	io::Error kind/raw_os_error (std model), libc errno constants, enum mapping, Path display	0,1,3,8,12
 bundle-policy-read	contract	handoff_policy::read_from_bundle, handoff_policy::read_bounded	For every file state on unix, with P = root/BUNDLE_PATH. read_bounded opens P with O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC and never blocks, a FIFO included. The result is Ok(None) on NotFound and Err(File("not a regular file (a symbolic link)")) on ELOOP. Any other open error gives unreadable(e). If the opened descriptor is not a regular file (a directory or a FIFO), the result is Err(File("not a regular file")). If its length exceeds MAX_POLICY_BYTES (16384), or the bounded read returns more than that, it is Err(File(.. "bound" ..)). If the bytes are not UTF-8, it is Err(File("not UTF-8")). Otherwise it is Ok(Some(text)). read_from_bundle(root) = judge(P, read_bounded(P)). So a link out of the bundle is never followed or read.	src/handoff_policy.rs::a_bundle_policy_is_read_absent_or_ignored_never_followed_through_a_link, src/handoff_policy.rs::a_fifo_in_place_of_the_policy_is_refused_without_waiting_for_a_writer	OpenOptions custom_flags, fstat via File::metadata, take/read_to_end, String::from_utf8	0,1,8
+github-pages-whole-listing	contract	github_pages::page, github_pages::all	page(status, headers, body) = Ok((json(body), {link}) ) iff status = 200, at most one `Link` header and body is JSON; else Err. all(api, base, per_page, get) asks base with `&page=n` for n = 1, 2, … and returns every item in order iff every page is a JSON array of at most per_page items, every `Link` names api with base's path and query (only `page` moves; a `/repos/{o}/{r}/…` base may be linked as `/repositories/{id}/…` with the same suffix and one id throughout), no `next` page answers empty, `last` never moves, and an exactly full final page is confirmed by the empty page after it; else Err, and at most MAX_PAGES pages are read.	src/github_pages.rs::every_page_is_read_and_a_full_final_page_is_confirmed_empty, src/github_pages.rs::a_link_off_the_api_origin_or_scope_and_an_empty_page_promising_more_are_refused, src/github_pages.rs::a_listing_answer_is_a_200_with_at_most_one_link, src/github_pages.rs::a_repository_listing_may_link_by_id_but_only_one_id_and_its_own_suffix	FnMut fetch, BTreeMap headers, JSON, URL parsing loops	0,1,7
+github-rest-lane	invariant	github_rest::Client::prepare, github_rest::Prepared::run, github_rest::Client::pages, github_rest::Client::upload, github_rest::Client::asset_location, github_rest::Client::open_asset, github_rest::Client::download_asset, github_rest::Token::new, github_rest::upload_path, github_rest::not_started	Every request is one `/usr/bin/curl` (`-q` first, `--globoff`) to the api or uploads origin, the token (when the client has one) on stdin as `-H @-` and never in argv or environment (`VENDOR_ENV_SCRUB`, `GH_TOKEN`, `GITHUB_TOKEN` removed); a token that could write a second header is refused; a non-GET without a token, or a URL off the api and uploads origins, is refused before curl starts. An answer is read by its status (`--fail-with-body` keeps GitHub's words and curl's exit 22); a redirect from the api is never followed. An asset is read through the asset API's redirect only onto a CDN origin (else Redirect, never asked), by an anonymous curl with `--max-redirs 0`, at most its cap (else Malformed, the file removed). An upload's file is `--upload-file` as given when absolute and from `./` when relative, so `-` and `.` are files, never curl's stdin. A Spawn's refusal to start curl (`ErrorKind::Interrupted`) is Local; any other failure to start it is Transport. pages() is github_pages::all over the client.	src/github_rest_tests.rs::the_token_rides_stdin_and_never_argv_or_the_environment, src/github_rest_tests.rs::a_hostile_curlrc_is_never_read, src/github_rest_tests.rs::a_release_is_created_uploaded_listed_and_downloaded_through_curl, src/github_rest_tests.rs::a_redirect_off_the_cdn_origin_is_refused_and_never_followed, src/github_rest_tests.rs::a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused, src/github_rest_tests.rs::a_write_without_a_token_and_a_url_off_the_origins_never_start_curl, src/github_rest_tests.rs::a_token_that_could_write_a_header_is_refused, src/github_rest_tests.rs::fail_with_body_keeps_curls_own_reading_and_githubs_words, src/github_rest_tests.rs::an_upload_names_its_file_and_never_curls_stdin_or_a_glob, src/github_rest_tests.rs::a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here	curl child, Secret on stdin, loopback fake GitHub	0,1,8
 ```
 
-### Distribution by kind (71)
+### Distribution by kind (73)
 
 | kind | specs |
 |---|---|
-| contract | 58 |
+| contract | 59 |
 | table-property | 4 |
 | round-trip | 3 |
 | equivalence | 2 |
 | refinement | 2 |
-| invariant | 2 |
+| invariant | 3 |
 
 ### Gap histogram (specs blocked by each gap)
 
 | gap | specs |
 |---|---|
-| 0 | 71 |
-| 1 | 61 |
+| 0 | 73 |
+| 1 | 63 |
 | 2 | 10 |
 | 3 | 35 |
 | 4 | 16 |
 | 5 | 17 |
-| 7 | 20 |
-| 8 | 16 |
+| 7 | 21 |
+| 8 | 17 |
 | 9 | 8 |
 | 10 | 1 |
 | 11 | 4 |
@@ -315,6 +322,20 @@ src/sys.rs	acquire_fails_fast_on_permanent_error	advisory-file-lock
 src/sys.rs	same_volume_true_within_a_dir_false_for_missing	same-volume	
 src/tag.rs	parse_release_tag_classifies_every_spelling	release-tag-grammar	
 src/tag.rs	canonical_version_pins_the_spelling_and_the_component_count	release-tag-grammar	
+src/github_pages.rs	every_page_is_read_and_a_full_final_page_is_confirmed_empty	github-pages-whole-listing	
+src/github_pages.rs	a_link_off_the_api_origin_or_scope_and_an_empty_page_promising_more_are_refused	github-pages-whole-listing	
+src/github_pages.rs	a_listing_answer_is_a_200_with_at_most_one_link	github-pages-whole-listing	
+src/github_pages.rs	a_repository_listing_may_link_by_id_but_only_one_id_and_its_own_suffix	github-pages-whole-listing	
+src/github_rest_tests.rs	the_token_rides_stdin_and_never_argv_or_the_environment	github-rest-lane	
+src/github_rest_tests.rs	a_hostile_curlrc_is_never_read	github-rest-lane	
+src/github_rest_tests.rs	a_release_is_created_uploaded_listed_and_downloaded_through_curl	github-rest-lane	
+src/github_rest_tests.rs	a_redirect_off_the_cdn_origin_is_refused_and_never_followed	github-rest-lane	
+src/github_rest_tests.rs	a_listing_is_read_to_its_end_and_an_incomplete_page_is_refused	github-rest-lane	
+src/github_rest_tests.rs	a_write_without_a_token_and_a_url_off_the_origins_never_start_curl	github-rest-lane	
+src/github_rest_tests.rs	a_token_that_could_write_a_header_is_refused	github-rest-lane	
+src/github_rest_tests.rs	fail_with_body_keeps_curls_own_reading_and_githubs_words	github-rest-lane	
+src/github_rest_tests.rs	an_upload_names_its_file_and_never_curls_stdin_or_a_glob	github-rest-lane	
+src/github_rest_tests.rs	a_spawn_that_refuses_once_interrupted_is_a_refusal_made_here	github-rest-lane	
 ```
 
 ## 3. Coverage

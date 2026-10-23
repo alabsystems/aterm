@@ -1,23 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Right-to-left runs on the run shaper (TF.6 of
-//! docs/AUDIT-third-party-2026-10-15.md): a bidi-reordered row paints its
-//! Arabic backwards, and the run planner shapes that stretch in logical
-//! order and puts each glyph back where its letter is painted, so each
-//! letter takes the form its logical neighbours give it. rustybuzz shaped
-//! the visual run as if it were logical, which joined the letters backwards
-//! (the TF.1 corpus recorded it, `ar.marhaba.visual.0`): the negative
-//! control below reads that line.
-//!
-//! The planner reads the row's bidi map, not the text: a row the reorder
-//! left alone (bidi off, the web modules) is shaped as written, and the
-//! left-to-right cells beside a reordered word (an operator after it) keep
-//! the order they are painted in.
-//!
-//! Mirroring is the bidi step's, by level (UAX #9 L4 in aterm-core's
-//! reorder): a bracket around an Arabic word in a left-to-right line stays
-//! as written, where rustybuzz mirrored every bracket of a right-to-left run.
+//! Right-to-left run shaping tests: bidi-reordered stretches are shaped in
+//! logical order and mapped back to visual columns, while un-reordered rows and
+//! adjacent LTR operators keep their painted order.
 
 use aterm_core::config::{BiDiConfig, BiDiMode, TerminalConfig};
 use aterm_core::terminal::Terminal;
@@ -114,7 +100,6 @@ fn recorded(case: &str) -> Vec<(u32, u32)> {
 fn visual_rtl_runs_join_in_logical_order() {
     let mut r = Renderer::from_bytes(CASCADIA, 18.0, Theme::default()).unwrap();
     let (input, plan) = plan_of(&mut r, MARHABA, 8);
-    // The row reached the renderer reordered: alef first, meem last.
     assert_eq!(input.cells[0][0].ch, '\u{627}');
     assert_eq!(input.cells[0][4].ch, '\u{645}');
     let want = logical_plan(&input, MARHABA);
@@ -123,14 +108,12 @@ fn visual_rtl_runs_join_in_logical_order() {
         want[..5],
         "each letter takes its logical joining form"
     );
-    // Meem, logically first, is initial; alef, logically last, is final.
     let ligated = |c: usize| match plan[c] {
         ColumnGlyph::Ligated(gid) => gid,
         other => panic!("column {c} is {other:?}"),
     };
-    // NEGATIVE CONTROL: rustybuzz shaped the visual run as logical text and
-    // drew meem final and alef isolated (`ar.marhaba.visual.0`; clusters are
-    // byte offsets of the visual run, two bytes a letter).
+    // Negative control: shaping the visual run as logical text (`ar.marhaba.visual.0`)
+    // draws meem final and alef isolated.
     let old: Vec<(u32, u32)> = recorded("ar.marhaba.visual.0");
     let old_at = |col: u32| old.iter().find(|&&(_, c)| c == 2 * col).unwrap().0;
     assert_ne!(
@@ -143,8 +126,6 @@ fn visual_rtl_runs_join_in_logical_order() {
         old_at(0),
         "alef no longer stands isolated"
     );
-    // And the new forms are the ones rustybuzz gave the LOGICAL text
-    // (`ar.marhaba.logical`): meem at logical byte 0, alef at byte 8.
     let logical = recorded("ar.marhaba.logical");
     let logical_at = |byte: u32| logical.iter().find(|&&(_, c)| c == byte).unwrap().0;
     assert_eq!(u32::from(ligated(4)), logical_at(0));
@@ -164,14 +145,11 @@ fn brackets_mirror_by_level_not_by_run() {
     assert_eq!(input.cells[0][6].ch, ')');
     assert_eq!(plan[0], ColumnGlyph::PerCell, "{plan:?}");
     assert_eq!(plan[6], ColumnGlyph::PerCell, "{plan:?}");
-    // NEGATIVE CONTROL: rustybuzz gave the leading '(' the glyph of ')'.
     let face = aterm_font::Face::parse(CASCADIA, 0).unwrap();
     let close = u32::from(face.glyph_index(')').unwrap().0);
     let old = recorded("ar.parens.visual.0");
     assert_eq!(old.iter().find(|&&(_, c)| c == 0).unwrap().0, close);
 
-    // A bracket INSIDE right-to-left text (between two Arabic letters) is at
-    // the right-to-left level: the bidi step draws its mirror.
     let inside = "\u{627}(\u{628})\u{62C}";
     let (input, _) = plan_of(&mut r, inside, 8);
     let row: String = input.cells[0][..5].iter().map(|c| c.ch).collect();
@@ -185,9 +163,6 @@ fn brackets_mirror_by_level_not_by_run() {
 /// `bidi = "off"` (`BiDiMode::Disabled`); the web modules build aterm-core
 /// without its reorder and hand the renderer the same rows. Each letter takes
 /// the form rustybuzz gave the logical text (`ar.marhaba.logical`).
-/// NEGATIVE CONTROL: shaping the row as if it were visual (reversed), as
-/// TF.6's first cut did, gives the forms rustybuzz recorded for the visual
-/// run (`ar.marhaba.visual.0`), and those differ for meem and alef.
 #[test]
 fn logical_order_rows_join_as_written() {
     let mut r = Renderer::from_bytes(CASCADIA, 18.0, Theme::default()).unwrap();
@@ -216,15 +191,13 @@ fn logical_order_rows_join_as_written() {
             ColumnGlyph::Ligated(u16::try_from(gid).unwrap())
         }
     };
-    // Column `j` holds logical letter `j`, two bytes into the text each.
     let logical = recorded("ar.marhaba.logical");
     let want: Vec<ColumnGlyph> = (0u32..)
         .zip(MARHABA.chars())
         .map(|(j, ch)| column(at(&logical, 2 * j), ch))
         .collect();
     assert_eq!(plan[..5], want[..], "each letter takes its logical form");
-    // The visual run `ar.marhaba.visual.0` holds logical letter `j` at byte
-    // 2 * (4 - j): what a reversed shape of this row would draw.
+    // Negative control: shaping the row reversed yields `ar.marhaba.visual.0` forms.
     let visual = recorded("ar.marhaba.visual.0");
     let backwards: Vec<ColumnGlyph> = (0u32..)
         .zip(MARHABA.chars())
@@ -240,9 +213,6 @@ fn logical_order_rows_join_as_written() {
 /// stay where the font draws them. After the word (`שלום==`, the operator
 /// at the line's level) and between two words (`שלום==עולם`, the operator
 /// at the words' level, painted inside the reversed token) alike.
-/// NEGATIVE CONTROL: each operator's plan is not its own reverse, so a
-/// planner that reversed the operator with the word (TF.6's first cut, which
-/// reversed every run it guessed right-to-left) fails here.
 #[test]
 fn operators_beside_an_rtl_word_ligate_as_in_an_ltr_run() {
     let mut r = Renderer::from_bytes(JETBRAINS, 18.0, Theme::default()).unwrap();
@@ -263,8 +233,7 @@ fn operators_beside_an_rtl_word_ligate_as_in_an_ltr_run() {
             let (_, ltr) = plan_of(&mut r, &ltr_text, 16);
             let ltr_op = &ltr[at..at + k];
             if painted != op {
-                // `->` between two Hebrew words is painted mirrored (`<-`);
-                // there is no left-to-right run of the same cells to match.
+                // `->` between two Hebrew words is painted mirrored (`<-`).
                 continue;
             }
             assert!(

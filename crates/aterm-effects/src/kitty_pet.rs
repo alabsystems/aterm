@@ -153,6 +153,14 @@ const LETTER_VEIL_FLOOR: f32 = 0.22;
 const LETTER_VEIL_ON_S: f32 = 0.08;
 const LETTER_VEIL_OFF_S: f32 = 0.20;
 const LETTER_VEIL_DWELL: f32 = 0.20;
+/// How long (s) the rest veil takes to go fully on
+/// ([`PetBrain::veil_over_letters`]): a few hundred milliseconds, one
+/// unhurried ease, never a blink.
+const LETTER_VEIL_REST_ON_S: f32 = 0.35;
+/// How far (rows) a body may reach into a lettered row from below: the
+/// descender band, under the letters' bodies ([`PetBrain::arc_under_letters`]).
+const HEAD_REACH_MAX: f32 = 0.25;
+/// Clearance (cells) kept between a re-anchored footprint and the ink it fled.
 const INK_GAP: f32 = 0.35;
 const INK_EVICT_MAX: f32 = 4.0;
 const INK_EVICT_SPEED: f32 = 12.0;
@@ -1489,6 +1497,19 @@ pub struct PetBrain {
     last_presence: f32,
     letter_veil: (f32, Option<Instant>, f32),
     letter_cover_since: Option<Instant>,
+    /// Since when a body at rest has lain on letters unbroken (the rest
+    /// veil, [`PetBrain::veil_over_letters`]).
+    letter_rest_since: Option<Instant>,
+    /// A gather on letters for a landing on letters whose rest veil is still
+    /// going on ([`PetBrain::veil_over_letters`]): the coil waits for it
+    /// ([`PetBrain::gather_owes_veil`]), so the flight leaves veiled.
+    veil_gather: bool,
+    /// A test's negative control ([`Self::set_letters_unseen`]): the letter
+    /// reader sees none, so the head law and the rest veil stand down.
+    #[cfg(any(test, debug_assertions))]
+    letters_unseen: bool,
+    /// The host is presenting a frame the program has not finished
+    /// ([`Self::note_repainting`]): its ink is a partial write.
     repainting: bool,
     last_drawn: [f32; PET_DEPARTURES_MAX],
     last_grid: (u16, u16),
@@ -1720,6 +1741,10 @@ impl Default for PetBrain {
             last_presence: 0.0,
             letter_veil: (1.0, None, 1.0),
             letter_cover_since: None,
+            letter_rest_since: None,
+            veil_gather: false,
+            #[cfg(any(test, debug_assertions))]
+            letters_unseen: false,
             repainting: false,
             last_drawn: [0.0; PET_DEPARTURES_MAX],
             last_grid: (0, 0),
@@ -2746,12 +2771,105 @@ impl PetBrain {
     fn station_safe(&self, caret: (u16, u16), cols: u16, rows: u16, width: f32) -> (f32, f32) {
         let want = self.station_now(caret.1, cols, width);
         let stand = self.ink_stand_for(want, f32::from(caret.0), width, cols, rows, Some(caret));
+        let stand = self.clear_of_letters_above(stand, caret, cols, width);
         if let Some(station) = self.console_station(stand, (rows, cols), width) {
             return station;
         }
         stand
     }
 
+    /// THE HEAD LAW: a cat standing beside the caret never rests its head on
+    /// a line of letters. Its 1.7-row body reaches 0.7 of a row into the row
+    /// above wherever it stands, so a stand beside a caret under a printed
+    /// line (the prompt an Enter at the bottom row leaves under its output)
+    /// sat the head on the line's letters, drawn under them in fur the
+    /// letters read against at 1.0 to 3.2:1 (2026-10-22, the trail gallery's
+    /// `enter-bottom` on dark and both light themes; the bound back to that
+    /// stand flew the whole body across the line too). The stand moves on
+    /// along the caret's own row to the first place whose row above holds
+    /// no letterform under the body ([`Self::observed_last_letter`], with
+    /// [`INK_GAP`] kept to the last one), there to wait for the writing,
+    /// beside the text: a cat a few cells further on, never one on the
+    /// words. Only a stand on the caret's own row and right of it moves,
+    /// only onto ground its own row leaves clear, and only inside the row; a
+    /// row above lettered to the margin (or a rule, a box's border: not
+    /// letters) keeps the stand, and the rest veil keeps those letters read
+    /// ([`Self::veil_over_letters`]). Only at a prompt: while a command runs
+    /// its output moves the caret line by line and the console's watch owns
+    /// the cat. Inert until the host's console observation certifies the
+    /// row above.
+    fn clear_of_letters_above(
+        &self,
+        (col, row): (f32, f32),
+        caret: (u16, u16),
+        cols: u16,
+        width: f32,
+    ) -> (f32, f32) {
+        let above = row - 1.0;
+        if above < 0.0
+            || (row - f32::from(caret.0)).abs() >= 0.5
+            || col < f32::from(caret.1)
+            || !width.is_finite()
+            || width <= 0.0
+            || self.console_executing()
+        {
+            return (col, row);
+        }
+        let limit = (f32::from(cols) - width).max(0.0);
+        // The body's columns over the row above: shaved of the tile's
+        // transparent margins on the right, and kept [`INK_GAP`] clear of a
+        // letter on the left.
+        let reach = |x: f32| (x + INK_PAD - INK_GAP, x + width - INK_PAD);
+        let mut x = col;
+        // Each step lands just past the last letter under the body, so a
+        // line of words is crossed in a step a word.
+        for _ in 0..cols {
+            let (a, b) = reach(x);
+            match self.observed_last_letter(above, a, b) {
+                None => return (col, row),
+                Some(None) => {
+                    if x > limit || self.ink_overlaps(x, row, width) {
+                        return (col, row);
+                    }
+                    return (x, row);
+                }
+                Some(Some(last)) => {
+                    x = last as f32 + 1.0 + INK_GAP - INK_PAD;
+                    if x > limit {
+                        return (col, row);
+                    }
+                }
+            }
+        }
+        (col, row)
+    }
+
+    /// THE HEAD LAW IN FLIGHT: a hop along its own row keeps its head out of
+    /// a line of letters two rows up. The 1.7-row body standing on row `r`
+    /// reaches 0.7 of a row into `r - 1`, and an arc of `lift` rows takes its
+    /// top `lift - 0.3` into `r - 2`; under a lettered `r - 2` the arc is held
+    /// to [`HEAD_REACH_MAX`] of a row past that (the descender band, under
+    /// the letters' bodies), so the bound off a prompt under a command's echo
+    /// never lays its ears on the echo's last word. A shallower arc, the same
+    /// body: only its height changes, and only where the letters are.
+    fn arc_under_letters(&self, to_col: f32, to_row: f32, width: f32, arc: f32) -> f32 {
+        if (to_row - self.row).abs() >= 0.5 || !width.is_finite() || width <= 0.0 {
+            return arc;
+        }
+        let over = self.row.round() - 2.0;
+        let (a, b) = (
+            self.col.min(to_col) + INK_PAD,
+            self.col.max(to_col) + width - INK_PAD,
+        );
+        let ceiling = 2.0 - ART_ROWS + HEAD_REACH_MAX;
+        match self.observed_last_letter(over, a, b) {
+            Some(Some(_)) if arc > ceiling => ceiling.max(0.0),
+            _ => arc,
+        }
+    }
+
+    /// The live output edge as a row coordinate — `None` until the host
+    /// feeds the ink map, which keeps the watch's hug inert without it.
     #[inline]
     const fn ink_live_row(&self) -> Option<f32> {
         match self.ink_live {
@@ -3077,7 +3195,19 @@ impl PetBrain {
         false
     }
 
-    /// Whether a cheer is latched and not yet played or wiped.
+    /// A test's negative control: the letter reader
+    /// ([`Self::observed_last_letter`]) sees no letters, so the head law
+    /// ([`Self::clear_of_letters_above`], [`Self::arc_under_letters`]) and the
+    /// rest veil ([`Self::veil_over_letters`]) stand down and the cat rests
+    /// and flies as it did before them.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letters_unseen(&mut self, unseen: bool) {
+        self.letters_unseen = unseen;
+    }
+
+    /// Whether a cheer is latched and not yet played or wiped: for the
+    /// host's tests, which see the brain from another crate.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     #[inline]
@@ -4379,7 +4509,7 @@ impl PetBrain {
                 } else {
                     BIG_CROUCH_DUR
                 };
-                if self.action_t >= dur {
+                if self.action_t >= dur && !self.gather_owes_veil(dur) {
                     self.big_gather = false;
                     self.leave_ground(
                         target,
@@ -4398,7 +4528,9 @@ impl PetBrain {
                     self.facing_left = target < self.col;
                 }
                 let tier = self.predicted_tier(target, target_row, true, sense.cols, width);
-                if (tier == Tier::Hop && self.coil_d <= 0.0) || self.action_t >= CROUCH_DUR {
+                if ((tier == Tier::Hop && self.coil_d <= 0.0) || self.action_t >= CROUCH_DUR)
+                    && !self.gather_owes_veil(CROUCH_DUR)
+                {
                     self.hop_crouch = false;
                     self.leave_ground(
                         target,
@@ -4568,7 +4700,7 @@ impl PetBrain {
                 } else {
                     Self::coil_dur((target - self.col).abs())
                 };
-                if self.action_t >= self.coil_d {
+                if self.action_t >= self.coil_d && !self.gather_owes_veil(self.coil_d) {
                     let vertical = (target_row - self.row).abs() >= 0.5;
                     self.leave_ground(
                         target,
@@ -6016,6 +6148,7 @@ impl PetBrain {
         match tier {
             Tier::Hop => {
                 let (dur, arc) = Self::flight_shape(span, vertical);
+                let arc = self.arc_under_letters(aim, to_row, width, arc);
                 self.begin_arc(
                     aim,
                     to_row,
@@ -7915,10 +8048,41 @@ impl PetBrain {
         self.drew_leg = travelling && matches!(frame.action, PetAction::Walk | PetAction::Run);
     }
 
+    /// The letter veil: a body walking or running along a line's letters (a
+    /// chase back along the line the hand just typed) never stands on them:
+    /// once its way has lain on letters for [`LETTER_VEIL_DWELL`] it drops
+    /// under the glyphs ([`PetFrame::under_ink`]) and fades toward
+    /// [`LETTER_VEIL_FLOOR`] by how much of it lies on inked cells
+    /// ([`Self::letter_cover`]), so the letters read in front of a faint cat.
+    /// A settled cat keeps its full body off letters (the console's own ink
+    /// rules seat it, and the head law keeps its head out of a lettered row
+    /// above, [`Self::clear_of_letters_above`]; one that cannot leave them
+    /// wears the rest veil below), and a flight keeps its body, from its
+    /// gather to its landing: the z-order
+    /// hold draws it under the glyphs it crosses. Veiled by each frame's box,
+    /// a bound across a wrap went from full to the floor and back three times
+    /// in two seconds, and held-delete pounces over the line flashed solid at
+    /// every landing (2026-10-21, both themes: the owner's "blinking"). The
+    /// level eases on over [`LETTER_VEIL_ON_S`] and off over
+    /// [`LETTER_VEIL_OFF_S`] (owing frames until it is off,
+    /// [`Self::needs_frames`]), and holds through a torn frame. Inert until
+    /// the host feeds the ink map ([`Self::sense_ink`]).
+    ///
+    /// On the ground the line it crosses is the row its feet are on
+    /// ([`Self::path_box`]): the 1.7-row body's head reaches into the row
+    /// above wherever it stands, and a still cat there keeps its full body.
+    /// Judged by the whole box, a cat walking beside the caret under a line
+    /// of ink (Claude Code's composer under its upper rule, a prompt under a
+    /// printed line) was veiled from its first step to its last: it faded to
+    /// a fifth of itself whenever it set off and came back full whenever it
+    /// stopped, every few keys (2026-10-20, real Claude Code 2.1.305 and the
+    /// recorded replay: every walking and running present at the floor).
     fn veil_over_letters(&mut self, frame: &mut PetFrame, sense: PetSense) {
         if sense.reduced_motion || frame.alpha == 0 {
             self.letter_veil = (1.0, None, 1.0);
             self.letter_cover_since = None;
+            self.letter_rest_since = None;
+            self.veil_gather = false;
             return;
         }
         let travelling = matches!(
@@ -7946,23 +8110,149 @@ impl PetBrain {
             0.0
         };
         let k = (cover / LETTER_VEIL_FULL).clamp(0.0, 1.0);
-        let target = 1.0 - (1.0 - LETTER_VEIL_FLOOR) * k * k * (3.0 - 2.0 * k);
+        let walk_target = 1.0 - (1.0 - LETTER_VEIL_FLOOR) * k * k * (3.0 - 2.0 * k);
+        // THE REST VEIL: a body at rest with its head on letters (in a
+        // lettered row above that the head law could not leave,
+        // [`Self::clear_of_letters_above`]) eases once, after the dwell, to
+        // the floor over [`LETTER_VEIL_REST_ON_S`], and the veil stays while
+        // the body lies on letters, through the walk that takes it off them.
+        // Nothing under it reads below 4.5:1, and nothing about it comes and
+        // goes: on once, off once. Only at a prompt: while a command runs,
+        // its output draws in front of the resident and the console's watch
+        // keeps its whole body.
+        //
+        // A flight keeps the presence it left with, as above: in the air and
+        // on its landing frame the veil holds where it was, and only a
+        // settled or travelling body certified off the letters takes it off.
+        // Lifted for every gather, a cat veiled under a line lettered to the
+        // margin went from 56 to 255 and back to 56 at every hop along its
+        // row (the blinking, again). A gather is on the ground: one on
+        // letters for a landing on letters while the hand is not writing
+        // (an Enter at the bottom row scrolls its output in under the
+        // resting cat, which bounds to the new prompt under that same line;
+        // [`Self::hand_writing`]) takes the rest veil there, and the coil
+        // waits for it ([`Self::gather_owes_veil`]), so the flight leaves
+        // veiled and lands veiled, instead of crossing and landing at full
+        // body and only then beginning its dwell (1.2 s of every such Enter
+        // with the letters at 1.0:1 under the fur; 0.38 s now, the dwell and
+        // the ease). A wake-up stretch and a sulk happen in place: they may
+        // put the veil on, never take it off.
         let (level, at, _) = self.letter_veil;
+        let veiled = level < 1.0;
+        let flight = matches!(
+            frame.action,
+            PetAction::Crouch | PetAction::Leap | PetAction::Land
+        );
+        let in_place = matches!(frame.action, PetAction::Waking | PetAction::Droop);
+        let cell = (sense.cell_w, sense.cell_h);
+        let mut gather_on_letters = false;
+        // A flight, an in-place stretch or a walk that keeps its presence:
+        // the veil (the rest veil or the walk's) holds where it is.
+        let mut keep = false;
+        // Only the printed lines above the caret's row: the caret's own row
+        // is the hand's, where the console's ink rules seat the cat (a
+        // composer's placeholder keeps its resident whole).
+        let on_letters = match sense.caret {
+            _ if self.console_executing() => Some(false),
+            Some((caret_row, _)) if frame.action.settled() => frame
+                .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+                .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row)),
+            // A walk keeps the veil it set off with until the observation
+            // certifies it off the letters, and never deepens it: deepened
+            // after a landing, the veil fell within half a second of the
+            // flight that held it.
+            Some((caret_row, _)) if travelling && level < 1.0 => {
+                let here = frame
+                    .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+                    .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                if here == Some(false) {
+                    here
+                } else {
+                    keep = true;
+                    None
+                }
+            }
+            Some((caret_row, _)) if in_place => {
+                let here = frame
+                    .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+                    .map_or(Some(false), |rect| self.on_letters(rect, cell, caret_row));
+                if here == Some(true) {
+                    here
+                } else if veiled {
+                    keep = true;
+                    None
+                } else {
+                    here
+                }
+            }
+            Some(caret) if flight => {
+                gather_on_letters = frame.action == PetAction::Crouch
+                    && !self.hand_writing()
+                    && frame
+                        .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+                        .and_then(|rect| self.on_letters(rect, cell, caret.0))
+                        == Some(true)
+                    && self.landing_on_letters(sense, caret) == Some(true);
+                if gather_on_letters {
+                    Some(true)
+                } else if veiled {
+                    keep = true;
+                    None
+                } else {
+                    Some(false)
+                }
+            }
+            // A hidden caret (a program's repaint) says nothing new about the
+            // letters: the veil holds.
+            None if flight || in_place => {
+                keep = veiled;
+                None
+            }
+            None if frame.action.settled() => None,
+            _ => Some(false),
+        };
+        let rest_target = match on_letters {
+            Some(true) => {
+                let since = *self.letter_rest_since.get_or_insert(sense.now);
+                if sense.now.saturating_duration_since(since).as_secs_f32() >= LETTER_VEIL_DWELL {
+                    LETTER_VEIL_FLOOR
+                } else {
+                    1.0
+                }
+            }
+            // A row the observation cannot certify this frame (a stale
+            // snapshot, a torn write), or a flight or an in-place stretch
+            // that keeps its presence: the veil holds where it is, so an
+            // unknown frame never lifts it and brings it back.
+            None if keep || self.letter_rest_since.is_some() => level,
+            _ => {
+                self.letter_rest_since = None;
+                1.0
+            }
+        };
+        let resting = rest_target < walk_target;
+        let target = walk_target.min(rest_target);
         let dt = at.map_or(f32::INFINITY, |at| {
             sense.now.saturating_duration_since(at).as_secs_f32()
         });
         let level = if self.repainting && at.is_some() {
             // finished frame.
             level
-        } else if dt > LETTER_VEIL_OFF_S {
+        } else if dt > LETTER_VEIL_OFF_S && !resting {
             // A gap in the frames (or the first one): no history to ease from.
             target
         } else if target < level {
-            (level - dt / LETTER_VEIL_ON_S).max(target)
+            let on = if resting {
+                LETTER_VEIL_REST_ON_S
+            } else {
+                LETTER_VEIL_ON_S
+            };
+            (level - dt.min(LETTER_VEIL_REST_ON_S) / on).max(target)
         } else {
             (level + dt / LETTER_VEIL_OFF_S).min(target)
         };
         self.letter_veil = (level, Some(sense.now), target);
+        self.veil_gather = gather_on_letters && level > LETTER_VEIL_FLOOR;
         if level >= 1.0 {
             return;
         }
@@ -7970,6 +8260,96 @@ impl PetBrain {
         frame.alpha = (f32::from(frame.alpha) * level).round() as u8;
     }
 
+    /// Whether the hand is writing: the last key it pressed within
+    /// [`SIT_AFTER`] is a letter or a delete (or, with no key noted, the caret
+    /// has been running). A gather then follows the writing, which no veil
+    /// holds on the ground ([`Self::veil_over_letters`]): held for its veil,
+    /// the bound a wrap typed through launches came down a row late.
+    fn hand_writing(&self) -> bool {
+        match self.key_within(SIT_AFTER) {
+            Some(kind) => matches!(kind, PetInputKind::Text | PetInputKind::Delete),
+            None => self.last_dir != 0 && self.run_t < SIT_AFTER,
+        }
+    }
+
+    /// Whether a gather of `coil` seconds still waits for its rest veil: one
+    /// on letters for a landing on letters ([`Self::veil_over_letters`])
+    /// leaves the ground once the veil is on, so the flight keeps the
+    /// presence it lands with. Bounded by the veil's own dwell and ease, so
+    /// a veil held where it is (a torn frame, a hidden caret) never keeps the
+    /// cat on the ground.
+    #[inline]
+    fn gather_owes_veil(&self, coil: f32) -> bool {
+        self.veil_gather && self.action_t < coil + LETTER_VEIL_DWELL + LETTER_VEIL_REST_ON_S
+    }
+
+    /// Whether the stand a gather will come down on lays the standing body's
+    /// head on letters ([`Self::on_letters`]): the flight's landing when one
+    /// is planned, else the caret's stand ([`Self::station_safe`]).
+    fn landing_on_letters(&self, sense: PetSense, caret: (u16, u16)) -> Option<bool> {
+        if sense.cell_w == 0 || sense.cell_h == 0 {
+            return Some(false);
+        }
+        let at = self.flight.map_or_else(
+            || {
+                self.station_safe(
+                    caret,
+                    sense.cols,
+                    sense.rows,
+                    art_cols(sense.cell_w, sense.cell_h),
+                )
+            },
+            |f| (f.to_col, f.to_row),
+        );
+        let rect = drawn_body_px(
+            at,
+            Stance::NEUTRAL,
+            (sense.cell_w, sense.cell_h),
+            (sense.cols, sense.rows),
+        );
+        self.on_letters(rect, (sense.cell_w, sense.cell_h), caret.0)
+    }
+
+    /// Whether a drawn body's box (grid pixels, right/bottom exclusive) lays
+    /// its head on letterforms the console observation certifies: any row
+    /// above both the one its feet stand in and the caret's `caret_row` that
+    /// it reaches by a quarter of a cell or more, over its columns shaved of
+    /// the tile's transparent margins ([`INK_PAD`]). `None` when such a row
+    /// holds no letter the observation saw but one it cannot certify. The
+    /// rest veil's reading ([`Self::veil_over_letters`]); the caret's own row
+    /// and the cat's are the console's ink rules' to seat it beside, and a
+    /// rule or a box's border is not a letter.
+    fn on_letters(
+        &self,
+        (x0, x1, y0, y1): (i32, i32, i32, i32),
+        (cell_w, cell_h): (u16, u16),
+        caret_row: u16,
+    ) -> Option<bool> {
+        if cell_w == 0 || cell_h == 0 || y1 <= y0 || x1 <= x0 {
+            return Some(false);
+        }
+        let (cw, ch) = (f32::from(cell_w), i32::from(cell_h));
+        let (a, b) = (x0 as f32 / cw + INK_PAD, x1 as f32 / cw - INK_PAD);
+        let below = (y1 - 1).div_euclid(ch).min(i32::from(caret_row));
+        let mut unknown = false;
+        for row in y0.div_euclid(ch).max(0)..below {
+            let top = (row * ch).max(y0);
+            let bottom = ((row + 1) * ch).min(y1);
+            if (bottom - top) * 4 < ch {
+                continue;
+            }
+            match self.observed_last_letter(row as f32, a, b) {
+                Some(Some(_)) => return Some(true),
+                Some(None) => {}
+                None => unknown = true,
+            }
+        }
+        (!unknown).then_some(false)
+    }
+
+    /// The part of a drawn body's box (grid pixels, right/bottom exclusive)
+    /// that travels over letters ([`Self::veil_over_letters`]): the row its
+    /// feet are on.
     #[inline]
     const fn path_box((x0, x1, y0, y1): (i32, i32, i32, i32), cell_h: u16) -> (i32, i32, i32, i32) {
         if cell_h == 0 || y1 <= y0 {
@@ -8275,6 +8655,16 @@ impl PetBrain {
     pub const fn needs_frames(&self) -> bool {
         // hide) holds its floor without the train.
         if self.letter_veil.0 != self.letter_veil.2 && self.alpha > 0.0 && !self.repainting {
+            return true;
+        }
+        // The rest veil's dwell and ease are owed their frames too (on once,
+        // finite): a host that stopped ticking at the settle would show it
+        // only on an unrelated repaint, a step instead of an ease.
+        if self.letter_rest_since.is_some()
+            && self.letter_veil.0 > LETTER_VEIL_FLOOR
+            && self.alpha > 0.0
+            && !self.repainting
+        {
             return true;
         }
         if let Some(frames) = self.console_frames() {
@@ -9302,6 +9692,92 @@ mod tests {
                 "a flight over letters keeps its body ({action:?})"
             );
         }
+    }
+
+    /// THE REST VEIL IS ON ONCE AND OFF ONCE: a cat at rest under a line
+    /// lettered to the margin wears it, and neither a flight (its gather, the
+    /// air, its landing frame) nor an in-place stretch (the wake-up, the
+    /// sulk) takes it off, though each of them is off the letters here; a
+    /// walk on the letters keeps it. Only a travelling or a settled body the
+    /// observation certifies off them lifts it. Negative control (as run on
+    /// 2026-10-22, the rule before): the first of them, the wake-up's
+    /// stretch, lifted it from 56 to 255.
+    #[test]
+    fn only_a_settled_or_travelling_body_off_the_letters_lifts_the_rest_veil() {
+        use crate::pet_world::{PetPane, PetWorldFacts};
+        use aterm_core::terminal::Terminal;
+
+        let mut term = Terminal::new(30, 100);
+        term.process(format!("\x1b[29;1H{}\x1b[30;3H", "x".repeat(100)).as_bytes());
+        let mut pet = PetBrain::default();
+        let input = term.cell_frame(30, 100);
+        let facts = PetWorldFacts::read(&term, 7);
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        pet.set_console_presentable(true);
+        let frame = |action: PetAction, lift: f32, scale_y: f32| PetFrame {
+            alpha: 255,
+            lane_alpha: 255,
+            action,
+            pose: PetGlyphId::PetStand,
+            col: 20.0,
+            row: 29.0,
+            lift,
+            facing_left: false,
+            scale_x: 1.0,
+            scale_y,
+            purr: 0.0,
+            contented: false,
+            under_ink: false,
+            motes: [None; PET_MOTES_MAX],
+            departures: [None; PET_DEPARTURES_MAX],
+        };
+        let mut t = Instant::now();
+        let mut run = |pet: &mut PetBrain, f: PetFrame, secs: f32| {
+            let end = t + Duration::from_secs_f32(secs);
+            let mut most = 0u8;
+            let mut last = 0u8;
+            while t < end {
+                t += Duration::from_millis(16);
+                let mut f = f;
+                pet.veil_over_letters(&mut f, sense(t, Some((29, 2))));
+                most = most.max(f.alpha);
+                last = f.alpha;
+            }
+            (most, last)
+        };
+        // A sitting body's head reaches 0.7 of a row into the lettered row.
+        let (_, rested) = run(&mut pet, frame(PetAction::Sit, 0.0, 1.0), 1.0);
+        assert!(rested < 64, "fixture: the resting cat is veiled ({rested})");
+        // Off the letters: a stretch low enough to keep its head out of the
+        // row above, a flight lifted clear of it.
+        let low = 0.7;
+        for (action, lift, scale_y) in [
+            (PetAction::Waking, 0.0, low),
+            (PetAction::Droop, 0.0, low),
+            (PetAction::Crouch, 0.0, low),
+            (PetAction::Leap, 3.0, 1.0),
+            (PetAction::Land, 0.0, low),
+        ] {
+            let (most, _) = run(&mut pet, frame(action, lift, scale_y), 0.6);
+            assert!(
+                most <= rested,
+                "{action:?} off the letters lifted the rest veil from {rested} to {most}"
+            );
+        }
+        let (most, _) = run(&mut pet, frame(PetAction::Walk, 0.0, 1.0), 0.6);
+        assert!(
+            most <= rested,
+            "a walk on the letters lifted the rest veil from {rested} to {most}"
+        );
+        let (_, lifted) = run(&mut pet, frame(PetAction::Walk, 0.0, low), 0.6);
+        assert_eq!(lifted, 255, "a walk off the letters lifts it");
+        let (_, rested) = run(&mut pet, frame(PetAction::Sit, 0.0, 1.0), 1.0);
+        assert!(
+            rested < 64,
+            "back on the letters at rest it is veiled again"
+        );
+        let (_, lifted) = run(&mut pet, frame(PetAction::Sit, 0.0, low), 0.6);
+        assert_eq!(lifted, 255, "a settled body off the letters lifts it");
     }
 
     #[test]

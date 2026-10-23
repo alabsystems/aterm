@@ -2,26 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! [`HasNativeWindow`]: a window's X11 or Wayland handles, handed from crate
-//! to crate.
-//!
-//! The windowing crate (`crates/aterm-window`) owns every window's display
-//! connection and its X11 window or `wl_surface`. `aterm-gpu`'s GL arm makes
-//! an EGL window surface on them, and `aterm-gui`'s CPU presenters draw into
-//! them over MIT-SHM or `wl_shm`. Those crates used to meet at
-//! `raw-window-handle`'s `RawWindowHandle` and `RawDisplayHandle`, third-party
-//! enums the Linux build carried for these few words
-//! (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6, the Linux half).
-//! This crate is the one all three already depend on. macOS's counterpart is
-//! `aterm_objc::HasNsView`.
+//! [`HasNativeWindow`]: a window's X11 or Wayland handles, handed from crate to crate.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A window's handles on its window system, borrowed from the window that
-/// owns them.
+/// A window's handles on its window system, borrowed from the window that owns them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeWindow {
     /// An X11 window, on the Xlib connection that made it.
@@ -44,15 +32,12 @@ pub enum NativeWindow {
     },
 }
 
-/// A value that owns or borrows an X11 or Wayland window: a window, or a
-/// reference or shared pointer to one.
-///
+/// A value that owns or borrows an X11 or Wayland window: a window, or a reference or shared
+/// pointer to one.
 /// # Safety
-///
-/// [`native_window`](Self::native_window) answers `None` or handles that stay
-/// live for as long as `self` does: the display connection stays open, and the
-/// X11 window or `wl_surface` is not destroyed. A caller that keeps a handle
-/// past `self` keeps `self` alive with it.
+/// [`native_window`](Self::native_window) answers `None` or handles that stay live for as long as
+/// `self` does: the display connection stays open, and the X11 window or `wl_surface` is not
+/// destroyed.
 pub unsafe trait HasNativeWindow {
     /// The window's handles, or `None` when there are none to hand out.
     fn native_window(&self) -> Option<NativeWindow>;

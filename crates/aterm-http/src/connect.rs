@@ -2,29 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! A timed TCP connect whose refusal is prompt on every platform.
-//!
-//! [`connect_timeout`] is `TcpStream::connect_timeout`'s contract. On unix it IS
-//! that call: the kernel answers a SYN's RST with `ECONNREFUSED` at once.
-//!
-//! Windows answers the RST by sending the SYN again (twice by default), so a
-//! refused connect takes about two seconds to say so — 2046 ms on loopback in the
-//! 2026-09-29 snapshot's measurement (6ad1a274d8, Windows 11 26200). A caller that
-//! splits a short budget across a host's addresses (aterm-gui's `harness_netprobe`)
-//! then reads a refusal as a timeout: Unknown, never the definite Down it promises.
-//! So the Windows arm runs std's own steps (a non-blocking connect, `select` for
-//! writable-or-failed, `SO_ERROR`, blocking again) on a socket told first, by
-//! `SIO_TCP_INITIAL_RTO`, to retransmit its SYN at most ONCE: the refusal then
-//! arrived in 523 ms in that same measurement, and a SYN lost on the way still
-//! gets its one retry.
 
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-/// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does — a zero
-/// `timeout` is `InvalidInput`, the stream comes back blocking — with a refusal
-/// reported promptly on Windows too (the module says why).
-///
+/// Connect to `addr` within `timeout`, as `TcpStream::connect_timeout` does.
 /// # Errors
 /// The connect failed, was refused, or did not complete within `timeout`.
 pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
@@ -160,8 +143,8 @@ mod winsock {
         static STARTED: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
         let code = *STARTED.get_or_init(|| {
             let mut data = WsaData([0; 512]);
-            // SAFETY: `data` is a live, aligned buffer larger than `WSADATA`, which
-            // the call only writes.
+            // SAFETY: `data` is a live, aligned buffer larger than `WSADATA`, which the call only
+            // writes.
             unsafe { WSAStartup(WINSOCK_2_2, &mut data) }
         });
         if code == 0 {
@@ -217,18 +200,16 @@ mod winsock {
         if s == INVALID_SOCKET {
             return Err(last_error());
         }
-        // SAFETY: `s` is a socket this call just created and owns alone; from here
-        // the stream closes it on every return. `RawSocket` is `u64`, as wide as
-        // `SOCKET` on every 64-bit Windows.
+        // SAFETY: `s` is a socket this call just created and owns alone; from here the stream
+        // closes it on every return.
         let stream = unsafe { TcpStream::from_raw_socket(s as RawSocket) };
         let rto = InitialRto {
             rtt: RTT_UNSPECIFIED,
             max_syn_retransmissions: SYN_RETRANSMISSIONS,
         };
         let mut returned = 0u32;
-        // Best effort: a Windows that refuses the control connects as it always did.
-        // SAFETY: `rto` is a live `TCP_INITIAL_RTO_PARAMETERS` read for its size; no
-        // output buffer, overlap or completion routine.
+        // SAFETY: `rto` is a live `TCP_INITIAL_RTO_PARAMETERS` read for its size; no output buffer,
+        // overlap or completion routine.
         let _ = unsafe {
             WSAIoctl(
                 s,
@@ -262,7 +243,6 @@ mod winsock {
                 v6 = SockaddrIn6 {
                     family,
                     port: a.port().to_be_bytes(),
-                    // Unconverted, as std hands it over.
                     flowinfo: a.flowinfo(),
                     addr: a.ip().octets(),
                     scope_id: a.scope_id(),
@@ -282,8 +262,7 @@ mod winsock {
             }
             let tv = timeval(timeout);
             let (mut writable, mut failed) = (one(s), one(s));
-            // SAFETY: both sets and the timeout are live for the call; winsock
-            // ignores `nfds`.
+            // SAFETY: both sets and the timeout are live for the call; winsock ignores `nfds`.
             match unsafe { select(1, std::ptr::null_mut(), &mut writable, &mut failed, &tv) } {
                 SOCKET_ERROR => return Err(last_error()),
                 0 => {
@@ -292,7 +271,6 @@ mod winsock {
                         "connection timed out",
                     ));
                 }
-                // Not writable: the connect failed, and `SO_ERROR` says how.
                 _ => {
                     if writable.count != 1
                         && let Some(e) = stream.take_error()?

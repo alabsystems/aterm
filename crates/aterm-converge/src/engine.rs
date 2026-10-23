@@ -493,10 +493,19 @@ fn run_one(
             row.outcome = Outcome::Deferred;
             row.why = Some(why);
         }
-        Probe::Unusable { why } => {
-            row.outcome = Outcome::Unknown;
-            row.why = Some(why);
-        }
+        Probe::Unusable { why } => match item.read_aside() {
+            // The read needed what the run lacks (the network): it stood aside, with its
+            // kind on the row, rather than reading as unmeasured.
+            Some(aside) => {
+                row.outcome = Outcome::Blocked;
+                row.why = Some(aside.why().to_owned());
+                row.stood_aside = Some(aside);
+            }
+            None => {
+                row.outcome = Outcome::Unknown;
+                row.why = Some(why);
+            }
+        },
         Probe::Change { from, to } => {
             row.from = Some(from.clone());
             row.to = Some(to.clone());
@@ -1301,6 +1310,86 @@ pub(crate) mod tests {
                 })
             );
         }
+    }
+
+    /// [`Scripted`] whose unreadable probe says the run lacked what the read needs.
+    struct ReadAside(Scripted, Option<StoodAside>);
+
+    impl Item for ReadAside {
+        fn id(&self) -> String {
+            self.0.id()
+        }
+        fn family(&self) -> &'static str {
+            "git"
+        }
+        fn layer(&self) -> Layer {
+            Layer::Develop
+        }
+        fn class(&self) -> Class {
+            Class::Install
+        }
+        fn title(&self) -> String {
+            self.0.title()
+        }
+        fn probe(&self) -> Probe {
+            self.0.probe()
+        }
+        fn apply(&self) -> Result<(), String> {
+            self.0.apply()
+        }
+        fn explain(&self, probe: &Probe) -> Explain {
+            explained(probe)
+        }
+        fn read_aside(&self) -> Option<StoodAside> {
+            self.1.clone()
+        }
+    }
+
+    /// A probe that could not read because the network is down stands aside: `Blocked`
+    /// with its line and kind (69), explained by the network, never applied, in a plan and
+    /// in an apply; what waits on it in an apply stands aside with it. Negative control:
+    /// the same unreadable probe with no aside is `Unknown` with its own reason.
+    #[test]
+    fn an_unreadable_probe_that_lacked_the_network_stands_aside_offline() {
+        let offline = StoodAside::Offline("origin could not be reached".into());
+        let unusable = || Probe::Unusable {
+            why: "cannot read origin's default branch".into(),
+        };
+        for mode in [Mode::Plan, Mode::Apply] {
+            let item = Scripted::new(vec![unusable()], Ok(()));
+            let applies = Arc::clone(&item.applies);
+            let waiting = Named {
+                id: "develop.tools",
+                probe: ok(),
+                after: vec![item.id()],
+            };
+            let items: Vec<Box<dyn Item>> = vec![
+                Box::new(ReadAside(item, Some(offline.clone()))),
+                Box::new(waiting),
+            ];
+            let rows = run(&items, mode, &mut NoJournal).unwrap();
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{mode:?}");
+            assert_eq!(rows[0].why.as_deref(), Some(offline.why()));
+            assert_eq!(rows[0].stood_aside, Some(offline.clone()));
+            assert_eq!(
+                rows[0].explain.as_ref().map(|explain| &explain.remedy),
+                Some(&Remedy::Network)
+            );
+            assert_eq!(applies.load(Ordering::SeqCst), 0);
+            if mode == Mode::Apply {
+                assert_eq!(rows[1].outcome, Outcome::Blocked);
+                assert_eq!(rows[1].stood_aside, Some(offline.clone()));
+            }
+        }
+        let control = ReadAside(Scripted::new(vec![unusable()], Ok(())), None);
+        let items: Vec<Box<dyn Item>> = vec![Box::new(control)];
+        let rows = run(&items, Mode::Apply, &mut NoJournal).unwrap();
+        assert_eq!(rows[0].outcome, Outcome::Unknown);
+        assert_eq!(
+            rows[0].why.as_deref(),
+            Some("cannot read origin's default branch")
+        );
+        assert_eq!(rows[0].stood_aside, None);
     }
 
     #[test]

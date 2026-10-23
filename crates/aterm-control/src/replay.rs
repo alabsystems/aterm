@@ -1,30 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one engine a recording is replayed through.
-//!
-//! Every replay of a session (`cast drift`'s folds, the `cast frames`
-//! flipbook, `temporal`'s reconstruction) builds its headless engine here, a
-//! copy of one mid-recording ([`ReplayEngine::fork`]) included, so each is set
-//! up as the live engine was in every way a replay can see:
-//!
-//! - the console-host posture of the session's resize seam policy
-//!   (`Terminal::set_console_host_posture`): a ConPTY session's engine honors
-//!   conhost's `?9001h`, which decides how an orphaned alternate screen is
-//!   left. It is set from the policy whatever a restored checkpoint carried;
-//! - that policy on every resize (`Terminal::resize_with_policy`): a Native
-//!   grow reveals history at the top where a ConPTY grow appends blank rows;
-//! - the resize law its rows were laid out under (`Terminal::set_resize_law`,
-//!   [`ReplayEngine::with_resize_law`]): the current one unless the recording
-//!   names an older one;
-//! - whether its host leaves a dead app's alternate screen
-//!   (`Terminal::set_host_resyncs_alt_screen`,
-//!   [`ReplayEngine::with_host_resyncs_alt_screen`]): OpenConsole's sessions
-//!   leave it on the `?1049l` the host forwarded, not at the shell's prompt;
-//! - the alternate-screen archive off. It keeps only the scrollback text of
-//!   committed alt frames, is never part of a checkpoint, never touches the
-//!   grid a replay reads, and is most of a fold's time on a recording of a
-//!   fullscreen app.
+//! Headless recording replay engine ([`ReplayEngine::fork`]).
+//! Configures [`ReplayEngine::with_resize_law`] and [`ReplayEngine::with_host_resyncs_alt_screen`].
 
 use aterm_core::grid::{ResizeLaw, ResizePolicy};
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
@@ -38,8 +16,7 @@ pub struct ReplayEngine {
 }
 
 impl ReplayEngine {
-    /// A blank engine of `rows` x `cols` (each at least 1), the geometry a
-    /// recording starts at, for a session that resizes under `policy`.
+    /// Creates a blank `rows` by `cols` engine that resizes under `policy`.
     #[must_use]
     pub fn new(rows: u16, cols: u16, policy: ResizePolicy) -> Self {
         Self::configured(
@@ -50,8 +27,7 @@ impl ReplayEngine {
         )
     }
 
-    /// An engine restored from `cp` (a recorded keyframe) for a session that
-    /// resizes under `policy`.
+    /// Restores an engine from keyframe `cp` that resizes under `policy`.
     #[must_use]
     pub fn from_checkpoint(cp: &TerminalCheckpoint, policy: ResizePolicy) -> Self {
         Self::configured(
@@ -62,17 +38,13 @@ impl ReplayEngine {
         )
     }
 
-    /// This engine laying its rows out under `law` from the next resize on: an
-    /// older law for a recording made under it (`cast drift`, from the
-    /// recording's `aterm_resize_undo`).
+    /// Sets `law` as the resize layout law for subsequent resizes.
     #[must_use]
     pub fn with_resize_law(self, law: ResizeLaw) -> Self {
         Self::configured(self.term, self.policy, law, self.host_resyncs)
     }
 
-    /// This engine leaving a dead app's alternate screen on the `?1049l` its
-    /// host forwards (`on`, an OpenConsole session's posture) rather than at
-    /// the shell's next prompt.
+    /// Configures whether the host forwards `?1049l` to exit an orphaned alternate screen.
     #[must_use]
     pub fn with_host_resyncs_alt_screen(self, on: bool) -> Self {
         Self::configured(self.term, self.policy, self.law, on)
@@ -106,11 +78,7 @@ impl ReplayEngine {
         self.term.resize_with_policy(rows, cols, self.policy);
     }
 
-    /// A copy of this engine at this point of the recording, which folds the
-    /// rest of it as this one would (`Terminal::replay_fork`), so replays
-    /// sharing a prefix fold it once. `None` when the engine holds state a
-    /// fork cannot carry (a parser inside a sequence, Kitty images, an open
-    /// resize undo); the caller folds from the start instead.
+    /// A copy of this engine at this point of the recording.
     #[must_use]
     pub fn fork(&self) -> Option<Self> {
         self.term
@@ -118,8 +86,7 @@ impl ReplayEngine {
             .map(|term| Self::configured(term, self.policy, self.law, self.host_resyncs))
     }
 
-    /// Drop the active grid's resize undo, so the next resize lands as it would
-    /// on an engine without the undo (`cast drift`'s undo-less replays).
+    /// Drop the active grid's resize undo.
     #[inline]
     pub fn drop_resize_undo(&mut self) {
         self.term.grid_mut().drop_resize_undo();
@@ -157,8 +124,7 @@ mod tests {
             .collect()
     }
 
-    /// Whether `term` is set up as a replay of a session resizing under
-    /// `policy`: the archive off and that policy's console-host posture.
+    /// Whether `term` is set up as a replay of a session resizing under `policy`.
     fn replays(term: &Terminal, policy: ResizePolicy) -> bool {
         let console_host = policy == ResizePolicy::ConPty;
         let modes = term.modes();

@@ -1,47 +1,16 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! WHAT NO BUILD READS AGAIN inside a build directory that stays: the part of
-//! [`super::reclaim`]'s rule that takes from a live workspace's build directory instead of
-//! the whole of a dead one.
-//!
-//! - **A stale incremental crate folder** (`<profile>/incremental/<crate>-<id>/`, rustc's
-//!   session folders and their locks) that nothing wrote for [`RECLAIM_STALE`]. The folder's
-//!   name follows the crate's features, profile and dependency versions, so every `main` a
-//!   worktree merges leaves the previous names behind, and rustc collects old sessions only
-//!   inside a folder it compiles into again. Losing one costs one non-incremental compile of
-//!   that crate.
-//! - **A unit built by a compiler that is no longer the store's current one**
-//!   (`.fingerprint/<name>-<hash>/` and the `deps/`, `build/` and `examples/` entries carrying
-//!   its hash) that nothing wrote for [`RECLAIM_STALE`]. Cargo rebuilds a unit whose
-//!   fingerprint names another compiler before it uses it, so its bytes are never read again.
-//!
-//! WHICH COMPILER IS CURRENT is read, never assumed: `.rustc_info.json` at the build
-//! directory's root names the sysroot cargo last built with there. Only when that sysroot is
-//! a store's build (`<store>/<program>/<build>`, its `current` link beside it) are units
-//! judged by compiler, and then the compilers current in a profile are the ones its units
-//! written since that link was made name. Cargo last built here with the store's current
-//! build: a profile nothing was built in since the link was made keeps every unit, since a
-//! link laid again over the same build would otherwise make every unit look old. Cargo last
-//! built here with an earlier build of the store: every unit whose compiler no unit built
-//! since the link names goes once stale, as the next build rebuilds each of them. A build directory last built
-//! by a compiler no store holds (a stock toolchain, a from-source stage) and a fingerprint
-//! whose compiler cannot be read keep every unit.
-//!
-//! [`survey`] reads a build directory through an injected [`Fs`], never following a link;
-//! [`decide`] is pure. The pass ([`super::reclaim_watched`]) surveys without locks, takes
-//! every cargo lock of the build directory (`.cargo-lock`, `.cargo-build-lock`,
-//! `.cargo-artifact-lock`; one a build holds keeps the whole directory this pass), makes
-//! its decision again from a fresh survey under those locks, and stages the chosen parts.
+//! WHAT NO BUILD READS AGAIN inside a build directory that stays.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// A stale incremental crate folder, or a unit an old compiler built, goes once nothing wrote
-/// it for this long: long enough that a worktree left over a weekend keeps its incremental
-/// state, short enough that a week of merges does not pile up beside it.
+/// A stale incremental crate folder, or a unit an old compiler built, goes once nothing wrote it
+/// for this long: long enough that a worktree left over a weekend keeps its incremental state,
+/// short enough that a week of merges does not pile up beside it.
 pub const RECLAIM_STALE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// The leading bytes of a fingerprint's JSON that name its compiler: cargo writes
@@ -74,8 +43,8 @@ pub struct Meta {
 pub trait Fs {
     /// `path`'s own kind and modification time.
     fn meta(&self, path: &Path) -> Option<Meta>;
-    /// The entries of the real directory `dir`, each with what its own metadata says (`None`
-    /// where it could not be read); `None` where `dir` is no readable real directory.
+    /// The entries of the real directory `dir`, each with what its own metadata says (`None` where
+    /// it could not be read); `None` where `dir` is no readable real directory.
     fn list(&self, dir: &Path) -> Option<Vec<(OsString, Option<Meta>)>>;
     /// Up to `max` leading bytes of the regular file `file`.
     fn head(&self, file: &Path, max: usize) -> Option<Vec<u8>>;
@@ -83,21 +52,18 @@ pub trait Fs {
     fn read_link(&self, link: &Path) -> Option<PathBuf>;
 }
 
-/// A path and the newest write seen in it: its own and its entries' modification times, one
-/// level down. `None` where some of it could not be read, which is never stale.
+/// A path and the newest write seen in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stamp {
     pub path: PathBuf,
     pub newest: Option<SystemTime>,
 }
 
-/// One cargo unit of a profile: its fingerprint folder, the compiler its JSON names, and the
-/// entries of `deps/`, `build/` and `examples/` named by its hash.
+/// One cargo unit of a profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
     pub fingerprint: Stamp,
-    /// The `rustc` every JSON in the fingerprint folder names; `None` where one names none,
-    /// they differ, or there is none.
+    /// The `rustc` every JSON in the fingerprint folder names.
     pub rustc: Option<u64>,
     pub artifacts: Vec<Stamp>,
 }
@@ -122,8 +88,7 @@ pub struct LastBuilt {
 /// What [`survey`] read of one build directory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Survey {
-    /// `None` where cargo last built here with a compiler no store holds, or that cannot be
-    /// read.
+    /// `None` where cargo last built here with a compiler no store holds, or that cannot be read.
     pub last_built: Option<LastBuilt>,
     pub profiles: Vec<Profile>,
 }
@@ -137,9 +102,7 @@ pub enum Part {
     Unit,
 }
 
-/// Something [`decide`] says goes: `paths`, moved together, and the `witness` whose newest
-/// write [`unchanged`] reads again under the locks (the crate folder, or the unit's
-/// fingerprint folder).
+/// Something [`decide`] says goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Doomed {
     pub part: Part,
@@ -147,13 +110,7 @@ pub struct Doomed {
     pub paths: Vec<PathBuf>,
 }
 
-/// THE RULE, pure: in each profile, every incremental crate folder nothing wrote for
-/// [`RECLAIM_STALE`]; and, when cargo last built here with a store's build
-/// ([`Survey::last_built`]), every unit whose fingerprint names a compiler no unit of the
-/// profile written since the store's `current` link was made names, nothing having written
-/// its fingerprint or any of its entries for [`RECLAIM_STALE`]. Where that build is the
-/// current one, a profile with no unit written since keeps every unit: nothing there says
-/// which compiler is current.
+/// THE RULE, pure.
 #[must_use]
 pub fn decide(survey: &Survey, now: SystemTime) -> Vec<Doomed> {
     let stale = |t: Option<SystemTime>| {
@@ -199,9 +156,7 @@ pub fn decide(survey: &Survey, now: SystemTime) -> Vec<Doomed> {
     doomed
 }
 
-/// Reads the build directory `leaf`: the store build cargo last built with there, and each
-/// of `profiles` (the folders holding its cargo locks). `store` is independently admitted
-/// by the caller; `None` keeps compiler-classified units.
+/// Reads the build directory `leaf`.
 pub fn survey(fs: &dyn Fs, leaf: &Path, profiles: &[PathBuf], store: Option<&Path>) -> Survey {
     Survey {
         last_built: last_built(fs, leaf, store),
@@ -214,8 +169,7 @@ pub fn unchanged(fs: &dyn Fs, doomed: &Doomed) -> bool {
     doomed.witness.newest.is_some() && stamp(fs, &doomed.witness.path) == doomed.witness
 }
 
-/// The newest write in `path`: its own, and each entry's one level down when it is a real
-/// directory. `None` where any of that cannot be read.
+/// The newest write in `path`.
 pub fn stamp(fs: &dyn Fs, path: &Path) -> Stamp {
     let newest = fs.meta(path).and_then(|meta| match meta.kind {
         Kind::Dir => fs
@@ -235,7 +189,6 @@ fn profile(fs: &dyn Fs, dir: &Path) -> Profile {
     let crates = subdirs(fs, &dir.join("incremental"))
         .map(|p| stamp(fs, &p))
         .collect();
-    // Each entry of deps/, build/ and examples/ named by a unit hash, under that hash.
     let mut named: Vec<(String, PathBuf)> = Vec::new();
     for sub in ["deps", "build", "examples"] {
         let sub = dir.join(sub);
@@ -281,9 +234,7 @@ fn subdirs<'a>(fs: &dyn Fs, dir: &'a Path) -> impl Iterator<Item = PathBuf> + 'a
         .map(move |(name, _)| dir.join(name))
 }
 
-/// The unit hash a cargo output's name carries: the first `-` followed by sixteen lowercase
-/// hex digits and then the end or a `.` (`libfoo-<hash>.rlib`, `foo-<hash>.foo.<cgu>.rcgu.o`,
-/// `foo-<hash>`, `my-pkg-<hash>`).
+/// The unit hash a cargo output's name carries.
 #[must_use]
 pub fn unit_hash(name: &str) -> Option<&str> {
     let bytes = name.as_bytes();
@@ -328,16 +279,19 @@ fn last_built(fs: &dyn Fs, leaf: &Path, store: Option<&Path>) -> Option<LastBuil
         return None;
     }
     let sysroot = sysroot_named(&info)?;
-    // Match the independently admitted store BEFORE any read outside leaf.
     let store = store?;
     let mut relative = sysroot.strip_prefix(store).ok()?.components();
     let std::path::Component::Normal(name) = relative.next()? else {
         return None;
     };
-    let std::path::Component::Normal(build) = relative.next()? else {
+    let std::path::Component::Normal(raw_sysroot_build) = relative.next()? else {
         return None;
     };
-    if relative.next().is_some() || build.to_str()?.parse::<u64>().is_err() {
+    let sysroot_build = raw_sysroot_build
+        .to_str()?
+        .strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+        .unwrap_or(raw_sysroot_build.to_str()?);
+    if relative.next().is_some() || sysroot_build.parse::<u64>().is_err() {
         return None;
     }
     let program = store.join(name);
@@ -357,14 +311,18 @@ fn last_built(fs: &dyn Fs, leaf: &Path, store: Option<&Path>) -> Option<LastBuil
     }
     let target = program.join(fs.read_link(&link)?);
     let mut relative = target.strip_prefix(&program).ok()?.components();
-    let std::path::Component::Normal(build) = relative.next()? else {
+    let std::path::Component::Normal(raw_target_build) = relative.next()? else {
         return None;
     };
-    if relative.next().is_some() || build.to_str()?.parse::<u64>().is_err() {
+    let target_build = raw_target_build
+        .to_str()?
+        .strip_suffix(aterm_toolchain::build_cache::NOINDEX)
+        .unwrap_or(raw_target_build.to_str()?);
+    if relative.next().is_some() || target_build.parse::<u64>().is_err() {
         return None;
     }
     Some(LastBuilt {
-        current: target == sysroot,
+        current: target_build == sysroot_build,
         since: meta.modified,
     })
 }
@@ -405,7 +363,6 @@ impl Fs for Disk {
         let mut out = Vec::new();
         for entry in entries {
             let entry = entry.ok()?;
-            // `DirEntry::metadata` does not follow a link.
             let meta = entry.metadata().ok().and_then(|m| meta_of(&m));
             out.push((entry.file_name(), meta));
         }

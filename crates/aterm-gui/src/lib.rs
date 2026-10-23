@@ -1467,6 +1467,103 @@ pub(crate) fn term_try_lock(term: &Mutex<Terminal>) -> Option<TermGuard<'_>> {
     })
 }
 
+/// Which thread reads the screen on a path both run (a search, a fenced press): only a control thread waits for a whole frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReadOn {
+    /// A control connection's thread (a socket verb, the supervisor's); its caller's hang-up ends the wait.
+    Control,
+    /// A control thread finishing what its caller's hang-up does not undo (a turn's guarded Enter).
+    Committed,
+    /// The event loop (the find bar, the footer's slash press, a worker's launch line).
+    EventLoop,
+}
+
+impl ReadOn {
+    /// Whether a read on this thread may wait for a whole frame: never on the event loop.
+    pub(crate) fn waits(self) -> bool {
+        self != Self::EventLoop
+    }
+
+    /// The lane such a wait parks on.
+    pub(crate) const fn lane(self) -> park::Lane {
+        match self {
+            Self::Committed => park::Lane::SERVED.ignoring_hangup(),
+            Self::Control | Self::EventLoop => park::Lane::SERVED,
+        }
+    }
+}
+
+/// [`term_lock`] for a control thread's read of the screen, held on a whole DEC 2026 frame
+/// (`docs/measured/half-drawn-frame-2026-10-22.md`). While the frame is unfinished the lock is let
+/// go and the read parks on the session's watcher list, which its PTY reader rings at every burst,
+/// until [`whole_frame_bound`] or its caller hangs up; a frame still unfinished then is read as it
+/// stands and the reply says `frame=open`. A whole frame costs two flag loads. Never on the event
+/// loop (census OB-23).
+#[track_caller]
+pub(crate) fn term_lock_whole(term: &Mutex<Terminal>) -> TermGuard<'_> {
+    term_lock_whole_when(term, park::Lane::SERVED, |_| true)
+}
+
+/// [`term_lock_whole`] parked on `lane`, where `needs`, asked only of an unfinished frame, says
+/// whether this read waits; one call bound by a plain `let`, so the census sees the guard. A read
+/// that finishes whether or not its caller is there (a turn's committed phases) passes
+/// [`park::Lane::ignoring_hangup`].
+#[track_caller]
+pub(crate) fn term_lock_whole_when(
+    term: &Mutex<Terminal>,
+    lane: park::Lane,
+    needs: impl FnOnce(&Terminal) -> bool,
+) -> TermGuard<'_> {
+    let guard = term_lock(term);
+    if !guard.sync_frame_unfinished() {
+        return guard;
+    }
+    let Some(bound) = whole_frame_bound(&guard, Instant::now()) else {
+        return guard;
+    };
+    if !needs(&guard) {
+        return guard;
+    }
+    let Some(watchers) = session_watch::Watchers::of(&guard) else {
+        return guard;
+    };
+    drop(guard);
+    // Registered before the next look: a burst that closes the frame after it rings this.
+    let sub = session_watch::Subscription::single(&watchers);
+    loop {
+        let guard = term_lock(term);
+        let now = Instant::now();
+        if now >= bound || !guard.frame_unfinished_at(now) {
+            return guard;
+        }
+        drop(guard);
+        // Sliced like every control park, so a caller that hung up gets its lane back.
+        let woke = park::park(|b| sub.wait(b), bound, lane, &|| false);
+        if woke == park::Woke::HungUp {
+            return term_lock(term);
+        }
+    }
+}
+
+/// Until when a read made at `call` waits for `t`'s unfinished frame: the sync timeout from the
+/// start of the frame's run, never past its hang detector; `None` when nothing is left to wait for.
+fn whole_frame_bound(t: &Terminal, call: Instant) -> Option<Instant> {
+    if !t.frame_unfinished_at(call) {
+        return None;
+    }
+    let hang = t.frame_hang_deadline()?;
+    let begun = hang
+        .checked_sub(aterm_core::terminal::FRAME_HANG)
+        .map_or(call, |run| run.min(call));
+    let bound = begun
+        .checked_add(t.sync_timeout())
+        .unwrap_or(hang)
+        .min(hang);
+    (call < bound).then_some(bound)
+}
+
+pub(crate) use aterm_control::wire::frame_unfinished_now;
+
 #[cfg(test)]
 thread_local! {
     static TERM_LOCK_ACQUISITIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -17129,20 +17226,12 @@ impl App {
             Wake::ProgramResolved { session } => {
                 self.session_status.note_program_answered(session);
                 let disable = self.pool.get(session).is_some_and(|entry| {
-                    let unset = entry
+                    entry
                         .ctx
-                        .meta
+                        .timeline
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .autopilot_word()
-                        .is_none();
-                    unset
-                        && entry
-                            .ctx
-                            .timeline
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .leader_no_harness()
+                        .take_leader_no_harness()
                 });
                 if disable {
                     let _ = self.set_session_autopilot(

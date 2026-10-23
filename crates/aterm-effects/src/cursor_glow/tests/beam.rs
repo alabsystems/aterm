@@ -18,8 +18,10 @@ fn beam_parses_to_its_own_style() {
 }
 
 /// A jumped beam is one solid rod spanning the whole leap (the full-vector
-/// rule it shares with laser), with no lightning bolts and only a modest wake
-/// of weightless stardust, and it drains to exactly empty.
+/// rule it shares with laser), with no lightning bolts and no dust (a leap's
+/// dust is the comet's: 2026-10-22, the owner), and it drains to exactly
+/// empty. On the dark ground the rod is its tube under the text
+/// ([`super::streak_bed`]'s ice-tube law).
 #[test]
 fn beam_jump_is_one_clean_full_vector_rod() {
     let g = geom();
@@ -30,7 +32,7 @@ fn beam_jump_is_one_clean_full_vector_rod() {
     glow.tick(Some((2, 2)), t0, &c, g, &mut out);
     glow.note_synthetic_move(t0);
     glow.tick(Some((2, 30)), t0, &c, g, &mut out); // a same-row tractor leap
-    assert!(!out.is_empty(), "the rod is lit at spawn");
+    assert!(!glow.under_quads().is_empty(), "the rod is laid at spawn");
     assert_invariants(&out, g);
     // Full-vector: sparks span the leap even past the configured length (18).
     assert!(
@@ -39,18 +41,11 @@ fn beam_jump_is_one_clean_full_vector_rod() {
         glow.sparks.len()
     );
     assert!(glow.bolts.is_empty(), "a beam is not a lightning weapon");
-    // Stardust, not exhaust: a modest wake whose motes float (zero gravity) and
-    // linger (star-length lives).
-    assert!(!glow.particles.is_empty(), "a warp leap stirs stardust");
     assert!(
-        glow.particles.len() <= 14,
-        "a modest wake, not a shower ({} motes)",
+        glow.particles.is_empty(),
+        "the tube arrives alone: a leap's dust is the comet's ({} motes)",
         glow.particles.len()
     );
-    for p in &glow.particles {
-        assert_eq!(p.gy, 0.0, "space is weightless — no gravity on stardust");
-        assert!(p.life >= 0.5, "stars linger, they don't blink out");
-    }
     // Near-constant power: the tail spark carries ≥~65% of the head's power.
     let head_cov = glow.sparks.last().expect("head").born_cov as f32;
     let tail_cov = glow.sparks.first().expect("tail").born_cov as f32;

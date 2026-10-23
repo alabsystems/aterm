@@ -72,7 +72,7 @@ fn curl_argv(args: &[&str], url: &str) -> Vec<String> {
 
 /// Build the argv-and-env part of the curl process for every lane; [`curl_fetch`] adds the
 /// stdio.
-fn curl_command(args: &[&str], url: &str) -> Command {
+pub(crate) fn curl_command(args: &[&str], url: &str) -> Command {
     let mut command = aterm_uds::spawnfd::command(curl_bin());
     command
         .args(curl_argv(args, url))
@@ -967,7 +967,7 @@ pub enum VendorResponse {
 /// everything that changes which CAs curl trusts, including the TLS backend switch
 /// (`CURL_SSL_BACKEND=secure-transport` makes a multi-backend curl trust the keychain's
 /// user-added roots).
-const VENDOR_ENV_SCRUB: [&str; 6] = [
+pub(crate) const VENDOR_ENV_SCRUB: [&str; 6] = [
     "CURL_HOME",
     "XDG_CONFIG_HOME",
     "CURL_CA_BUNDLE",
@@ -1329,11 +1329,18 @@ fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String
 
 /// A fresh private directory for one vendor request's body and header dump, removed on
 /// drop.
-struct VendorScratch(std::path::PathBuf);
+pub(crate) struct VendorScratch(pub(crate) std::path::PathBuf);
 
 impl VendorScratch {
     #[cfg_attr(trust_verify, trust::skip)]
     fn new() -> Result<Self, String> {
+        Self::labelled("vendor")
+    }
+
+    /// [`Self::new`] named `aterm-{label}-…` (the REST lane's is `github`).
+    // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn labelled(label: &str) -> Result<Self, String> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         #[cfg(unix)]
@@ -1351,14 +1358,14 @@ impl VendorScratch {
         for _ in 0..8 {
             let n = NEXT.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir()
-                .join(format!("aterm-vendor-{}-{n}-{nanos}", std::process::id()));
+                .join(format!("aterm-{label}-{}-{n}-{nanos}", std::process::id()));
             match builder.create(&dir) {
                 Ok(()) => return Ok(Self(dir)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(format!("create vendor scratch dir: {e}")),
+                Err(e) => return Err(format!("create {label} scratch dir: {e}")),
             }
         }
-        Err("create vendor scratch dir: no free name".to_string())
+        Err(format!("create {label} scratch dir: no free name"))
     }
 }
 

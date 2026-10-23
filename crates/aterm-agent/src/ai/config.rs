@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `[ai]` TABLE AND THE FLEET DOCUMENT (docs/DESIGN-ai-connections-2026-10-16.md §6).
-//!
-//! Only `[ai]` keys are interpreted from valid TOML; unusable values are notes and their
-//! defaults, and malformed TOML reads as defaults with a note. It is not under `[harness]`,
-//! whose keys may only take power away: these are choices. Batteries included: reviews are
-//! on, every CLI used on this machine reviews, at the asking agent's own permission level.
-//!
-//! The fleet document (`[ai] fleet`, a file or an `https://` URL) carries the same choices
-//! for many machines, at its top level and under `[machine.<name>]`. A URL's document is
-//! signed, and verified under the key `[ai] fleet_key` pins (`fleet.rs`); a file's is too
-//! when a key is pinned. Precedence, per key: this machine's `[ai]`, the document's row for
-//! `[ai] machine`, the document's top level, the built-in default.
+//! `[ai]` configuration table and fleet document parser.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -220,10 +209,7 @@ fn accepted_ids() -> String {
     connector::ids().join(", ")
 }
 
-/// Reads one key of a choices table into `layer`. A value that cannot be used, a CLI name
-/// this build does not know and a key it does not know are each a note, never a refusal: a
-/// document written for a newer build, which knows a fifth CLI or a new key, still applies
-/// everything this build can read. `at` prefixes the notes.
+/// Reads one key of a choices table into `layer`.
 fn read_key(layer: &mut Layer, key: &str, value: &Value, at: &str, notes: &mut Vec<String>) {
     let mut note = |why: String| notes.push(format!("{at}{why}; ignored"));
     match key {
@@ -321,8 +307,7 @@ fn machine_name(word: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-/// Reads `[ai]` out of `aterm.toml`'s text, leniently: every value that cannot be used is a
-/// note and its default. A file that is not TOML reads as an empty table, with a note.
+/// Reads `[ai]` out of `aterm.toml`'s text, leniently.
 #[must_use]
 pub fn read(text: &str) -> (Local, Vec<String>) {
     let mut local = Local::default();
@@ -384,17 +369,8 @@ pub fn read(text: &str) -> (Local, Vec<String>) {
     (local, notes)
 }
 
-/// Reads a fleet document. Only text that is not TOML, or a schema this build does not
-/// read, refuses it: anything else it cannot use is a note, so a document written for a
-/// newer build still applies here. Its `seq` and `valid_until` are the fetch's
-/// ([`super::fleet::meta`]).
-///
-/// # Errors
-///
-/// Why it is refused, in one line.
+/// Reads a fleet document ([`super::fleet::meta`]).
 pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
-    // The parser's message quotes the offending line: a path that names the wrong file must
-    // not print it.
     let doc = aterm_toml::from_str::<Value>(text).map_err(|_| "not TOML".to_string())?;
     let table = doc.as_table().ok_or("not a table")?;
     match table.get("schema").and_then(Value::as_integer) {
@@ -438,11 +414,7 @@ pub fn read_fleet(text: &str) -> Result<(Fleet, Vec<String>), String> {
     Ok((fleet, notes))
 }
 
-/// The bytes of the file at `path`, opened once, its owner, mode, kind and size read from the
-/// open file. A file another user owns, or that another account may write
-/// ([`aterm_uds::shared_write`]: world-write, or group-write unless the group is the owner's
-/// private one and neither an access ACL nor a network or FUSE filesystem grants it further),
-/// is refused: whoever can write it chooses this machine's CLIs.
+/// The bytes of the file at `path` ([`aterm_uds::shared_write`]).
 fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
     let mut open = std::fs::OpenOptions::new();
@@ -471,9 +443,6 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         if meta.uid() != me {
             return Err("owned by another user".to_string());
         }
-        // Group-write is the owner's own on their private group: Ubuntu's umask `002`
-        // makes every document its user writes `0664`. Judged on this descriptor, ACL and
-        // all, so what is read is what was judged.
         if aterm_uds::shared_write::others_can_write(&file).map_err(|e| one(&e.to_string()))? {
             return Err("writable by others".to_string());
         }
@@ -488,12 +457,7 @@ fn read_private(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Reads the fleet document at `path`, bounded; a symbolic link is followed (the owner's
-/// synced dotfiles are often one). With `key`, its `<path>.sig` must verify under it.
-///
-/// # Errors
-///
-/// Why it is not read or refused, in one line.
+/// Reads the fleet document at `path`, bounded.
 pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>), String> {
     let bytes = read_private(path, FLEET_MAX_BYTES)?;
     if let Some(key) = key {
@@ -507,12 +471,7 @@ pub fn load_fleet(path: &Path, key: Option<&str>) -> Result<(Fleet, Vec<String>)
     read_fleet(&text)
 }
 
-/// Reads the fleet document `source` names: a file as [`load_fleet`] reads it; a URL's as
-/// the cache under `ai_dir` holds it, verified again under `key` ([`super::fleet::held`]).
-///
-/// # Errors
-///
-/// Why it is not read or refused, in one line.
+/// Reads the fleet document `source` names: a file as [`load_fleet`] reads it.
 pub fn load_source(
     source: &FleetSource,
     key: Option<&str>,
@@ -557,9 +516,7 @@ pub fn default_preferred() -> &'static Connector {
         .unwrap_or(&connector::CLAUDE)
 }
 
-/// The named fleet document, else `ai-fleet.toml` beside `aterm.toml` unless it is
-/// genuinely absent (a dangling entry or uncertain metadata reaches admission, which refuses
-/// it).
+/// The named fleet document.
 #[must_use]
 pub fn fleet_source(local: &Local, config: Option<&Path>) -> Option<FleetSource> {
     local.fleet.clone().or_else(|| {
@@ -576,8 +533,7 @@ pub fn fleet_source(local: &Local, config: Option<&Path>) -> Option<FleetSource>
     })
 }
 
-/// Resolves `local` over the fleet document `source` names, already read (`None`: no
-/// document is named and none lies beside `aterm.toml`).
+/// Resolves `local` over the fleet document `source` names.
 #[must_use]
 pub fn resolve(
     local: &Local,
@@ -707,8 +663,7 @@ pub fn default_ai_dir() -> Option<PathBuf> {
     aterm_types::dirs::state_dir().map(|root| root.join(super::store::DIR))
 }
 
-/// Reads `aterm.toml` at `config` (absent or unreadable: every default) and the fleet
-/// document, as held under `ai_dir`, at `now`.
+/// Reads `aterm.toml` at `config` (absent or unreadable: every default) and the fleet document.
 #[must_use]
 pub fn load_with(config: Option<&Path>, ai_dir: Option<&Path>, now: i64) -> Settings {
     let text = config.and_then(|p| {

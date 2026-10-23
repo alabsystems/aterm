@@ -165,7 +165,7 @@ impl Health {
 
     /// Total consecutive failed checks across all classes.
     #[must_use]
-    pub fn total_failures(&self) -> u32 {
+    pub const fn total_failures(&self) -> u32 {
         self.network_failures
             .saturating_add(self.pipeline_failures)
             .saturating_add(self.manifest_failures)
@@ -447,7 +447,7 @@ impl Health {
 
     /// Whether the recorded apply refusal still applies to `current_build`.
     #[must_use]
-    pub fn apply_refusal_applies_to(&self, current_build: u64) -> bool {
+    pub const fn apply_refusal_applies_to(&self, current_build: u64) -> bool {
         !self.last_apply_refusal.is_empty() && self.last_apply_refusal_build == current_build
     }
 

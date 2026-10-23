@@ -105,7 +105,7 @@ impl LiveSettings {
         Self::at(crate::config::config_path(), gate)
     }
 
-    fn at(path: Option<PathBuf>, gate: Gate) -> Self {
+    const fn at(path: Option<PathBuf>, gate: Gate) -> Self {
         Self {
             path,
             seen: None,
@@ -342,7 +342,7 @@ struct IndexAttempt {
 }
 
 impl IndexAttempt {
-    fn retry_after(self) -> Duration {
+    const fn retry_after(self) -> Duration {
         match self.passes {
             0 => crate::index_probe::INTERVAL,
             1 => Duration::from_secs(5 * 60),

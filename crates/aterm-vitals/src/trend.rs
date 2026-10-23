@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One quantity over time: its level, momentum and variance (design §12.1), and
-//! a bounded history of what it read.
-//!
-//! * **Level** is the fast average (τ 2 s), so one noisy sample does not jump
-//!   a tile.
-//! * **Momentum** is fast − slow (τ 20 s): positive while the quantity climbs
-//!   above where it has been, negative while it eases back.
-//! * **Variance** is the median absolute deviation of the last
-//!   [`MAD_WINDOW`] raw samples (10 s at 1 Hz): steady or jittery.
-//!
-//! Every average is time-weighted (`α = 1 − e^(−dt/τ)`), so a late or skipped
-//! sample is folded in at its true age.
+//! Time-weighted level, momentum, and variance ([`MAD_WINDOW`]) over a bounded sample history.
 
 /// The fast average's time constant: the level the surfaces draw.
 pub const FAST_TAU_S: f32 = 2.0;
-/// The slow average's time constant: the ghost line momentum is measured from.
+/// Time constant for the slow average baseline used to measure momentum.
 pub const SLOW_TAU_S: f32 = 20.0;
 /// Raw samples the variance is taken over (10 s at the 1 s cadence).
 pub const MAD_WINDOW: usize = 10;
@@ -28,8 +17,7 @@ pub const HISTORY_LEN: usize = 120;
 pub struct TrendView {
     /// The last raw sample.
     pub raw: f32,
-    /// The fast average (τ [`FAST_TAU_S`]): what a tile's height and a bar's
-    /// length draw.
+    /// The fast average (τ [`FAST_TAU_S`]): what a tile's height and a bar's length draw.
     pub level: f32,
     /// The slow average (τ [`SLOW_TAU_S`]): the dotted ghost.
     pub slow: f32,
@@ -57,9 +45,7 @@ impl TrendView {
         self.level - self.slow
     }
 
-    /// Which way the quantity is moving, past a noise gate. The gate is the
-    /// larger of `floor` (in the quantity's own units) and half the variance,
-    /// so a jittery series has to move further before it reads as rising.
+    /// Which way the quantity is moving, past a noise gate.
     #[inline]
     #[must_use]
     pub fn motion(&self, floor: f32) -> Motion {
@@ -74,9 +60,7 @@ impl TrendView {
         }
     }
 
-    /// The rise glow's step past the same gate as [`Self::motion`]: 0 (none)
-    /// while not rising, then 1, 2 or 3 as momentum passes 1×, 2.5× and 5× the
-    /// gate. Never for a falling quantity.
+    /// The rise glow's step past the same gate as [`Self::motion`].
     #[inline]
     #[must_use]
     pub fn glow_step(&self, floor: f32) -> u8 {
@@ -109,8 +93,7 @@ pub enum Motion {
 }
 
 impl Motion {
-    /// The word the sentences print after a figure: `rising`, `easing`, or
-    /// nothing while steady.
+    /// The word the sentences print after a figure: `rising`, `easing`, or nothing while steady.
     #[inline]
     #[must_use]
     pub const fn word(self) -> Option<&'static str> {
@@ -160,9 +143,7 @@ impl Trend {
         self.primed
     }
 
-    /// Fold in sample `v`, taken `dt_s` seconds after the previous one. The
-    /// first sample seeds both averages, so a fresh series starts steady
-    /// instead of rising from zero. A non-finite sample is ignored.
+    /// Fold in sample `v`, taken `dt_s` seconds after the previous one.
     pub fn push(&mut self, v: f32, dt_s: f32) {
         if !v.is_finite() {
             return;
@@ -227,27 +208,15 @@ fn median(v: &mut [f32]) -> f32 {
     }
 }
 
-/// Skipped seconds a timed push ([`History::push_at`]) fills with the
-/// reading that ends them: a reading every five seconds in the background is
-/// that quantity over those five seconds. A longer silence (no window showed
-/// the bars) is a gap.
+/// Skipped seconds a timed push ([`History::push_at`]) fills with the reading that ends them.
 pub const HISTORY_FILL_S: u64 = 6;
 
-/// The last [`HISTORY_LEN`] (or a chosen count of) seconds of one quantity,
-/// oldest first. `None` marks a gap: a second nothing was read (the window
-/// was hidden, the reader failed), drawn as a gap, never as zero.
-///
-/// A timed push ([`History::push_at`]) keeps one entry per second of the
-/// host clock whatever the reading cadence: two readings in one second (the
-/// lens's 2 Hz) fold into that second's mean, and a reading after a short
-/// silence (the background's 5 s) fills the seconds it spans. So a history
-/// of 60 entries is always the last minute, and the surfaces may say so.
+/// The last [`HISTORY_LEN`] (or a chosen count of) seconds of one quantity, oldest first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct History {
     values: std::collections::VecDeque<Option<f32>>,
     cap: usize,
-    /// The second the newest entry holds, and how many readings it averages
-    /// (`None` before the first timed push).
+    /// The second the newest entry holds.
     last: Option<(u64, u32)>,
 }
 
@@ -269,24 +238,18 @@ impl History {
         }
     }
 
-    /// Append one sample, or a gap with `None`, dropping the oldest past the
-    /// cap: one entry per call, whatever the time (see [`Self::push_at`]).
+    /// Append one sample, or a gap with `None`, dropping the oldest past the cap.
     pub fn push(&mut self, v: Option<f32>) {
         self.last = None;
         self.append(v.filter(|x| x.is_finite()));
     }
 
-    /// Record the reading taken at `at_ns` (the host's monotonic clock) in
-    /// the second it fell in: folded into that second's mean when the second
-    /// already holds one, else appended after the seconds since the last
-    /// reading (filled with this reading for at most [`HISTORY_FILL_S`] of
-    /// them, gaps beyond).
+    /// Records the reading taken at `at_ns` in its corresponding second bucket.
     pub fn push_at(&mut self, v: Option<f32>, at_ns: u64) {
         let v = v.filter(|x| x.is_finite());
         let second = at_ns / 1_000_000_000;
         match self.last {
             Some((last, n)) if second <= last => {
-                // A gap reading leaves the second's mean as it is.
                 if let (Some(back), Some(new)) = (self.values.back_mut(), v) {
                     *back = Some(match *back {
                         Some(old) if n > 0 => (old * n as f32 + new) / (n + 1) as f32,
@@ -392,7 +355,6 @@ mod tests {
     fn the_fast_average_follows_its_time_constant() {
         let mut t = Trend::new();
         t.push(0.0, 1.0);
-        // One τ later the fast average has covered 1 − 1/e of a step.
         t.push(1.0, FAST_TAU_S);
         let want = 1.0 - (-1.0f32).exp();
         assert!((t.view().level - want).abs() < 1e-5, "{:?}", t.view());
@@ -414,7 +376,6 @@ mod tests {
         assert_eq!(mad(&[]), 0.0);
         assert_eq!(mad(&[5.0]), 0.0);
         assert_eq!(mad(&[1.0, 1.0, 1.0, 1.0]), 0.0);
-        // Median 3; deviations 2,1,0,1,2 → median 1.
         assert_eq!(mad(&[1.0, 2.0, 3.0, 4.0, 5.0]), 1.0);
         let mut t = Trend::new();
         for i in 0..30 {
@@ -450,7 +411,6 @@ mod tests {
 
     #[test]
     fn a_timed_history_keeps_one_entry_a_second_at_any_cadence() {
-        // 2 Hz (the lens): two readings a second fold into that second's mean.
         let mut h = History::with_capacity(60);
         for i in 0..120u64 {
             h.push_at(Some(if i % 2 == 0 { 0.2 } else { 0.4 }), 10 * S + i * S / 2);
@@ -461,7 +421,6 @@ mod tests {
                 .iter()
                 .all(|v| v.is_some_and(|x| (x - 0.3).abs() < 1e-6))
         );
-        // 1 Hz: one entry each.
         let mut h = History::with_capacity(60);
         for i in 0..30u64 {
             h.push_at(Some(0.5), 10 * S + i * S);
@@ -471,7 +430,6 @@ mod tests {
 
     #[test]
     fn a_timed_history_fills_a_short_silence_and_gaps_a_long_one() {
-        // The background's 5 s: the reading spans the seconds it ends.
         let mut h = History::with_capacity(60);
         h.push_at(Some(0.1), 10 * S);
         h.push_at(Some(0.7), 15 * S);
@@ -486,7 +444,6 @@ mod tests {
                 Some(0.7)
             ]
         );
-        // Minutes with no reading (the bars were hidden) are gaps.
         let mut h = History::with_capacity(60);
         h.push_at(Some(0.1), 10 * S);
         h.push_at(Some(0.7), 100 * S);

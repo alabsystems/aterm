@@ -139,6 +139,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
             _ => Reach::Unknown,
         },
         program: aterm_phase::Program::Claude,
+        seat: Default::default(),
         account: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,

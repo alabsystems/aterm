@@ -2,18 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! THE EMITTED-SOURCE SHAPE GATE: what a type-level oracle cannot see.
-//!
-//! The conformance crate compares types. A function-pointer coercion cannot tell
-//! an `extern` declaration from an inline Rust body with the same signature, nor
-//! does it see a method widened from `unsafe` to safe or a dropped `Clone`. So the
-//! shim's rustdoc is reduced to [`ShapeRecord`]s — each public item's kind, each
-//! function's body bit and full header, each struct/union field, enum variant,
-//! public inherent item, and explicit `Clone`/`Copy`/`Debug`/`PartialEq`/`Eq`/
-//! `Hash` impl — and compared, set against set, with the reference crate's records
-//! over the cell's declaration set ([`crate::closure`]).
-//!
-//! Compiler-synthesized auto-trait verdicts and generic blanket impls are not
-//! compared: nobody declared them on the type.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -36,8 +24,8 @@ pub enum ShapeRecord {
         name: String,
         has_body: bool,
     },
-    /// The function's whole rustdoc header (const/unsafe/async/ABI), as compact
-    /// sorted JSON, so a field rustdoc adds later is compared too.
+    /// The function's whole rustdoc header (const/unsafe/async/ABI), as compact sorted JSON, so a
+    /// field rustdoc adds later is compared too.
     Header {
         name: String,
         header: String,
@@ -68,8 +56,7 @@ pub enum ShapeRecord {
     Trait {
         owner: String,
         kind: String,
-        /// The trait's canonical path; the crate's own items read `$crate::…`,
-        /// since the reference and the shim are differently named crates.
+        /// The trait's canonical path.
         path: String,
         /// The normalized generic arguments as compact JSON, `None` for none.
         args: Option<String>,
@@ -167,7 +154,6 @@ impl fmt::Display for ShapeDiff {
 }
 
 /// A function item's `has_body`: false for an `extern` declaration.
-///
 /// # Errors
 /// When rustdoc omitted the bit.
 pub fn function_has_body(name: &str, item: &Value) -> Result<bool> {
@@ -177,7 +163,6 @@ pub fn function_has_body(name: &str, item: &Value) -> Result<bool> {
 }
 
 /// A function item's whole header as compact sorted JSON.
-///
 /// # Errors
 /// When rustdoc omitted the header.
 pub fn function_header(name: &str, item: &Value) -> Result<String> {
@@ -381,7 +366,6 @@ fn entry_records(
 }
 
 /// The surface `public` shows, restricted to `names` when given.
-///
 /// # Errors
 /// When rustdoc omitted a fact a record needs.
 pub fn public_shape(
@@ -401,9 +385,7 @@ pub fn public_shape(
     Ok(out)
 }
 
-/// The reference's surface over one cell's declaration set: its `union.json`
-/// names, their closure, and the `core::ffi` primitives.
-///
+/// The reference's surface over one cell's declaration set.
 /// # Errors
 /// When the reference's rustdoc omitted a fact a record needs.
 pub fn expected_shape(
@@ -543,7 +525,6 @@ mod tests {
 
     #[test]
     fn a_crate_local_trait_argument_reads_as_dollar_crate_on_both_sides() {
-        // PartialEq<timespec> with the local type's id differing per document.
         let with_arg = |local_id: u64, krate: &str| {
             let index = format!(
                 r#""2":{{"id":2,"name":"timespec","inner":{{"struct":{{"kind":{{"plain":{{"fields":[]}}}},"impls":[4]}}}}}},

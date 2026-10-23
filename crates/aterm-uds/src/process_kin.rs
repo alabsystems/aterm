@@ -121,7 +121,7 @@ pub fn launchd_idversion() -> Option<i32> {
 
 /// Whether pid version `launcher` was handed out before `shell`'s.
 #[must_use]
-pub fn launched_before(launcher: i32, shell: i32) -> bool {
+pub const fn launched_before(launcher: i32, shell: i32) -> bool {
     shell.wrapping_sub(launcher) > 0
 }
 

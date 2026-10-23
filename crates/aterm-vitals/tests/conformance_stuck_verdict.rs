@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `StuckVerdict` (`aterm_models_misc::stuck_verdict_model`): every
-//! scenario of the design's §18 expectation table that the model covers is
-//! replayed through the real step (`jobs::step::classify_tick`, through
-//! `Jobs::absorb`), and each tick is projected onto the model's
-//! `(cls, q band, v)`. The action fired is the one the tick's own record
-//! names (`JobRow::tick`: progress, a refused reading, μ grown, how the job
-//! counted) together with the class's change and the φ band's move; each
-//! must be ENABLED in the model, land on the projected state, and leave every
-//! law holding.
-//!
-//! The unread-input gate's runs are left out: the gate is its own machine
-//! (`InputUnreadGate`), and its published word decides the verdict with no φ.
-//!
-//! NEGATIVE CONTROLS (§17's table): the real step with one injected defect
-//! (`jobs::Fault`, a `cfg(any(test, debug_assertions))` seam). Each trace is
-//! rejected at Buggy 0, admitted by its own mutant, and that mutant's run
-//! breaks its own law — so a projection that accepts everything fails here.
-//! The liveness controls (a CR redraw, idle churn, M7's logical-write noise
-//! taken for progress) are held to the scenarios' own flags: the true stall
-//! is never flagged.
+//! Tier-1 for `StuckVerdict` (`aterm_models_misc::stuck_verdict_model`).
 
 #[path = "support/world.rs"]
 mod world;
@@ -123,9 +104,6 @@ fn replay(m: &Model, t: &Trace, fired: &mut BTreeSet<&'static str>) -> Result<S,
                 (2, 2) | (3, 3) => {}
                 (a, b) => return Err(format!("no model step takes cls {a} to {b}")),
             }
-            // A legitimate wait's time passing, a band at a time: at Buggy 0
-            // `LegitTick` holds `q` at 0 (a stutter), so a legit row whose φ
-            // left band 0 is refused right here.
             if next == 1 {
                 while s["q"] < b {
                     let q = s["q"];
@@ -193,9 +171,6 @@ fn every_covered_scenario_is_a_run_of_the_model() {
         bad.len(),
         bad.join("\n  ")
     );
-    // The binding drives every action of the healthy lane but `LegitTick`,
-    // which at Buggy 0 is a stutter (a legit wait holds `q = v = 0`): the
-    // `AccrueOnLegit` control drives it, and every legit row is held to band 0.
     for a in [
         "Progress",
         "QuietTick",

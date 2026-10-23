@@ -4,21 +4,7 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! A new X11 window clears keep-above and keep-below once it is mapped, live. winit's
-//! creation-time `set_window_level(WindowLevel::Normal)` sent the root two `_NET_WM_STATE`
-//! REMOVE messages, `_NET_WM_STATE_ABOVE` and then `_NET_WM_STATE_BELOW`, for every window. WC.8
-//! left the setter to Windows and keeps the two messages
-//! ([`super::window::UnownedWindow`]'s `clear_window_level`), so a window manager's keep-above
-//! or keep-below rule applied at the map is still cancelled. A second client watching the root's
-//! substructure, as a window manager does, receives both, in that order. The negative control is
-//! the call removed from `UnownedWindow::new`: the watcher then sees neither.
-//!
-//! No timing decides it. The window's creation ends in a round trip on its own connection, so
-//! the server has sent both messages before it answers the watcher's round trip that follows,
-//! and the watcher reads what it was sent up to that answer.
-//!
-//! It runs where `$DISPLAY` names an X server (the Linux lane's Xvfb); elsewhere it says SKIP and
-//! returns.
+//! Live X11 test verifying mapped windows clear `_NET_WM_STATE_ABOVE` and `_NET_WM_STATE_BELOW`.
 
 use aterm_x11::proto::event::Event;
 use aterm_x11::proto::xproto::{self, cw, event_mask};

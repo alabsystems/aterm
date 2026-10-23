@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify perf aos` (MEASURED): what hosting the momentum glow under Aos costs, measured
-//! by `aterm-bench`'s `aos_harness` on one matched, recorded, deterministic typing story.
-//!
-//! The lane builds the harness twice:
-//! * `--release`, for the warm run and the cold runs;
-//! * `--profile opt-test` (release optimization with debug assertions on), for the stranded
-//!   repair, because the demonstration fault it repairs exists only with debug assertions.
-//!
-//! Then it runs, each as its own process:
-//! * every cold op [`COLD_RUNS`] times, one fresh process per run, round robin;
-//! * the warm run once;
-//! * the stranded run once;
-//! * `--export PATH` once (the story played into an attached host, its trace file written
-//!   under the target directory), then `--import PATH` once in another process, which
-//!   decodes the file on its own epoch and replays it.
-//!
-//! It checks that every report names the same story and that every process reached the
-//! same head ([`cross_process`]: the export's state digest and observation chain, the ones
-//! the file records, the import's replay, and each cold `replay` and `checkpoint` run),
-//! refusing on any disagreement. It prints a summary, and with `--json-out`
-//! writes every report with the run's provenance (load before and after, the thermal state,
-//! `targo --unverified --version`, the checkout's commit). Nothing is judged: the numbers
-//! are a shared desk's before they are aterm's, so there is no floor, no baseline and no
-//! trend sample. `docs/measured/aos-m0-m1-baseline-2026-10-22.md` records one run.
+//! `verify perf aos` (MEASURED).
 
 use std::path::Path;
 
@@ -36,8 +13,7 @@ use super::driver::{cargo_driver, target_dir};
 use super::floors::last_json_line;
 use super::{LaneRun, workspace_root};
 
-/// The harness's cold ops, each OP of `aos_harness --cold OP` (the harness refuses any
-/// other).
+/// The harness's cold ops, each OP of `aos_harness --cold OP` (the harness refuses any other).
 pub(crate) const COLD_OPS: [&str; 7] = [
     "direct",
     "host",

@@ -1,36 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The trust-anchor writer: a surgical, verified, idempotent edit of one
-//! `pub const NAME: &[&str] = &[…];` constant in `crates/aterm-update-core/src/pins.rs`, the
-//! file that decides what every shipped binary trusts. A mangled anchor either bricks the
-//! channel or arms it with a key nobody holds, so the writer obeys five rules:
-//!
-//! 1. Narrow: only the `&[ … ]` block of the one named constant changes, by a byte-splice at a
-//!    located offset, never a parse-and-re-emit; the surrounding doc comments hold the
-//!    rotation rules.
-//! 2. Anchored: the constant is found by a line that is exactly its declaration at column 0,
-//!    never by a pattern that could match its name inside its own doc comment.
-//! 3. Idempotent: a key already present is a no-op ([`Edit::AlreadyPresent`]), so re-running
-//!    `setup` or an interrupted `join` converges. A duplicate member would fail
-//!    `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates`.
-//! 4. Additive: existing members keep their order and the new key goes at the tail. Index 0
-//!    is the head, the master a build names as current, which only a deliberate rotation
-//!    changes.
-//! 5. Refuse rather than guess: a missing or doubled constant, an unterminated block, an entry
-//!    that is not a plain quoted literal with its trailing comma, or an empty member is an
-//!    error naming the line.
-//!
-//! [`verify_members`] then re-reads the result, both the planned text and the file on disk.
-//! The writer never commits or stages: arming a trust anchor is a reviewed act.
-
 use crate::fsio::concat;
 
-/// The paper-master anchor's constant name — the one trust anchor this writer edits.
+/// The paper-master anchor's constant name.
 pub const MASTER_ANCHOR: &str = "PAPER_MASTER_PUBKEYS";
 
-/// The ceiling `pins::tests::the_master_keyset_has_no_empty_members_and_no_duplicates`
-/// enforces: a master rotation window holds at most two.
+/// Maximum members in the master rotation window.
 pub const MAX_MASTER_MEMBERS: usize = 2;
 
 /// Base64 characters in an Ed25519 public key (32 bytes, one `=` of padding), checked here so
@@ -58,9 +34,9 @@ struct Span {
     end: usize,
 }
 
-/// A located anchor constant: where it is, what it currently holds, and how it is spelled.
+/// A located anchor constant.
 pub struct Anchor {
-    /// The members in source order. Index 0 is the head, and the head is a contract.
+    /// The members in source order; index 0 is the head.
     pub members: Vec<String>,
     form: Form,
     /// The declaration line, including its newline.
@@ -94,9 +70,7 @@ impl Anchor {
     }
 }
 
-/// Refuse a value that is not a base64 Ed25519 public key before it can reach the file: the
-/// check `pins::tests::the_master_is_a_well_formed_base64_ed25519_key` runs, done early, since
-/// a malformed key in the file fails closed at runtime with no hint that the value is wrong.
+/// Refuse a value that is not a 44-character base64 Ed25519 public key.
 pub fn vet_key(key: &str) -> Result<(), String> {
     if key.len() != KEY_B64_LEN {
         return Err(concat(&[
@@ -138,10 +112,6 @@ enum Entry {
 }
 
 /// Classify one entry line, or `None` for a shape this writer will not edit around.
-///
-/// The trailing comma is required: appending after a comma-less last member would edit that
-/// member's line too, and rustfmt never produces one here. Escapes and inner quotes are
-/// refused: a base64 key has neither.
 fn classify(trimmed: &str) -> Option<Entry> {
     if trimmed.is_empty() {
         return Some(Entry::Blank);
@@ -188,14 +158,11 @@ fn lines_with_spans(src: &str) -> Vec<(&str, Span)> {
 ///
 /// # Errors
 ///
-/// Absent, declared twice, spelled in a form this writer does not know, unterminated, or
-/// holding an entry line that is not a plain quoted literal. None is guessed at.
+/// Returns an error if the constant is absent, declared twice, malformed, or unterminated.
 pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     let lines = lines_with_spans(src);
     let decl_prefix = concat(&["pub const ", name, ":"]);
 
-    // A top-level item starts at column 0, which keeps this from matching the constant's
-    // name inside its doc comment.
     let mut found: Option<usize> = None;
     let mut count = 0usize;
     for (i, (text, _)) in lines.iter().enumerate() {
@@ -225,7 +192,6 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
     }
     let idx = found.unwrap_or(0);
     let (decl_text, decl_span) = lines[idx];
-    // The file's own line ending, read off the located declaration rather than assumed.
     let newline = if src[decl_span.start..decl_span.end].ends_with("\r\n") {
         "\r\n"
     } else {
@@ -259,11 +225,9 @@ pub fn read_anchor(src: &str, name: &str) -> Result<Anchor, String> {
         ]));
     }
 
-    // The open form: walk to the `];` terminator, classifying every line on the way.
     let mut members = Vec::new();
     let mut indent: Option<String> = None;
     for (text, span) in lines.iter().skip(idx + 1) {
-        // A `];` at column 0 closes a top-level item. Anything indented is not it.
         if *text == "];" {
             return Ok(Anchor {
                 members,
@@ -327,19 +291,15 @@ impl std::fmt::Debug for Edit {
     }
 }
 
-/// The result of planning an append. Nothing is written by planning.
+/// The result of planning an append.
 pub enum Edit {
-    /// The key is already a member: the idempotent outcome of re-running `setup` or
-    /// finishing an interrupted `join`.
+    /// The key is already a member.
     AlreadyPresent { members: Vec<String> },
     /// The edit to write, and the members the file must hold afterwards.
     Changed { text: String, members: Vec<String> },
 }
 
 /// Plan an append of `key` to the named anchor, with `comment` lines above it.
-///
-/// Append only (rule 4): `key` becomes the head only when the anchor was empty, with no
-/// incumbent to strand.
 pub fn append_member(
     src: &str,
     name: &str,
@@ -350,8 +310,6 @@ pub fn append_member(
     vet_key(key)?;
     let anchor = read_anchor(src, name)?;
 
-    // An empty member reads as armed to `roster_tier_armed()` while authorizing nobody: the
-    // file is already a brick, and a good key beside it would hide that.
     for (i, m) in anchor.members.iter().enumerate() {
         if m.is_empty() {
             return Err(concat(&[
@@ -398,8 +356,6 @@ pub fn append_member(
     let mut text = String::new();
     match anchor.form {
         Form::EmptyInline => {
-            // The one case where a line is replaced: `= &[];` has no body, so it becomes the
-            // open form carrying one entry, the declaration reproduced verbatim.
             let raw = &src[anchor.decl.start..anchor.decl.end];
             let nl = if raw.ends_with('\n') {
                 anchor.newline
@@ -429,9 +385,6 @@ pub fn append_member(
     let mut members = anchor.members;
     members.push(key.to_string());
 
-    // Read the plan back before offering it to a caller that will write it: the post-write
-    // `verify_members` check fires only once damaged bytes are on disk, while this refuses an
-    // unreadable plan with the working tree untouched.
     verify_members(&text, name, &members).map_err(|e| {
         concat(&[
             "the edit this writer planned for `",
@@ -448,12 +401,6 @@ pub fn append_member(
 }
 
 /// Parse `src` and check the named anchor holds exactly `expected`, in order.
-///
-/// Used twice: by [`append_member`] on the text it built, so an unreadable plan never reaches
-/// the file, and by the caller on the bytes read back from disk, catching a short write, a full
-/// filesystem or a concurrent editor. The messages are phase-neutral and each caller says
-/// which phase failed: "nothing has been written" and "the file on disk may be damaged" are
-/// opposite instructions.
 pub fn verify_members(src: &str, name: &str, expected: &[String]) -> Result<(), String> {
     let anchor = read_anchor(src, name)
         .map_err(|e| concat(&["`", name, "` could not be read back: ", &e]))?;
@@ -567,7 +514,6 @@ mod tests {
             }
             Edit::Changed { .. } => panic!("a re-append must be a no-op, not a second entry"),
         }
-        // Re-reading the once-written text still sees exactly one.
         let after = read_anchor(&once, FIXTURE).unwrap();
         assert_eq!(after.members.iter().filter(|m| *m == NEW).count(), 1);
         assert_eq!(once.matches(NEW).count(), 1);
@@ -585,7 +531,6 @@ mod tests {
         );
         assert_eq!(after.head(), Some(K1), "the head is never reordered");
 
-        // A second machine appends behind the first, still without disturbing the head.
         let (text2, _) =
             changed(append_member(&text, FIXTURE, NEW2, &["m11"], FIXTURE_MAX).unwrap());
         let after2 = read_anchor(&text2, FIXTURE).unwrap();
@@ -598,7 +543,6 @@ mod tests {
         let src = fixture();
         let (text, _) =
             changed(append_member(&src, FIXTURE, NEW, &["provenance"], FIXTURE_MAX).unwrap());
-        // Every original line still present, in order, with exactly two lines added.
         let before: Vec<&str> = src.lines().collect();
         let after: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -617,7 +561,6 @@ mod tests {
         assert!(text.contains("/// The paper master. Empty here, and therefore INERT."));
         assert!(text.contains("/// The channel keyset. ORDER IS A CONTRACT: index 0 is the head."));
         assert!(text.contains("pub const PKG_ROOT_PUBKEY: &str = \"whatever\";"));
-        // The other anchor is untouched.
         assert!(
             read_anchor(&text, MASTER_ANCHOR)
                 .unwrap()
@@ -648,14 +591,11 @@ mod tests {
             "the doc comment naming the constant must survive verbatim"
         );
         assert!(!text.contains("= &[];"), "the empty form is gone");
-        // The channel anchor, in the same file, is untouched.
         assert_eq!(
             read_anchor(&text, FIXTURE).unwrap().members,
             vec![K1.to_string(), K2.to_string()]
         );
 
-        // A declaration on the last line with no newline after it gains none: the diff is
-        // the declaration and the entry and nothing else.
         let last = "pub const PAPER_MASTER_PUBKEYS: &[&str] = &[];";
         let (text, members) =
             changed(append_member(last, MASTER_ANCHOR, NEW, &[], MAX_MASTER_MEMBERS).unwrap());
@@ -667,7 +607,6 @@ mod tests {
     /// would count trailing whitespace and slice into the line's content.
     #[test]
     fn trailing_whitespace_on_a_neighbouring_line_does_not_poison_the_indent() {
-        // Trailing whitespace after the comment, after the key, and after the declaration.
         let src = fixture()
             .replace(
                 "    // K1 — HEAD: the key this build signs with.",
@@ -691,7 +630,6 @@ mod tests {
             members,
             vec![K1.to_string(), K2.to_string(), NEW.to_string()]
         );
-        // The appended lines carry the indent and nothing else.
         assert!(text.contains("\n    // m3\n"), "{text}");
         let mut entry = String::from("\n    \"");
         entry.push_str(NEW);
@@ -701,7 +639,6 @@ mod tests {
             !text.contains("\"cw//"),
             "no key bytes leaked into the comment: {text}"
         );
-        // And it reads back (the writer's pre-write check enforces this too).
         assert_eq!(read_anchor(&text, FIXTURE).unwrap().members, members);
     }
 
@@ -743,7 +680,6 @@ mod tests {
         );
         assert_eq!(text.matches('\n').count(), text.matches("\r\n").count());
 
-        // The empty form converts to the open form in the file's own ending too.
         let (text, _) = changed(
             append_member(src, MASTER_ANCHOR, NEW2, &["master"], MAX_MASTER_MEMBERS).unwrap(),
         );
@@ -760,26 +696,22 @@ mod tests {
 
     #[test]
     fn unrecognised_shapes_are_refused_not_guessed_at() {
-        // Absent.
         let err = read_anchor("// nothing here\n", FIXTURE).unwrap_err();
         assert!(err.contains("no `pub const"), "{err}");
         assert!(err.contains("will not guess"), "{err}");
 
-        // Declared twice.
         let twice = fixture().replace(
             "pub const PKG_ROOT_PUBKEY: &str = \"whatever\";",
             "pub const FIXTURE_KEYS: &[&str] = &[];",
         );
         let err = read_anchor(&twice, FIXTURE).unwrap_err();
         assert!(err.contains("2 declarations"), "{err}");
-        // ...but an INDENTED one (a nested module's) is not a top-level item at all.
         let nested = fixture() + "mod nested {\n    pub const FIXTURE_KEYS: &[&str] = &[];\n}\n";
         assert_eq!(
             read_anchor(&nested, FIXTURE).unwrap().members,
             [K1.to_string(), K2.to_string()]
         );
 
-        // A spelling this writer does not know: a fixed-size array.
         let arrayed = fixture().replace(
             "pub const FIXTURE_KEYS: &[&str] = &[",
             "pub const FIXTURE_KEYS: &[&str; 2] = &[",
@@ -787,7 +719,6 @@ mod tests {
         let err = read_anchor(&arrayed, FIXTURE).unwrap_err();
         assert!(err.contains("refusing to guess"), "{err}");
 
-        // An entry that is not a plain quoted literal.
         let computed = fixture().replace(
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
             "    SOME_OTHER_CONST,",
@@ -796,16 +727,12 @@ mod tests {
         assert!(err.contains("does not recognise"), "{err}");
         assert!(err.contains("SOME_OTHER_CONST"), "{err}");
 
-        // No trailing comma: legal Rust, but not a line to edit around.
         let no_comma = fixture().replace(
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\",",
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\"",
         );
         assert!(read_anchor(&no_comma, FIXTURE).is_err());
 
-        // A literal the compiler would read differently from its bytes (an escape), two
-        // literals on one line, and an INDENTED `];` (not this item's terminator): each is
-        // a line this writer refuses rather than misreads.
         for line in [
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNd\\x41\",",
             "    \"bsuawZEJq6qhEpcUovJCFFfMXgp7AgLZHjPvd14qNdc=\", \"x\",",
@@ -818,19 +745,15 @@ mod tests {
             assert!(read_anchor(&odd, FIXTURE).is_err(), "{line}");
         }
 
-        // A missing terminator swallows the next top-level item: refused as an unrecognised
-        // line.
         let swallowed = fixture().replace("];\n", "");
         let err = read_anchor(&swallowed, FIXTURE).unwrap_err();
         assert!(err.contains("does not recognise"), "{err}");
         assert!(err.contains("PKG_ROOT_PUBKEY"), "{err}");
 
-        // Genuinely unterminated: the block runs to end of file.
         let unterminated = "pub const FIXTURE_KEYS: &[&str] = &[\n    \"x\",\n";
         let err = read_anchor(unterminated, FIXTURE).unwrap_err();
         assert!(err.contains("never closed"), "{err}");
 
-        // Negative control: the undamaged file plans, so the refusals are about the damage.
         assert!(append_member(&computed, FIXTURE, NEW, &[], 4).is_err());
         assert!(append_member(&fixture(), FIXTURE, NEW, &[], 4).is_ok());
     }
@@ -841,8 +764,6 @@ mod tests {
             "    \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\",",
             "    \"\",",
         );
-        // The read succeeds (the shape is legal), so the refusal is a decision, not a parse
-        // accident.
         assert_eq!(read_anchor(&bricked, FIXTURE).unwrap().members[0], "");
         let err = append_member(&bricked, FIXTURE, NEW, &[], 4).unwrap_err();
         assert!(err.contains("empty string"), "{err}");
@@ -873,7 +794,6 @@ mod tests {
     #[test]
     fn the_keyset_ceiling_is_enforced_by_the_writer() {
         let src = fixture();
-        // Master: one key fits, a second fits, a third does not.
         let (one, _) =
             changed(append_member(&src, MASTER_ANCHOR, NEW, &[], MAX_MASTER_MEMBERS).unwrap());
         let (two, _) =
@@ -892,18 +812,15 @@ mod tests {
             changed(append_member(&src, FIXTURE, NEW, &["m3"], FIXTURE_MAX).unwrap());
         verify_members(&text, FIXTURE, &members).expect("the intended write verifies");
 
-        // The write never happened (the original file is still on disk).
         let err = verify_members(&src, FIXTURE, &members).unwrap_err();
         assert!(err.contains("holds 2 keys but 3 were intended"), "{err}");
 
-        // One character of the key was corrupted in flight.
         let mangled = text.replace(NEW, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB=");
         assert_ne!(mangled, text, "the mutation must actually change the text");
         let err = verify_members(&mangled, FIXTURE, &members).unwrap_err();
         assert!(err.contains("[2]"), "{err}");
         assert!(err.contains("was intended"), "{err}");
 
-        // The head was reordered behind our back.
         let reordered = {
             let mut m = members.clone();
             m.swap(0, 2);
@@ -911,12 +828,9 @@ mod tests {
         };
         assert!(verify_members(&text, FIXTURE, &reordered).is_err());
 
-        // The file was truncated to nothing readable.
         let err = verify_members("// gone\n", FIXTURE, &members).unwrap_err();
         assert!(err.contains("could not be read back"), "{err}");
 
-        // A PLAN that would not read back is refused before it is offered: a provenance
-        // comment carrying a newline puts a bare line in the block.
         assert!(append_member(&src, FIXTURE, NEW, &["two\nlines"], FIXTURE_MAX).is_err());
     }
 
@@ -928,7 +842,6 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../aterm-update-core/src/pins.rs"
         );
-        // Through the tool's own bounded reader: `setup` and `join` must be able to read it.
         let src = String::from_utf8(
             crate::fsio::read_bytes(path).expect("the anchor file is in the tree"),
         )

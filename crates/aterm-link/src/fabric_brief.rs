@@ -271,7 +271,7 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
 const BODY_MIN_TOKENS: usize = 24;
 
 /// The tokens one line costs, its newline included.
-fn line_tokens(line: &str) -> usize {
+const fn line_tokens(line: &str) -> usize {
     aterm_slog::tokens(line.len() + 1)
 }
 

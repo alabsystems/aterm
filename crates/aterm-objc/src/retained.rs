@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! [`Retained<T>`] — the typed twin of [`crate::Obj`].
-//!
-//! For a declared class the Rust type is the ObjC class, so the owner carries
-//! the type (reaching `ivars()` and the class's methods through `Deref`). Every
-//! other rule matches [`crate::Obj`], including the absence of `Clone`.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -29,10 +25,6 @@ pub unsafe trait ClassType: Sized {
 }
 
 /// An owned (+1) reference to an instance of `T`.
-///
-/// Ownership rules are [`crate::Obj`]'s: `from_owned` adopts a +1, `retain`
-/// takes a borrowed reference to +1, `Drop` releases once, and a retain is
-/// spelled [`Retained::clone_retained`] rather than `Clone`.
 #[repr(transparent)]
 pub struct Retained<T: ClassType> {
     ptr: NonNull<T>,
@@ -88,17 +80,13 @@ impl<T: ClassType> Retained<T> {
     /// Give up ownership without releasing — the caller inherits the +1.
     #[inline]
     #[must_use]
-    pub fn into_raw(self) -> Id {
+    pub const fn into_raw(self) -> Id {
         let id = self.as_id();
         std::mem::forget(self);
         id
     }
 
     /// Hand the +1 to the innermost pool and return the now-borrowed pointer.
-    ///
-    /// The typed twin of [`crate::Obj::autorelease`]: what a declared method
-    /// returning an object owes its caller (objc2's `#[method_id]`), e.g. the
-    /// `NSToolbarDelegate` item returns.
     #[inline]
     #[must_use]
     pub fn autorelease(self) -> Id {
@@ -135,7 +123,3 @@ impl<T: ClassType> fmt::Debug for Retained<T> {
         write!(f, "Retained<{}>({:p})", T::NAME, self.ptr.as_ptr())
     }
 }
-
-// Not `Send`/`Sync` (auto-derived from `NonNull`): every declared class is
-// main-thread AppKit state. A thread-safe class should get its own wrapper
-// rather than loosen this one.

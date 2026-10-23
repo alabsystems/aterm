@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! The work budgets over real faces (TF.5 of
 //! docs/AUDIT-third-party-2026-10-15.md): how many outline steps each glyph
 //! takes against aterm-font's 65,536 (`src/work.rs`) and how many `COLR`
@@ -10,16 +9,6 @@
 //! it, which has no such budget: the outline's commands and box (each
 //! coordinate's f32 bits) and the paint walk's calls must match, so a
 //! budget that cut a real glyph short would show as a difference.
-//!
-//! The domain, fixed so a rerun measures the same thing:
-//!
-//! - faces: `crate::hint_diff::face_files` (this host's system font
-//!   directories, aterm-render's committed fonts, and the extra roots
-//!   named on the command line), every face of a collection;
-//! - instances: the default, and on a variable face every axis at its
-//!   minimum and every axis at its maximum (all axes at once);
-//! - glyphs: every glyph of the face; the paint walk for each glyph
-//!   `is_color_glyph` names, palette 0.
 
 use std::collections::BTreeMap;
 

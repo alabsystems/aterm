@@ -86,7 +86,7 @@ impl EndClass {
 
     /// Whether this end is one the person did not ask for — the class the keeper exists for.
     #[must_use]
-    pub fn is_unexpected(self) -> bool {
+    pub const fn is_unexpected(self) -> bool {
         matches!(self, Self::Killed | Self::Signal(_) | Self::Panic)
     }
 
@@ -107,7 +107,7 @@ impl EndClass {
 }
 
 /// The conventional name of the fatal signals the handler traps (Darwin numbering).
-fn signal_name(n: u8) -> &'static str {
+const fn signal_name(n: u8) -> &'static str {
     match n {
         4 => "SIGILL",
         6 => "SIGABRT",
@@ -130,7 +130,7 @@ pub enum Tri {
 }
 
 impl Tri {
-    fn token(self) -> &'static str {
+    const fn token(self) -> &'static str {
         match self {
             Self::Yes => "yes",
             Self::No => "no",
@@ -164,7 +164,7 @@ pub enum Pressure {
 }
 
 impl Pressure {
-    fn token(self) -> &'static str {
+    const fn token(self) -> &'static str {
         match self {
             Self::Critical => "critical",
             Self::Warn => "warn",
@@ -219,7 +219,7 @@ pub struct PrevRun {
 impl PrevRun {
     /// The "nothing earlier" value of a ledger's first row.
     #[must_use]
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             pid: None,
             build: None,
@@ -243,7 +243,7 @@ pub enum LaunchKind {
 }
 
 impl LaunchKind {
-    fn token(self) -> &'static str {
+    const fn token(self) -> &'static str {
         match self {
             Self::Cold => "cold",
             Self::Successor => "successor",
@@ -289,7 +289,7 @@ pub struct Restores {
 impl Restores {
     /// The sessions the recovery admitted, on any rung (the refused ones are not).
     #[must_use]
-    pub fn recovered(&self) -> u32 {
+    pub const fn recovered(&self) -> u32 {
         self.exact
             .saturating_add(self.screen)
             .saturating_add(self.meta)
@@ -389,7 +389,7 @@ pub enum KeeperAtLaunch {
 impl KeeperAtLaunch {
     /// The row word (`off`, `absent`, `on`, `armed`).
     #[must_use]
-    pub fn token(self) -> &'static str {
+    pub const fn token(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Absent => "absent",
@@ -412,7 +412,7 @@ impl KeeperAtLaunch {
 
     /// Whether the link was on (whatever answered it).
     #[must_use]
-    pub fn link_on(self) -> bool {
+    pub const fn link_on(self) -> bool {
         !matches!(self, Self::Off)
     }
 }
@@ -471,7 +471,7 @@ fn parse_opt_u64(token: &str) -> Option<Option<u64>> {
 impl Row {
     /// Whether this row is the process born `started` (Unix seconds) and `started_us` (its microseconds, when known) with `pid`: to the microsecond when both sides carry it, else to the second — a pid reused within the second matches only then.
     #[must_use]
-    pub fn is_process(&self, pid: u32, started: u64, started_us: Option<u32>) -> bool {
+    pub const fn is_process(&self, pid: u32, started: u64, started_us: Option<u32>) -> bool {
         self.pid == pid
             && self.started == started
             && match (self.started_us, started_us) {
@@ -815,7 +815,7 @@ pub struct Summary {
 impl Summary {
     /// Whether any recorded run ended unexpectedly.
     #[must_use]
-    pub fn any_unexpected(&self) -> bool {
+    pub const fn any_unexpected(&self) -> bool {
         self.last_unexpected.is_some()
     }
 }

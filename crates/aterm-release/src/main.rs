@@ -52,6 +52,9 @@ mod durable;
 // The release's own handoff fixtures, landed on main after its cut for the next cut.
 mod fixtures;
 mod gates;
+// GitHub's REST API through curl, the channel token on its stdin: every release read
+// and write the cut makes on GitHub (no gh).
+mod github;
 // `ship hook`: the publication engine's pre-promote, post-promote and transforms hooks.
 mod hook;
 // The release's interrupt: SIGINT, SIGTERM and SIGHUP caught, handed to a running

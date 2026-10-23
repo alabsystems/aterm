@@ -798,6 +798,7 @@ fn attention_outcome(facts: &NeedFacts) -> (Option<Need>, Option<Waiting>, bool)
 /// else, or where the entry names no program this build knows,
 /// the entry's own parse ([`need_words`], 2a); `None` where neither reads.
 fn harness_ask(text: &str, told: Option<&[String]>) -> Option<HarnessAsk> {
+    let text = entry_words(text);
     let (head, rest) = text.split_once(NEEDS_YOU)?;
     let program = aterm_phase::Program::ALL
         .into_iter()

@@ -1,40 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shaper differential (TF.6 of docs/AUDIT-third-party-2026-10-15.md):
-//! seeded random runs shaped by rustybuzz 0.20.1 (`probe.rs`) and by
-//! aterm-font's shaper (`shaper.rs`), each written as the corpus answer
-//! string, compared run by run. The seed is fixed, so a rerun draws the same
-//! runs; what it measured is recorded in the audit (§5.7) and the text-fonts
-//! ruling.
-//!
-//! The verdict holds inside this text domain only:
-//!
-//! - left to right: ASCII 0x21-0x7E, the Latin-1 letters, Greek and
-//!   Cyrillic capitals and small letters, each only on a face that maps it;
-//! - right to left: Hebrew letters; Arabic and Persian letters (those with a
-//!   canonical decomposition only on a face that maps them), tatweel,
-//!   Arabic-Indic digits, at most one haraka (U+064B..U+0652) after a letter,
-//!   ZWJ and ZWNJ between letters; ASCII digits and the punctuation that has
-//!   no Bidi_Mirroring_Glyph among them; and runs mixing both;
-//! - default ignorables (ZWSP, WJ, soft hyphen, LRM, RLM) and variation
-//!   selectors (VS1, VS2, VS15, VS16) after a character.
-//!
-//! Left out on purpose, each an accepted TF.6 delta measured elsewhere: a
-//! mirrorable character in a run holding a Hebrew or Arabic letter (upstream
-//! mirrored it), a combining mark after a non-Arabic letter and U+0653..U+0655
-//! (upstream composed them), stacked marks (upstream reordered them), and a
-//! precomposed letter the face lacks (upstream decomposed it). Faces:
-//! every face of the oracle's table this host has but those with `morx`
-//! (CoreText shapes those on macOS), at the default instance and, with a
-//! `wght` axis, at 700, under four feature lists (`liga`/`calt` on and off,
-//! each with and without `zero`, `ss01` and `cv01`).
-//!
-//! A second pool measures the shapers TF.6 did not carve (Indic, USE,
-//! Khmer, Myanmar, Thai, Hangul): runs of the characters of those scripts
-//! aterm gives a cell of their own (`char_width` 1; a zero-width mark rides
-//! its base cell and never joins a run), on the oracle's faces and the macOS
-//! faces for those scripts.
+//! Differential shaper comparison between rustybuzz and aterm-font's shaper.
 
 use crate::{Loaded, load, probe, shaper};
 
@@ -153,7 +120,6 @@ impl Pools {
         let mut out = String::new();
         for _ in 0..len {
             let c = match kind {
-                // Left to right.
                 0..=3 => {
                     if rng.chance(60) {
                         rng.pick(&self.ascii)
@@ -161,7 +127,6 @@ impl Pools {
                         rng.pick(&self.letters)
                     }
                 }
-                // Hebrew among neutrals.
                 4 | 5 => {
                     if rng.chance(75) {
                         rng.pick(&self.hebrew)
@@ -169,7 +134,6 @@ impl Pools {
                         rng.pick(&self.neutral)
                     }
                 }
-                // Arabic.
                 6..=8 => match rng.below(20) {
                     0 => '\u{640}',
                     1 => rng.pick(&self.arabic_digits),
@@ -183,7 +147,6 @@ impl Pools {
                     }
                     _ => rng.pick(&self.arabic),
                 },
-                // Both directions, no mirrorable character.
                 _ => match rng.below(3) {
                     0 => rng.pick(&self.hebrew),
                     1 => rng.pick(&self.arabic),
@@ -360,7 +323,6 @@ fn complex(faces: &[Loaded], rng: &mut Rng, runs: usize) {
         .map(|l| (l.face.label.to_string(), l.bytes.clone()))
         .collect();
     for path in COMPLEX_FACES {
-        // A file the oracle's table already holds (Kohinoor) is shaped once.
         if let Ok(bytes) = std::fs::read(path)
             && !files.iter().any(|(_, held)| *held == bytes)
         {

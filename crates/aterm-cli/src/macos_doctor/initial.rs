@@ -1293,6 +1293,8 @@ trait InitialHost {
 /// This Mac's setup stages. `reads`: what paces the Secrets stage ([`secrets_retry::Live`]).
 struct LiveInitial<R> {
     reads: R,
+    spotlight_result: Option<Result<Vec<Row>, String>>,
+    permissions_result: Option<Result<Vec<Row>, String>>,
 }
 
 impl LiveInitial<secrets_retry::Live> {
@@ -1300,6 +1302,8 @@ impl LiveInitial<secrets_retry::Live> {
     const fn live() -> Self {
         Self {
             reads: secrets_retry::Live,
+            spotlight_result: None,
+            permissions_result: None,
         }
     }
 }
@@ -1335,17 +1339,178 @@ fn item_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
                 Outcome::Failed => "error",
             }
             .into(),
-            detail: row.why.or(row.to).unwrap_or_else(|| "verified".into()),
+            detail: row
+                .why
+                .or_else(|| match (row.from, row.to) {
+                    (Some(from), Some(to)) => Some(format!("{from} → {to}")),
+                    (None, Some(to)) => Some(to),
+                    (Some(from), None) => Some(from),
+                    (None, None) => None,
+                })
+                .unwrap_or_else(|| "verified".into()),
         })
         .collect()
 }
 
+pub(super) fn read_permissions_live(apply: bool) -> Result<Vec<Row>, String> {
+    use crate::{DebuggerMember, DebuggerMode, FdaState, Mark};
+    use aterm_machines::port::System as _;
+    use atpkg::prereq::CcVerdict;
+    let (privacy, debugger, devtools, clt, ax) = std::thread::scope(|s| {
+        let privacy = s.spawn(crate::privacy_facts);
+        let debugger = s.spawn(crate::debugger_facts);
+        let devtools = s.spawn(atpkg::devtools::facts);
+        let clt = s.spawn(|| {
+            let verdict = atpkg::prereq::probe(std::env::var_os("PATH").as_deref());
+            if apply
+                && matches!(verdict, CcVerdict::NoDeveloperDir | CcVerdict::NoDriver)
+                && let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize())
+            {
+                let sys = aterm_machines::port::Live::new();
+                if sys.has_tty()
+                    && let Ok(ctx) = aterm_machines::init::initial_setup_context(&sys)
+                {
+                    let item = aterm_machines::init_clt::CommandLineTools::new(
+                        Box::new(|_| aterm_machines::init_clt::Found::Missing("missing".into())),
+                        exe,
+                    );
+                    let _ = aterm_machines::items::Item::apply(&item, &sys, &ctx);
+                    return atpkg::prereq::probe(std::env::var_os("PATH").as_deref());
+                }
+            }
+            verdict
+        });
+        let ax = s.spawn(|| {
+            let sys = aterm_machines::port::Live::new();
+            let ready = aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false);
+            if ready {
+                return (
+                    true,
+                    "Accessibility & UI Automation granted → Desired: granted".to_owned(),
+                );
+            }
+            let needed = aterm_machines::init_accounts::accessibility_needed(&sys)
+                .unwrap_or(false);
+            if apply {
+                let _ = aterm_machines::init_accounts::request_accessibility(&sys);
+                if aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false) {
+                    return (
+                        true,
+                        "Accessibility & UI Automation granted → Desired: granted".to_owned(),
+                    );
+                }
+            }
+            if !needed {
+                (
+                    true,
+                    "AppleEvents automation ready (Accessibility optional until account sign-out or alert remote-control click)".to_owned(),
+                )
+            } else {
+                (
+                    false,
+                    "Accessibility not granted → Desired: enable aterm in System Settings > Privacy & Security > Accessibility".to_owned(),
+                )
+            }
+        });
+        (
+            privacy.join().expect("privacy_facts thread"),
+            debugger.join().expect("debugger_facts thread"),
+            devtools.join().expect("devtools::facts thread"),
+            clt.join().expect("prereq::probe thread"),
+            ax.join().expect("accessibility thread"),
+        )
+    });
+    let (debugger_mark, debugger_detail) = crate::debugger_row(&debugger);
+    let devtools_ready = devtools
+        .as_ref()
+        .is_some_and(|facts| facts.grant() == aterm_containment::consent::DevToolGrant::Granted);
+    let clt_ready = matches!(clt, CcVerdict::Ready { .. });
+    let clt_detail = match &clt {
+        CcVerdict::Ready { driver } => {
+            format!("{} builds a C program → Desired: ready", driver.display())
+        }
+        _ => format!(
+            "{} → Desired: ready (`aterm init --only base.clt`)",
+            clt.line()
+        ),
+    };
+    Ok(vec![
+        readiness_row("Command Line Tools", clt_ready, clt_detail),
+        readiness_row(
+            "Full Disk Access",
+            privacy.fda == FdaState::Granted,
+            crate::privacy_row(&privacy).1,
+        ),
+        readiness_row(
+            "Debugger access",
+            debugger.probe.mode == DebuggerMode::Enabled
+                && debugger_mark == Mark::Ok
+                && matches!(
+                    debugger.probe.member,
+                    DebuggerMember::Admin | DebuggerMember::Developer
+                ),
+            debugger_detail,
+        ),
+        readiness_row(
+            "Developer Tools",
+            devtools_ready,
+            devtools
+                .as_ref()
+                .and_then(atpkg::devtools::row)
+                .map_or_else(|| "permission status not measured".into(), |row| row.text),
+        ),
+        readiness_row("Accessibility & UI Automation", ax.0, ax.1),
+    ])
+}
+
+impl<R> LiveInitial<R> {
+    pub(super) fn read_permissions(&self, apply: bool) -> Result<Vec<Row>, String> {
+        read_permissions_live(apply)
+    }
+}
+
 impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     fn workstation(&mut self, root: &Path) -> Result<Option<Report>, String> {
-        apply_on_first_run_at(root)
+        let (sp_due, perm_due) = match (saved_plan(root), progress(root)) {
+            (Ok(Some(plan)), Ok(Some(prog))) => (
+                Stage::Spotlight.selected(&plan) && prog.done & Stage::Spotlight.bit() == 0,
+                Stage::Permissions.selected(&plan) && prog.done & Stage::Permissions.bit() == 0,
+            ),
+            _ => (false, false),
+        };
+        if !sp_due && !perm_due {
+            return apply_on_first_run_at(root);
+        }
+        let (ws, sp, perm) = std::thread::scope(|s| {
+            let ws = s.spawn(|| apply_on_first_run_at(root));
+            let sp = sp_due.then(|| {
+                s.spawn(|| {
+                    let sys = aterm_machines::port::Live::new();
+                    let ctx = aterm_machines::init::initial_setup_context(&sys)?;
+                    aterm_machines::init::run_initial_spotlight(
+                        &sys,
+                        &ctx,
+                        aterm_machines::model::Mode::Apply,
+                    )
+                    .map(item_rows)
+                })
+            });
+            let perm = perm_due.then(|| s.spawn(|| read_permissions_live(true)));
+            (
+                ws.join().expect("workstation apply thread"),
+                sp.map(|h| h.join().expect("spotlight apply thread")),
+                perm.map(|h| h.join().expect("permissions apply thread")),
+            )
+        });
+        self.spotlight_result = sp;
+        self.permissions_result = perm;
+        ws
     }
 
     fn spotlight(&mut self) -> Result<Vec<Row>, String> {
+        if let Some(res) = self.spotlight_result.take() {
+            return res;
+        }
         let sys = aterm_machines::port::Live::new();
         aterm_machines::init::run_initial_spotlight(
             &sys,
@@ -1356,39 +1521,10 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
     }
 
     fn permissions(&mut self) -> Result<Vec<Row>, String> {
-        use crate::{DebuggerMember, DebuggerMode, FdaState, Mark};
-        let privacy = crate::privacy_facts();
-        let debugger = crate::debugger_facts();
-        let devtools = atpkg::devtools::facts();
-        let (debugger_mark, debugger_detail) = crate::debugger_row(&debugger);
-        let devtools_ready = devtools.as_ref().is_some_and(|facts| {
-            facts.grant() == aterm_containment::consent::DevToolGrant::Granted
-        });
-        Ok(vec![
-            readiness_row(
-                "Full Disk Access",
-                privacy.fda == FdaState::Granted,
-                crate::privacy_row(&privacy).1,
-            ),
-            readiness_row(
-                "Debugger access",
-                debugger.probe.mode == DebuggerMode::Enabled
-                    && debugger_mark == Mark::Ok
-                    && matches!(
-                        debugger.probe.member,
-                        DebuggerMember::Admin | DebuggerMember::Developer
-                    ),
-                debugger_detail,
-            ),
-            readiness_row(
-                "Developer Tools",
-                devtools_ready,
-                devtools
-                    .as_ref()
-                    .and_then(atpkg::devtools::row)
-                    .map_or_else(|| "permission status not measured".into(), |row| row.text),
-            ),
-        ])
+        if let Some(res) = self.permissions_result.take() {
+            return res;
+        }
+        self.read_permissions(true)
     }
 
     fn secrets(
@@ -4887,7 +5023,11 @@ mod tests {
             build: "1.0.0+gtest".into(),
             now: vault::START,
         };
-        let mut host = LiveInitial { reads: reads(true) };
+        let mut host = LiveInitial {
+            reads: reads(true),
+            spotlight_result: None,
+            permissions_result: None,
+        };
         let first = host.secrets_pace().expect("the live host paces every try");
         assert_eq!(first, secrets_retry::pace(&reads(true)));
         assert_eq!(first.build, "1.0.0+gtest");

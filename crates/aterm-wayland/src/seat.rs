@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Seats: every `wl_seat` the registry lists, bound on the registry's queue,
-//! and the devices their capabilities announce (pointer, keyboard, touch),
-//! made when a capability arrives and released when it goes. Each device's
-//! events are decoded into [`Input`] values, handed to the caller's
-//! [`Sink`] as they are heard ([`crate::sink`]): a pointer's grouped by
-//! `wl_pointer.frame` ([`crate::pointer_frame`]), a keyboard's keymap read
-//! from its descriptor.
-//! The seat keeps what a clipboard copy and a drag need: the newest serial
-//! its keyboard and its pointer gave this client, and the surface each is on.
-//!
-//! `wl_seat` is bound at version 7 at most, as smithay-client-toolkit 0.19.2
-//! (the winit fork's seat until LW.7) binds it, so the fork hears the events
-//! it heard: no `axis_value120` (8), no `axis_relative_direction` (9), no
-//! `repeated` key state (10); key repeat stays the client's.
+//! Wayland seat binding (`wl_seat` <= v7) and pointer, keyboard, and touch event decoding.
 
 use std::ffi::CStr;
 use std::fs::File;
@@ -31,15 +18,13 @@ use crate::sink::Sink;
 /// The highest `wl_seat` version bound (smithay-client-toolkit 0.19.2's).
 pub const VERSION: u32 = 7;
 
-/// The largest keymap read (a full XKB keymap is well under 1 MiB); a
-/// larger size is refused, never allocated.
+/// Maximum keymap size accepted before refusing allocation.
 pub const MAX_KEYMAP: u32 = 16 << 20;
 
 /// What one seat's devices said, in order.
 #[derive(Debug)]
 pub enum Input {
-    /// The seat's capabilities (`wl_seat.capability` bits) changed; its
-    /// devices follow them.
+    /// Seat capability bitmask (`wl_seat.capability`) changed.
     Capabilities {
         seat: u32,
         capabilities: u32,
@@ -64,8 +49,7 @@ pub enum Input {
 pub enum KeyboardEvent {
     /// The keymap, read from the descriptor the compositor sent.
     Keymap(Result<Keymap, KeymapError>),
-    /// The keyboard is on `surface` (`None`: one the client destroyed),
-    /// with `keys` (evdev codes) held.
+    /// Keyboard entered `surface` (`None` if destroyed) with `keys` (evdev codes) held.
     Enter {
         serial: u32,
         surface: Option<Proxy>,
@@ -75,8 +59,7 @@ pub enum KeyboardEvent {
         serial: u32,
         surface: Option<Proxy>,
     },
-    /// `key` is an evdev code (XKB's keycode less 8); `state` is
-    /// `wl_keyboard.key_state`.
+    /// Key press or release (`key` is evdev code; `state` is `wl_keyboard.key_state`).
     Key {
         serial: u32,
         time: u32,
@@ -126,9 +109,7 @@ impl std::fmt::Display for KeymapError {
 
 impl std::error::Error for KeymapError {}
 
-/// Read a keymap of `size` bytes from `fd` (which is closed). The
-/// descriptor is read from offset 0, never mapped: version 7 sends one the
-/// client may map only privately, and a read is that and no more.
+/// Read a keymap of `size` bytes from `fd` at offset 0 without mapping it.
 pub fn read_keymap(format: u32, fd: OwnedFd, size: u32) -> Result<Keymap, KeymapError> {
     if format != wl_keyboard::keymap_format::XKB_V1 {
         return Ok(Keymap {
@@ -185,8 +166,7 @@ pub enum TouchEvent {
     },
 }
 
-/// One seat's live objects and pointer serials, as [`Seats::with_seat`] lends
-/// them.
+/// Live seat proxies and pointer serials lent by [`Seats::with_seat`].
 #[derive(Clone, Copy, Debug)]
 pub struct SeatRefs {
     /// The `wl_seat`.
@@ -195,8 +175,7 @@ pub struct SeatRefs {
     pub pointer: Option<Proxy>,
     /// The serial of the pointer's newest `enter` (what `set_cursor` takes).
     pub pointer_enter_serial: Option<u32>,
-    /// The serial of the pointer's newest button (what a move, a resize or a
-    /// window menu takes).
+    /// Serial of the pointer's newest button event (for move, resize, or window menu).
     pub pointer_button_serial: Option<u32>,
 }
 
@@ -223,8 +202,7 @@ struct Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // SAFETY: a device this module made, released once; its listener
-        // is freed after.
+        // SAFETY: a device this module made, released once; its listener is freed after.
         unsafe {
             if self.version >= 3 {
                 (self.release)(self.proxy);
@@ -313,9 +291,7 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 }
 
 impl Seats {
-    /// Bind every `wl_seat` `registry` lists. Their names and capabilities
-    /// arrive on the registry's queue: dispatch it (a round trip), and the
-    /// devices follow. Every seat's input goes to `sink`, as it is heard.
+    /// Bind every `wl_seat` in `registry` and forward decoded input to `sink`.
     pub fn bind_all(registry: &Registry, sink: Sink<Input>) -> Result<Seats, Error> {
         let seats = Seats {
             seat_book: Arc::new(Mutex::new(SeatBook::default())),
@@ -325,8 +301,7 @@ impl Seats {
         Ok(seats)
     }
 
-    /// Bind the seats `registry` lists that are not bound yet, and release
-    /// the ones it no longer lists (a seat's global went away).
+    /// Bind newly advertised seats in `registry` and release removed ones.
     pub fn sync(&self, registry: &Registry) -> Result<(), Error> {
         let globals: Vec<_> = registry
             .globals()
@@ -346,7 +321,6 @@ impl Seats {
             let bound = seat_book.seats.iter().map(|s| s.id).collect();
             (gone, bound)
         };
-        // Released as they drop, with the book unlocked.
         drop(gone);
         for global in globals.iter().filter(|g| !bound.contains(&g.name)) {
             let version = global.version.min(VERSION);
@@ -400,8 +374,7 @@ impl Seats {
             .collect()
     }
 
-    /// The seat's `wl_seat`, for the objects made per seat elsewhere (a
-    /// data device, a text input, a cursor-shape device).
+    /// Return the seat's `wl_seat` proxy.
     pub fn proxy(&self, seat: u32) -> Option<Proxy> {
         self.seat_book
             .lock()
@@ -428,8 +401,7 @@ impl Seats {
             .and_then(|s| s.frames.latest_enter())
     }
 
-    /// The serial of the pointer's newest button (what a move, a resize or a
-    /// drag takes).
+    /// Serial of the pointer's newest button event (for move, resize, or drag).
     pub fn pointer_button_serial(&self, seat: u32) -> Option<u32> {
         self.seat_book
             .lock()
@@ -438,9 +410,7 @@ impl Seats {
             .and_then(|s| s.frames.latest_button())
     }
 
-    /// The newest serial the seat's keyboard (enter, key, modifiers) or
-    /// pointer (enter, button) gave this client: what a selection is set
-    /// with. `None` when it never gave one.
+    /// Newest serial received from the seat's keyboard or pointer.
     pub fn latest_serial(&self, seat: u32) -> Option<u32> {
         let mut seat_book = self
             .seat_book
@@ -457,8 +427,7 @@ impl Seats {
         .max()
     }
 
-    /// The surface the seat's keyboard is on, if it is on one of this
-    /// client's.
+    /// Surface currently holding the seat's keyboard focus, if any.
     pub fn keyboard_focus(&self, seat: u32) -> Option<Proxy> {
         self.seat_book
             .lock()
@@ -467,12 +436,7 @@ impl Seats {
             .and_then(|s| s.keyboard_focus)
     }
 
-    /// Run `request` with the seat's live objects and serials, the seat's
-    /// book held: a request it makes on them cannot race the seat's release
-    /// or a capability's on the dispatching thread (each takes the book
-    /// first), so a thread other than the dispatching one may make it.
-    /// `request` makes requests and nothing else: it runs under the book's
-    /// lock. `None` when the registry no longer lists the seat.
+    /// Run `request` with the seat's live objects and serials while holding the seat book lock.
     pub fn with_seat<R>(&self, seat: u32, request: impl FnOnce(&SeatRefs) -> R) -> Option<R> {
         let mut seat_book = self
             .seat_book
@@ -527,10 +491,6 @@ impl Drop for SeatSlot {
 }
 
 /// Listen to a seat.
-///
-/// # Safety
-/// `proxy` is a live seat this module bound, without a listener, released
-/// before the listener is freed.
 unsafe fn seat_listener(
     proxy: Proxy,
     seat_book: &Arc<Mutex<SeatBook>>,
@@ -581,7 +541,6 @@ fn on_seat(
         caps & wl_seat::capability::KEYBOARD != 0,
         caps & wl_seat::capability::TOUCH != 0,
     );
-    // What goes, taken out under the lock; what is wanted, read there too.
     let (gone, want) = {
         let mut seat_book = seat_book.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(slot) = seat_book.slot(id) else {
@@ -606,11 +565,7 @@ fn on_seat(
     };
     let pointer_gone = gone.pointer.is_some();
     drop(gone);
-    // Made in smithay-client-toolkit 0.19.2's order (keyboard, pointer, touch),
-    // so the compositor hears the requests, and answers them, as the winit
-    // fork's seat had it.
-    // SAFETY: the live seat the event came from, which has each capability
-    // asked for.
+    // SAFETY: the live seat the event came from, which has each capability asked for.
     let made = unsafe {
         let keyboard = want
             .1
@@ -639,9 +594,6 @@ fn on_seat(
         let mut seat_book = seat_book.lock().unwrap_or_else(PoisonError::into_inner);
         match seat_book.slot(id) {
             Some(slot) => {
-                // The book was unlocked while the devices were made, so
-                // their places should be empty; a spare is released with
-                // `orphans`.
                 let spare = slot.devices.adopt(made);
                 if let Some(frames) = frames {
                     slot.frames = frames;
@@ -651,7 +603,6 @@ fn on_seat(
             None => (made, false),
         }
     };
-    // Released as they drop, with the book unlocked.
     drop(orphans);
     if live {
         sink(Input::Capabilities {
@@ -736,8 +687,6 @@ impl SeatBook {
                         slot.keyboard_serial = Some(*serial);
                         slot.keyboard_focus = *surface;
                     }
-                    // A leave naming no surface (one the client destroyed)
-                    // leaves all the same.
                     KeyboardEvent::Leave { .. } => slot.keyboard_focus = None,
                     KeyboardEvent::Key { serial, .. } | KeyboardEvent::Modifiers { serial, .. } => {
                         slot.keyboard_serial = Some(*serial);

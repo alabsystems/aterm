@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The flight fold and the mapping ([`super`]). The transcripts are MEASURED
-//! (`testdata/flight/`, the lab's 2.1.304 rows), and so are the screens
-//! (`aterm-phase`'s `claude-2.1.304-agents-panel-*long-bash*` fixtures);
-//! the rest are built on their rows.
+//! Tests for the flight fold and mapping ([`super`]).
 
 use super::*;
 use aterm_phase::agents_panel::parse_row;
 use std::path::Path;
 
-/// A measured transcript of `testdata/flight/`, its rows (the header left
-/// out).
+/// A measured transcript of `testdata/flight/`, its rows (the header left out).
 fn rows(name: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/harness/testdata/flight")
@@ -66,7 +62,6 @@ fn the_measured_long_call_is_in_flight_until_its_result() {
     assert_eq!(call.at_ms, ms("2026-10-20T15:58:20.732Z"));
     assert_eq!(call.budget_ms, 400_000, "its declared timeout");
     assert_eq!(call.until_ms(), call.at_ms + 430_000, "and the slack");
-    // The measured result came 300.26 s on: inside its budget.
     assert!(ms("2026-10-20T16:03:20.995Z") < call.until_ms());
     assert_eq!(fold(&rows[..3]).flight(), FileFlight::Model, "answered");
     assert_eq!(fold(&rows).flight(), FileFlight::Done, "its turn ended");
@@ -89,8 +84,7 @@ fn a_background_call_is_never_in_flight() {
     assert_eq!(fold(&rows).flight(), FileFlight::Done);
 }
 
-/// A call row of message `msg`, call `id`, tool `name`, input `input`, at
-/// second `s` past 10:00.
+/// A call row of message `msg`, call `id`, tool `name`, input `input`, at second `s` past 10:00.
 fn call_row(msg: &str, id: &str, name: &str, input: &str, s: u32) -> String {
     format!(
         "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{msg}\",\"stop_reason\":\"tool_use\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\",\"name\":\"{name}\",\"input\":{input}}}]}},\"timestamp\":\"2026-10-20T10:{:02}:{:02}.000Z\"}}",
@@ -108,8 +102,7 @@ fn result_row(id: &str) -> String {
 
 const PROMPT: &str = "{\"type\":\"user\",\"message\":{\"content\":\"[stand-in prompt]\"},\"timestamp\":\"2026-10-20T10:00:00.000Z\"}";
 
-/// A text row of message `msg` whose turn ends on `stop` (`None`: a row of
-/// a turn going on, `stop_reason: null`), at second `s` past 10:00.
+/// Builds a text row for message `msg` with optional `stop` reason.
 fn text_row(msg: &str, stop: Option<&str>, s: u32) -> String {
     let stop = stop.map_or_else(|| "null".to_owned(), |stop| format!("\"{stop}\""));
     format!(
@@ -166,7 +159,6 @@ fn an_agent_ends_on_its_answered_output_or_its_stop() {
         FileFlight::Model,
         "a turn going on"
     );
-    // CONTROLS: an errored output, and another tool's answer.
     let errored = [
         PROMPT.to_owned(),
         call_row("m1", "o1", FINAL_TOOL, "{}", 1),
@@ -236,7 +228,6 @@ fn parallel_calls_show_the_first_due_and_a_new_message_answers_them() {
     let mut answered = rows.clone();
     answered.push(result_row("short"));
     assert!(matches!(fold(&answered).flight(), FileFlight::Tool(c) if c.budget_ms == 500_000));
-    // Control: a new message, though neither result was read.
     let mut next = rows;
     next.push(call_row("m2", "other", "Read", "{}", 9));
     let FileFlight::Tool(call) = fold(&next).flight() else {
@@ -320,8 +311,7 @@ fn keyed(screen: &[String]) -> (Vec<String>, Vec<Option<RowKey>>) {
     (names, keys)
 }
 
-/// `long probe`'s and `bg probe`'s files as the measured rows and metas say,
-/// read up to `rows_read` of `long probe`'s rows.
+/// Writes measured `long probe` and `bg probe` fixture files up to `rows_read`.
 fn run1_table(rows_read: usize) -> FlightTable {
     let long = rows("claude-2.1.304-long-bash.jsonl");
     let bg = rows("claude-2.1.304-bg-bash.jsonl");
@@ -377,7 +367,6 @@ fn the_measured_rows_map_to_their_own_files() {
     assert_eq!(left_ms, 430_000 - 157_450);
     assert_eq!(flights[row_of(&names, "bg probe")], Flight::Unknown);
     assert_eq!(flights[row_of(&names, "main")], Flight::Unknown, "no task");
-    // Control: the result read, the same row is the model's.
     assert_eq!(place(&keys, &run1_table(3), now)[long], Flight::Model);
 }
 
@@ -414,27 +403,22 @@ fn a_row_maps_only_by_exact_agreement() {
         &with(&|f| *f = Flyer::agent("general-purpose", None, f.start_ms, f.flight)),
         now
     ));
-    // The clock says 157 s, resolution 1 s: the start may be 3 s out.
     let slack = i64::try_from(1_000 + START_SLACK_MS).unwrap();
     assert!(maps(&with(&|f| f.start_ms -= slack - 500), now));
     assert!(!maps(&with(&|f| f.start_ms -= slack + 500), now));
     assert!(!maps(&with(&|f| f.start_ms += slack + 1_000), now));
-    // Two files agree: ambiguous.
     let mut twins = table.clone();
     twins.flyers.push(twins.flyers[0].clone());
     assert!(!maps(&twins, now));
-    // Two rows take one file: neither is certainly its.
     let doubled = [keys[long], keys[long]];
     assert_eq!(place(&doubled, &table, now)[..2], [Flight::Unknown; 2]);
     assert!(matches!(
         place(&doubled[..1], &table, now)[0],
         Flight::Tool { .. }
     ));
-    // A row with no clock to compare cannot map.
     let mut clockless = keys[long].unwrap();
     clockless.clock = None;
     assert_eq!(place(&[Some(clockless)], &table, now)[0], Flight::Unknown);
-    // A file whose fold is unknown leaves its row unknown.
     assert_eq!(
         place(&keys, &with(&|f| f.flight = FileFlight::Unknown), now)[long],
         Flight::Unknown
@@ -486,7 +470,6 @@ fn the_measured_workflow_row_maps_to_its_run() {
     let long = rows("claude-2.1.304-workflow-long.jsonl");
     let quick = fold(&rows("claude-2.1.304-workflow-quick.jsonl"));
     assert_eq!(quick.flight(), FileFlight::Done);
-    // The script's mtime, measured: 1792512327.967.
     let start = 1_792_512_327_967i64;
     let now = start + 166_500;
     let table = |long_read: usize| FlightTable {

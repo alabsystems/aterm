@@ -147,7 +147,7 @@ USAGE
                            the develop layer, LibreSSL, the publication engine,
                            the site checkout, node and firebase-tools, the Apple
                            identity, a live-tested notary credential, the
-                           credentials profile, gh auth, the channel token) and
+                           credentials profile, the channel token) and
                            prints every gap with its remedy. Only on a clean
                            pass does it mint this machine's key, by the join
                            ceremony: the paper phrase, typed once, is the only

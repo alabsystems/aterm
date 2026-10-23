@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The built library, loaded into a probe child (`lab-clock-probe`, started by
-//! the spawn seam with `DYLD_INSERT_LIBRARIES`), and its offset file stepped
-//! by a day as `lab sleep` steps it: every wall-clock read moves by the step,
-//! the clocks that count a sleep move by it under the continuous switch and
-//! not without it, and uptime never does. Each delta is set against the
-//! child's own uptime delta and the step, never against a latency: the waits
-//! are one-minute hang detectors for the step to be taken, which must happen.
-//!
-//! The library is built here (`targo --unverified build -p aterm-lab-clock
-//! --lib`, into a target dir of its own under `CARGO_TARGET_TMPDIR`): a
-//! cdylib is no dependency a test can name.
+//! The built library, loaded into a probe child (`lab-clock-probe`, started by the spawn seam with
+//! `DYLD_INSERT_LIBRARIES`), and its offset file stepped by a day as `lab sleep` steps it: every
+//! wall-clock read moves by the step, the clocks that count a sleep move by it under the continuous
+//! switch and not without it, and uptime never does.
 
 #![cfg(target_os = "macos")]
 

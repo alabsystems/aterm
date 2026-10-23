@@ -78,6 +78,23 @@ pub fn visible_row_into(t: &aterm_core::terminal::Terminal, r: usize, out: &mut 
     show_tail(out, start, VisibleTrim::Whitespace);
 }
 
+/// The word a reply carries when the program's DEC 2026 frame was still unfinished at the read's bound.
+pub const FRAME_OPEN_WORD: &str = "frame=open";
+
+/// Whether `t`'s DEC 2026 frame is unfinished now, reading the clock only while one is open.
+#[must_use]
+#[inline]
+pub fn frame_unfinished_now(t: &aterm_core::terminal::Terminal) -> bool {
+    t.sync_frame_unfinished() && t.frame_unfinished_at(std::time::Instant::now())
+}
+
+/// ` frame=open` when `open`, else nothing: a header's trailing word.
+#[must_use]
+#[inline]
+pub const fn frame_open_tail(open: bool) -> &'static str {
+    if open { " frame=open" } else { "" }
+}
+
 /// The control wire's percent escape under the names verbs and hosts use: [`pct_encode`] makes one space-free token (non-graphic bytes and `%` as uppercase `%XX`), [`pct_encode_into`] appends into a caller buffer, and [`pct_decode`] is the total inverse.
 pub use aterm_codec::pct::{
     decode as pct_decode, encode as pct_encode, encode_into as pct_encode_into,

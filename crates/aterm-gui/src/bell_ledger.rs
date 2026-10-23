@@ -1,35 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH TAB RANG (2026-10-22): each session's own record of the bells its
-//! programs rang, so "why do I keep hearing a ping?" has an answer after the
-//! fact. A BEL reaches `App::on_bell`, which decides whether the Mac's alert
-//! sound plays and records the bell here: when, the program in front, and
-//! what the sound gates made of it ([`BellSound`]). `status` and the survey
-//! print it (`bells= bells_sounded= last_bell=`, [`BellRead::wire`]).
-//! A BEL reaches `on_bell` at most once per 100 ms: the engine's throttle,
-//! ahead of its bell callback, drops a BEL under 100 ms after the last one
-//! that rang, so a burst is one bell and a sustained flood one every 100 ms
-//! or so (aterm-core's `bels_ring_at_most_once_per_hundred_ms`). A count
-//! here is of bells that rang, not BEL bytes.
-//!
-//! A FACT FOR LATER, NEVER AN ALERT: nothing here raises attention, posts a
-//! message or moves a need, and recording changes nothing the bell does —
-//! the beep, the flash and the attention request are `on_bell`'s, decided
-//! before the record is written.
-//!
-//! The counts are this aterm process's: a self-update starts them over, as
-//! it does `human_ms=` (the session log's `bell` marks are what crosses one).
+//! WHICH TAB RANG (2026-10-22): each session's own record of the bells its programs rang, so "why
+//! do I keep hearing a ping?" has an answer after the fact.
 
 use std::sync::Mutex;
 
-/// How many bells [`BellLedger`] keeps, the newest first: enough to tell a
-/// tab whose one program rings from one where two take turns, and few enough
-/// for one `status` line.
+/// How many bells [`BellLedger`] keeps, the newest first: enough to tell a tab whose one program
+/// rings from one where two take turns, and few enough for one `status` line.
 pub(crate) const KEPT: usize = 4;
 
-/// What became of one bell's sound: it played, or the gate that kept it
-/// quiet, in `App::on_bell`'s order.
+/// What became of one bell's sound: it played, or the gate that kept it quiet, in `App::on_bell`'s
+/// order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BellSound {
     /// The Mac's alert sound played.
@@ -40,8 +22,8 @@ pub(crate) enum BellSound {
     Serious,
     /// `bell_sound = false` in aterm.toml.
     Off,
-    /// The alert sound had played within the rate limit's interval
-    /// (`BELL_BEEP_INTERVAL`, a second): this bell went unheard.
+    /// The alert sound had played within the rate limit's interval (`BELL_BEEP_INTERVAL`, a
+    /// second): this bell went unheard.
     Limited,
 }
 
@@ -63,21 +45,18 @@ impl BellSound {
 pub(crate) struct Rang {
     /// When it arrived (unix ms).
     pub(crate) at_unix_ms: u64,
-    /// The program in front of the session then, as `status program=` names
-    /// it, or the process name of a foreground group the sweep had not yet
-    /// named (`App::bell_program`). `None` when nothing could say.
+    /// The program in front of the session then, as `status program=` names it, or the process name
+    /// of a foreground group the sweep had not yet named (`App::bell_program`).
     pub(crate) program: Option<String>,
     /// What became of its sound.
     pub(crate) sound: BellSound,
 }
 
-/// The program in front of a session as its bell rang ([`Rang::program`]):
-/// the name the status sweep published (`status program=`, read off the
-/// leader's argv, so Claude Code is `claude`) while the PTY's foreground
-/// group, `live_pgid`, is the group it named; else the process name of the
-/// group in front now (`name_of`), a program the sweep has not read yet;
-/// else the published name. `live_pgid <= 0` is no reading (a ConPTY, a
-/// session with no PTY).
+/// The program in front of a session as its bell rang ([`Rang::program`]): the name the status
+/// sweep published (`status program=`, read off the leader's argv, so Claude Code is `claude`)
+/// while the PTY's foreground group, `live_pgid`, is the group it named; else the process name of
+/// the group in front now (`name_of`), a program the sweep has not read yet; else the published
+/// name.
 pub(crate) fn program_in_front(
     published: Option<String>,
     published_pgid: i32,
@@ -115,10 +94,9 @@ fn program_token(program: Option<&str>) -> String {
 }
 
 impl BellRead {
-    /// ` bells=<n> bells_sounded=<n> last_bell=<ms>/<sound>/<program>[,…]|-`
-    /// as `status` and the survey print it, ages counted to `now_unix_ms`:
-    /// each kept bell as how long ago it rang, what became of its sound
-    /// ([`BellSound::word`]) and the program in front, the newest first.
+    /// ` bells=<n> bells_sounded=<n> last_bell=<ms>/<sound>/<program>[,…]|-` as `status` and the
+    /// survey print it, ages counted to `now_unix_ms`: each kept bell as how long ago it rang, what
+    /// became of its sound ([`BellSound::word`]) and the program in front, the newest first.
     pub(crate) fn wire(&self, now_unix_ms: u64) -> String {
         let last = if self.recent.is_empty() {
             "-".to_string()
@@ -143,8 +121,8 @@ impl BellRead {
     }
 }
 
-/// A session's bells ([the module](self)): a leaf lock on its context, held
-/// only to copy a few words in or out.
+/// A session's bells ([the module](self)): a leaf lock on its context, held only to copy a few
+/// words in or out.
 #[derive(Debug, Default)]
 pub(crate) struct BellLedger(Mutex<BellRead>);
 

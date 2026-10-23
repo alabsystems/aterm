@@ -1,22 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The GL arm's presents (Linux, docs/AUDIT-third-party-2026-10-15.md GW.4),
-//! the twin of the armed Metal present (`metal_encode_submit_b` and
-//! `metal/present.rs`): after the frame's encode, compose the present copy,
-//! the bloom halo, the heat shimmer, the sub-row band shift with its apron,
-//! the settings card, then the letterbox blit and the SDR crown into a
-//! destination texture, in the order and with the uniforms, gates and
-//! scissors the other arms use.
-//!
-//! The destination is the window surface's stand-in
-//! (`gl::surface::GlWindowSurface`, posted by a flipped blit and a swap), the
-//! headless window's virtual target (`WindowGpu::gl_virtual_off`), or a
-//! throwaway for the readback helpers. GL runs commands in issue order and
-//! orders a buffer or texture write after the draws already issued that read
-//! it, so every resource here is resident and rewritten in place: no ring, no
-//! completion probe. The taps read the destination back as soon as it is
-//! drawn.
+//! The GL arm's presents (Linux, docs/AUDIT-third-party-2026-10-15.md GW.4), the twin of the armed
+//! Metal present (`metal_encode_submit_b` and `metal/present.rs`): after the frame's encode,
+//! compose the present copy, the bloom halo, the heat shimmer, the sub-row band shift with its
+//! apron, the settings card, then the letterbox blit and the SDR crown into a destination texture,
+//! in the order and with the uniforms, gates and scissors the other arms use.
 
 use super::*;
 use crate::device_layer::TexelFormat;
@@ -26,8 +15,7 @@ use crate::gl::resources::{GlBuffer, GlBufferRole, GlTexture};
 use gl_arm::gl_arm_note;
 use gl_arm::{GlArmLive, offscreen_format};
 
-/// The present's resident uniform blocks and glow streams on one device,
-/// rewritten every present.
+/// The present's resident uniform blocks and glow streams on one device, rewritten every present.
 pub(crate) struct GlPresentBufs {
     blit: GlBuffer,
     bloom_cell: GlBuffer,
@@ -57,10 +45,8 @@ impl GlPresentBufs {
     }
 }
 
-/// What a window's post composed beyond the frame's own texels: the blit
-/// that placed the frame on the stand-in, the sizes, and what drew over the
-/// frame. Two posts with the same blit and sizes differ only where the
-/// frame's texels, the effects or the crown did ([`post_damage`]).
+/// What a window's post composed beyond the frame's own texels: the blit that placed the frame on
+/// the stand-in, the sizes, and what drew over the frame.
 #[derive(Clone, Copy)]
 #[cfg_attr(
     all(wgpu_arm, not(test)),
@@ -102,7 +88,6 @@ fn post_damage(
     dirty: Option<[u32; 4]>,
 ) -> Option<[u32; 4]> {
     let last = last?;
-    // Compared as bytes, so a NaN in the uniform is a change too.
     let same_blit = aterm_bits::bytes_of(&last.blit) == aterm_bits::bytes_of(&now.blit);
     if !same_blit || last.frame != now.frame || last.dest != now.dest {
         return None;
@@ -242,12 +227,8 @@ pub(crate) enum GlDest<'a> {
 }
 
 impl GpuRenderer {
-    /// The GL present body after the frame's encode: compose, effects, card,
-    /// blit and crown into `dest` at its size, then the taps' copies. Returns
-    /// whether the present copy was composed (the readback helper samples it)
-    /// and what the compose put on `dest` beyond the frame's texels (a
-    /// window's post reads its damage off it, [`post_damage`]).
-    /// `Err` names the failure; the trackers stay conservative.
+    /// The GL present body after the frame's encode: compose, effects, card, blit and crown into
+    /// `dest` at its size, then the taps' copies.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -270,7 +251,6 @@ impl GpuRenderer {
             GlDest::Texture(t) => (t.width, t.height),
             GlDest::Virtual => virtual_dims.ok_or("the virtual target is absent")?,
         };
-        // ---- Phase A: derivations off `self` and `win` --------------------
         let PresentUniforms {
             live_bg,
             mut want,
@@ -291,9 +271,6 @@ impl GpuRenderer {
             false,
         );
         let live = self.gl_arm.as_ref().ok_or("the GL arm is not minted")?;
-        // The blit samples the frame raw where the device keeps both views
-        // (the native plan), else decoded, which it re-encodes: the arm's own
-        // caps decide, whatever the context reported.
         let raw = live.dev.caps().srgb_views;
         want.encode_srgb = if raw { 0.0 } else { 1.0 };
         let want_bloom = self.enable_bloom && fx_gpu::bloom_source_live(input);
@@ -340,7 +317,6 @@ impl GpuRenderer {
             || tray.is_some()
             || band_shift.is_some();
 
-        // ---- Phase B: residency ------------------------------------------
         let live = self.gl_arm.as_mut().ok_or("the GL arm is not minted")?;
         for row in [Pipeline::Blit, Pipeline::SdrGlow] {
             live.ensure_pipeline(row)?;
@@ -356,7 +332,6 @@ impl GpuRenderer {
             live.ensure_pipeline(Pipeline::Tray)?;
         }
         if run_hdr_glow {
-            // No f16 destination exists on GL; the gate keeps this off.
             return Err("an EDR crown on a GL destination".to_owned());
         }
         if live.present.is_none() {
@@ -370,7 +345,6 @@ impl GpuRenderer {
             .ok_or("the armed frame's GL offscreen is absent")?;
         debug_assert_eq!(off_dims, (fw, fh), "the present composes the encoded frame");
         if use_present_off && ensure_offscreen_family(live, &mut win.gl_present_off, (fw, fh))? {
-            // A fresh copy holds undefined texels: copy the whole frame.
             win.offscreen_dirty_since_sync = None;
             win.present_offscreen_fx = None;
         }
@@ -430,7 +404,6 @@ impl GpuRenderer {
                 });
             }
         }
-        // Uniforms and streams.
         let mut bufs = live.present.take().expect("minted above");
         let staged = (|| -> Result<(), String> {
             live.dev
@@ -502,7 +475,6 @@ impl GpuRenderer {
         live.present = Some(bufs);
         staged?;
 
-        // The bloom composite scissor (`encode_bloom_halo`'s spelling).
         let bloom_scissor = bloom_state.and_then(|(_, bbox, _)| {
             let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
                 [
@@ -542,7 +514,6 @@ impl GpuRenderer {
             (fw, fh),
         );
 
-        // ---- Phase C: the encode -----------------------------------------
         let live = self.gl_arm.as_ref().expect("checked above");
         let bufs = live.present.as_ref().expect("restored above");
         let pipe = |row: Pipeline| {
@@ -559,15 +530,12 @@ impl GpuRenderer {
             GlDest::Virtual => win.gl_virtual_off.as_ref().expect("dims read above"),
         };
         let mut frame = GlFrame::begin(&live.dev)?;
-        // 1. Compose: the clean offscreen's stale rect onto the present copy.
         if let Some(copy) = present_off {
             let [x0, y0, x1, y1] = copy_rect;
             if x1 > x0 && y1 > y0 {
                 frame.copy_rect(off, (x0, y0), copy, (x0, y0), x1 - x0, y1 - y0)?;
             }
         }
-        // 2. Bloom: extract into the cleared half target, then the screen
-        //    composite over the copy.
         if let Some((count, _, _)) = bloom_state {
             let half = win.gl_bloom_half.as_ref().expect("ensured above");
             let (stream, _) = bufs.extract.as_ref().expect("uploaded above");
@@ -607,7 +575,6 @@ impl GpuRenderer {
             pass.bind_texture(half, linear, binds.fragment_textures[0], raw);
             pass.draw(3, 1)?;
         }
-        // 3. Shimmer: stage the sample rect, then the scissored refract.
         if let Some(region) = shimmer_region.as_ref() {
             let scratch = win.gl_shimmer_scratch.as_ref().expect("ensured above");
             let m = SHIMMER_COPY_MARGIN;
@@ -642,14 +609,12 @@ impl GpuRenderer {
             pass.bind_texture(scratch, linear, binds.fragment_textures[0], raw);
             pass.draw(3, 1)?;
         }
-        // 3b. The sub-row band shift over the copy, never the offscreen.
         if let Some(shift) = band_shift {
             let copy = present_off.ok_or("the band shift needs the present copy")?;
             let scratch = win.gl_shift_scratch.as_ref().expect("ensured above");
             frame.copy_rect(copy, (0, shift.src_y), scratch, (0, 0), fw, shift.moved)?;
             frame.copy_rect(scratch, (0, 0), copy, (0, shift.dst_y), fw, shift.moved)?;
         }
-        // 3c. The incoming row over the exposed strip.
         if let Some(strip) = apron {
             let copy = present_off.ok_or("the apron strip needs the present copy")?;
             let tex = win.gl_apron_tex.as_ref().expect("ensured above");
@@ -662,7 +627,6 @@ impl GpuRenderer {
                 frame.copy_rect(tex, (0, 0), copy, (0, strip.dst_y), w, rows)?;
             }
         }
-        // 4. The card over the finished copy.
         if tray.is_some() {
             let card = win.gl_tray_card.as_ref().expect("ensured above");
             let binds = Pipeline::Tray.spec().binds;
@@ -677,8 +641,6 @@ impl GpuRenderer {
             pass.bind_texture(&card.tex, linear, binds.fragment_textures[0], false);
             pass.draw(4, 1)?;
         }
-        // 5. The blit pass: clear to the live background, the letterbox blit
-        //    over the whole destination, then the crown in the same pass.
         let mut crown_drawn = [0, 0, 0, 0];
         {
             let binds = Pipeline::Blit.spec().binds;
@@ -722,8 +684,6 @@ impl GpuRenderer {
             }
         }
         frame.submit()?;
-        // Bookkeeping after the encode: the copy now differs from the
-        // offscreen only where this present wrote over it.
         let mut fx: Option<[u32; 4]> = Some([0, 0, 0, 0]);
         if use_present_off {
             fx = union_rect_opt(fx, bloom_scissor, (fw, fh));
@@ -747,7 +707,6 @@ impl GpuRenderer {
             fx,
             crown: crown_drawn,
         };
-        // The taps read the drawn destination back now.
         if win.video.is_some() || win.presented_snapshot.is_some() {
             let capture_color_space = win.capture_color_space();
             let capture_sdr_white_scale = win.sdr_white_scale();
@@ -778,10 +737,8 @@ impl GpuRenderer {
         Ok((use_present_off, posted))
     }
 
-    /// The armed headless present: encode on GL, compose into the resident
-    /// virtual target at the destination size (opaque, as every arm's virtual
-    /// present is). Its bytes are what the tap ring and
-    /// `virtual_presented_snapshot_current` read.
+    /// The armed headless present: encode on GL, compose into the resident virtual target at the
+    /// destination size (opaque, as every arm's virtual present is).
     #[allow(
         clippy::too_many_arguments,
         reason = "the shared virtual-present seam's tuple"
@@ -802,7 +759,6 @@ impl GpuRenderer {
             .map_err(|()| "virtual present crop outside the resident frame")?;
         let w = self.clamp_fb_dim(destination.0.max(1));
         let h = self.clamp_fb_dim(destination.1.max(1));
-        // One bind for the whole present, as the window present's.
         let device = Arc::clone(
             self.gl_arm
                 .as_ref()
@@ -849,12 +805,11 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// The injected-loss drill's fire site (`gl_inject_loss_after`): counts
-    /// successful GL presents, and at zero arms the device so it loses its
-    /// context as a real loss does (`GlShared::inject_context_loss`: on a GLX
-    /// device the next present's reset check reads a reset, after its GLX
-    /// binds; on an EGL device the next `eglMakeCurrent` fails as a lost
-    /// context's does). Announces itself on stderr.
+    /// The injected-loss drill's fire site (`gl_inject_loss_after`): counts successful GL presents,
+    /// and at zero arms the device so it loses its context as a real loss does
+    /// (`GlShared::inject_context_loss`: on a GLX device the next present's reset check reads a
+    /// reset, after its GLX binds; on an EGL device the next `eglMakeCurrent` fails as a lost
+    /// context's does).
     pub(crate) fn gl_maybe_inject_loss(&mut self) {
         let Some(n) = self.gl_inject_loss_after.as_mut() else {
             return;
@@ -872,16 +827,15 @@ impl GpuRenderer {
     }
 
     /// Fire the injected-loss drill after `n` more successful GL presents, as
-    /// `ATERM_GL_INJECT_LOSS=<n>` does at construct. The oracle lane's loss
-    /// test (`gl_replay_tests`) drives it.
+    /// `ATERM_GL_INJECT_LOSS=<n>` does at construct.
     #[cfg(all(test, wgpu_arm))]
     pub(crate) fn gl_inject_loss_after_for_test(&mut self, n: u64) {
         self.gl_inject_loss_after = Some(n).filter(|n| *n > 0);
     }
 
-    /// The armed present helper's readback (`present_input_readback`): a plain
-    /// frame reads the offscreen; an effect frame composes into a throwaway
-    /// destination and reads the present copy the blit sampled.
+    /// The armed present helper's readback (`present_input_readback`): a plain frame reads the
+    /// offscreen; an effect frame composes into a throwaway destination and reads the present copy
+    /// the blit sampled.
     pub(crate) fn gl_present_readback(
         &mut self,
         win: &mut WindowGpu,
@@ -940,12 +894,10 @@ impl GpuRenderer {
 /// on wgpu).
 #[cfg(not(wgpu_arm))]
 impl GpuRenderer {
-    /// Attach `target`'s window: the arm on the window system's display (minted
-    /// there, or minted again there if a headless frame came first), and a
-    /// window surface at `width` x `height` (clamped like every framebuffer):
-    /// a `GLXWindow` on X11, an EGL surface on Wayland (where X11's GLX
-    /// cannot serve there is no device, `gl::glx`). `Err` sends the frontend
-    /// to the CPU renderer.
+    /// Attach `target`'s window: the arm on the window system's display (minted there, or minted
+    /// again there if a headless frame came first), and a window surface at `width` x `height`
+    /// (clamped like every framebuffer): a `GLXWindow` on X11, an EGL surface on Wayland (where
+    /// X11's GLX cannot serve there is no device, `gl::glx`).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn gl_create_window_surface<W: WindowTarget>(
         &mut self,
@@ -996,8 +948,6 @@ impl GpuRenderer {
         let width = self.clamp_fb_dim(width.max(1));
         let height = self.clamp_fb_dim(height.max(1));
         let live = self.gl_arm.as_ref().expect("gl_arm_ready above");
-        // The frontend's presenter posts the window where a window surface
-        // would stall the window system (`gl::surface`'s module header).
         let sink = sink.filter(|_| crate::gl::surface::readback_wanted_on(&live.dev));
         let gs = GlWindowSurface::create(&live.dev, native, width, height, Box::new(target), sink)?;
         if crate::verbose() {
@@ -1014,19 +964,15 @@ impl GpuRenderer {
                 format: TexelFormat::Rgba8Unorm,
             },
             supports_f16: false,
-            // Opaque presents only, as wgpu's Vulkan surfaces were on Linux
-            // (no post-multiplied composite there).
             post_mult: false,
-            // The stand-in reads back, so the taps always have a source.
             copyable: true,
             gl: Some(gs),
         })
     }
 
-    /// The window present: encode on GL, compose into the surface's stand-in,
-    /// post it (`GlWindowSurface::present`: the flipped blit and the swap,
-    /// timed as the acquire wait, since a synchronized swap is where a GL
-    /// present waits for the display).
+    /// The window present: encode on GL, compose into the surface's stand-in, post it
+    /// (`GlWindowSurface::present`: the flipped blit and the swap, timed as the acquire wait, since
+    /// a synchronized swap is where a GL present waits for the display).
     #[allow(
         clippy::too_many_arguments,
         reason = "the shared swapchain seam's established tuple"
@@ -1053,15 +999,6 @@ impl GpuRenderer {
             gl_arm_note("armed present refused: the GL arm is not live");
             return Err(SurfacePresentFailure::Validation);
         }
-        // One bind of the context for the whole present, so every `enter` the
-        // encode, the compose and the post make inside it is a nested guard,
-        // which binds nothing. A top-level `enter` is a `glXMakeContextCurrent`
-        // on the context's pbuffer and its drop a release, and on NVIDIA's GLX
-        // each takes milliseconds, tens while the X server is busy with a
-        // resize: a present made 15 to 36 of them, 78% of its time, and one
-        // after a resize took 100 to 460 ms (the desk, 2026-10-22). A refused
-        // bind is no answer here: the steps meet the refusal again, each on
-        // its own route (a lost frame falls off the arm, its present drops).
         let device = Arc::clone(
             self.gl_arm
                 .as_ref()
@@ -1070,7 +1007,6 @@ impl GpuRenderer {
                 .shared(),
         );
         let _bound = device.enter().ok();
-        // The retained desire (`resize_surface`) is the surface's size.
         gs.resize(surf.neutral.width, surf.neutral.height);
         let work_started = aterm_time::Instant::now();
         let (fw, fh) = self.encode_present_frame(win, input);
@@ -1082,8 +1018,6 @@ impl GpuRenderer {
         if tray.is_none() {
             win.gl_tray_card = None;
         }
-        // Translucency follows the opacity knob where the surface composites
-        // non-opaque content (`post_mult`, false on every GL surface today).
         let translucent = self.cpu.background_opacity() < 1.0 && surf.post_mult;
         let composed = (|| -> Result<GlPosted, String> {
             let live = self.gl_arm.as_ref().ok_or("the GL arm is not live")?;
@@ -1119,8 +1053,6 @@ impl GpuRenderer {
             win.offscreen_dirty_since_post,
         );
         let posted = win.measure_surface_acquire(|| gs.present(&live.dev, fill, damage));
-        // A refused post leaves the window holding an unknown part of it: the
-        // next is whole.
         win.gl_posted = posted.is_ok().then_some(composed);
         if posted.is_ok() {
             win.offscreen_dirty_since_post = Some([0, 0, 0, 0]);
@@ -1133,8 +1065,8 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// The error a caller returns when the arm cannot start: the mint
-    /// failure's cause when there was one.
+    /// The error a caller returns when the arm cannot start: the mint failure's cause when there
+    /// was one.
     pub(crate) fn gl_start_error(&self) -> String {
         match &self.gl_mint_error {
             Some(e) => format!("the GL renderer could not start: {e}"),

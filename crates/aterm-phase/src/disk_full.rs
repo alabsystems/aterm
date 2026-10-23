@@ -1,46 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE DISK IS FULL, BY CLAUDE CODE'S OWN WORD — read by PLACE, never by
-//! the words alone.
-//!
-//! On 2026-10-16 a supervised Claude Code drew `Transcript writes are failing
-//! (disk full — ENOSPC) · recent messages may not be saved for resume` and
-//! every tool call it made failed with `ENOSPC`, while the harness went on
-//! typing `keep going` into it. Claude Code 2.1.302 (read from the store
-//! binary) draws three such texts:
-//!
-//! * the pinned notification `transcript-writer-degraded`: `<anchor>` +
-//!   `disk full — ENOSPC` (or `disk quota exceeded — EDQUOT`, and others that
-//!   are no full disk: `read-only filesystem — EROFS`, `permission denied —
-//!   EACCES`) + `)` + ` · recent messages may not be saved for resume`,
-//!   where `<anchor>` is [`crate::anchors`]' `wall.disk_full`. It clears
-//!   itself at the next successful write to the same transcript;
-//! * a tool's output row: `Command output was lost: the temp filesystem at
-//!   <dir> is full (<n>MB free). The child process's stdout/stderr writes
-//!   failed with ENOSPC. …` (`wall.disk_full.tool`), or `is out of inodes`;
-//! * a goal ended by it: `Goal cleared after an unrecoverable error (disk
-//!   full): "<condition>"` (`wall.disk_full.goal` is the template's head,
-//!   its label `disk full` this cause's).
-//!
-//! Where the notification is drawn was MEASURED on 2.1.304 (the lab,
-//! 2026-10-20, `prompt::fixtures::TRANSCRIPT_DEGRADED_EACCES_2_1_304`): under
-//! the composer's bottom rule, over the footer's mode row, two columns in,
-//! and opened by the vendor's warning glyph — `  ⚠ Transcript writes are
-//! failing (…` — as every pinned notice is (the bundle's notice row draws
-//! `⚠`, one space, then the notice). It is read there and in the live zone
-//! between the status row and the composer's top rule, where Claude Code
-//! draws its other banners: the anchor opening a segment of the row, or
-//! following the glyph and ONE space at a segment's head (`after_glyph`),
-//! never after any other text — never inside the composer (a draft can
-//! quote it) and never in a message a person queued. A tool's row is read
-//! only as the vendor's `⎿` row at column two, and the goal's notice only
-//! where a vendor row or the footer stands.
-//!
-//! WHAT A READING IS FOR: a request to MEASURE. aterm's disk watch reads the
-//! volume's free space when this says so; nothing is removed on a screen's
-//! word (`aterm_agent::harness::disk::poke`), so a misread costs one
-//! `statvfs`.
+//! THE DISK IS FULL, BY CLAUDE CODE'S OWN WORD — read by PLACE, never by the words alone.
 
 /// The error code a disk-full notice names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +15,7 @@ pub enum Code {
 impl Code {
     /// The code as the notice spells it.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Code::Enospc => "ENOSPC",
             Code::Edquot => "EDQUOT",
@@ -80,17 +41,15 @@ pub struct DiskFull {
     pub source: Source,
     /// The row it opens on.
     pub row: usize,
-    /// The notice as drawn on that row, from its anchor on (the vendor's
-    /// glyph before it left off).
+    /// The notice as drawn on that row, from its anchor on (the vendor's glyph before it left off).
     pub message: String,
 }
 
-/// The disk-full notice on a Claude Code screen, if one stands where Claude
-/// Code draws it (the module's rules); the newest (lowest) first.
+/// The disk-full notice on a Claude Code screen, if one stands where Claude Code draws it (the
+/// module's rules); the newest (lowest) first.
 #[must_use]
 pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
     let frame = crate::phase::composer_frame(rows)?;
-    // Under the composer: the footer and its notifications.
     let under = (frame.bottom + 1..rows.len()).rev().find_map(|i| {
         notification(rows, i)
             .or_else(|| goal_cleared(rows, i, false))
@@ -99,9 +58,6 @@ pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
     if under.is_some() {
         return under;
     }
-    // Above it: the live zone under the status row, or with none the rows
-    // the last block ends on — a notice there is a vendor row (`⎿`) or a
-    // banner standing alone at the edge.
     let block = crate::phase::status_block(rows, frame.top);
     let from = block.status.map_or(block.from, |s| s + 1);
     (from..frame.top)
@@ -119,9 +75,6 @@ pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
         })
         .or_else(|| {
             // The vendor's `⎿` rows of the LAST TURN, above the status row
-            // (the rows under it were read above): up to the last message a
-            // person sent (a `❯` row at the edge), never past it — a row of
-            // an earlier turn is an incident since answered.
             let end = block.status.unwrap_or(frame.top).min(frame.top);
             (0..end)
                 .rev()
@@ -213,7 +166,6 @@ fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
     if !seg.starts_with(anchor) {
         return None;
     }
-    // The rest of the notice may be wrapped onto the rows under it.
     let joined: String = std::iter::once(seg)
         .chain(
             rows.iter()
@@ -244,8 +196,6 @@ fn goal_cleared(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
     let anchor = const { crate::anchors::anchor_text("wall.disk_full.goal") };
     let row = crate::text::trim_end(&rows[i]);
     let seg = if vendor {
-        // Above the composer only the vendor's own rows: a `⎿` row, or a
-        // `⏺` system row.
         let t = row.trim_start();
         t.strip_prefix('⎿')
             .or_else(|| t.strip_prefix('⏺'))?
@@ -253,8 +203,6 @@ fn goal_cleared(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
     } else {
         segments(row).find(|s| s.starts_with(anchor))?
     };
-    // The anchor is the template's head; its label (`disk full`) is the
-    // vendor's for this cause alone.
     seg.strip_prefix(anchor)
         .is_some_and(|rest| rest.starts_with("disk full)"))
         .then(|| DiskFull {

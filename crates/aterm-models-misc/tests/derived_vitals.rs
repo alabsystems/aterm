@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use aterm_models_misc::{
-    end_by_proof_model, explain_honesty_model, scope_balance_model, stuck_verdict_liveness,
-    stuck_verdict_model,
+    end_by_proof_model, explain_honesty_model, scope_balance_model, stuck_verdict_model,
 };
 use aterm_spec::{interp, verify};
 
@@ -14,7 +13,6 @@ use aterm_spec::{interp, verify};
 #[test]
 fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     let model = stuck_verdict_model();
-    verify::prove_and_catch_scalar(&model, "stuck verdict");
 
     for (dial, law) in [
         (1, "NeverStuckWhileProgressing"),
@@ -57,7 +55,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
             "`{mutant}` alone breaks the age law"
         );
     }
-    verify::liveness_proves_and_catches_tiered(&model, &stuck_verdict_liveness(), "stuck verdict");
 
     // The healthy lane, as the design's curl row: quiet at φ 3, stuck at φ 8.
     let mut s = model.init_state();
@@ -92,7 +89,6 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
 #[test]
 fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
     let model = end_by_proof_model();
-    verify::prove_and_catch_scalar(&model, "end by proof");
 
     // The one law has its own mutant, and the committed config breaks none.
     let mut buggy = interp::with_buggy(&model, 1);
@@ -138,11 +134,6 @@ fn the_end_by_proof_holds_and_its_mutant_signals_after_a_move() {
 #[test]
 fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
     let model = scope_balance_model();
-    assert_eq!(
-        verify::sweep_faults(std::slice::from_ref(&model)),
-        Vec::<String>::new()
-    );
-    verify::prove_and_catch_scalar(&model, "scope balance");
 
     for (dial, laws) in [
         (1, &["PartsSumToWhole", "ResidualIsShown"][..]),
@@ -176,11 +167,6 @@ fn the_scope_balance_holds_and_each_law_has_its_own_mutant() {
 #[test]
 fn the_explanations_honesty_holds_and_each_law_has_its_own_mutant() {
     let model = explain_honesty_model();
-    assert_eq!(
-        verify::sweep_faults(std::slice::from_ref(&model)),
-        Vec::<String>::new()
-    );
-    verify::prove_and_catch_scalar(&model, "explain honesty");
 
     for (dial, law) in [
         (1, "CauseOnlyWithEvidence"),

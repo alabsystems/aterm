@@ -200,7 +200,7 @@ impl WebBand {
     /// The look the band draws in: moving only while the page is visible and
     /// allows motion, graded unless forced colours own it.
     #[inline]
-    fn look(&self) -> Look {
+    const fn look(&self) -> Look {
         drive::look(LookIn {
             motion_allowed: self.motion_ok,
             on_screen: self.visible,

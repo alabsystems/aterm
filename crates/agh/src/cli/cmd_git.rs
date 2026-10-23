@@ -72,9 +72,7 @@ pub(crate) fn rev(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     })
 }
 
-/// `agh log REPO[@REF] [--path P] [--since T] [--author L] [--limit N]`: the newest N
-/// commits, in GitHub's order. A history cut at its limit is the answer asked for, so the
-/// cut is silent.
+/// `agh log REPO[@REF] [--path P] [--since T] [--author L] [--limit N]`: the newest N commits.
 ///
 /// # Errors
 ///
@@ -125,9 +123,7 @@ fn unrelated(base: &str, head: &str) -> Value {
     })
 }
 
-/// `agh compare REPO BASE...HEAD`: the comparison, `base` and `head` as typed. GitHub's
-/// commit and file caps are Incomplete `CompareCap` when the capped list is projected (a
-/// partial answer under `--partial`); refs with no common history answer `unrelated`.
+/// `agh compare REPO BASE...HEAD`: compares `base` and `head`.
 ///
 /// # Errors
 ///
@@ -157,7 +153,6 @@ pub(crate) fn compare(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                 ));
             }
             if compared.capped_files() && project::wants(Noun::Compare, &opts, "files") {
-                // GitHub's compare answer has no file total, so the why says only what it lists.
                 caps.push(format!(
                     "GitHub lists at most 300 files of a comparison, and this one lists {}",
                     compared.files.len()
@@ -169,8 +164,6 @@ pub(crate) fn compare(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
                         .with_sub(Sub::CompareCap)
                         .with_repo(slug.to_string()));
                 }
-                // An object has no completeness of its own: the receipt says it, and prints
-                // itself, as a partial list's does.
                 receipt.partial(why.clone());
             }
             let mut value = compared.raw;

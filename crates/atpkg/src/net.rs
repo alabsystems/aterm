@@ -106,7 +106,7 @@ const ARTIFACT_CAP: u64 = 8u64 << 30;
 
 /// The byte cap for one artifact transfer: the row's signed `size`, clamped by
 /// [`ARTIFACT_CAP`].
-fn artifact_cap(size: u64) -> u64 {
+const fn artifact_cap(size: u64) -> u64 {
     if size == 0 || size > ARTIFACT_CAP {
         ARTIFACT_CAP
     } else {
@@ -736,14 +736,14 @@ impl GithubFetcher {
 
     /// Attach this store's verified index floor, which the discovery walk counts from.
     #[must_use]
-    pub fn with_index_floor(mut self, floor: u64) -> Self {
+    pub const fn with_index_floor(mut self, floor: u64) -> Self {
         self.index_floor = floor;
         self
     }
 
     /// Attach what this store may guess the channel publishes ([`IndexHint`]): the discovery rounds guess from it ([`ahead_of_walk`]).
     #[must_use]
-    pub fn with_index_hint(mut self, hint: Option<IndexHint>) -> Self {
+    pub const fn with_index_hint(mut self, hint: Option<IndexHint>) -> Self {
         self.index_hint = hint;
         self
     }

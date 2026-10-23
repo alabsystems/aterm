@@ -1,22 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A
-//! --macos V --xcode V|none --no-clt]`: how much of Homebrew abrew installs
-//! natively. abrew's own admission ([`atpkg::abrew::census`]: the pre-lock
-//! check every native install passes) runs over formulae.brew.sh's full
-//! `formula.json` and `cask.json`, fetched now the way abrew fetches them
-//! (in memory; nothing is cached or written), or read from `DIR`. The machine
-//! is modelled: by default the newest Mac abrew can name (arm64, its newest
-//! macOS with that release's Xcode and the Command Line Tools), the API's
-//! default system; `--this-machine` probes this one instead. It prints the
-//! totals with the ten most common refusals of each population, or with
-//! `--json` the whole census. The dated totals in
-//! `docs/DESIGN-abrew-2026-10-19.md` §3 come from here. Exit 0, 1 when an
-//! index cannot be fetched or read, 2 usage (a modelled fact this machine's
-//! own probes could never report among them).
+//! `abrew-admission`: measures native Homebrew formula and cask admission across machines.
 
-use atpkg::abrew::{api, census, machine::Machine};
+use atpkg::abrew::{
+    api, census,
+    machine::{self, Machine},
+};
 
 use crate::{Fail, Res};
 
@@ -71,8 +61,10 @@ fn machine(args: &Args) -> Result<Option<Machine>, Fail> {
         .clone()
         .or_else(|| newest.macos_version().map(str::to_owned))
         .unwrap_or_default();
-    // A modelled macOS brings its own Xcode unless one is named.
-    let xcode = args.xcode.clone().unwrap_or_else(|| Some(macos.clone()));
+    let xcode = args
+        .xcode
+        .clone()
+        .unwrap_or_else(|| machine::release_xcode(&macos));
     Machine::modelled(
         args.arch.as_deref().unwrap_or(newest.arch()),
         &macos,
@@ -138,7 +130,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             intel.describe(),
-            "x86_64, macOS 15.5, Xcode 15.5, no Command Line Tools"
+            "x86_64, macOS 15.5, Xcode 16.0, no Command Line Tools"
         );
         let no_xcode = judged(&["--xcode", "none"]).unwrap().unwrap();
         assert_eq!(no_xcode.xcode_version(), None);

@@ -1179,6 +1179,37 @@ fn an_agent_with_no_excerpts_shows_its_last_rows() {
     assert_eq!(claude_row["rows"], "-", "{}", lines[3]);
 }
 
+/// A frame the program has not finished gives `rows=-`, never its prefix, and no wait for the rest.
+#[test]
+fn a_frame_the_program_has_not_finished_gives_no_rows() {
+    let shell = crate::session_store::test_handle(6);
+    shell
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?2026h\x1b[H\x1b[2Jbuilding 3 of 9\x1b[?2026l");
+    shell
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\x1b[?2026h\x1b[H\x1b[2Jbuilding 4 of 9");
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(shell.clone());
+
+    let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+    let row = out.lines().nth(2).expect("the session row");
+    assert_eq!(fields(row)["rows"], "-", "{row}");
+
+    shell
+        .term
+        .lock()
+        .unwrap()
+        .process(b"\r\nlinking\x1b[?2026l");
+    let out = survey_rows(&store, SurveyLevel::Content, usize::MAX, &here());
+    let row = out.lines().nth(2).expect("the session row");
+    assert_eq!(fields(row)["rows"], "building 4 of 9\nlinking", "{row}");
+}
+
 /// `program_kind=` is the server's word for what runs in front, so a reader
 /// keeps no list of shells.
 #[test]
