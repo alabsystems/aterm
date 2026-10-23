@@ -1331,22 +1331,52 @@ unwritable_remedy() { # <dir> <setting>
 }
 
 # The build's target dir and cargo's home, when an install under sudo left
-# anything in them root's (or any other uid's), fail the build minutes in on a
-# permission error with no way out named: say so before it starts, with the
-# chown that gives them back. Root changes anything; a folder whose parent is
-# not this account's is never named (it is someone else's to give).
+# what the build writes there root's (or any other uid's), fail the build
+# minutes in on a permission error with no way out named: the CLI pre-flight
+# says so instead (CARGO_RESOLVE_REASON, status 1), with the chown that gives
+# them back. Only what the build writes is asked: target/ itself and
+# release/ in it (cargo_build_pinned runs the store's targo by its physical
+# path, or rustup's proxy, never atpkg's targo shim, which would put a
+# build.noindex/ beside them); cargo's home itself, its registry/, its git/
+# when Cargo.lock names a git source or there is no Cargo.lock to say, and its
+# lock and cache files. A folder is named by its physical path, since
+# `chown -R` on a link changes only the link. Root changes anything; a folder
+# whose parent is not this account's is never named (it is someone else's to
+# give).
 source_build_preflight() {
-	local d stale=""
-	[[ "$(id -u)" != 0 ]] || return 0
+	local d p me stale=""
+	me="$(id -u)"
+	[[ "$me" != 0 ]] || return 0
 	for d in "$ROOT/target" "${CARGO_HOME:-$HOME/.cargo}"; do
-		[[ -d "$d" && -O "${d%/*}" ]] || continue
-		[[ -n "$(find "$d/" \( -name "*"$'\n'"*" -prune \) -o \( ! -type l ! -user "$(id -u)" -print \) 2>/dev/null |
-			head -n 1)" ]] || continue
-		stale+=" $(shell_word "$d")"
+		p="$(cd -P -- "$d" 2>/dev/null && pwd -P)" || continue
+		[[ -n "$p" && -O "${p%/*}" ]] || continue
+		if [[ "$d" == "$ROOT/target" ]]; then
+			set -- release
+		else
+			set -- registry .package-cache .package-cache-mutate .global-cache
+			[[ -f "$ROOT/Cargo.lock" ]] && ! grep -q '^source = "git+' "$ROOT/Cargo.lock" 2>/dev/null ||
+				set -- "$@" git
+		fi
+		[[ -n "$(not_owned_in "$me" "$p" "$@")" ]] || continue
+		stale+=" $(shell_word "$p")"
 	done
 	[[ -n "$stale" ]] || return 0
-	echo "install.sh: the source build would fail: not yours, so cargo cannot change what is in$stale (an install under sudo makes such folders root's) — give them back with: sudo chown -R $(shell_word "$(id -un 2>/dev/null || id -u)")$stale" >&2
-	exit 1
+	CARGO_RESOLVE_REASON="building from source writes in$stale, and an install under sudo left some of what is there root's, which cargo cannot change — give it back with: sudo chown -R $(shell_word "$(id -un 2>/dev/null || id -u)")$stale"
+	return 1
+}
+
+# The first entry not <uid>'s (a link aside) of <dir> itself and of each
+# <sub> under it with everything below that; nothing when there is none.
+not_owned_in() { # <uid> <dir> <sub>...
+	local uid="$1" dir="$2" sub
+	shift 2
+	{
+		find "$dir" -maxdepth 0 ! -user "$uid" -print
+		for sub in "$@"; do
+			[[ -e "$dir/$sub" ]] || continue
+			find "$dir/$sub" \( -name "*"$'\n'"*" -prune \) -o \( ! -type l ! -user "$uid" -print \)
+		done
+	} 2>/dev/null | head -n 1
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -1437,11 +1467,12 @@ gate_pinned_channel() { # <root>
 # trustc by absolute path, so PATH cannot steer the compiler (an ambient RUSTC
 # or CARGO_BUILD_RUSTC can, and cargo_build_pinned scrubs both). The store is
 # resolved three ways, in order:
-#   1. `aterm pkg which targo` when `aterm` is in reach: its last `→` arm, up
-#      to the ` — ` note. A targo ahead of the managed bin/ on PATH makes atpkg
-#      answer the SHADOWED shape (`targo → <stray> — managed <build> — SHADOWED
-#      by <stray> — type alab-targo for the managed one`), so a SHADOWED answer
-#      is re-asked as `alab-targo`; an alias that is not laid falls through.
+#   1. `aterm pkg which targo` when `aterm` is in reach (and, under root, is
+#      one may_run allows): its last `→` arm, up to the ` — ` note. A targo
+#      ahead of the managed bin/ on PATH makes atpkg answer the SHADOWED shape
+#      (`targo → <stray> — managed <build> — SHADOWED by <stray> — type
+#      alab-targo for the managed one`), so a SHADOWED answer is re-asked as
+#      `alab-targo`; an alias that is not laid falls through.
 #   2. PATH, scanned dir by dir for a `targo` or `alab-targo` — a shim followed
 #      to its exec target — taking the first that is the store's: the shape
 #      proof below admits a candidate, never its PATH rank. When none is the
@@ -1552,7 +1583,7 @@ find_managed_targo() { # <root>
 		MANAGED_DECLINE="rust-toolchain.toml pins '${pin:-nothing}', not 'trust', so the aterm-managed Trust store is not this checkout's toolchain"
 		return 1
 	fi
-	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]]; then
+	if aterm="$(command -v aterm 2>/dev/null)" && [[ -n "$aterm" ]] && may_run "$aterm"; then
 		out="$("$aterm" pkg which targo 2>/dev/null | head -n 1 || true)"
 		case "$out" in
 		*" — SHADOWED by "*)
@@ -1634,7 +1665,10 @@ trust_link_remedy() { # [name]
 # rustup's lane runs (CARGO_LANE=rustup). Under the trust pin a refusal with no
 # rustup installed names one remedy (gate_trust_remedy); with rustup installed,
 # the product's remedy comes first, then rustup's link. Under a stock pin,
-# which the store cannot serve, rustup's remedy alone.
+# which the store cannot serve, rustup's remedy alone. Under root, a cargo or
+# rustup another account can change is refused before it runs
+# (root_may_run_toolchain), as cargo_honours_pin refuses the cargo, rustc or
+# trustc it would run next.
 find_cargo_and_rustup() { # [root]
 	local root="${1:-}" home="${CARGO_HOME:-$HOME/.cargo}" beside="" seen managed=1 declined=""
 	CARGO_BIN=""
@@ -1647,7 +1681,8 @@ find_cargo_and_rustup() { # [root]
 		if find_managed_targo "$root"; then
 			CARGO_LANE=store
 			CARGO_BIN="$MANAGED_TARGO"
-			return 0
+			root_may_run_toolchain "$CARGO_BIN"
+			return
 		fi
 		[[ "$(gate_pinned_channel "$root")" == trust ]] || managed=0
 	fi
@@ -1681,6 +1716,7 @@ find_cargo_and_rustup() { # [root]
 		fi
 		return 1
 	fi
+	root_may_run_toolchain ${RUSTUP_BIN:+"$RUSTUP_BIN"} "$CARGO_BIN" || return 1
 	if [[ -z "$RUSTUP_BIN" ]]; then
 		seen="$(env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$CARGO_BIN" --version 2>/dev/null | head -n 1 || true)"
 		if [[ "$managed" -eq 1 ]]; then
@@ -1691,6 +1727,19 @@ find_cargo_and_rustup() { # [root]
 		return 1
 	fi
 	return 0
+}
+
+# Under root, whether this run may run each <program> (may_run); else
+# CARGO_RESOLVE_REASON names the first it may not, and status 1. The probes
+# and the build run the toolchain as root, and one another account can change
+# would run that account's code as root.
+root_may_run_toolchain() { # <program>...
+	local p
+	for p in "$@"; do
+		may_run "$p" && continue
+		CARGO_RESOLVE_REASON="root does not run a toolchain another account can change, and $p is one (it, a folder on its way from /, or a link it passes through is not root's alone) — run install.sh as the account whose toolchain it is, without sudo"
+		return 1
+	done
 }
 
 cargo_honours_pin() {
@@ -1725,6 +1774,7 @@ cargo_honours_pin() {
 			CARGO_RESOLVE_REASON="$CARGO_BIN ($CARGO_VERSION) has no trustc beside it at $trustc — targo runs the compiler beside itself, so store build $MANAGED_BUILD under $MANAGED_PREFIX is incomplete: aterm pkg doctor, then aterm pkg install trust"
 			return 1
 		fi
+		root_may_run_toolchain "$trustc" || return 1
 		CARGO_RUSTC="$trustc"
 		CARGO_TOOLCHAIN="trust (pinned by '$pinfile'; aterm-managed store build $MANAGED_BUILD under $MANAGED_PREFIX)"
 		return 0
@@ -1742,6 +1792,11 @@ cargo_honours_pin() {
 		fi
 		return 1
 	fi
+	# rustup's proxies run the pin's own cargo and, for the build, the rustc
+	# beside it.
+	d="${pinned%/cargo}/rustc"
+	[[ -e "$d" || -L "$d" ]] || d=""
+	root_may_run_toolchain "$pinned" ${d:+"$d"} || return 1
 	# What rustup resolved must be the file's pin (the lane header): `show
 	# active-toolchain` prints `<name> (overridden by '<file>')`, and <file> must
 	# be this checkout's rust-toolchain.toml, by inode. The messages spell the
@@ -1801,6 +1856,10 @@ cargo_honours_pin() {
 			break
 		fi
 	done
+	if [[ -n "$CARGO_RUSTC" ]] && ! root_may_run_toolchain "$CARGO_RUSTC"; then
+		CARGO_RUSTC=""
+		return 1
+	fi
 	if [[ -z "$CARGO_RUSTC" ]]; then
 		why="no rustc sits beside it (nor in ${CARGO_HOME:-$HOME/.cargo}/bin), so the build would take PATH's"
 	elif (cd "$root" && RUSTUP_AUTO_INSTALL=0 RUSTUP_TOOLCHAIN=aterm-pin-probe-absent "$CARGO_RUSTC" --version >/dev/null 2>&1); then
@@ -2770,9 +2829,89 @@ app_dest_verdict() { # <app-dir>
 	echo "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if it is a damaged aterm install, move it aside (mv '$app' '$app.broken') and re-run"
 }
 
-# Whether <bundle> and everything in it is root's.
+# Whether <bundle> and everything in it is root's, with no file in it that a
+# group other than root's can write (root_entry).
 bundle_is_roots() { # <bundle>
-	[[ -d "$1" && -z "$(find "$1" ! -user 0 -print 2>/dev/null | head -n 1)" ]]
+	bundle_is_only 0 "$1"
+}
+
+# Whether <bundle> and everything in it is <uid>'s, with no file in it that a
+# group other than gid 0 can write.
+bundle_is_only() { # <uid> <bundle>
+	[[ -d "$2" && -z "$(find "$2" \( ! -user "$1" -o \( -type f -perm -020 ! -group 0 \) \) -print 2>/dev/null |
+		head -n 1)" ]]
+}
+
+# Make the staged bundle <stage> a root run's: root's, and as writable as
+# <dest> and no more. Under root, ditto keeps the owner the container recorded
+# (the release builder's, 501:staff), which on this Mac may be any account or
+# none, and that account could change the app every account and root run. Its
+# folders take <dest>'s group and, when that group can write <dest>, its write
+# (/Applications: admin, as an admin's updater renames and removes the bundle);
+# its files stay root's alone to write, so no group changes what root runs.
+own_bundle_as_root() { # <stage> <dest>
+	local mode links uid gid rest
+	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$2")"
+	chown -R "0:${gid:-0}" "$1"
+	chmod -R go-w "$1"
+	[[ "${mode:5:1}" != w ]] || find "$1" -type d -exec chmod g+w {} +
+}
+
+# Enable at Startup, aterm Caffeine's login job (crates/aterm-caffeine
+# launchd.rs), runs `<exe> caffeine serve` at every login and again each time
+# it fails, so placing an aterm with no `caffeine` verb at <exe> (a release
+# before 0.107.0, by an explicit --version) leaves a job that fails every 10 s
+# all session. When <exe>, at its final path, answers `help caffeine` with a
+# definite no (code::serves_caffeine's probe and its reading: a status <exe>
+# chose, 1 to 125 but bounded's cut-off, 124; from 126 up a run that could not
+# start or one a signal ended, Ctrl-C's in bounded among them, is no answer),
+# each such job is turned off, as a running mug whose code lost the verb turns
+# its own off (macos/app.rs restart_or_retire): its plist in this home's
+# ~/Library/LaunchAgents goes, and launchd unloads the job, ending a mug it
+# runs. A job is one such when its label is one aterm makes (launchd.rs
+# is_label) and its ProgramArguments are exactly <exe> caffeine serve. Only on
+# macOS, and under root only over root's own home: a root run acts on another
+# account's home only as that account (run_as_home_account). Nothing runs <exe>
+# when no such job is there.
+retire_caffeine_startup() { # <exe>
+	local exe="$1" plist label s=0 found=()
+	[[ "$(uname -s)" == Darwin ]] || return 0
+	[[ "$(id -u)" != 0 || "$(home_owner_uid)" == 0 ]] || return 0
+	for plist in "$HOME"/Library/LaunchAgents/com.aterm.aterm.caffeine*.plist; do
+		[[ -f "$plist" && ! -L "$plist" ]] || continue
+		label="${plist##*/}"
+		label="${label%.plist}"
+		caffeine_label "$label" || continue
+		[[ "$(plist_raw "$plist" Label)" == "$label" ]] || continue
+		[[ "$(plist_raw "$plist" ProgramArguments)" == 3 &&
+			"$(plist_raw "$plist" ProgramArguments.0)" == "$exe" &&
+			"$(plist_raw "$plist" ProgramArguments.1)" == caffeine &&
+			"$(plist_raw "$plist" ProgramArguments.2)" == serve ]] || continue
+		found+=("$plist")
+	done
+	[[ ${#found[@]} -gt 0 ]] && may_run "$exe" || return 0
+	bounded "$VERIFY_WAIT_SECS" "$exe" help caffeine >/dev/null 2>&1 || s=$?
+	[[ "$s" -ge 1 && "$s" -le 125 && "$s" -ne 124 ]] || return 0
+	for plist in "${found[@]}"; do
+		rm -f "$plist" || continue
+		label="${plist##*/}"
+		# Not loaded is as good as unloaded.
+		bounded "$VERIFY_WAIT_SECS" launchctl bootout "gui/$(id -u)/${label%.plist}" >/dev/null 2>&1 || true
+		echo "install.sh: turned off aterm Caffeine's Enable at Startup ($plist): this aterm has no Caffeine, so its login job would fail every 10 s — an aterm with the Caffeine menu turns it back on"
+	done
+}
+
+# Whether <label> is one aterm Caffeine makes (launchd.rs is_label): the
+# installed app's, or a dev build's with its 8-hex-digit path hash.
+caffeine_label() { # <label>
+	local re='^com\.aterm\.aterm\.caffeine\.dev\.[0123456789abcdef]{8}$'
+	[[ "$1" == com.aterm.aterm.caffeine || "$1" =~ $re ]]
+}
+
+# The value at <keypath> in <plist> as plutil prints it raw (an array's count),
+# or nothing.
+plist_raw() { # <plist> <keypath>
+	plutil -extract "$2" raw -o - -- "$1" 2>/dev/null || true
 }
 
 # Whether a bin entry is a symlink this installer places: into an aterm.app
@@ -2848,13 +2987,18 @@ root_folders() { # <dir>
 }
 
 # Whether <path> itself is root's and, unless it is a sticky folder or a link,
-# not one every account can write. A link's mode is nothing (Linux shows every
-# link as lrwxrwxrwx, /bin among them): no account rewrites a link in place,
-# only through its folder, and the walks judge that folder and where it leads.
+# not one every account can write, nor, when it is a file, one a group other
+# than root's can write (that group could rewrite it in place; a folder a group
+# can write lets it move entries, but what it moves in is either not root's or
+# root's from another folder it can write, which it still cannot rewrite). A
+# link's mode is nothing (Linux shows every link as lrwxrwxrwx, /bin among
+# them): no account rewrites a link in place, only through its folder, and the
+# walks judge that folder and where it leads.
 root_entry() { # <path>
-	local mode links uid rest
-	read -r mode links uid rest <<<"$(ls_entry -nd -- "$1" 2>/dev/null)"
-	[[ "$uid" == 0 && ( "${mode:0:1}" == l || "${mode:8:1}" != w || "${mode:9:1}" == [tT] ) ]]
+	local mode links uid gid rest
+	read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$1" 2>/dev/null)"
+	[[ "$uid" == 0 && ( "${mode:0:1}" == l || "${mode:8:1}" != w || "${mode:9:1}" == [tT] ) ]] &&
+		[[ "${mode:0:1}" != - || "${mode:5:1}" != w || "$gid" == 0 ]]
 }
 
 # first_line_bounded <exe> [args…] -> the first line a run that finished printed,
@@ -3249,7 +3393,8 @@ print_install_plan() {
 		bin_aterm_plan "$BIN_DIR/aterm" "$STORE_DIR"
 		# The skip first: every refusal found after a cargo was (no rustup
 		# behind it, the pinned toolchain absent, a cargo that ignores the
-		# pin, a rustc beside it that is not the proxy, an unwritable store)
+		# pin, a rustc beside it that is not the proxy, an unwritable store,
+		# a target dir or cargo home the build cannot write)
 		# leaves CARGO_BIN set to the very cargo this line must not announce
 		# as the build's.
 		if [[ -n "$CLI_CARGO_SKIP" ]]; then
@@ -3616,9 +3761,10 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				SKIP_STATUS=0
 				installed_bundle_verified "$DEST/aterm.app" "$SKIP_TEAM" || SKIP_STATUS=$?
 				if [[ "$SKIP_STATUS" -eq 0 && "$(id -u)" == 0 ]] && ! bundle_is_roots "$DEST/aterm.app"; then
-					# A root run's bundle is root's (install_app): one an earlier
-					# root run left the builder's uid is installed again.
-					echo "install.sh: installed aterm matches the elected version but another account owns files in it — reinstalling it as root's" >&2
+					# A root run's bundle is root's (own_bundle_as_root): one in
+					# which an earlier root run left the builder's uid, or files
+					# its folder's group can write, is installed again.
+					echo "install.sh: installed aterm matches the elected version but another account owns files in it or a group can write them — reinstalling it as root's" >&2
 				elif [[ "$SKIP_STATUS" -eq 0 ]]; then
 					APP_ALREADY="${TAG#v}"
 				elif [[ "$SKIP_STATUS" -eq 124 ]]; then
@@ -3710,6 +3856,10 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 		elif ! ensure_dirs_writable "$STORE_DIR"; then
 			# Pre-flighted here, never discovered after the multi-minute build.
 			CLI_CARGO_SKIP="cannot create/write $STORE_DIR ($(unwritable_remedy "$STORE_DIR" ATERM_STORE_DIR))"
+		elif ! source_build_preflight; then
+			# The same: an earlier install under sudo left what the build
+			# writes root's, so it would fail on a permission error.
+			CLI_CARGO_SKIP="$CARGO_RESOLVE_REASON"
 		fi
 	fi
 fi
@@ -3947,18 +4097,7 @@ install_app() {
 	# the swap. Same rule for the set-aside path.
 	STAGE="$DEST/aterm.app.installing.$(random_suffix)"
 	ditto "$MNT/aterm.app" "$STAGE"
-	# Under root, ditto keeps the owner the container recorded (the release
-	# builder's, 501:staff), which on this Mac may be any account or none, and
-	# that account could change the app every account and root run: a root
-	# run's bundle is root's, as writable as $DEST and no more (/Applications:
-	# its admin group, as an admin's updater swaps it).
-	if [[ "$(id -u)" == 0 ]]; then
-		local mode links uid gid rest
-		read -r mode links uid gid rest <<<"$(ls_entry -nd -- "$DEST")"
-		chown -R "0:${gid:-0}" "$STAGE"
-		chmod -R go-w "$STAGE"
-		[[ "${mode:5:1}" != w ]] || chmod -R g+w "$STAGE"
-	fi
+	[[ "$(id -u)" != 0 ]] || own_bundle_as_root "$STAGE" "$DEST"
 	if [[ -e "$DEST/aterm.app" ]]; then
 		OLD="$DEST/.aterm.app.old.$(random_suffix)"
 		mv "$DEST/aterm.app" "$OLD"
@@ -3977,6 +4116,8 @@ install_app() {
 	mdimport "$DEST/aterm.app" >/dev/null 2>&1 || true
 	/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
 		-f "$DEST/aterm.app" >/dev/null 2>&1 || true
+
+	retire_caffeine_startup "$DEST/aterm.app/Contents/MacOS/aterm"
 
 	if pgrep -f '/aterm\.app/Contents/MacOS/aterm' >/dev/null 2>&1; then
 		echo "install.sh: NOTE: aterm is currently running — the new version takes effect on next launch"
@@ -4145,7 +4286,6 @@ install_cli() {
 }
 
 install_cli_from_source() {
-	source_build_preflight
 	echo "install.sh: building aterm from $ROOT at $(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo '(not a git checkout)')"
 	# Pin the target dir (a global CARGO_TARGET_DIR / build.target-dir redirect
 	# would strand the fresh binaries elsewhere) but NEVER a --target triple:
